@@ -86,7 +86,8 @@ pub struct SyncState {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
-    pub new: usize,
+    /// Ids of the messages stored for the first time.
+    pub new: Vec<i64>,
     /// Messages that left the inbox elsewhere.
     pub gone: usize,
     pub first: bool,
@@ -300,7 +301,9 @@ pub async fn sync_inbox(
         ..Default::default()
     };
     for batch in new.chunks(FETCH_BATCH) {
-        report.new += fetch_new(session, store, account_id, batch, !first).await?;
+        report
+            .new
+            .extend(fetch_new(session, store, account_id, batch, !first).await?);
     }
 
     // Flags of everything else we track in the inbox.
@@ -333,7 +336,7 @@ async fn fetch_new(
     account_id: i64,
     uids: &[u32],
     screen_new_senders: bool,
-) -> Result<usize> {
+) -> Result<Vec<i64>> {
     let set = uid_set(uids);
     let sizes: Vec<Fetch> = session
         .uid_fetch(&set, "(UID RFC822.SIZE)")
@@ -345,7 +348,7 @@ async fn fetch_new(
         .filter_map(|f| Some((f.uid?, f.size.unwrap_or(0))))
         .partition(|(_, size)| *size <= MAX_BODY_BYTES);
 
-    let mut added = 0;
+    let mut added = Vec::new();
     for (uids, query) in [
         (small, "(UID FLAGS INTERNALDATE BODY.PEEK[])"),
         (large, "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])"),
@@ -378,8 +381,8 @@ async fn fetch_new(
             if let Some(date) = fetch.internal_date() {
                 m.date = date.timestamp_millis();
             }
-            if let Added::New(_) = lock(store).add_incoming(&m, screen_new_senders)? {
-                added += 1;
+            if let Added::New(id) = lock(store).add_incoming(&m, screen_new_senders)? {
+                added.push(id);
             }
         }
     }

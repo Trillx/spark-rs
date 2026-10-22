@@ -57,12 +57,24 @@ pub struct Report {
     pub new: usize,
     pub gone: usize,
     pub pushed: usize,
+    /// Ids of the new messages worth telling the user about: all of them,
+    /// except on an account's first sync, which brings in mail they've
+    /// already seen elsewhere.
+    pub arrived: Vec<i64>,
 }
 
 impl Report {
     /// Whether the message list needs reloading.
     pub fn changed(&self) -> bool {
         self.new + self.gone > 0
+    }
+
+    fn synced(&mut self, new: Vec<i64>, gone: usize, first: bool) {
+        self.new = new.len();
+        self.gone = gone;
+        if !first {
+            self.arrived = new;
+        }
     }
 }
 
@@ -218,8 +230,7 @@ impl Engine {
                     // Keep the position even if part of the sync failed.
                     self.store().set_sync_state(account_id, &to_json(&state))?;
                     let sync = sync?;
-                    report.new = sync.new;
-                    report.gone = sync.gone;
+                    report.synced(sync.new, sync.gone, sync.first);
                 }
                 self.store().set_sync_state(account_id, &to_json(&state))?;
                 let _ = session.logout().await;
@@ -237,8 +248,7 @@ impl Engine {
                         .sync_inbox(&self.store, account_id, &mut state)
                         .await?;
                     self.store().set_sync_state(account_id, &to_json(&state))?;
-                    report.new = sync.new;
-                    report.gone = sync.gone;
+                    report.synced(sync.new, sync.gone, sync.first);
                 }
             }
         }

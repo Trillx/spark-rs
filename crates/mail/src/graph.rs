@@ -54,7 +54,8 @@ pub struct SyncState {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
-    pub new: usize,
+    /// Ids of the messages stored for the first time.
+    pub new: Vec<i64>,
     pub gone: usize,
     pub first: bool,
 }
@@ -249,8 +250,8 @@ impl Graph {
                 {
                     incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
                 }
-                if let spark_store::Added::New(_) = lock(store).add_incoming(&incoming, !first)? {
-                    report.new += 1;
+                if let spark_store::Added::New(id) = lock(store).add_incoming(&incoming, !first)? {
+                    report.new.push(id);
                 }
             }
             match (page.next_link, page.delta_link) {

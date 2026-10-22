@@ -58,6 +58,20 @@ Office opens them in Protected View. Attach files with the paperclip,
 Ctrl+Shift+A, or by dropping them on the window; forwards keep the original's
 attachments. Messages over 10 MB are stored without their body or file list.
 
+## Notifications and the tray
+
+Closing the window leaves spark-rs running in the notification area, still
+syncing; click its icon to bring the window back, or right-click it to check
+for mail or quit. New mail shows a Windows notification with the New Mail
+sound, and clicking one opens the message. By default only mail from people
+notifies (Spark's smart notifications); newsletters, notifications, mail from
+new senders waiting in the Gatekeeper, and an account's first sync stay
+quiet, as does anything arriving while the window is in front. Settings →
+Notifications changes this, turns the sound off, stops closing to the tray, or
+opens spark-rs in the background when you sign in to Windows.
+
+Starting spark-rs again while it runs brings the running window forward.
+
 ## Layout
 
 ```

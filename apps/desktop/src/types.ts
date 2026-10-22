@@ -55,6 +55,20 @@ export interface Message {
   attachment?: string;
 }
 
+/** Which new mail shows a notification. `people` is Spark's smart notifications. */
+export type NotifyFor = "people" | "all" | "off";
+
+/** Settings → Notifications. */
+export interface Prefs {
+  notify: NotifyFor;
+  /** Windows' New Mail sound with each notification. */
+  sound: boolean;
+  /** Closing the window leaves the app running in the notification area. */
+  keepRunning: boolean;
+  /** Start in the background when the user signs in to Windows. */
+  openAtLogin: boolean;
+}
+
 export type MessagePatch = Partial<
   Pick<Message, "state" | "unread" | "pinned" | "priority" | "screening" | "snoozedUntil">
 >;

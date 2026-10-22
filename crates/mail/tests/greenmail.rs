@@ -108,9 +108,10 @@ async fn imap_round_trip() {
         .unwrap();
     assert_eq!(account.label, "example.com");
 
-    // First sync: everything in, nobody screened.
+    // First sync: everything in, nobody screened, nothing to notify about.
     let report = engine.run(account.id, true).await.unwrap();
     assert_eq!(report.new, 3, "{report:?}");
+    assert!(report.arrived.is_empty());
     assert_eq!(
         find(&engine, "Weekly digest").category,
         Category::Newsletters
@@ -123,7 +124,9 @@ async fn imap_round_trip() {
     deliver(&smtp, "Stranger <s@z.net>", &me, "Hi there", false).await;
     let report = engine.run(account.id, true).await.unwrap();
     assert_eq!(report.new, 1);
-    assert!(find(&engine, "Hi there").screening);
+    let hi = find(&engine, "Hi there");
+    assert!(hi.screening);
+    assert_eq!(report.arrived, [hi.id]);
 
     // Done + read is pushed as an archive move with \Seen.
     back_in_time(

@@ -1,6 +1,7 @@
 import {
   AlignLeft,
   ArrowDownLeft,
+  Bell,
   Check,
   CircleAlert,
   CircleCheck,
@@ -47,6 +48,7 @@ import {
   listMessages,
   onAccountsChanged,
   onMailboxChanged,
+  onOpenMessage,
   onSendStatus,
   onSyncStatus,
   openAttachment,
@@ -216,14 +218,15 @@ export default function App() {
   }, []);
 
   // Backend events. They call through a ref so the listeners, registered once, see current state.
-  const events = useRef({ reloadMessages, reloadAccounts, syncStatus, sendStatus });
-  events.current = { reloadMessages, reloadAccounts, syncStatus, sendStatus };
+  const events = useRef({ reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification });
+  events.current = { reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification };
   useEffect(() => {
     const stops = [
       onMailboxChanged(() => void events.current.reloadMessages()),
       onAccountsChanged(() => void events.current.reloadAccounts()),
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
+      onOpenMessage((id) => events.current.openFromNotification(id)),
     ];
     return () => stops.forEach((stop) => stop());
   }, []);
@@ -425,6 +428,25 @@ export default function App() {
       setSticky((s) => new Set(s).add(id));
       void update(id, { unread: false });
     }
+  }
+
+  /** A notification was clicked: show its message in the Inbox, closing what covers it. */
+  function openFromNotification(id: number) {
+    void listMessages().then(
+      (loaded) => {
+        setMessages(loaded);
+        const m = loaded.find((x) => x.id === id);
+        if (!m) return;
+        setSettingsPage(null);
+        setPalette(null);
+        changeView(
+          { folder: "inbox", sub: null, search: null, account: view.account === m.account ? m.account : "all" },
+          true,
+        );
+        openThread(id, loaded);
+      },
+      (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
+    );
   }
 
   function moveCursor(step: 1 | -1) {
@@ -953,6 +975,13 @@ export default function App() {
         keywords: "accounts gmail google microsoft outlook office 365 exchange imap sign in login",
         Icon: UserPlus,
         run: () => openSettings("accounts"),
+      },
+      {
+        id: "notification-settings",
+        label: "Notification settings",
+        keywords: "notify alerts sound tray background close startup sign in login",
+        Icon: Bell,
+        run: () => openSettings("notifications"),
       },
       {
         id: "ai-settings",

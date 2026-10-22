@@ -3,7 +3,7 @@
 //! A worker loops: send what's due, push local changes once they're past the
 //! undo window, and fetch new mail every couple of minutes or when asked.
 //! It tells the UI through events (`mailbox-changed`, `sync-status`,
-//! `send-status`).
+//! `send-status`), and the user through notifications for new mail.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{Notify, oneshot};
 
 use crate::mailbox::{SyncStatus, SyncView};
+use crate::notify;
 use crate::secrets::MailSecrets;
 
 const TICK: Duration = Duration::from_secs(2);
@@ -247,6 +248,9 @@ async fn work(
                     }
                     if report.changed() {
                         let _ = app.emit("mailbox-changed", ());
+                    }
+                    if !report.arrived.is_empty() {
+                        notify::new_mail(&app, &engine, account_id, &report.arrived);
                     }
                 }
                 Err(e) => {

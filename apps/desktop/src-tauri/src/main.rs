@@ -2,28 +2,39 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod background;
 mod demo;
 mod files;
 mod live;
 mod mailbox;
+mod notify;
+mod prefs;
 mod secrets;
 
 use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
+        // First, so a second launch only brings this one's window forward.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            background::second_launch(app, args)
+        }))
         .setup(|app| {
             files::clear_opened();
             let config_dir = app.path().app_config_dir()?;
+            app.manage(prefs::PrefsState::load(config_dir.clone()));
             app.manage(ai::AiState::new(config_dir, ai::Keys::platform()));
+            notify::register(app.handle());
             let live = live::Live::open(&app.path().app_local_data_dir()?)?;
             live.start_all(app.handle());
             app.manage(mailbox::Mailbox {
                 demo: demo::DemoMailbox::load(),
                 live,
             });
+            background::setup(app)?;
             Ok(())
         })
+        .on_window_event(background::on_window_event)
         .invoke_handler(tauri::generate_handler![
             mailbox::list_accounts,
             mailbox::list_messages,
@@ -50,6 +61,9 @@ fn main() {
             ai::list_ai_models,
             ai::summarize_message,
             ai::cancel_summary,
+            prefs::get_prefs,
+            prefs::save_prefs,
+            notify::test_notification,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start spark-rs");

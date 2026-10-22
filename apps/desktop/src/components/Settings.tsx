@@ -1,4 +1,5 @@
 import {
+  Bell,
   Building2,
   CircleAlert,
   CircleCheck,
@@ -42,19 +43,22 @@ import {
   addImapAccount,
   addMicrosoftAccount,
   cancelSignIn,
+  getPrefs,
   openExternal,
   removeAccount,
   renameAccount,
+  savePrefs,
+  testNotification,
 } from "../api";
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo } from "../lib/format";
 import type { ThemePref } from "../lib/theme";
-import type { AccountView, SyncStatus } from "../types";
+import type { AccountView, NotifyFor, Prefs, SyncStatus } from "../types";
 import AccountMark from "./AccountMark";
 import Dropdown, { MenuItem } from "./Dropdown";
 import { tipAttrs } from "../lib/tooltip";
 
-export type SettingsPage = "accounts" | "ai" | "appearance";
+export type SettingsPage = "accounts" | "ai" | "notifications" | "appearance";
 
 /** Nav groups, in order. Only pages that exist so far. */
 const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
@@ -62,7 +66,10 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
     { key: "accounts", label: "Accounts", Icon: UsersRound },
     { key: "ai", label: "AI", Icon: Sparkles },
   ],
-  [{ key: "appearance", label: "Appearance", Icon: Palette }],
+  [
+    { key: "notifications", label: "Notifications", Icon: Bell },
+    { key: "appearance", label: "Appearance", Icon: Palette },
+  ],
 ];
 const PAGES = NAV.flat();
 
@@ -165,6 +172,7 @@ export default function Settings({
             <div className="max-w-[560px]">
               {page === "accounts" && <AccountsPage onChanged={onAccountsChanged} />}
               {page === "ai" && <AiPage />}
+              {page === "notifications" && <NotificationsPage />}
               {page === "appearance" && <AppearancePage theme={theme} onTheme={onTheme} />}
             </div>
           </div>
@@ -207,6 +215,37 @@ function Row({
       </div>
       {children}
     </div>
+  );
+}
+
+function Switch({
+  id,
+  on,
+  disabled = false,
+  onToggle,
+}: {
+  id: string;
+  on: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      id={id}
+      role="switch"
+      aria-checked={on}
+      disabled={disabled}
+      onClick={onToggle}
+      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
+        on ? "bg-primary" : "bg-base-content/20"
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 size-4 rounded-full bg-white shadow-sm transition-[left] ${
+          on ? "left-[18px]" : "left-0.5"
+        }`}
+      />
+    </button>
   );
 }
 
@@ -824,6 +863,117 @@ function LabelRow({
         className={INPUT}
       />
     </Row>
+  );
+}
+
+// ---- Notifications ----
+
+const NOTIFY_CHOICES: { key: NotifyFor; label: string; detail: string }[] = [
+  { key: "people", label: "Smart", detail: "Only mail from people" },
+  { key: "all", label: "All", detail: "Every new email" },
+  { key: "off", label: "Off", detail: "No notifications" },
+];
+
+function NotificationsPage() {
+  const [prefs, setPrefs] = useState<Prefs | null>(null);
+  const [status, setStatus] = useState<Status>({ kind: "idle" });
+
+  useEffect(() => {
+    void getPrefs().then(setPrefs, (error) => setStatus({ kind: "error", text: String(error) }));
+  }, []);
+
+  async function change(patch: Partial<Prefs>) {
+    if (!prefs) return;
+    const before = prefs;
+    setPrefs({ ...before, ...patch });
+    try {
+      setPrefs(await savePrefs({ ...before, ...patch }));
+      setStatus({ kind: "idle" });
+    } catch (error) {
+      setPrefs(before);
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  async function test() {
+    setStatus({ kind: "busy", what: "Sending…" });
+    try {
+      await testNotification();
+      setStatus({ kind: "ok", text: "Sent. Windows shows it at the bottom right of the screen." });
+    } catch (error) {
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  if (!prefs) return <StatusLine status={status} />;
+  const off = prefs.notify === "off";
+
+  return (
+    <>
+      <section className="mb-7">
+        <h3 className="mb-2 px-1 text-[13px] font-semibold text-text-2">Notify me about new mail</h3>
+        <div role="radiogroup" aria-label="Notify me about new mail" className="grid grid-cols-3 gap-3">
+          {NOTIFY_CHOICES.map((c) => (
+            <button
+              key={c.key}
+              role="radio"
+              aria-checked={prefs.notify === c.key}
+              onClick={() => void change({ notify: c.key })}
+              className={`rounded-2xl border px-3.5 py-3 text-left ${
+                prefs.notify === c.key
+                  ? "border-primary bg-primary/5 ring-1 ring-primary"
+                  : "border-hairline hover:border-splitter"
+              }`}
+            >
+              <span className="block text-[13px] font-semibold leading-5">{c.label}</span>
+              <span className="block text-xs leading-4 text-text-2">{c.detail}</span>
+            </button>
+          ))}
+        </div>
+        <p className="mt-2 px-1 text-xs leading-[18px] text-text-2">
+          Smart leaves out notifications and newsletters. Mail from new senders waits in the Gatekeeper without a
+          notification, and while the spark-rs window is in front, new mail just appears in the list.
+        </p>
+      </section>
+
+      <Group>
+        <Row label="Sound" description="Windows' New Mail sound, set in Windows' sound settings." htmlFor="notify-sound">
+          <Switch id="notify-sound" on={prefs.sound} disabled={off} onToggle={() => void change({ sound: !prefs.sound })} />
+        </Row>
+        <Row label="Test notification" description="Check how new mail will look and sound.">
+          <button className="btn btn-sm h-8 rounded-lg" disabled={status.kind === "busy"} onClick={() => void test()}>
+            Send test
+          </button>
+        </Row>
+      </Group>
+
+      <Group title="In the background">
+        <Row
+          label="Keep running when closed"
+          description="Closing the window leaves spark-rs in the notification area, checking for mail. Quit from its icon there."
+          htmlFor="keep-running"
+        >
+          <Switch
+            id="keep-running"
+            on={prefs.keepRunning}
+            onToggle={() => void change({ keepRunning: !prefs.keepRunning })}
+          />
+        </Row>
+        <Row
+          label="Open at sign-in"
+          description="Starts in the background when you sign in to Windows."
+          htmlFor="open-at-login"
+        >
+          <Switch
+            id="open-at-login"
+            on={prefs.openAtLogin}
+            onToggle={() => void change({ openAtLogin: !prefs.openAtLogin })}
+          />
+        </Row>
+      </Group>
+
+      <StatusLine status={status} />
+    </>
   );
 }
 

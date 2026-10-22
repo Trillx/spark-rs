@@ -14,13 +14,19 @@ rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 spark-ai = { version = "0.1.0", path = "../../../crates/ai" }
 spark-mail = { version = "0.1.0", path = "../../../crates/mail" }
 spark-store = { version = "0.1.0", path = "../../../crates/store" }
-tauri = "2.12.5"
+tauri = { version = "2.12.5", features = ["tray-icon"] }
+# A second launch brings the running app forward instead of syncing twice.
+tauri-plugin-single-instance = "2.5.4"
 tokio = { version = "1.54.1", features = ["macros", "sync", "time"] }
 url = "2.5.8"
 
-# The OS credential store for API keys; see `ai/keys.rs`.
 [target.'cfg(target_os = "windows")'.dependencies]
+# The OS credential store for API keys; see `ai/keys.rs`.
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
+# New-mail toasts (`notify.rs`) and opening at sign-in (`background.rs`).
+# The same versions Tauri already uses.
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications"] }
+windows-registry = "0.6.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = "1.0.0"

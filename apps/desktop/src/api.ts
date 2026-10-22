@@ -10,6 +10,7 @@ import type {
   MessageContent,
   MessagePatch,
   OutgoingDraft,
+  Prefs,
   SendStatusEvent,
   SyncStatusEvent,
 } from "./types";
@@ -192,6 +193,26 @@ export function openExternal(url: string): Promise<void> {
   return Promise.resolve();
 }
 
+// ---- notifications and running in the background ----
+
+export function getPrefs(): Promise<Prefs> {
+  if (isTauri()) return invoke("get_prefs");
+  return Promise.resolve({ ...browserPrefs });
+}
+
+/** Returns what was saved. Rejects when Windows' sign-in list can't be changed. */
+export function savePrefs(prefs: Prefs): Promise<Prefs> {
+  if (isTauri()) return invoke("save_prefs", { prefs });
+  browserPrefs = { ...prefs };
+  return Promise.resolve({ ...prefs });
+}
+
+/** Rejects with a user-facing reason, e.g. notifications are off for the app in Windows. */
+export function testNotification(): Promise<void> {
+  if (isTauri()) return invoke("test_notification");
+  return Promise.reject("Run the desktop app to see notifications.");
+}
+
 // ---- events ----
 // Each returns its unsubscribe. In the browser nothing is ever emitted.
 
@@ -210,6 +231,9 @@ export const onAccountsChanged = (handler: () => void) => on<null>("accounts-cha
 export const onSyncStatus = (handler: (event: SyncStatusEvent) => void) => on("sync-status", handler);
 
 export const onSendStatus = (handler: (event: SendStatusEvent) => void) => on("send-status", handler);
+
+/** A new-mail notification was clicked: show this message. */
+export const onOpenMessage = (handler: (id: number) => void) => on("open-message", handler);
 
 // ---- browser preview (`npm run dev`) ----
 
@@ -258,6 +282,9 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, ...m }) => ({
 })) as Message[];
 
 let browserOutbox = 0;
+
+/** The Rust side's defaults. */
+let browserPrefs: Prefs = { notify: "people", sound: true, keepRunning: true, openAtLogin: false };
 
 /** Snoozed mail whose time has come goes back to the Inbox, unread, as the Rust side does. */
 function wakeSnoozed(now = Date.now()) {
