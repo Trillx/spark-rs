@@ -7,6 +7,50 @@ on ARM (`aarch64-pc-windows-msvc`).
 
 Created in [T3 Code](https://t3.codes).
 
+## Accounts
+
+Settings (`Ctrl+,`) → Accounts → Add an account. Until the first account is
+added the app shows a demo mailbox.
+
+Mail is stored in `mail.sqlite` in the app's local data folder
+(`%LOCALAPPDATA%\dev.sparkrs.desktop` on Windows). Passwords and Microsoft
+sign-ins are kept in Windows Credential Manager under `spark-rs`, never in
+files. Removing an account deletes its local mail and saved sign-in; nothing
+is deleted on the server.
+
+**Gmail.** Google requires an app password for mail apps: turn on 2-Step
+Verification, create one at <https://myaccount.google.com/apppasswords>, then
+choose **Gmail** and enter your address and the 16 letters. spark-rs uses
+`imap.gmail.com:993` and `smtp.gmail.com:465` and checks the login before
+saving.
+
+**Microsoft 365 (work or school).** This needs an app registration in your
+organization's Microsoft Entra tenant (<https://entra.microsoft.com> → App
+registrations → New registration). If you can't register apps, ask IT:
+
+- Supported account types: this organizational directory only.
+- Platform: **Mobile and desktop applications**, redirect URI
+  `http://localhost` (any port matches; spark-rs picks a free one).
+- API permissions, Microsoft Graph, delegated: `User.Read`,
+  `Mail.ReadWrite`, `Mail.Send`, `offline_access`. If your tenant requires
+  admin consent, IT has to grant it.
+- No client secret: desktop apps are public clients.
+
+Then choose **Microsoft 365** and enter the Application (client) ID and the
+Directory (tenant) ID, or your domain such as `contoso.onmicrosoft.com`.
+Your browser opens Microsoft's sign-in; when it's done the account appears.
+Check your company's rules first: using your own client on work mail, and
+sending work mail to an AI provider for summaries, may not be allowed.
+
+**Other IMAP servers.** Choose **Other (IMAP)** and enter the servers. Ports
+993 and 465 use TLS from the start; 143 and 587 use STARTTLS.
+
+What syncs: the inbox (the newest 300 messages on Gmail/IMAP, the last 30
+days on Microsoft 365), checked every two minutes and on demand. Done,
+Delete, read and pinned go back to the server after the 6-second undo
+window; Done archives (All Mail on Gmail). Snooze, Set Aside, Priority and
+new-sender screening stay on this computer.
+
 ## Layout
 
 ```
