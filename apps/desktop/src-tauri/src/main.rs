@@ -1,6 +1,7 @@
 // Without this, release builds on Windows also open a console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agents;
 mod ai;
 mod background;
 mod demo;
@@ -31,6 +32,9 @@ fn main() {
                 demo: demo::DemoMailbox::load(),
                 live,
             });
+            if let Err(e) = agents::start(app.handle()) {
+                eprintln!("spark-rs: agents can't connect: {e}");
+            }
             background::setup(app)?;
             Ok(())
         })
@@ -64,7 +68,14 @@ fn main() {
             prefs::get_prefs,
             prefs::save_prefs,
             notify::test_notification,
+            agents::get_agents,
+            agents::set_agent_access,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to start spark-rs");
+        .build(tauri::generate_context!())
+        .expect("failed to start spark-rs")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                agents::stopped(app);
+            }
+        });
 }

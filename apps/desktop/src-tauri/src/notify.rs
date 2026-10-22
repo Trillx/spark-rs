@@ -85,6 +85,27 @@ pub fn kept_running(app: &AppHandle) {
     }
 }
 
+/// An agent's email waits in the outbox; while the window isn't in front,
+/// a notification says so, since only the app can undo it.
+pub fn agent_sending(app: &AppHandle, agent: &str, to: &str, subject: &str) {
+    if background::in_front(app) {
+        return;
+    }
+    let alert = Alert {
+        title: format!("{agent} is sending an email"),
+        lines: vec![
+            format!("To {to}: {subject}"),
+            "Open spark-rs within 30 seconds to undo it.".into(),
+        ],
+        attribution: None,
+        message: None,
+    };
+    let sound = app.state::<PrefsState>().get().sound;
+    if let Err(e) = show(app, &alert, sound) {
+        eprintln!("spark-rs: couldn't show a notification: {e}");
+    }
+}
+
 /// Settings → Notifications → Send a test notification.
 #[tauri::command]
 pub fn test_notification(app: AppHandle) -> Result<(), String> {

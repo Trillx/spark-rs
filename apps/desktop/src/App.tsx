@@ -2,6 +2,7 @@ import {
   AlignLeft,
   ArrowDownLeft,
   Bell,
+  Bot,
   Check,
   CircleAlert,
   CircleCheck,
@@ -47,6 +48,8 @@ import {
   listAccounts,
   listMessages,
   onAccountsChanged,
+  onAgentActivity,
+  onAgentSending,
   onMailboxChanged,
   onOpenMessage,
   onSendStatus,
@@ -111,7 +114,14 @@ import {
   shortcutLabel,
   type ActionId,
 } from "./lib/shortcuts";
-import type { AccountView, Message, MessagePatch, SendStatusEvent, SyncStatusEvent } from "./types";
+import type {
+  AccountView,
+  AgentSendingEvent,
+  Message,
+  MessagePatch,
+  SendStatusEvent,
+  SyncStatusEvent,
+} from "./types";
 
 /** `targetId` points the actions at one row (its ⋯) rather than the current message. */
 type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetId: number };
@@ -141,6 +151,7 @@ const ICONS = {
   copy: { Icon: Copy, className: "text-primary" },
   download: { Icon: Download, className: "text-primary" },
   error: { Icon: CircleAlert, className: "text-error" },
+  agent: { Icon: Bot, className: "text-primary" },
 } satisfies Record<string, ToastIcon>;
 
 /** Failures stay up longer than undo toasts. */
@@ -218,8 +229,8 @@ export default function App() {
   }, []);
 
   // Backend events. They call through a ref so the listeners, registered once, see current state.
-  const events = useRef({ reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification });
-  events.current = { reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification };
+  const events = useRef({ reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification, agentSending });
+  events.current = { reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification, agentSending };
   useEffect(() => {
     const stops = [
       onMailboxChanged(() => void events.current.reloadMessages()),
@@ -227,6 +238,8 @@ export default function App() {
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
       onOpenMessage((id) => events.current.openFromNotification(id)),
+      onAgentActivity((e) => showToast(e.text, undefined, ICONS.agent)),
+      onAgentSending((e) => events.current.agentSending(e)),
     ];
     return () => stops.forEach((stop) => stop());
   }, []);
@@ -327,6 +340,21 @@ export default function App() {
       sent && (() => openComposer(sent)),
       ICONS.error,
       { actionLabel: "Edit", duration: ERROR_TOAST_MS },
+    );
+  }
+
+  /** An agent's email waits in the outbox; the toast's Undo stops it until `sendAt`. */
+  function agentSending(e: AgentSendingEvent) {
+    const subject = e.subject.trim() || "(no subject)";
+    showToast(
+      `${e.agent} is sending “${subject}” to ${e.to}`,
+      () =>
+        void cancelSend(e.id).then(
+          (cancelled) => showToast(cancelled ? "Not sent" : "Already sent", undefined, ICONS.send),
+          (error) => showToast(`Couldn't stop it: ${String(error)}`, undefined, ICONS.error),
+        ),
+      ICONS.agent,
+      { duration: Math.max(e.sendAt - Date.now(), TOAST_MS) },
     );
   }
 
@@ -982,6 +1010,13 @@ export default function App() {
         keywords: "notify alerts sound tray background close startup sign in login",
         Icon: Bell,
         run: () => openSettings("notifications"),
+      },
+      {
+        id: "agent-settings",
+        label: "Agent settings",
+        keywords: "ai agents claude code codex hermes mcp cli access",
+        Icon: Bot,
+        run: () => openSettings("agents"),
       },
       {
         id: "ai-settings",

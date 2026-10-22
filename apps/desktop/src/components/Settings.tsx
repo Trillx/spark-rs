@@ -1,9 +1,15 @@
 import {
   Bell,
+  Bot,
   Building2,
+  Check,
   CircleAlert,
   CircleCheck,
+  CircleX,
+  Copy,
   Ellipsis,
+  Eye,
+  Inbox,
   KeyRound,
   LoaderCircle,
   Mail,
@@ -13,6 +19,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Send,
   Server,
   Sparkles,
   Sun,
@@ -43,28 +50,31 @@ import {
   addImapAccount,
   addMicrosoftAccount,
   cancelSignIn,
+  getAgents,
   getPrefs,
   openExternal,
   removeAccount,
   renameAccount,
   savePrefs,
+  setAgentAccess,
   testNotification,
 } from "../api";
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo } from "../lib/format";
 import type { ThemePref } from "../lib/theme";
-import type { AccountView, NotifyFor, Prefs, SyncStatus } from "../types";
+import type { AccountView, AgentAccess, AgentsView, NotifyFor, Prefs, SyncStatus } from "../types";
 import AccountMark from "./AccountMark";
 import Dropdown, { MenuItem } from "./Dropdown";
 import { tipAttrs } from "../lib/tooltip";
 
-export type SettingsPage = "accounts" | "ai" | "notifications" | "appearance";
+export type SettingsPage = "accounts" | "ai" | "agents" | "notifications" | "appearance";
 
 /** Nav groups, in order. Only pages that exist so far. */
 const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
   [
     { key: "accounts", label: "Accounts", Icon: UsersRound },
     { key: "ai", label: "AI", Icon: Sparkles },
+    { key: "agents", label: "Agents", Icon: Bot },
   ],
   [
     { key: "notifications", label: "Notifications", Icon: Bell },
@@ -172,6 +182,7 @@ export default function Settings({
             <div className="max-w-[560px]">
               {page === "accounts" && <AccountsPage onChanged={onAccountsChanged} />}
               {page === "ai" && <AiPage />}
+              {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "notifications" && <NotificationsPage />}
               {page === "appearance" && <AppearancePage theme={theme} onTheme={onTheme} />}
             </div>
@@ -863,6 +874,160 @@ function LabelRow({
         className={INPUT}
       />
     </Row>
+  );
+}
+
+// ---- Agents ----
+
+const ACCESS: { key: AgentAccess; label: string; detail: string; Icon: LucideIcon }[] = [
+  { key: "none", label: "No access", detail: "Agents can't see this account.", Icon: CircleX },
+  { key: "read", label: "Read", detail: "Agents can list, search and read mail.", Icon: Eye },
+  {
+    key: "triage",
+    label: "Triage",
+    detail: "Agents can also mark mail Done, read, pinned, set aside, snoozed or deleted.",
+    Icon: Inbox,
+  },
+  {
+    key: "send",
+    label: "Send",
+    detail: "Agents can also send email as you. Each one waits 30 seconds so you can undo it.",
+    Icon: Send,
+  },
+];
+
+function AgentsPage({ onAddAccount }: { onAddAccount: () => void }) {
+  const [view, setView] = useState<AgentsView | null>(null);
+  const [status, setStatus] = useState<Status>({ kind: "idle" });
+
+  useEffect(() => {
+    void getAgents().then(setView, (error) => setStatus({ kind: "error", text: String(error) }));
+  }, []);
+
+  async function change(account: number, access: AgentAccess) {
+    try {
+      setView(await setAgentAccess(account, access));
+      setStatus({ kind: "idle" });
+    } catch (error) {
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  if (!view) return <StatusLine status={status} />;
+  const cli = view.cli && `"${view.cli}"`;
+
+  return (
+    <>
+      <p className="mb-6 text-[13px] leading-5 text-text-2">
+        AI agents on this computer, such as Claude Code, Codex and Hermes, can work with your email through
+        spark-cli. They see nothing until you allow it here, and they start spark-rs in the background when they
+        need it.
+      </p>
+
+      <Group
+        title="What agents can do"
+        note="Emails can contain text written to trick an agent. Allow sending only if you trust the agents you use."
+      >
+        {view.accounts.length === 0 ? (
+          <Row label="No mail accounts yet" description="Demo mail can't be shared with agents.">
+            <button className="btn btn-sm h-8 rounded-lg" onClick={onAddAccount}>
+              Add account
+            </button>
+          </Row>
+        ) : (
+          view.accounts.map((a) => (
+            <Row key={a.id} label={a.email} description={a.label}>
+              <AccessPicker
+                access={a.access}
+                label={`What agents can do in ${a.email}`}
+                onChange={(access) => void change(a.id, access)}
+              />
+            </Row>
+          ))
+        )}
+      </Group>
+
+      <Group
+        title="Connect an agent"
+        note="Run the command in a terminal, then start a new session in that agent."
+      >
+        {cli ? (
+          <>
+            <CommandRow label="Claude Code" command={`claude mcp add --scope user spark-rs -- ${cli} mcp`} />
+            <CommandRow label="Codex" command={`codex mcp add spark-rs -- ${cli} mcp`} />
+            <CommandRow label="Hermes" command={`hermes mcp add spark-rs --command ${cli} --args mcp`} />
+            <CommandRow label="Other agents" description="Their MCP server command." command={`${cli} mcp`} />
+          </>
+        ) : (
+          <Row
+            label="spark-cli is missing"
+            description="Agents need spark-cli next to spark-rs. Build it with tools\win-arm64\cargo.cmd build -p spark-cli."
+          />
+        )}
+      </Group>
+
+      <StatusLine status={status} />
+    </>
+  );
+}
+
+/** Spark's four-way access switch: no access, read, triage, send. */
+function AccessPicker({
+  access,
+  label,
+  onChange,
+}: {
+  access: AgentAccess;
+  label: string;
+  onChange: (access: AgentAccess) => void;
+}) {
+  return (
+    <div role="radiogroup" aria-label={label} className="flex rounded-full border border-hairline bg-base-200 p-0.5">
+      {ACCESS.map(({ key, label, detail, Icon }) => (
+        <button
+          key={key}
+          role="radio"
+          aria-checked={access === key}
+          aria-label={label}
+          {...tipAttrs({ label, detail })}
+          onClick={() => onChange(key)}
+          className={`grid h-7 w-10 place-items-center rounded-full ${
+            access === key ? "bg-base-100 text-primary shadow-sm" : "text-text-2 hover:text-base-content"
+          }`}
+        >
+          <Icon size={15} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CommandRow({ label, description, command }: { label: string; description?: string; command: string }) {
+  const [copied, setCopied] = useState(false);
+
+  function copy() {
+    void navigator.clipboard.writeText(command).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
+  }
+
+  return (
+    <div className="px-4 py-2.5">
+      <div className="flex min-h-8 items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-medium leading-5">{label}</div>
+          {description && <div className="text-xs leading-[18px] text-text-2">{description}</div>}
+        </div>
+        <button className="btn btn-ghost btn-sm h-8 gap-1.5 rounded-lg text-text-2" onClick={copy}>
+          {copied ? <Check size={14} /> : <Copy size={14} />}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <code className="mt-1 block select-text break-all rounded-lg bg-base-200 px-2.5 py-1.5 font-mono text-xs text-text-2">
+        {command}
+      </code>
+    </div>
   );
 }
 

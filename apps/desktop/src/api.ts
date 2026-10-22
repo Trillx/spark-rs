@@ -4,6 +4,9 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import demo from "../demo/mailbox.json";
 import type {
   AccountId,
+  AgentAccess,
+  AgentSendingEvent,
+  AgentsView,
   AccountView,
   LocalFile,
   Message,
@@ -213,6 +216,18 @@ export function testNotification(): Promise<void> {
   return Promise.reject("Run the desktop app to see notifications.");
 }
 
+// ---- agents ----
+
+export function getAgents(): Promise<AgentsView> {
+  if (isTauri()) return invoke("get_agents");
+  return Promise.resolve({ accounts: [], cli: null, computer: "This computer" });
+}
+
+export function setAgentAccess(account: AccountId, access: AgentAccess): Promise<AgentsView> {
+  if (isTauri()) return invoke("set_agent_access", { account, access });
+  return Promise.reject(DESKTOP_ONLY);
+}
+
 // ---- events ----
 // Each returns its unsubscribe. In the browser nothing is ever emitted.
 
@@ -231,6 +246,12 @@ export const onAccountsChanged = (handler: () => void) => on<null>("accounts-cha
 export const onSyncStatus = (handler: (event: SyncStatusEvent) => void) => on("sync-status", handler);
 
 export const onSendStatus = (handler: (event: SendStatusEvent) => void) => on("send-status", handler);
+
+/** An agent changed mail; `text` says what, e.g. "Codex marked 3 emails Done". */
+export const onAgentActivity = (handler: (event: { text: string }) => void) => on("agent-activity", handler);
+
+/** An agent queued an email; it can be cancelled until it goes out. */
+export const onAgentSending = (handler: (event: AgentSendingEvent) => void) => on("agent-sending", handler);
 
 /** A new-mail notification was clicked: show this message. */
 export const onOpenMessage = (handler: (id: number) => void) => on("open-message", handler);

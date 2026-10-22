@@ -72,13 +72,36 @@ opens spark-rs in the background when you sign in to Windows.
 
 Starting spark-rs again while it runs brings the running window forward.
 
+## AI agents
+
+Agents on this computer, such as Claude Code, Codex and Hermes, can work
+with your mail through `spark-cli`, which they run as an MCP server
+(`spark-cli mcp`). They see nothing until you choose what they may do in each
+account under Settings → Agents:
+
+- **Read**: list, search and read mail.
+- **Triage**: also mark mail Done, read, pinned, set aside, snoozed or deleted.
+  Changes reach the server after the usual undo window.
+- **Send**: also send email as you. spark-rs holds each one for 30 seconds
+  and shows it with Undo (or a notification while the window is hidden).
+
+The same page has the command that connects each agent, for example
+`claude mcp add --scope user spark-rs -- "<path>\spark-cli.exe" mcp`.
+`spark-cli` reaches the running app over a loopback port with a token that
+only your Windows account can read, and starts spark-rs in the background if
+it isn't running. From a shell, `spark-cli status`, `spark-cli tools` and
+`spark-cli call <tool> '<json>'` do the same. Emails are written by other
+people and can contain text aimed at agents, so allow sending only if you
+trust the agents you use.
+
 ## Layout
 
 ```
 crates/store              SQLite storage: accounts, messages, outbox (bundled SQLite with FTS5)
 crates/mail               IMAP/SMTP and Microsoft Graph: sync, sending, Microsoft sign-in
 crates/ai                 bring-your-own-key AI client (Anthropic, OpenAI-compatible)
-apps/cli                  spark-cli, the headless dev tool
+crates/agent              how spark-cli reaches the running app (loopback port + token)
+apps/cli                  spark-cli: MCP server for AI agents, plus headless dev checks
 apps/desktop              desktop app UI: React + Tailwind + daisyUI (Vite)
 apps/desktop/src-tauri    desktop app shell (Tauri 2): accounts, sync workers, demo mailbox
 tools/cross               Docker image for building Windows binaries on Linux

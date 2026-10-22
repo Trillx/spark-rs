@@ -688,6 +688,24 @@ impl Store {
         stmt.query_map([], message_row)?.collect()
     }
 
+    /// Messages whose sender, subject or text contains `text`, ignoring
+    /// case, newest first, without bodies.
+    pub fn search(&self, text: &str) -> Result<Vec<Message>> {
+        let pattern = format!(
+            "%{}%",
+            text.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE from_name LIKE ?1 ESCAPE '\\' OR from_address LIKE ?1 ESCAPE '\\'
+                OR subject LIKE ?1 ESCAPE '\\' OR text_body LIKE ?1 ESCAPE '\\'
+             ORDER BY date DESC"
+        ))?;
+        stmt.query_map([pattern], message_row)?.collect()
+    }
+
     pub fn message(&self, id: i64) -> Result<Option<Message>> {
         self.conn
             .query_row(

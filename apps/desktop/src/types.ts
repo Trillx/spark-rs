@@ -69,6 +69,27 @@ export interface Prefs {
   openAtLogin: boolean;
 }
 
+/** What agents may do in an account; each level includes the ones before. */
+export type AgentAccess = "none" | "read" | "triage" | "send";
+
+/** Settings → Agents. */
+export interface AgentsView {
+  accounts: { id: AccountId; email: string; label: string; color: string; access: AgentAccess }[];
+  /** spark-cli beside the app, which agents run; null if it's missing. */
+  cli: string | null;
+  /** This computer's name. */
+  computer: string;
+}
+
+/** An agent's email waits in the outbox until `sendAt` (Unix ms). */
+export interface AgentSendingEvent {
+  id: number;
+  agent: string;
+  to: string;
+  subject: string;
+  sendAt: number;
+}
+
 export type MessagePatch = Partial<
   Pick<Message, "state" | "unread" | "pinned" | "priority" | "screening" | "snoozedUntil">
 >;

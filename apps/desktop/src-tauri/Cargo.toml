@@ -5,19 +5,21 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 keyring-core = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 open = "5.4.5"
 # Native open/save dialogs for attachments.
 rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
+spark-agent = { version = "0.1.0", path = "../../../crates/agent" }
 spark-ai = { version = "0.1.0", path = "../../../crates/ai" }
 spark-mail = { version = "0.1.0", path = "../../../crates/mail" }
 spark-store = { version = "0.1.0", path = "../../../crates/store" }
 tauri = { version = "2.12.5", features = ["tray-icon"] }
 # A second launch brings the running app forward instead of syncing twice.
 tauri-plugin-single-instance = "2.5.4"
-tokio = { version = "1.54.1", features = ["macros", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "net", "sync", "time"] }
 url = "2.5.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]

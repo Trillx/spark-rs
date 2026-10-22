@@ -149,6 +149,34 @@ fn incoming_mail_is_stored_once_and_found_again_after_leaving_the_inbox() {
 }
 
 #[test]
+fn search_looks_in_senders_subjects_and_bodies() {
+    let (mut store, account) = store_with_account();
+    let mut quote = incoming(account, 1, "ana@parts.com");
+    quote.text = "The 100% steel bracket ships Friday.".into();
+    let quote = new_id(store.add_incoming(&quote, false).unwrap());
+    let invoice = new_id(
+        store
+            .add_incoming(&incoming(account, 2, "billing@vendor.com"), false)
+            .unwrap(),
+    );
+    let ids = |text: &str| -> Vec<i64> {
+        store
+            .search(text)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    };
+    assert_eq!(ids("STEEL"), [quote]);
+    assert_eq!(ids("vendor.com"), [invoice]);
+    assert_eq!(ids("message 2"), [invoice]);
+    // Newest first, and LIKE's wildcards are plain characters.
+    assert_eq!(ids("sender"), [invoice, quote]);
+    assert_eq!(ids("100%"), [quote]);
+    assert!(ids("_").is_empty());
+}
+
+#[test]
 fn new_senders_wait_in_the_gatekeeper_after_the_first_sync() {
     let (mut store, account) = store_with_account();
     // First sync: everyone already in the inbox is accepted.

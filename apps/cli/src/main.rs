@@ -1,3 +1,5 @@
+mod agent;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +15,11 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 #[derive(Parser)]
-#[command(name = "spark-cli", version, about = "Headless spark-rs tool")]
+#[command(
+    name = "spark-cli",
+    version,
+    about = "Connects AI agents to spark-rs, and checks this machine"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -21,6 +27,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve spark-rs's mail tools over MCP on stdin/stdout, for agents
+    /// such as Claude Code and Codex. Starts spark-rs if it isn't running.
+    Mcp,
+    /// List the tools agents get.
+    Tools,
+    /// Run one tool and print its result, e.g.
+    /// `spark-cli call list_messages '{"unread_only": true}'`.
+    Call {
+        tool: String,
+        /// The tool's arguments as a JSON object.
+        arguments: Option<String>,
+    },
+    /// Check that agents can reach spark-rs, and what they may do there.
+    Status,
     /// Check that storage, TLS and networking work on this machine.
     Doctor {
         /// Database file to open; defaults to an in-memory database.
@@ -61,6 +81,10 @@ enum AiProvider {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Mcp => agent::mcp().await,
+        Command::Tools => agent::tools().await,
+        Command::Call { tool, arguments } => agent::call_tool(&tool, arguments.as_deref()).await,
+        Command::Status => agent::status().await,
         Command::Doctor {
             db,
             imap_host,

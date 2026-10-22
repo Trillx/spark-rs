@@ -2,6 +2,7 @@
 //! and running in the background. Saved as `prefs.json` in the app's config
 //! directory.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::{fs, io};
@@ -9,6 +10,7 @@ use std::{fs, io};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::agents::Access;
 use crate::background;
 
 const FILE_NAME: &str = "prefs.json";
@@ -38,6 +40,9 @@ pub struct Prefs {
     pub open_at_login: bool,
     /// The "still running" notice has been shown, on the first close.
     pub told_keep_running: bool,
+    /// What agents may do in each account, by account id; absent is none.
+    /// Settings → Agents changes it, not `save_prefs`.
+    pub agent_access: BTreeMap<i64, Access>,
 }
 
 impl Default for Prefs {
@@ -48,6 +53,7 @@ impl Default for Prefs {
             keep_running: true,
             open_at_login: false,
             told_keep_running: false,
+            agent_access: BTreeMap::new(),
         }
     }
 }
@@ -131,6 +137,7 @@ pub fn save_prefs(state: State<'_, PrefsState>, prefs: Prefs) -> Result<Prefs, S
     state.update(|current| {
         *current = Prefs {
             told_keep_running: current.told_keep_running,
+            agent_access: std::mem::take(&mut current.agent_access),
             ..prefs
         }
     })

@@ -8,8 +8,10 @@ publish.workspace = true
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+serde_json = "1.0.154"
+spark-agent = { version = "0.1.0", path = "../../crates/agent" }
 spark-ai = { version = "0.1.0", path = "../../crates/ai" }
 spark-store = { version = "0.1.0", path = "../../crates/store" }
-tokio = { version = "1.54.1", features = ["rt", "net", "io-util", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "net", "io-std", "io-util", "time", "macros"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 webpki-roots = "1.0.10"
