@@ -1,13 +1,40 @@
-// Mirrors the serde types in src-tauri/src/mailbox.rs.
+// Mirrors the serde types on the Rust side (camelCase JSON).
 
-export type Account = "personal" | "work";
+export type AccountId = number;
+export type AccountKind = "gmail" | "microsoft" | "imap";
+export type SyncState = "idle" | "syncing" | "error";
+
+export interface SyncStatus {
+  status: SyncState;
+  message?: string;
+  /** Unix ms of the last finished sync. */
+  lastSync?: number;
+}
+
+export interface AccountView {
+  id: AccountId;
+  kind: AccountKind;
+  email: string;
+  /** The user's own name, used in From. */
+  name: string;
+  /** Short label shown in the sidebar, e.g. "Work". */
+  label: string;
+  /** Hex color, e.g. "#0ea5e9". Applied with inline styles. */
+  color: string;
+  /** "Gmail", "Microsoft 365" or "IMAP". */
+  provider: string;
+  /** The built-in demo accounts, shown while no real account exists. */
+  demo: boolean;
+  sync: SyncStatus;
+}
+
 export type Category = "people" | "notifications" | "newsletters";
 /** `done` is Spark's Done (archive); `aside` is Set Aside. */
 export type MessageState = "inbox" | "done" | "snoozed" | "aside" | "deleted" | "blocked";
 
 export interface Message {
   id: number;
-  account: Account;
+  account: AccountId;
   category: Category;
   state: MessageState;
   unread: boolean;
@@ -15,17 +42,58 @@ export interface Message {
   priority: boolean;
   /** From a sender not yet accepted through the Gatekeeper. */
   screening: boolean;
-  snoozedUntil?: string;
+  /** When a snoozed message comes back, in Unix milliseconds. */
+  snoozedUntil?: number;
   from: string;
   address: string;
   /** When the message arrived, in Unix milliseconds. */
   timestamp: number;
   subject: string;
   snippet: string;
-  body: string[];
+  /** Demo messages only; real ones load through `getMessageContent`. */
+  body?: string[];
   attachment?: string;
 }
 
 export type MessagePatch = Partial<
   Pick<Message, "state" | "unread" | "pinned" | "priority" | "screening" | "snoozedUntil">
 >;
+
+export interface MessageContent {
+  /** Plain-text paragraphs, always present (derived from the HTML if needed). */
+  text: string[];
+  /** The email's own HTML. Untrusted: only ever rendered in the sandboxed frame. */
+  html: string | null;
+  /** Display strings, e.g. "Ana Ruiz <ana@x.com>". */
+  to: string[];
+  cc: string[];
+  /** File names. */
+  attachments: string[];
+}
+
+export interface OutgoingDraft {
+  account: AccountId;
+  /** Comma- or semicolon-separated "Name <addr>" or bare addresses. */
+  to: string;
+  cc: string;
+  bcc: string;
+  subject: string;
+  /** Plain text. */
+  body: string;
+  /** The message being replied to, so the reply is threaded. */
+  replyTo?: number;
+  /** Unix ms: the end of the undo window for a normal send, or the Send Later time. */
+  sendAt: number;
+}
+
+/** Payload of the `sync-status` event. */
+export interface SyncStatusEvent extends SyncStatus {
+  account: AccountId;
+}
+
+/** Payload of the `send-status` event; `id` is the outbox id `sendMessage` returned. */
+export interface SendStatusEvent {
+  id: number;
+  status: "sent" | "failed";
+  message?: string;
+}

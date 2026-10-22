@@ -14,13 +14,13 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import type { Account, Message } from "../types";
-import { ACCOUNTS, datePeriod } from "./format";
+import type { AccountId, AccountView, Message } from "../types";
+import { datePeriod } from "./format";
 import type { ActionId } from "./shortcuts";
 
 export type Folder = "inbox" | "pins" | "snoozed" | "aside" | "archive" | "sent" | "drafts" | "trash";
 export type InboxMode = "focused" | "cards" | "simple";
-export type AccountFilter = Account | "all";
+export type AccountFilter = AccountId | "all";
 export type CardKey = "priority" | "pinned" | "people" | "notifications" | "newsletters" | "seen";
 export type GroupKey = "notifications" | "newsletters";
 export type SubList = { kind: "card"; key: CardKey } | { kind: "group"; key: GroupKey } | { kind: "gatekeeper" };
@@ -164,7 +164,13 @@ function model(title: string, blocks: ListBlock[], bulk: Message[] = []): ListMo
   return { title, blocks, order: rowIds(blocks), bulk };
 }
 
-export function buildList(messages: Message[], view: ListView, sticky: ReadonlySet<number>): ListModel {
+/** `accounts` names the list when the Inbox is narrowed to one account. */
+export function buildList(
+  messages: Message[],
+  view: ListView,
+  sticky: ReadonlySet<number>,
+  accounts: AccountView[] = [],
+): ListModel {
   if (view.search !== null) {
     if (!view.search.trim()) return model("Search", []);
     const hits = messages.filter((m) => isLive(m) && matchesQuery(m, view.search!)).sort(newestFirst);
@@ -190,7 +196,7 @@ export function buildList(messages: Message[], view: ListView, sticky: ReadonlyS
   }
 
   const { mail, screening } = inboxMessages(messages, view.account, view.showDone);
-  const title = view.account === "all" ? "Inbox" : ACCOUNTS[view.account].name;
+  const title = (view.account !== "all" && accounts.find((a) => a.id === view.account)?.label) || "Inbox";
   const gatekeeper: ListBlock[] = screening.length ? [{ kind: "gatekeeper", items: screening, layout: "strip" }] : [];
 
   if (view.sub?.kind === "gatekeeper") {
@@ -256,20 +262,20 @@ export function matchesQuery(m: Message, query: string) {
   if (from && !`${m.from} ${m.address}`.toLowerCase().includes(from)) return false;
   if (hasAttachment && !m.attachment) return false;
   if (unreadOnly && !m.unread) return false;
-  return !text || `${m.from} ${m.address} ${m.subject} ${m.snippet} ${m.body.join(" ")}`.toLowerCase().includes(text);
+  const haystack = `${m.from} ${m.address} ${m.subject} ${m.snippet} ${m.body?.join(" ") ?? ""}`;
+  return !text || haystack.toLowerCase().includes(text);
 }
 
 export type SidebarCounts = ReturnType<typeof sidebarCounts>;
 
-/** Sidebar counters: unread accepted inbox mail, plus totals for parked folders. */
+/** Sidebar counters: unread accepted inbox mail (in all and per account), plus totals for parked folders. */
 export function sidebarCounts(messages: Message[]) {
-  const unreadInbox = (account?: Account) =>
-    messages.filter((m) => m.state === "inbox" && !m.screening && m.unread && (!account || m.account === account))
-      .length;
+  const unread = messages.filter((m) => m.state === "inbox" && !m.screening && m.unread);
+  const accounts: Partial<Record<AccountId, number>> = {};
+  for (const m of unread) accounts[m.account] = (accounts[m.account] ?? 0) + 1;
   return {
-    inbox: unreadInbox(),
-    personal: unreadInbox("personal"),
-    work: unreadInbox("work"),
+    inbox: unread.length,
+    accounts,
     snoozed: messages.filter((m) => m.state === "snoozed").length,
     aside: messages.filter((m) => m.state === "aside").length,
   };

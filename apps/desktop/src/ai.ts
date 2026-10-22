@@ -183,7 +183,7 @@ function browserSummarize(m: Message, style: SummaryStyle, onEvent: (event: Summ
     onEvent({ event: "notConfigured", data: { message: missing } });
     return;
   }
-  const firstLine = m.body.find((p) => p.trim().length > 20) ?? m.snippet;
+  const firstLine = m.body?.find((p) => p.trim().length > 20) ?? m.snippet;
   const text =
     style === "actionPoints"
       ? `- Preview only, not written by AI.\n- Reply to ${m.from} about "${m.subject}".`

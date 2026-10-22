@@ -55,6 +55,9 @@ interface Props {
   onToggleDone: () => void;
   onOpenGatekeeper: () => void;
   searchRef: RefObject<HTMLInputElement | null>;
+  /** Only the demo accounts exist: a notice offers to add real ones. */
+  demo: boolean;
+  onAddAccounts: () => void;
 }
 
 const SEARCH_TIPS = [
@@ -73,6 +76,7 @@ export default function MessageList(props: Props) {
   return (
     <>
       <Toolbar {...props} />
+      {props.demo && <DemoNotice onAddAccounts={props.onAddAccounts} />}
       <div role="listbox" aria-label={model.title} className="min-h-0 flex-1 overflow-y-auto px-2 pb-8">
         {searching && !view.search!.trim() ? (
           <SearchTips onPick={(q) => props.onSearchChange(q)} />
@@ -273,6 +277,17 @@ function Toolbar({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function DemoNotice({ onAddAccounts }: { onAddAccounts: () => void }) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-hairline px-4 py-1.5 text-xs leading-5 text-text-2">
+      You're looking at demo mail.
+      <button className="font-medium text-primary hover:underline" onClick={onAddAccounts}>
+        Add your accounts
+      </button>
     </div>
   );
 }

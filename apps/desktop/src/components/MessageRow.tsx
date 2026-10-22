@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef } from "react";
 import type { Message } from "../types";
-import { formatListDate } from "../lib/format";
+import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
 import { hint } from "../lib/shortcuts";
 import Avatar from "./Avatar";
 
@@ -53,7 +53,7 @@ export default function MessageRow({
   }, [selected]);
 
   const done = m.state === "done";
-  const snoozed = m.state === "snoozed" && m.snoozedUntil;
+  const snoozed = m.state === "snoozed" && m.snoozedUntil !== undefined;
   const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
   return (
     <div
@@ -84,6 +84,7 @@ export default function MessageRow({
         <div className="flex h-5 items-center gap-1">
           <span className={`truncate text-sm leading-5 ${m.unread ? "font-semibold" : "font-medium"}`}>{m.from}</span>
           <span
+            title={snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : undefined}
             className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${
               snoozed ? "text-priority" : "text-text-2"
             }`}
@@ -91,7 +92,7 @@ export default function MessageRow({
             {snoozed ? (
               <>
                 <Clock size={12} />
-                {m.snoozedUntil!.split(" · ")[0]}
+                {formatLaterShort(m.snoozedUntil!)}
               </>
             ) : (
               formatListDate(m.timestamp)

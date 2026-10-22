@@ -11,7 +11,11 @@ export interface ToastData {
   id: number;
   text: string;
   undo?: () => void;
+  /** The action's label when it isn't Undo, e.g. "Edit" to reopen a draft that failed to send. */
+  actionLabel?: string;
   icon?: ToastIcon;
+  /** How long it stays, in ms; TOAST_MS by default. */
+  duration?: number;
 }
 
 export const TOAST_MS = 5000;
@@ -40,7 +44,7 @@ export default function UndoToast({ toast, left, onUndo }: { toast: ToastData; l
             className="text-[13px] font-semibold uppercase leading-4 text-primary hover:brightness-90"
             onClick={onUndo}
           >
-            Undo
+            {toast.actionLabel ?? "Undo"}
           </button>
           <svg key={toast.id} width="18" height="18" viewBox="0 0 18 18" className="-rotate-90" aria-hidden>
             <circle cx="9" cy="9" r={RING_RADIUS} fill="none" strokeWidth="2" className="stroke-base-300" />
@@ -53,7 +57,7 @@ export default function UndoToast({ toast, left, onUndo }: { toast: ToastData; l
               strokeLinecap="round"
               strokeDasharray={RING_LENGTH}
               className="countdown-ring stroke-primary"
-              style={{ "--ring-length": RING_LENGTH, "--ring-duration": `${TOAST_MS}ms` } as CSSProperties}
+              style={{ "--ring-length": RING_LENGTH, "--ring-duration": `${toast.duration ?? TOAST_MS}ms` } as CSSProperties}
             />
           </svg>
         </>

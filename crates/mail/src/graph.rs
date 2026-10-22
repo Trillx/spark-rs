@@ -1,0 +1,636 @@
+//! Microsoft Graph for Microsoft 365 mailboxes: the inbox through delta
+//! queries, flag and move changes, and sending.
+//!
+//! Every request asks for immutable ids, so a message keeps its id when it
+//! moves to Archive or Deleted Items and back.
+
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+use reqwest::{Method, RequestBuilder, StatusCode};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use spark_store::{Category, Incoming, Pending, Place, Pushed, Store};
+
+use crate::draft::{Draft, recipients};
+use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
+use crate::{Error, Result};
+
+pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
+/// How far back the first sync of a Microsoft account reaches.
+pub const FIRST_SYNC_DAYS: i64 = 30;
+const HOST: &str = "graph.microsoft.com";
+
+const SELECT: &str = "subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,\
+     bodyPreview,body,hasAttachments,internetMessageId,conversationId,inferenceClassification";
+
+/// One HTTP client for the process (connection reuse).
+pub(crate) fn http() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(90))
+                .user_agent(concat!("spark-rs/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("the HTTP client builds")
+        })
+        .clone()
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncState {
+    pub delta_link: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    pub new: usize,
+    pub gone: usize,
+    pub first: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Me {
+    pub display_name: Option<String>,
+    pub mail: Option<String>,
+    pub user_principal_name: Option<String>,
+}
+
+impl Me {
+    pub fn address(&self) -> Option<&str> {
+        self.mail
+            .as_deref()
+            .or(self.user_principal_name.as_deref())
+            .filter(|a| a.contains('@'))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphMessage {
+    pub id: String,
+    #[serde(rename = "@removed")]
+    pub removed: Option<Value>,
+    pub subject: Option<String>,
+    pub from: Option<GraphRecipient>,
+    #[serde(default)]
+    pub to_recipients: Vec<GraphRecipient>,
+    #[serde(default)]
+    pub cc_recipients: Vec<GraphRecipient>,
+    pub received_date_time: Option<String>,
+    pub is_read: Option<bool>,
+    pub flag: Option<GraphFlag>,
+    pub body_preview: Option<String>,
+    pub body: Option<GraphBody>,
+    pub has_attachments: Option<bool>,
+    pub internet_message_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub inference_classification: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphRecipient {
+    pub email_address: GraphAddress,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GraphAddress {
+    pub name: Option<String>,
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphFlag {
+    pub flag_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphBody {
+    pub content_type: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeltaPage {
+    #[serde(default)]
+    value: Vec<GraphMessage>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink")]
+    delta_link: Option<String>,
+}
+
+pub struct Graph {
+    token: String,
+    base: String,
+}
+
+impl Graph {
+    pub fn new(access_token: &str) -> Self {
+        Self::with_base(GRAPH, access_token)
+    }
+
+    /// For tests against a local stand-in.
+    pub fn with_base(base: &str, access_token: &str) -> Self {
+        Self {
+            token: access_token.to_owned(),
+            base: base.trim_end_matches('/').to_owned(),
+        }
+    }
+
+    fn request(&self, method: Method, url: &str) -> RequestBuilder {
+        let url = if url.starts_with("http") {
+            url.to_owned()
+        } else {
+            format!("{}{url}", self.base)
+        };
+        http()
+            .request(method, url)
+            .bearer_auth(&self.token)
+            .header("Prefer", "IdType=\"ImmutableId\"")
+    }
+
+    async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response> {
+        let response = request.send().await.map_err(|e| Error::network(HOST, e))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let detail = response
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| status.to_string());
+        Err(match status {
+            StatusCode::UNAUTHORIZED => Error::Auth("Microsoft needs you to sign in again.".into()),
+            StatusCode::FORBIDDEN => Error::Auth(format!(
+                "Microsoft refused access ({detail}). Your organization may need to approve the app."
+            )),
+            StatusCode::NOT_FOUND | StatusCode::GONE => Error::Gone,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+                Error::network(HOST, "Microsoft is busy; trying again shortly")
+            }
+            _ => Error::Server(format!("Microsoft Graph: {detail}")),
+        })
+    }
+
+    async fn json<T: for<'de> Deserialize<'de>>(&self, request: RequestBuilder) -> Result<T> {
+        self.send(request)
+            .await?
+            .json()
+            .await
+            .map_err(|e| Error::Server(format!("Microsoft Graph sent an unexpected reply: {e}")))
+    }
+
+    pub async fn me(&self) -> Result<Me> {
+        self.json(self.request(
+            Method::GET,
+            "/me?$select=displayName,mail,userPrincipalName",
+        ))
+        .await
+    }
+
+    /// Brings the inbox into the store through a delta query.
+    pub async fn sync_inbox(
+        &self,
+        store: &Mutex<Store>,
+        account_id: i64,
+        state: &mut SyncState,
+    ) -> Result<SyncReport> {
+        let first = state.delta_link.is_none();
+        let mut report = SyncReport {
+            first,
+            ..Default::default()
+        };
+        let mut url = match &state.delta_link {
+            Some(link) => link.clone(),
+            None => first_delta_url(spark_store::now_ms()),
+        };
+        loop {
+            let request = self
+                .request(Method::GET, &url)
+                .header("Prefer", "odata.maxpagesize=50")
+                .header("Prefer", "outlook.body-content-type=\"html\"");
+            let page: DeltaPage = match self.json(request).await {
+                // The delta token expired: start over.
+                Err(Error::Gone) if !first => {
+                    state.delta_link = None;
+                    return Box::pin(self.sync_inbox(store, account_id, state)).await;
+                }
+                other => other?,
+            };
+            for m in page.value {
+                if m.removed.is_some() {
+                    report.gone += lock(store).observe_gone_remote(account_id, &m.id)?;
+                    continue;
+                }
+                // Updates without flags tell us nothing we use.
+                if m.is_read.is_none() {
+                    continue;
+                }
+                let mut incoming = to_incoming(account_id, &m);
+                if m.has_attachments == Some(true)
+                    && !lock(store).has_remote_id(account_id, &m.id)?
+                {
+                    incoming.attachments = self.attachment_names(&m.id).await.unwrap_or_default();
+                }
+                if let spark_store::Added::New(_) = lock(store).add_incoming(&incoming, !first)? {
+                    report.new += 1;
+                }
+            }
+            match (page.next_link, page.delta_link) {
+                (Some(next), _) => url = next,
+                (None, Some(delta)) => {
+                    state.delta_link = Some(delta);
+                    return Ok(report);
+                }
+                (None, None) => {
+                    return Err(Error::Server(
+                        "Microsoft Graph ended the inbox listing early.".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub async fn attachment_names(&self, id: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Page {
+            value: Vec<Named>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Named {
+            name: Option<String>,
+            is_inline: Option<bool>,
+        }
+        let page: Page = self
+            .json(self.request(
+                Method::GET,
+                &format!(
+                    "/me/messages/{}/attachments?$select=name,isInline",
+                    path(id)
+                ),
+            ))
+            .await?;
+        Ok(page
+            .value
+            .into_iter()
+            .filter(|a| a.is_inline != Some(true))
+            .filter_map(|a| a.name)
+            .collect())
+    }
+
+    /// Sends local changes: read and flagged state, then the move for Done
+    /// (Archive) or Delete (Deleted Items).
+    pub async fn push(&self, store: &Mutex<Store>, pending: Vec<Pending>) -> Result<usize> {
+        let mut pushed = 0;
+        for p in pending {
+            let Some(id) = p.remote_id.clone() else {
+                lock(store).drop_pending(p.id)?;
+                continue;
+            };
+            let result = async {
+                if p.unread != p.remote_unread || p.pinned != p.remote_pinned {
+                    let flag = if p.pinned { "flagged" } else { "notFlagged" };
+                    let body = json!({ "isRead": !p.unread, "flag": { "flagStatus": flag } });
+                    self.send(
+                        self.request(Method::PATCH, &format!("/me/messages/{}", path(&id)))
+                            .json(&body),
+                    )
+                    .await?;
+                }
+                if p.place != p.remote_place {
+                    let destination = match p.place {
+                        Place::Inbox => "inbox",
+                        Place::Archive => "archive",
+                        Place::Trash => "deleteditems",
+                    };
+                    self.send(
+                        self.request(Method::POST, &format!("/me/messages/{}/move", path(&id)))
+                            .json(&json!({ "destinationId": destination })),
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    lock(store).mark_pushed(
+                        &p,
+                        Pushed {
+                            mailbox: None,
+                            uid: None,
+                        },
+                    )?;
+                    pushed += 1;
+                }
+                Err(Error::Gone) => lock(store).drop_pending(p.id)?,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(pushed)
+    }
+
+    /// Sends a new message, or a reply threaded under `reply_to` (a Graph
+    /// message id). Replies go through createReply so Outlook adds the
+    /// quoted original and threading itself.
+    pub async fn send_draft(&self, draft: &Draft, reply_to: Option<&str>) -> Result<()> {
+        let to = graph_recipients(&draft.to)?;
+        let cc = graph_recipients(&draft.cc)?;
+        let bcc = graph_recipients(&draft.bcc)?;
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            return Err(Error::Config("Add at least one recipient.".into()));
+        }
+        let Some(original) = reply_to else {
+            let message = json!({
+                "subject": draft.subject.trim(),
+                "body": { "contentType": "Text", "content": draft.body },
+                "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
+            });
+            self.send(
+                self.request(Method::POST, "/me/sendMail")
+                    .json(&json!({ "message": message, "saveToSentItems": true })),
+            )
+            .await?;
+            return Ok(());
+        };
+
+        let reply: GraphMessage = self
+            .json(
+                self.request(
+                    Method::POST,
+                    &format!("/me/messages/{}/createReply", path(original)),
+                )
+                .json(&json!({})),
+            )
+            .await?;
+        let quoted = reply.body.map(|b| b.content).unwrap_or_default();
+        let update = json!({
+            "subject": draft.subject.trim(),
+            "body": { "contentType": "HTML", "content": format!("{}{quoted}", text_to_html(&draft.body)) },
+            "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
+        });
+        let draft_path = format!("/me/messages/{}", path(&reply.id));
+        self.send(self.request(Method::PATCH, &draft_path).json(&update))
+            .await?;
+        self.send(
+            self.request(Method::POST, &format!("{draft_path}/send"))
+                .json(&json!({})),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// The first delta request: the inbox's last `FIRST_SYNC_DAYS` days.
+pub fn first_delta_url(now_ms: i64) -> String {
+    let since = iso_date(now_ms - FIRST_SYNC_DAYS * 86_400_000);
+    format!(
+        "{GRAPH}/me/mailFolders/inbox/messages/delta?$select={SELECT}&$filter=receivedDateTime+ge+{since}"
+    )
+}
+
+pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
+    let (from_name, from_address) = m
+        .from
+        .as_ref()
+        .map(|f| {
+            let address = f.email_address.address.clone().unwrap_or_default();
+            let name = f
+                .email_address
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| address.clone());
+            (name, address)
+        })
+        .unwrap_or_default();
+    let (text, html) = match &m.body {
+        Some(b) if b.content_type.eq_ignore_ascii_case("html") => {
+            (html_to_text(&b.content), Some(b.content.clone()))
+        }
+        Some(b) => (b.content.clone(), None),
+        None => (m.body_preview.clone().unwrap_or_default(), None),
+    };
+    let category = if automated_sender(&from_address) {
+        Category::Notifications
+    } else if m.inference_classification.as_deref() == Some("other") {
+        Category::Newsletters
+    } else {
+        Category::People
+    };
+    Incoming {
+        account_id,
+        remote_id: Some(m.id.clone()),
+        message_id: m.internet_message_id.as_deref().map(bare_id),
+        thread_id: m.conversation_id.clone(),
+        from_name,
+        from_address,
+        to: m.to_recipients.iter().filter_map(display).collect(),
+        cc: m.cc_recipients.iter().filter_map(display).collect(),
+        subject: m.subject.clone().unwrap_or_default().trim().to_owned(),
+        snippet: snippet(m.body_preview.as_deref().unwrap_or(&text)),
+        date: m
+            .received_date_time
+            .as_deref()
+            .and_then(parse_iso_date)
+            .unwrap_or_else(spark_store::now_ms),
+        text,
+        html,
+        category,
+        unread: !m.is_read.unwrap_or(false),
+        flagged: m.flag.as_ref().is_some_and(|f| f.flag_status == "flagged"),
+        ..Default::default()
+    }
+}
+
+fn display(r: &GraphRecipient) -> Option<String> {
+    let address = r.email_address.address.as_deref()?;
+    Some(match r.email_address.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() && name != address => format!("{name} <{address}>"),
+        _ => address.to_owned(),
+    })
+}
+
+fn graph_recipients(field: &str) -> Result<Vec<Value>> {
+    Ok(recipients(field)?
+        .into_iter()
+        .map(|m| {
+            let mut address = json!({ "address": m.email.to_string() });
+            if let Some(name) = m.name {
+                address["name"] = Value::String(name);
+            }
+            json!({ "emailAddress": address })
+        })
+        .collect())
+}
+
+/// Plain text as an HTML block for a reply body.
+fn text_to_html(text: &str) -> String {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "<br>");
+    format!(
+        "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:11pt\">{escaped}</div><br>"
+    )
+}
+
+/// Graph ids can contain `/`, `+` and `=`; immutable ids are URL-safe base64.
+fn path(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
+}
+
+/// `2026-10-21T14:00:00Z` (Graph's format) from Unix ms.
+fn iso_date(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let t = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        t / 3600,
+        t % 3600 / 60,
+        t % 60
+    )
+}
+
+/// Unix ms from `2026-10-21T14:00:00Z` or with fractional seconds.
+fn parse_iso_date(s: &str) -> Option<i64> {
+    let s = s.trim().trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>());
+    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+    let mut t = time.split(':');
+    let (h, min) = (
+        t.next()?.parse::<i64>().ok()?,
+        t.next()?.parse::<i64>().ok()?,
+    );
+    let sec: f64 = t.next().unwrap_or("0").parse().ok()?;
+    let days = days_from_civil(y, m, day);
+    Some((days * 86_400 + h * 3600 + min * 60) * 1000 + (sec * 1000.0).round() as i64)
+}
+
+/// Howard Hinnant's date algorithms.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
+    store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dates_round_trip() {
+        let ms = 1_792_591_200_000; // 2026-10-21 14:00 UTC
+        assert_eq!(iso_date(ms), "2026-10-21T14:00:00Z");
+        assert_eq!(parse_iso_date("2026-10-21T14:00:00Z"), Some(ms));
+        assert_eq!(parse_iso_date("2026-10-21T14:00:00.250Z"), Some(ms + 250));
+        assert_eq!(
+            parse_iso_date("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800_000)
+        );
+        assert_eq!(parse_iso_date("nonsense"), None);
+        let url = first_delta_url(ms);
+        assert!(
+            url.ends_with("$filter=receivedDateTime+ge+2026-09-21T14:00:00Z"),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn graph_messages_become_incoming_mail() {
+        let m: GraphMessage = serde_json::from_value(json!({
+            "id": "AAMkAD/1+x=",
+            "subject": " Q4 plan ",
+            "from": { "emailAddress": { "name": "Ana Ruiz", "address": "ana@contoso.com" } },
+            "toRecipients": [
+                { "emailAddress": { "name": "Me", "address": "me@contoso.com" } },
+                { "emailAddress": { "name": "bob@contoso.com", "address": "bob@contoso.com" } }
+            ],
+            "receivedDateTime": "2026-10-21T14:00:00Z",
+            "isRead": false,
+            "flag": { "flagStatus": "flagged" },
+            "bodyPreview": "Hi team,\r\nthe plan is attached.",
+            "body": { "contentType": "html", "content": "<p>Hi team,</p><p>the plan is attached.</p>" },
+            "hasAttachments": true,
+            "internetMessageId": "<abc@contoso.com>",
+            "conversationId": "conv1",
+            "inferenceClassification": "focused"
+        }))
+        .unwrap();
+        let i = to_incoming(3, &m);
+        assert_eq!(i.remote_id.as_deref(), Some("AAMkAD/1+x="));
+        assert_eq!(i.message_id.as_deref(), Some("abc@contoso.com"));
+        assert_eq!(i.from_name, "Ana Ruiz");
+        assert_eq!(i.to, vec!["Me <me@contoso.com>", "bob@contoso.com"]);
+        assert_eq!(i.subject, "Q4 plan");
+        assert_eq!(i.snippet, "Hi team, the plan is attached.");
+        assert!(i.text.contains("the plan is attached"));
+        assert!(i.html.is_some());
+        assert_eq!(i.date, 1_792_591_200_000);
+        assert!(i.unread && i.flagged);
+        assert_eq!(i.category, Category::People);
+        assert_eq!(path(&m.id), "AAMkAD%2F1%2Bx%3D");
+
+        let other: GraphMessage = serde_json::from_value(json!({
+            "id": "x", "isRead": true, "inferenceClassification": "other",
+            "from": { "emailAddress": { "address": "deals@shop.com" } }
+        }))
+        .unwrap();
+        let i = to_incoming(3, &other);
+        assert_eq!(i.category, Category::Newsletters);
+        assert_eq!(i.from_name, "deals@shop.com");
+    }
+
+    #[test]
+    fn removed_entries_parse() {
+        let page: DeltaPage = serde_json::from_value(json!({
+            "value": [ { "id": "gone1", "@removed": { "reason": "deleted" } } ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=abc"
+        }))
+        .unwrap();
+        assert!(page.value[0].removed.is_some());
+        assert!(page.delta_link.is_some() && page.next_link.is_none());
+    }
+
+    #[test]
+    fn reply_text_is_escaped() {
+        assert_eq!(
+            text_to_html("a < b\nc & d"),
+            "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:11pt\">a &lt; b<br>c &amp; d</div><br>"
+        );
+    }
+}

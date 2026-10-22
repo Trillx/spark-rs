@@ -71,6 +71,7 @@ fn email_text(m: &Message) -> String {
     let body: Vec<&str> = m
         .body
         .iter()
+        .flatten()
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
@@ -170,14 +171,14 @@ impl SummaryEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox::{Account, Category, MessageState};
     use serde_json::json;
     use spark_ai::{Role, Usage};
+    use spark_store::{Category, MessageState};
 
     fn message() -> Message {
         Message {
             id: 7,
-            account: Account::Work,
+            account: 2,
             category: Category::People,
             state: MessageState::Inbox,
             unread: true,
@@ -190,12 +191,12 @@ mod tests {
             timestamp: 1_790_000_000_000,
             subject: "Q4 budget review".into(),
             snippet: "Can you send".into(),
-            body: vec![
+            body: Some(vec![
                 "Hi,".into(),
                 "  Can you send the revised numbers by Thursday?  ".into(),
                 "".into(),
                 "Thanks, Dana".into(),
-            ],
+            ]),
             attachment: None,
         }
     }

@@ -2,6 +2,7 @@ import {
   AlignLeft,
   ArrowDownLeft,
   Check,
+  CircleAlert,
   CircleCheck,
   Circle,
   Clock,
@@ -15,6 +16,7 @@ import {
   PanelLeft,
   Pen,
   Pin,
+  RefreshCw,
   Reply,
   ReplyAll,
   Rows3,
@@ -26,6 +28,7 @@ import {
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  UserPlus,
   Zap,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
@@ -37,7 +40,19 @@ import {
   type SummaryEvent,
   type SummaryStyle,
 } from "./ai";
-import { listMessages, patched, updateMessage } from "./api";
+import {
+  cancelSend,
+  listAccounts,
+  listMessages,
+  onAccountsChanged,
+  onMailboxChanged,
+  onSendStatus,
+  onSyncStatus,
+  patched,
+  sendMessage,
+  syncNow,
+  updateMessage,
+} from "./api";
 import CommandCenter, { type Command } from "./components/CommandCenter";
 import Composer, { draftHasContent, emptyDraft, type Draft } from "./components/Composer";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
@@ -48,7 +63,17 @@ import { reduceSummary, startSummary, type SummaryState } from "./components/Sum
 import ThreadView, { type ThreadActions } from "./components/ThreadView";
 import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./components/UndoToast";
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
-import { LATER_PRESETS, plural, presetText, type LaterPreset } from "./lib/format";
+import { AccountsContext, isDemoMode } from "./lib/accounts";
+import { clearContent, loadContent } from "./lib/content";
+import {
+  LATER_PRESETS,
+  formatFullDate,
+  laterTime,
+  parseAddress,
+  plural,
+  presetDetail,
+  type LaterPreset,
+} from "./lib/format";
 import { loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
   FOLDERS,
@@ -80,7 +105,7 @@ import {
   shortcutLabel,
   type ActionId,
 } from "./lib/shortcuts";
-import type { Message, MessagePatch } from "./types";
+import type { AccountView, Message, MessagePatch, SendStatusEvent, SyncStatusEvent } from "./types";
 
 /** `targetId` points the actions at one row (its ⋯) rather than the current message. */
 type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetId: number };
@@ -108,7 +133,11 @@ const ICONS = {
   block: { Icon: ThumbsDown, className: "text-text-2" },
   send: { Icon: Send, className: "text-primary" },
   copy: { Icon: Copy, className: "text-primary" },
+  error: { Icon: CircleAlert, className: "text-error" },
 } satisfies Record<string, ToastIcon>;
+
+/** Failures stay up longer than undo toasts. */
+const ERROR_TOAST_MS = 10_000;
 
 const SUMMARY_ACTIONS: Record<"summarize" | "summarizeDetailed" | "summarizeActions", SummaryStyle> = {
   summarize: "short",
@@ -117,7 +146,16 @@ const SUMMARY_ACTIONS: Record<"summarize" | "summarizeDetailed" | "summarizeActi
 };
 const MODE_ICONS = { focused: List, cards: LayoutGrid, simple: Rows3 } as const;
 
+/** Changes when accounts come or go (or demo mode ends), not on a rename or sync. */
+const accountSet = (accounts: AccountView[]) => accounts.map((a) => `${a.id}${a.demo ? "d" : ""}`).join(",");
+
 export default function App() {
+  const [accounts, setAccounts] = useState<AccountView[]>([]);
+  const loadedAccounts = useRef("");
+  /** The last sync error toasted per account, so a retry that fails the same way stays quiet. */
+  const syncErrors = useRef(new Map<number, string | undefined>());
+  /** Sent drafts by outbox id until they go out, to reopen one that fails. */
+  const outbox = useRef(new Map<number, Draft>());
   const [messages, setMessages] = useState<Message[]>([]);
   const [view, setView] = useState<ListView>(INITIAL_VIEW);
   /** Messages read during this visit to the list; they keep their Smart Inbox card until the list changes. */
@@ -150,20 +188,39 @@ export default function App() {
   const listWidthUsed = effectiveListWidth(listWidth, container);
   const twoColumns = useTwoColumns(container, listWidthUsed);
 
-  const model = useMemo(() => buildList(messages, view, sticky), [messages, view, sticky]);
+  const model = useMemo(() => buildList(messages, view, sticky, accounts), [messages, view, sticky, accounts]);
   const counts = useMemo(() => sidebarCounts(messages), [messages]);
   const openMessage = messages.find((m) => m.id === openId) ?? null;
   const selected = messages.find((m) => m.id === selectedId && model.order.includes(m.id)) ?? null;
   /** What message shortcuts and commands act on. */
   const current = openMessage ?? selected;
   const searching = view.search !== null;
+  const syncing = accounts.some((a) => a.sync.status === "syncing");
 
   useEffect(() => {
-    void listMessages().then((loaded) => {
-      setMessages(loaded);
-      const first = buildList(loaded, INITIAL_VIEW, new Set()).order[0];
-      if (first !== undefined && twoColumns) openThread(first, loaded);
-    });
+    void Promise.all([listAccounts(), listMessages()]).then(
+      ([loadedAccountList, loaded]) => {
+        loadedAccounts.current = accountSet(loadedAccountList);
+        setAccounts(loadedAccountList);
+        setMessages(loaded);
+        const first = buildList(loaded, INITIAL_VIEW, new Set()).order[0];
+        if (first !== undefined && twoColumns) openThread(first, loaded);
+      },
+      (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
+    );
+  }, []);
+
+  // Backend events. They call through a ref so the listeners, registered once, see current state.
+  const events = useRef({ reloadMessages, reloadAccounts, syncStatus, sendStatus });
+  events.current = { reloadMessages, reloadAccounts, syncStatus, sendStatus };
+  useEffect(() => {
+    const stops = [
+      onMailboxChanged(() => void events.current.reloadMessages()),
+      onAccountsChanged(() => void events.current.reloadAccounts()),
+      onSyncStatus((e) => events.current.syncStatus(e)),
+      onSendStatus((e) => events.current.sendStatus(e)),
+    ];
+    return () => stops.forEach((stop) => stop());
   }, []);
 
   useEffect(() => {
@@ -187,15 +244,105 @@ export default function App() {
       setMessages((ms) => ms.map((m) => (m.id === id ? saved : m)));
     } catch (error) {
       showToast(`Couldn't update the message: ${String(error)}`);
-      void listMessages().then(setMessages);
+      void reloadMessages();
     }
   }
 
-  function showToast(text: string, undo?: () => void, icon?: ToastIcon) {
+  /** Reloads the list, keeping the cursor and open thread while their messages still exist. */
+  function reloadMessages() {
+    return listMessages().then(
+      (loaded) => {
+        const ids = new Set(loaded.map((m) => m.id));
+        setMessages(loaded);
+        setOpenId((id) => (id !== null && ids.has(id) ? id : null));
+        setSelectedId((id) => (id !== null && ids.has(id) ? id : null));
+      },
+      (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
+    );
+  }
+
+  /**
+   * Reloads accounts. When accounts come or go, message ids may now name other
+   * messages (demo mail ends when the first real account arrives), so cached
+   * bodies and summaries go, and an Inbox filter or From on a removed account resets.
+   */
+  function reloadAccounts() {
+    return listAccounts().then(
+      (loaded) => {
+        setAccounts(loaded);
+        const set = accountSet(loaded);
+        if (set === loadedAccounts.current) return;
+        const demoChanged = isDemoMode(accounts) !== isDemoMode(loaded);
+        loadedAccounts.current = set;
+        const exists = (id: number) => loaded.some((a) => a.id === id);
+        clearContent();
+        setSummaries(new Map());
+        setSticky(new Set());
+        setView((v) => (v.account !== "all" && !exists(v.account) ? { ...v, account: "all", sub: null } : v));
+        setDraft((d) => (d && !exists(d.from) && loaded.length ? { ...d, from: loaded[0].id } : d));
+        if (demoChanged) {
+          setOpenId(null);
+          setSelectedId(null);
+        }
+        void reloadMessages();
+      },
+      (error) => showToast(`Couldn't load accounts: ${String(error)}`, undefined, ICONS.error),
+    );
+  }
+
+  function syncStatus(e: SyncStatusEvent) {
+    setAccounts((list) =>
+      list.map((a) =>
+        a.id === e.account
+          ? { ...a, sync: { status: e.status, message: e.message, lastSync: e.lastSync ?? a.sync.lastSync } }
+          : a,
+      ),
+    );
+    if (e.status === "idle") syncErrors.current.delete(e.account);
+    if (e.status !== "error" || syncErrors.current.get(e.account) === e.message) return;
+    syncErrors.current.set(e.account, e.message);
+    const label = accounts.find((a) => a.id === e.account)?.label ?? "Mail";
+    showToast(
+      `${label}: ${e.message ?? "Couldn't check for new mail."}`,
+      () => openSettings("accounts"),
+      ICONS.error,
+      { actionLabel: "Settings", duration: ERROR_TOAST_MS },
+    );
+  }
+
+  function sendStatus(e: SendStatusEvent) {
+    const sent = outbox.current.get(e.id);
+    outbox.current.delete(e.id);
+    if (e.status !== "failed") return;
+    showToast(
+      `Couldn't send: ${e.message ?? "the server refused the message."}`,
+      sent && (() => openComposer(sent)),
+      ICONS.error,
+      { actionLabel: "Edit", duration: ERROR_TOAST_MS },
+    );
+  }
+
+  function checkMail() {
+    syncNow().then(
+      () => void reloadMessages(),
+      (error) => showToast(`Couldn't check for new mail: ${String(error)}`, undefined, ICONS.error),
+    );
+  }
+
+  /** `options.actionLabel` replaces Undo, e.g. "Edit"; such toasts don't answer Ctrl+Z. */
+  function showToast(
+    text: string,
+    undo?: () => void,
+    icon?: ToastIcon,
+    options: Pick<ToastData, "actionLabel" | "duration"> = {},
+  ) {
     window.clearTimeout(toastTimer.current);
-    const next = { id: Date.now(), text, undo, icon };
+    const next = { id: Date.now(), text, undo, icon, ...options };
     setToast(next);
-    toastTimer.current = window.setTimeout(() => setToast((t) => (t?.id === next.id ? null : t)), TOAST_MS);
+    toastTimer.current = window.setTimeout(
+      () => setToast((t) => (t?.id === next.id ? null : t)),
+      options.duration ?? TOAST_MS,
+    );
   }
 
   function undoToast() {
@@ -353,7 +500,7 @@ export default function App() {
     snooze: (m: Message, p: LaterPreset) =>
       act(
         [m],
-        { state: "snoozed", snoozedUntil: presetText(p) },
+        { state: "snoozed", snoozedUntil: laterTime(p) },
         `Snoozed until ${p.label.toLowerCase()}`,
         ICONS.snooze,
       ),
@@ -393,28 +540,59 @@ export default function App() {
     setComposerKey((k) => k + 1);
   }
 
+  /** From the account the Inbox is narrowed to, else the first. */
   function compose(seed: Partial<Draft> = {}) {
-    openComposer({ ...emptyDraft(view.account === "all" ? "personal" : view.account), ...seed });
+    const from = view.account !== "all" ? view.account : (accounts[0]?.id ?? 0);
+    openComposer({ ...emptyDraft(from), ...seed });
   }
 
-  const reply = (m: Message, body = "", title = "Reply") =>
+  const replySubject = (m: Message) => (/^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`);
+
+  const reply = (m: Message, body = "") =>
+    compose({ title: "Reply", to: m.address, subject: replySubject(m), body, from: m.account, replyTo: m.id });
+
+  /** The sender plus everyone else on To and Cc, minus this account's own address. */
+  async function replyAll(m: Message) {
+    const content = await loadContent(m.id).catch(() => null);
+    const own = accounts.find((a) => a.id === m.account)?.email.toLowerCase();
+    const others = (list: string[]) =>
+      list.filter((r) => {
+        const address = parseAddress(r).address.toLowerCase();
+        return r !== "You" && address !== own && address !== m.address.toLowerCase();
+      });
+    const to = [m.address, ...others(content?.to ?? [])].join(", ");
+    const cc = others(content?.cc ?? []).join(", ");
     compose({
-      title,
-      to: m.address,
-      subject: /^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`,
-      body,
+      title: "Reply all",
+      to,
+      cc,
+      showCc: cc !== "",
+      subject: replySubject(m),
       from: m.account,
       replyTo: m.id,
     });
+  }
 
-  const forward = (m: Message) =>
+  async function forward(m: Message) {
+    const content = await loadContent(m.id).catch(() => null);
+    const text = content?.text ?? m.body ?? [m.snippet];
+    const to = (content?.to ?? []).filter((r) => r !== "You");
+    const header = [
+      "---------- Forwarded message ----------",
+      `From: ${m.from} <${m.address}>`,
+      `Date: ${formatFullDate(m.timestamp)}`,
+      `Subject: ${m.subject}`,
+      ...(to.length ? [`To: ${to.join(", ")}`] : []),
+    ];
     compose({
       title: "Forward",
-      subject: `Fwd: ${m.subject}`,
-      body: `\n\n---------- Forwarded message ----------\nFrom: ${m.from} <${m.address}>\nSubject: ${m.subject}\n\n${m.body.join("\n\n")}`,
+      subject: /^fwd?:/i.test(m.subject) ? m.subject : `Fwd: ${m.subject}`,
+      body: `\n\n${header.join("\n")}\n\n${text.join("\n\n")}`,
       from: m.account,
       replyTo: m.id,
+      forward: true,
     });
+  }
 
   function closeComposer() {
     if (!draft) return;
@@ -423,8 +601,11 @@ export default function App() {
     if (draftHasContent(closed)) showToast("Draft discarded", () => openComposer(closed));
   }
 
-  /** Sending is simulated: close, then an undo window that reopens the composer. */
-  function send() {
+  /**
+   * Queues the message to go out when the undo window ends (or at the Send
+   * Later time). Undo cancels it in the outbox and reopens the composer.
+   */
+  async function send() {
     if (!draft) return;
     if (!draft.to.trim()) {
       showToast("Add at least one recipient");
@@ -434,14 +615,38 @@ export default function App() {
     const repliedTo = sent.doneAfter ? messages.find((m) => m.id === sent.replyTo && m.state !== "done") : undefined;
     setDraft(null);
     const undoDone = repliedTo ? apply([repliedTo], () => ({ state: "done" })) : undefined;
-    showToast(
-      sent.sendLater ? "Message scheduled" : "Message sent",
-      () => {
-        undoDone?.();
-        openComposer(sent);
-      },
-      ICONS.send,
-    );
+    let id: number;
+    try {
+      id = await sendMessage({
+        account: sent.from,
+        to: sent.to,
+        cc: sent.cc,
+        bcc: sent.bcc,
+        subject: sent.subject,
+        body: sent.body,
+        // A forward isn't a reply; it only carries replyTo for "Mark as Done after sending".
+        replyTo: sent.forward ? undefined : sent.replyTo,
+        sendAt: sent.sendLater?.at ?? Date.now() + TOAST_MS,
+      });
+    } catch (error) {
+      undoDone?.();
+      openComposer(sent);
+      showToast(`Couldn't send: ${String(error)}`, undefined, ICONS.error, { duration: ERROR_TOAST_MS });
+      return;
+    }
+    outbox.current.set(id, sent);
+    showToast(sent.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, sent, undoDone), ICONS.send);
+  }
+
+  async function unsend(id: number, sent: Draft, undoDone?: () => void) {
+    const cancelled = await cancelSend(id).catch(() => false);
+    if (!cancelled) {
+      showToast("Already sent", undefined, ICONS.send);
+      return;
+    }
+    outbox.current.delete(id);
+    undoDone?.();
+    openComposer(sent);
   }
 
   // ---- +AI Summary ----
@@ -538,11 +743,11 @@ export default function App() {
       case "priority":
         return actions.priority(m);
       case "replyAll":
-        return reply(m, "", "Reply all");
+        return void replyAll(m);
       case "reply":
         return reply(m);
       case "forward":
-        return forward(m);
+        return void forward(m);
       case "trash":
         return actions.trash(m);
       case "summarize":
@@ -558,7 +763,7 @@ export default function App() {
       if (e.defaultPrevented || palette || settingsPage || isInsideOverlay(e.target)) return;
       const typing = isTypingTarget(e.target);
       if (isModShortcut(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "z") {
-        if (!typing && toast?.undo) {
+        if (!typing && toast?.undo && !toast.actionLabel) {
           e.preventDefault();
           undoToast();
         }
@@ -600,7 +805,7 @@ export default function App() {
             label: "Snooze until tomorrow",
             keywords: "later",
             Icon: Clock,
-            detail: LATER_PRESETS[1].detail,
+            detail: presetDetail(LATER_PRESETS[1]),
             run: () => actions.snooze(m, LATER_PRESETS[1]),
           },
           {
@@ -656,9 +861,15 @@ export default function App() {
             label: "Reply all",
             Icon: ReplyAll,
             shortcut: shortcutLabel("replyAll"),
-            run: () => reply(m, "", "Reply all"),
+            run: () => void replyAll(m),
           },
-          { id: "forward", label: "Forward", Icon: Forward, shortcut: shortcutLabel("forward"), run: () => forward(m) },
+          {
+            id: "forward",
+            label: "Forward",
+            Icon: Forward,
+            shortcut: shortcutLabel("forward"),
+            run: () => void forward(m),
+          },
           ...(
             [
               { action: "summarize", label: "+AI Summary: Short", Icon: Text },
@@ -689,6 +900,7 @@ export default function App() {
         run: () => compose(),
       },
       { id: "search", label: "Search", keywords: "find", Icon: Search, shortcut: shortcutLabel("search"), run: openSearch },
+      { id: "sync", label: "Check for new mail", keywords: "sync refresh fetch receive", Icon: RefreshCw, run: checkMail },
       { id: "go-inbox", label: "Go to Inbox", keywords: "folder", Icon: Inbox, run: () => selectFolder("inbox") },
       ...FOLDERS.map(({ key, label, Icon }) => ({
         id: `go-${key}`,
@@ -722,6 +934,13 @@ export default function App() {
         run: () => openSettings(),
       },
       {
+        id: "add-account",
+        label: "Add account",
+        keywords: "accounts gmail google microsoft outlook office 365 exchange imap sign in login",
+        Icon: UserPlus,
+        run: () => openSettings("accounts"),
+      },
+      {
         id: "ai-settings",
         label: "AI settings",
         keywords: "api key provider anthropic openai model",
@@ -741,10 +960,10 @@ export default function App() {
   const snoozeTarget = palette?.kind === "snooze" ? messages.find((m) => m.id === palette.targetId) : undefined;
   const snoozeCommands: Command[] = snoozeTarget
     ? LATER_PRESETS.map((p) => ({
-        id: p.label,
+        id: p.key,
         label: p.label,
         Icon: Clock,
-        detail: p.detail,
+        detail: presetDetail(p),
         run: () => actions.snooze(snoozeTarget, p),
       }))
     : [];
@@ -772,8 +991,8 @@ export default function App() {
     summaryCopied: () => showToast("Summary Copied", undefined, ICONS.copy),
     openAiSettings: () => openSettings("ai"),
     reply: (m, body) => reply(m, body),
-    replyAll: (m) => reply(m, "", "Reply all"),
-    forward,
+    replyAll: (m) => void replyAll(m),
+    forward: (m) => void forward(m),
   };
 
   const showList = twoColumns || !openMessage;
@@ -781,133 +1000,139 @@ export default function App() {
   const readerLeft = sidebarSpace + (twoColumns ? listWidthUsed : 0);
 
   return (
-    <div className="flex h-full bg-base-100 text-base-content">
-      <Sidebar
-        mode={sidebarMode}
-        width={sidebarWidth}
-        folder={view.folder}
-        account={view.account}
-        counts={counts}
-        onSelect={selectFolder}
-        onOpen={() => setSidebarMode("overlay")}
-        onClose={() => setSidebarMode("rail")}
-        onToggleLock={() => setSidebarMode((m) => (m === "locked" ? "rail" : "locked"))}
-        onResize={setSidebarWidth}
-        onSync={() => void listMessages().then(setMessages)}
-        onSettings={() => openSettings()}
-      />
+    <AccountsContext value={accounts}>
+      <div className="flex h-full bg-base-100 text-base-content">
+        <Sidebar
+          mode={sidebarMode}
+          width={sidebarWidth}
+          folder={view.folder}
+          account={view.account}
+          counts={counts}
+          syncing={syncing}
+          onSelect={selectFolder}
+          onOpen={() => setSidebarMode("overlay")}
+          onClose={() => setSidebarMode("rail")}
+          onToggleLock={() => setSidebarMode((m) => (m === "locked" ? "rail" : "locked"))}
+          onResize={setSidebarWidth}
+          onSync={checkMail}
+          onSettings={() => openSettings()}
+        />
 
-      <main className="relative flex min-w-0 flex-1">
-        <DragStrip />
-        <CaptionButtons />
-        {showList && (
-          <section
-            aria-label="Message list"
-            className={`relative flex min-w-0 flex-col pt-8 ${twoColumns ? "shrink-0 border-r border-hairline" : "flex-1"}`}
-            style={twoColumns ? { width: listWidthUsed } : undefined}
-          >
-            <MessageList
-              model={model}
-              view={view}
-              selectedId={selectedId}
-              openId={openId}
-              rows={rows}
-              gatekeeper={gatekeeper}
-              onDoneAll={doneAll}
-              onShowAll={(key) => changeView({ sub: { kind: "card", key } }, true)}
-              onOpenGroup={(key) => changeView({ sub: { kind: "group", key } }, true)}
-              onBack={() => changeView({ sub: null }, true)}
-              onModeChange={setMode}
-              onSearchOpen={openSearch}
-              onSearchChange={(search) => setView((v) => ({ ...v, search }))}
-              onSearchClose={closeSearch}
-              onSearchKeyDown={onSearchKeyDown}
-              onCompose={() => compose()}
-              onToggleDone={toggleDone}
-              onOpenGatekeeper={() => changeView({ sub: { kind: "gatekeeper" } }, true)}
-              searchRef={searchRef}
-            />
-            {twoColumns && (
-              <Splitter
-                width={listWidthUsed}
-                onResize={(w) => setListWidth(clamp(w, LIST_MIN, Math.min(LIST_MAX, container - READER_MIN)))}
+        <main className="relative flex min-w-0 flex-1">
+          <DragStrip />
+          <CaptionButtons />
+          {showList && (
+            <section
+              aria-label="Message list"
+              className={`relative flex min-w-0 flex-col pt-8 ${twoColumns ? "shrink-0 border-r border-hairline" : "flex-1"}`}
+              style={twoColumns ? { width: listWidthUsed } : undefined}
+            >
+              <MessageList
+                model={model}
+                view={view}
+                selectedId={selectedId}
+                openId={openId}
+                rows={rows}
+                gatekeeper={gatekeeper}
+                onDoneAll={doneAll}
+                onShowAll={(key) => changeView({ sub: { kind: "card", key } }, true)}
+                onOpenGroup={(key) => changeView({ sub: { kind: "group", key } }, true)}
+                onBack={() => changeView({ sub: null }, true)}
+                onModeChange={setMode}
+                onSearchOpen={openSearch}
+                onSearchChange={(search) => setView((v) => ({ ...v, search }))}
+                onSearchClose={closeSearch}
+                onSearchKeyDown={onSearchKeyDown}
+                onCompose={() => compose()}
+                onToggleDone={toggleDone}
+                onOpenGatekeeper={() => changeView({ sub: { kind: "gatekeeper" } }, true)}
+                searchRef={searchRef}
+                demo={isDemoMode(accounts)}
+                onAddAccounts={() => openSettings("accounts")}
               />
-            )}
-          </section>
+              {twoColumns && (
+                <Splitter
+                  width={listWidthUsed}
+                  onResize={(w) => setListWidth(clamp(w, LIST_MIN, Math.min(LIST_MAX, container - READER_MIN)))}
+                />
+              )}
+            </section>
+          )}
+          {showReader && (
+            <section aria-label="Conversation" className="flex min-w-0 flex-1 flex-col pt-8">
+              {openMessage ? (
+                <ThreadView
+                  key={openMessage.id}
+                  message={openMessage}
+                  singleColumn={!twoColumns}
+                  summary={summaries.get(openMessage.id)}
+                  aiProvider={aiProvider}
+                  actions={threadActions}
+                />
+              ) : (
+                <EmptyReader />
+              )}
+            </section>
+          )}
+        </main>
+
+        {draft && (
+          <Composer
+            key={composerKey}
+            draft={draft}
+            full={composerFull}
+            fullStyle={{ left: readerLeft, right: 0 }}
+            onChange={(patch) => setDraft((d) => d && { ...d, ...patch })}
+            onToggleFull={() => setComposerFull((f) => !f)}
+            onClose={closeComposer}
+            onSend={send}
+          />
         )}
-        {showReader && (
-          <section aria-label="Conversation" className="flex min-w-0 flex-1 flex-col pt-8">
-            {openMessage ? (
-              <ThreadView
-                key={openMessage.id}
-                message={openMessage}
-                singleColumn={!twoColumns}
-                summary={summaries.get(openMessage.id)}
-                aiProvider={aiProvider}
-                actions={threadActions}
-              />
-            ) : (
-              <EmptyReader />
-            )}
-          </section>
+
+        {palette?.kind === "actions" && (
+          <CommandCenter
+            key="actions"
+            title="Actions"
+            placeholder="Type a command, or go to…"
+            commands={actionCommands(palette.targetId)}
+            onRun={(c) => {
+              setPalette(null);
+              c.run();
+            }}
+            onClose={() => setPalette(null)}
+          />
         )}
-      </main>
+        {palette?.kind === "snooze" && (
+          <CommandCenter
+            key="snooze"
+            title={snoozeTarget ? `Snooze · ${snoozeTarget.subject}` : "Snooze"}
+            placeholder="Snooze until…"
+            commands={snoozeCommands}
+            onRun={(c) => {
+              setPalette(null);
+              c.run();
+            }}
+            onClose={() => setPalette(null)}
+          />
+        )}
 
-      {draft && (
-        <Composer
-          key={composerKey}
-          draft={draft}
-          full={composerFull}
-          fullStyle={{ left: readerLeft, right: 0 }}
-          onChange={(patch) => setDraft((d) => d && { ...d, ...patch })}
-          onToggleFull={() => setComposerFull((f) => !f)}
-          onClose={closeComposer}
-          onSend={send}
-        />
-      )}
+        {settingsPage && (
+          <Settings
+            page={settingsPage}
+            onPage={(page) => {
+              lastSettingsPage.current = page;
+              setSettingsPage(page);
+            }}
+            onClose={() => setSettingsPage(null)}
+            theme={theme}
+            onTheme={changeTheme}
+            onAccountsChanged={() => void reloadAccounts()}
+          />
+        )}
 
-      {palette?.kind === "actions" && (
-        <CommandCenter
-          key="actions"
-          title="Actions"
-          placeholder="Type a command, or go to…"
-          commands={actionCommands(palette.targetId)}
-          onRun={(c) => {
-            setPalette(null);
-            c.run();
-          }}
-          onClose={() => setPalette(null)}
-        />
-      )}
-      {palette?.kind === "snooze" && (
-        <CommandCenter
-          key="snooze"
-          title={snoozeTarget ? `Snooze · ${snoozeTarget.subject}` : "Snooze"}
-          placeholder="Snooze until…"
-          commands={snoozeCommands}
-          onRun={(c) => {
-            setPalette(null);
-            c.run();
-          }}
-          onClose={() => setPalette(null)}
-        />
-      )}
-
-      {settingsPage && (
-        <Settings
-          page={settingsPage}
-          onPage={(page) => {
-            lastSettingsPage.current = page;
-            setSettingsPage(page);
-          }}
-          onClose={() => setSettingsPage(null)}
-          theme={theme}
-          onTheme={changeTheme}
-        />
-      )}
-
-      {toast && <UndoToast toast={toast} left={sidebarSpace + 16} onUndo={undoToast} />}
-    </div>
+        {toast && <UndoToast toast={toast} left={sidebarSpace + 16} onUndo={undoToast} />}
+      </div>
+    </AccountsContext>
   );
 }
 

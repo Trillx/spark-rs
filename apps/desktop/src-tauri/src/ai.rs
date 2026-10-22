@@ -2,7 +2,7 @@
 //! credential store, and +AI Summary. The key stays on this side; the UI only
 //! learns whether one is stored.
 
-mod keys;
+pub(crate) mod keys;
 mod settings;
 mod summary;
 
@@ -17,7 +17,7 @@ use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
-use crate::mailbox::DemoMailbox;
+use crate::mailbox::Mailbox;
 pub use keys::Keys;
 use settings::{AiSettings, Preset};
 use summary::{SummaryEvent, SummaryStyle};
@@ -28,7 +28,7 @@ pub struct AiState {
     /// Serializes writes to `ai.json`.
     saving: Mutex<()>,
     /// In-flight summaries by message id, so they can be stopped or replaced.
-    summaries: Mutex<HashMap<u32, SummaryRun>>,
+    summaries: Mutex<HashMap<i64, SummaryRun>>,
     next_run: AtomicU64,
 }
 
@@ -125,14 +125,14 @@ impl AiState {
         Ok(models)
     }
 
-    fn cancel(&self, id: u32) {
+    fn cancel(&self, id: i64) {
         if let Some(running) = self.summaries.lock().unwrap().remove(&id) {
             running.task.abort();
         }
     }
 
     /// Drops a finished run's handle, unless a newer run for the message replaced it.
-    fn finish(&self, id: u32, run: u64) {
+    fn finish(&self, id: i64, run: u64) {
         let mut summaries = self.summaries.lock().unwrap();
         if summaries.get(&id).is_some_and(|r| r.run == run) {
             summaries.remove(&id);
@@ -176,13 +176,13 @@ pub async fn list_ai_models(state: State<'_, AiState>) -> Result<Vec<String>, St
 pub async fn summarize_message(
     app: AppHandle,
     state: State<'_, AiState>,
-    mailbox: State<'_, DemoMailbox>,
-    id: u32,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
     style: Option<SummaryStyle>,
     on_event: Channel<SummaryEvent>,
 ) -> Result<(), String> {
     let mail = mailbox
-        .get(id)
+        .with_body(id)
         .ok_or_else(|| format!("no message with id {id}"))?;
     let (client, key) = match state.client(true) {
         Ok(ready) => ready,
@@ -218,7 +218,7 @@ pub async fn summarize_message(
 
 /// Stops a running summary. The UI keeps whatever text already arrived.
 #[tauri::command]
-pub fn cancel_summary(state: State<'_, AiState>, id: u32) {
+pub fn cancel_summary(state: State<'_, AiState>, id: i64) {
     state.cancel(id);
 }
 

@@ -19,14 +19,17 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useRef, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { SUMMARY_STYLES, type SummaryStyle } from "../ai";
-import type { Message } from "../types";
-import { ACCOUNTS, LATER_PRESETS, formatFullDate, type LaterPreset } from "../lib/format";
+import type { AccountView, Message, MessageContent } from "../types";
+import { useAccount } from "../lib/accounts";
+import { allowRemoteImages, remoteImagesAllowed, useMessageContent } from "../lib/content";
+import { LATER_PRESETS, formatFullDate, formatLater, parseAddress, presetDetail, type LaterPreset } from "../lib/format";
 import { hint, shortcutLabel, type ActionId } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
+import { BlockedImagesBar, HtmlBody, TextBody, hasRemoteImages } from "./MessageBody";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
 
 export interface ThreadActions {
@@ -104,9 +107,9 @@ export default function ThreadView({
               <Zap size={12} className="fill-current" /> Priority
             </Pill>
           )}
-          {m.state === "snoozed" && m.snoozedUntil && (
+          {m.state === "snoozed" && m.snoozedUntil !== undefined && (
             <Pill className="bg-priority-fill text-priority">
-              <Clock size={12} /> Snoozed until {m.snoozedUntil}
+              <Clock size={12} /> Snoozed until {formatLater(m.snoozedUntil)}
             </Pill>
           )}
           {m.state === "aside" && (
@@ -206,7 +209,7 @@ function Toolbar({
         )}
       >
         {LATER_PRESETS.map((p) => (
-          <MenuItem key={p.label} label={p.label} detail={p.detail} onSelect={() => actions.snooze(m, p)} />
+          <MenuItem key={p.key} label={p.label} detail={presetDetail(p)} onSelect={() => actions.snooze(m, p)} />
         ))}
       </Dropdown>
       <SummarizeButton message={m} summary={summary} onJump={onJumpToSummary} actions={actions} />
@@ -396,7 +399,9 @@ function MessageCard({
   showReplyBar: boolean;
   actions: ThreadActions;
 }) {
-  const account = ACCOUNTS[m.account];
+  const account = useAccount(m.account);
+  const [state, retry] = useMessageContent(m.id);
+  const content = state.status === "ready" ? state.content : null;
   return (
     <article className="rounded-2xl border border-hairline bg-card">
       <header className="flex items-center gap-3 px-5 pb-1.5 pt-3.5">
@@ -405,10 +410,7 @@ function MessageCard({
           <span className="font-bold" title={m.address}>
             {m.from}
           </span>
-          <span className="text-text-2"> to </span>
-          <span className="font-medium text-primary" title={`${account.email} (${account.name})`}>
-            You
-          </span>
+          {content && <Recipients content={content} account={account} />}
         </div>
         <time className="shrink-0 text-xs leading-5 text-text-2" dateTime={new Date(m.timestamp).toISOString()}>
           {formatFullDate(m.timestamp)}
@@ -433,12 +435,23 @@ function MessageCard({
           <MessageMenuItems message={m} actions={actions} />
         </Dropdown>
       </header>
-      <div className="select-text space-y-3 px-5 pb-5 pt-2 text-sm leading-[1.57]">
-        {m.body.map((paragraph, i) => (
-          <p key={i}>{paragraph}</p>
-        ))}
-      </div>
-      {m.attachment && <AttachmentTile name={m.attachment} />}
+      {state.status === "loading" && <BodySkeleton />}
+      {state.status === "error" && (
+        <div className="px-5 pb-5 pt-2 text-[13px] leading-5">
+          <p className="select-text text-error">Couldn't load this email. {state.message}</p>
+          <button className="mt-1 font-medium text-primary hover:underline" onClick={retry}>
+            Try again
+          </button>
+        </div>
+      )}
+      {content && <Body id={m.id} content={content} />}
+      {content && content.attachments.length > 0 && (
+        <div className="flex flex-wrap gap-2 px-5 pb-4">
+          {content.attachments.map((name, i) => (
+            <AttachmentTile key={i} name={name} />
+          ))}
+        </div>
+      )}
       {showReplyBar && (
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
           {QUICK_REPLIES.map(({ label, body }) => (
@@ -459,18 +472,76 @@ function MessageCard({
   );
 }
 
+/** The email's HTML in the sandboxed frame (remote images on request), else its text. */
+function Body({ id, content }: { id: number; content: MessageContent }) {
+  const [images, setImages] = useState(() => remoteImagesAllowed(id));
+  const html = content.html;
+  const blocked = useMemo(() => html !== null && hasRemoteImages(html), [html]);
+  if (html === null) return <TextBody paragraphs={content.text} />;
+  return (
+    <>
+      {blocked && !images && (
+        <BlockedImagesBar
+          onLoad={() => {
+            allowRemoteImages(id);
+            setImages(true);
+          }}
+        />
+      )}
+      <HtmlBody html={html} remoteImages={images} />
+    </>
+  );
+}
+
+/** " to You, Ana Ruiz cc Ben": names only, the full address in each tooltip. */
+function Recipients({ content, account }: { content: MessageContent; account?: AccountView }) {
+  const own = account?.email.toLowerCase();
+  const list = (items: string[]) =>
+    items.map((raw, i) => {
+      const { name, address } = parseAddress(raw);
+      const you = raw === "You" || address.toLowerCase() === own;
+      return (
+        <span key={i}>
+          {i > 0 && <span className="text-text-2">, </span>}
+          <span
+            className={`font-medium ${you ? "text-primary" : ""}`}
+            title={you && account ? `${account.email} (${account.label})` : raw}
+          >
+            {you ? "You" : name}
+          </span>
+        </span>
+      );
+    });
+  return (
+    <>
+      {content.to.length > 0 && <span className="text-text-2"> to </span>}
+      {list(content.to)}
+      {content.cc.length > 0 && <span className="text-text-2"> cc </span>}
+      {list(content.cc)}
+    </>
+  );
+}
+
+function BodySkeleton() {
+  return (
+    <div className="appear-late space-y-2.5 px-5 pb-6 pt-3" aria-label="Loading email">
+      {["w-11/12", "w-4/5", "w-5/6", "w-2/5"].map((w) => (
+        <div key={w} className={`skeleton h-2.5 ${w} rounded-full bg-base-content/5`} />
+      ))}
+    </div>
+  );
+}
+
 function AttachmentTile({ name }: { name: string }) {
-  const ext = name.includes(".") ? name.split(".").pop()!.toUpperCase() : "FILE";
+  const ext = name.includes(".") ? name.split(".").pop()!.toUpperCase().slice(0, 4) : "FILE";
   const tint =
     ext === "PDF" ? "bg-error/10 text-error" : ext === "ZIP" ? "bg-warning/15 text-warning" : "bg-primary/10 text-primary";
   return (
-    <div className="px-5 pb-4">
-      <div className="flex w-60 items-center gap-2.5 rounded-xl border border-hairline p-2 hover:bg-row-hover">
-        <span className={`grid size-9 shrink-0 place-items-center rounded-lg text-[10px] font-bold ${tint}`}>{ext}</span>
-        <div className="min-w-0">
-          <div className="truncate text-[13px] font-medium leading-5">{name}</div>
-          <div className="text-[11px] leading-4 text-text-2">{ext === "FILE" ? "Attachment" : `${ext} file`}</div>
-        </div>
+    <div className="flex w-60 items-center gap-2.5 rounded-xl border border-hairline p-2" title={name}>
+      <span className={`grid size-9 shrink-0 place-items-center rounded-lg text-[10px] font-bold ${tint}`}>{ext}</span>
+      <div className="min-w-0">
+        <div className="truncate text-[13px] font-medium leading-5">{name}</div>
+        <div className="text-[11px] leading-4 text-text-2">{ext === "FILE" ? "Attachment" : `${ext} file`}</div>
       </div>
     </div>
   );

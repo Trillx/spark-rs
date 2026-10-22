@@ -2,6 +2,8 @@
 # Run a command in the cross-build container with the repo mounted at /work.
 #   tools/cross/run.sh cargo xwin build --release --target aarch64-pc-windows-msvc -p spark-cli
 #   tools/cross/run.sh cargo test
+# Extra `docker run` arguments (e.g. a network for test servers) go in
+# SPARK_CROSS_DOCKER_ARGS.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -18,4 +20,5 @@ exec docker run --rm \
   -v "$repo:/work" -w /work \
   -v "$cache:/cache" \
   -e HOME=/cache \
+  ${SPARK_CROSS_DOCKER_ARGS:-} \
   "$image" "$@"

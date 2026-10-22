@@ -10,10 +10,12 @@ Created in [T3 Code](https://t3.codes).
 ## Layout
 
 ```
-crates/store              SQLite storage (bundled SQLite with FTS5)
+crates/store              SQLite storage: accounts, messages, outbox (bundled SQLite with FTS5)
+crates/mail               IMAP/SMTP and Microsoft Graph: sync, sending, Microsoft sign-in
+crates/ai                 bring-your-own-key AI client (Anthropic, OpenAI-compatible)
 apps/cli                  spark-cli, the headless dev tool
 apps/desktop              desktop app UI: React + Tailwind + daisyUI (Vite)
-apps/desktop/src-tauri    desktop app shell (Tauri 2), serves the demo mailbox
+apps/desktop/src-tauri    desktop app shell (Tauri 2): accounts, sync workers, demo mailbox
 tools/cross               Docker image for building Windows binaries on Linux
 ```
 
@@ -30,6 +32,10 @@ terms for them.
 tools/cross/run.sh cargo clippy --workspace --all-targets -- -D warnings
 tools/cross/run.sh cargo test --workspace
 tools/cross/run.sh cargo run -p spark-cli -- doctor
+
+# IMAP/SMTP end-to-end test against GreenMail (setup in crates/mail/tests/greenmail.rs)
+SPARK_CROSS_DOCKER_ARGS='--network spark-test -e SPARK_TEST_GREENMAIL=spark-greenmail' \
+  tools/cross/run.sh cargo test -p spark-mail --test greenmail
 
 # Desktop UI: build it first (Node on the host); the app embeds apps/desktop/dist
 (cd apps/desktop && npm install && npm run build)

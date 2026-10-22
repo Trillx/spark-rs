@@ -62,7 +62,7 @@ impl Keys {
     }
 }
 
-fn describe(error: &Error) -> String {
+pub(crate) fn describe(error: &Error) -> String {
     match error {
         Error::NoStorageAccess(e) => format!("Couldn't open the credential store: {e}"),
         Error::PlatformFailure(e) => format!("The credential store failed: {e}"),
@@ -75,21 +75,21 @@ fn describe(error: &Error) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn platform_store() -> Result<Arc<CredentialStore>, String> {
+pub(crate) fn platform_store() -> Result<Arc<CredentialStore>, String> {
     windows_native_keyring_store::Store::new()
         .map(|store| store as Arc<CredentialStore>)
         .map_err(|e| describe(&e))
 }
 
 #[cfg(target_os = "linux")]
-fn platform_store() -> Result<Arc<CredentialStore>, String> {
+pub(crate) fn platform_store() -> Result<Arc<CredentialStore>, String> {
     linux_keyutils_keyring_store::Store::new()
         .map(|store| store as Arc<CredentialStore>)
         .map_err(|e| describe(&e))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn platform_store() -> Result<Arc<CredentialStore>, String> {
+pub(crate) fn platform_store() -> Result<Arc<CredentialStore>, String> {
     Err("spark-rs can't store API keys on this system yet.".into())
 }
 

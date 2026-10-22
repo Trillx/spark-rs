@@ -109,6 +109,7 @@
   --spark-priority-line: #ffe2bf; /* yellow1 */
   --spark-chip: #edeff2; /* gray1: quick replies, Gatekeeper Block */
   --spark-ai-time: #9453ef; /* purple100 */
+  --spark-email-inset: 0px; /* HTML emails sit on white: flush with the card here */
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="spark-light"]) {
@@ -130,6 +131,7 @@
     --spark-priority-line: #473b23;
     --spark-chip: #2f3237;
     --spark-ai-time: #b471fa;
+    --spark-email-inset: 10px;
   }
 }
 [data-theme="spark-dark"] {
@@ -156,6 +158,7 @@
   --spark-priority-line: #473b23;
   --spark-chip: #2f3237;
   --spark-ai-time: #b471fa;
+  --spark-email-inset: 10px;
 }
 
 @theme inline {
@@ -250,4 +253,14 @@
 }
 .animate-sync {
   animation: spin-once 3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Loading placeholders appear only if loading takes a moment, so fast loads don't flash. */
+@keyframes appear {
+  from {
+    opacity: 0;
+  }
+}
+.appear-late {
+  animation: appear 200ms ease-out 150ms backwards;
 }

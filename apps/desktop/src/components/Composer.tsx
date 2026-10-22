@@ -9,8 +9,9 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useRef, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
-import type { Account } from "../types";
-import { ACCOUNT_IDS, ACCOUNTS, LATER_PRESETS, presetText, type LaterPreset } from "../lib/format";
+import type { AccountId } from "../types";
+import { useAccounts } from "../lib/accounts";
+import { LATER_PRESETS, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
 import Dropdown, { MenuItem } from "./Dropdown";
 
@@ -23,15 +24,17 @@ export interface Draft {
   showBcc: boolean;
   subject: string;
   body: string;
-  from: Account;
-  sendLater: LaterPreset | null;
-  remind: LaterPreset | null;
+  from: AccountId;
+  sendLater: Later | null;
+  remind: Later | null;
   doneAfter: boolean;
   /** The message being replied to or forwarded; "Mark as Done after sending" applies to it. */
   replyTo?: number;
+  /** `replyTo` is forwarded, not answered, so the message isn't sent as a reply. */
+  forward?: boolean;
 }
 
-export function emptyDraft(from: Account): Draft {
+export function emptyDraft(from: AccountId): Draft {
   return {
     title: "New message",
     to: "",
@@ -96,7 +99,8 @@ export default function Composer({
   }
 
   const sendLabel = draft.sendLater ? "Schedule" : "Send";
-  const account = ACCOUNTS[draft.from];
+  const accounts = useAccounts();
+  const account = accounts.find((a) => a.id === draft.from) ?? accounts[0];
 
   return (
     <div
@@ -178,12 +182,12 @@ export default function Composer({
         <div className="flex shrink-0 flex-wrap gap-1.5 px-3 pb-2">
           {draft.sendLater && (
             <Chip onClear={() => onChange({ sendLater: null })}>
-              <CalendarClock size={13} /> Send {presetText(draft.sendLater)}
+              <CalendarClock size={13} /> Send {formatLater(draft.sendLater.at)}
             </Chip>
           )}
           {draft.remind && (
             <Chip onClear={() => onChange({ remind: null })}>
-              <BellRing size={13} /> Remind me {presetText(draft.remind)}
+              <BellRing size={13} /> Remind me {formatLater(draft.remind.at)}
             </Chip>
           )}
         </div>
@@ -205,11 +209,11 @@ export default function Composer({
           <li className="menu-title px-2 py-1 text-[11px]">Send later</li>
           {LATER_PRESETS.map((p) => (
             <MenuItem
-              key={p.label}
+              key={p.key}
               label={p.label}
-              detail={p.detail}
-              checked={draft.sendLater?.label === p.label}
-              onSelect={() => onChange({ sendLater: p })}
+              detail={presetDetail(p)}
+              checked={draft.sendLater?.key === p.key}
+              onSelect={() => onChange({ sendLater: pickLater(p) })}
             />
           ))}
           {draft.sendLater && <MenuItem label="Don't schedule" onSelect={() => onChange({ sendLater: null })} />}
@@ -226,11 +230,11 @@ export default function Composer({
           <li className="menu-title px-2 py-1 text-[11px]">Remind me if no reply</li>
           {LATER_PRESETS.map((p) => (
             <MenuItem
-              key={p.label}
+              key={p.key}
               label={p.label}
-              detail={p.detail}
-              checked={draft.remind?.label === p.label}
-              onSelect={() => onChange({ remind: p })}
+              detail={presetDetail(p)}
+              checked={draft.remind?.key === p.key}
+              onSelect={() => onChange({ remind: pickLater(p) })}
             />
           ))}
           {draft.remind && <MenuItem label="No reminder" onSelect={() => onChange({ remind: null })} />}
@@ -254,24 +258,24 @@ export default function Composer({
                 title="From"
                 onClick={toggle}
               >
-                <span className={`size-2 rounded-full ${account.dot}`} />
+                <span className="size-2 rounded-full" style={{ backgroundColor: account?.color }} />
                 <span className="leading-none">
-                  <span className="block text-xs">{account.email}</span>
+                  <span className="block text-xs">{account?.email}</span>
                   <span className="block text-[8px] font-semibold uppercase tracking-wide text-text-2">
-                    {account.name}
+                    {account?.label}
                   </span>
                 </span>
                 <ChevronsUpDown size={12} className="text-text-2" />
               </button>
             )}
           >
-            {ACCOUNT_IDS.map((id) => (
+            {accounts.map((a) => (
               <MenuItem
-                key={id}
-                label={ACCOUNTS[id].email}
-                detail={ACCOUNTS[id].name}
-                checked={draft.from === id}
-                onSelect={() => onChange({ from: id })}
+                key={a.id}
+                label={a.email}
+                detail={a.label}
+                checked={account?.id === a.id}
+                onSelect={() => onChange({ from: a.id })}
               />
             ))}
           </Dropdown>

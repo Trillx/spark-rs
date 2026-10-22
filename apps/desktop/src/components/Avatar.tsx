@@ -1,5 +1,6 @@
-import type { Account } from "../types";
-import { ACCOUNTS, avatarColor, initials } from "../lib/format";
+import type { AccountId } from "../types";
+import { useAccount } from "../lib/accounts";
+import { avatarColor, initials } from "../lib/format";
 
 const SIZES = {
   xs: "size-4 text-[7px]",
@@ -17,13 +18,13 @@ export default function Avatar({
 }: {
   name: string;
   size?: keyof typeof SIZES;
-  account?: Account;
+  account?: AccountId;
 }) {
+  const ring = useAccount(account)?.color;
   return (
     <span
-      className={`grid shrink-0 place-items-center rounded-full ${SIZES[size]} ${
-        account ? `border-2 ${ACCOUNTS[account].ring}` : ""
-      }`}
+      className={`grid shrink-0 place-items-center rounded-full ${SIZES[size]} ${ring ? "border-2" : ""}`}
+      style={ring ? { borderColor: ring } : undefined}
       aria-hidden
     >
       <span

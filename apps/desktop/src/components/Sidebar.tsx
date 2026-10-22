@@ -1,10 +1,11 @@
-import { Inbox, Lock, LockOpen, PanelLeftOpen, RefreshCw } from "lucide-react";
+import { CircleAlert, Inbox, Lock, LockOpen, PanelLeftOpen, RefreshCw } from "lucide-react";
 import { useState, type MouseEvent, type ReactNode } from "react";
-import type { Account } from "../types";
-import { ACCOUNT_IDS, ACCOUNTS } from "../lib/format";
+import type { AccountView } from "../types";
+import { useAccounts } from "../lib/accounts";
 import { FOLDERS, type AccountFilter, type Folder, type SidebarCounts } from "../lib/layout";
 import { SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, clamp, startHorizontalDrag } from "../lib/panes";
 import { hint } from "../lib/shortcuts";
+import AccountMark from "./AccountMark";
 
 export type SidebarMode = "rail" | "overlay" | "locked";
 
@@ -14,6 +15,8 @@ interface Props {
   folder: Folder;
   account: AccountFilter;
   counts: SidebarCounts;
+  /** Some account is syncing: the sync button spins until it's done. */
+  syncing: boolean;
   onSelect: (folder: Folder, account?: AccountFilter) => void;
   onOpen: () => void;
   onClose: () => void;
@@ -49,6 +52,7 @@ export default function Sidebar(props: Props) {
 }
 
 function Rail({ folder, account, counts, onSelect, onOpen, onSettings }: Props) {
+  const accounts = useAccounts();
   // Clicking empty rail space opens the sidebar, like Spark.
   const openOnEmpty = (e: MouseEvent) => {
     if (e.target === e.currentTarget) onOpen();
@@ -68,14 +72,15 @@ function Rail({ folder, account, counts, onSelect, onOpen, onSettings }: Props) 
       >
         <Inbox size={18} />
       </RailButton>
-      {ACCOUNT_IDS.map((id) => (
+      {accounts.map((a) => (
         <RailButton
-          key={id}
-          title={`${ACCOUNTS[id].name} · ${ACCOUNTS[id].provider}`}
-          active={folder === "inbox" && account === id}
-          onClick={() => onSelect("inbox", id)}
+          key={a.id}
+          title={accountTitle(a)}
+          active={folder === "inbox" && account === a.id}
+          alert={a.sync.status === "error"}
+          onClick={() => onSelect("inbox", a.id)}
         >
-          <AccountMark account={id} />
+          <AccountMark color={a.color} />
         </RailButton>
       ))}
       <span className="my-1 h-px w-6 bg-white/10" />
@@ -97,12 +102,16 @@ function RailButton({
   title,
   active = false,
   dot = false,
+  alert = false,
   onClick,
   children,
 }: {
   title: string;
   active?: boolean;
+  /** Unread mail. */
   dot?: boolean;
+  /** A sync error. */
+  alert?: boolean;
   onClick: () => void;
   children: ReactNode;
 }) {
@@ -117,7 +126,9 @@ function RailButton({
       }`}
     >
       {children}
-      {dot && <span className="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary" />}
+      {(dot || alert) && (
+        <span className={`absolute right-0.5 top-0.5 size-1.5 rounded-full ${alert ? "bg-error" : "bg-primary"}`} />
+      )}
     </button>
   );
 }
@@ -128,17 +139,19 @@ function Expanded({
   folder,
   account,
   counts,
+  syncing,
   onSelect,
   onToggleLock,
   onResize,
   onSync,
   onSettings,
 }: Props) {
-  const [syncing, setSyncing] = useState(0);
+  const accounts = useAccounts();
+  const [clicks, setClicks] = useState(0);
   const locked = mode === "locked";
 
   function sync() {
-    setSyncing((n) => n + 1);
+    setClicks((n) => n + 1);
     onSync();
   }
 
@@ -149,8 +162,12 @@ function Expanded({
       style={{ width }}
     >
       <div data-tauri-drag-region className="flex h-8 shrink-0 items-center justify-end gap-0.5 px-2">
-        <SidebarIconButton title="Check new mail" onClick={sync}>
-          <RefreshCw key={syncing} size={15} className={syncing ? "animate-sync" : ""} />
+        <SidebarIconButton title="Check for new mail" onClick={sync}>
+          <RefreshCw
+            key={syncing ? "syncing" : clicks}
+            size={15}
+            className={syncing ? "animate-spin" : clicks ? "animate-sync" : ""}
+          />
         </SidebarIconButton>
         <SidebarIconButton title={locked ? "Unlock sidebar" : "Lock sidebar"} onClick={onToggleLock}>
           {locked ? <Lock size={15} /> : <LockOpen size={15} />}
@@ -165,15 +182,17 @@ function Expanded({
           active={folder === "inbox" && account === "all"}
           onClick={() => onSelect("inbox", "all")}
         />
-        {ACCOUNT_IDS.map((id) => (
+        {accounts.map((a) => (
           <SidebarRow
-            key={id}
+            key={a.id}
             indent
-            icon={<AccountMark account={id} />}
-            label={`${ACCOUNTS[id].name} · ${ACCOUNTS[id].provider}`}
-            count={counts[id]}
-            active={folder === "inbox" && account === id}
-            onClick={() => onSelect("inbox", id)}
+            icon={<AccountMark color={a.color} />}
+            label={a.label}
+            title={accountTitle(a)}
+            count={counts.accounts[a.id] ?? 0}
+            alert={a.sync.status === "error" ? (a.sync.message ?? "Couldn't sync") : undefined}
+            active={folder === "inbox" && account === a.id}
+            onClick={() => onSelect("inbox", a.id)}
           />
         ))}
 
@@ -215,20 +234,26 @@ function Expanded({
 function SidebarRow({
   icon,
   label,
+  title,
   count,
+  alert,
   active,
   indent = false,
   onClick,
 }: {
   icon: ReactNode;
   label: string;
+  title?: string;
   count: number;
+  /** A sync error, shown as an icon in place of the count. */
+  alert?: string;
   active: boolean;
   indent?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
+      title={title}
       aria-current={active || undefined}
       onClick={onClick}
       className={`mb-0.5 flex h-[30px] w-full items-center gap-2 rounded-lg pr-2.5 text-left text-[13px] ${
@@ -237,7 +262,11 @@ function SidebarRow({
     >
       <span className="grid w-5 shrink-0 place-items-center">{icon}</span>
       <span className="min-w-0 flex-1 truncate">{label}</span>
-      {count > 0 && (
+      {alert ? (
+        <span title={alert} className="text-error">
+          <CircleAlert size={14} aria-label={alert} />
+        </span>
+      ) : count > 0 && (
         <span className={`text-[11px] font-medium leading-[13px] ${active ? "" : "opacity-50"}`}>{count}</span>
       )}
     </button>
@@ -257,13 +286,9 @@ function SidebarIconButton({ title, onClick, children }: { title: string; onClic
   );
 }
 
-/** Account color ring with a dot, used for the per-account Inbox rows. */
-function AccountMark({ account }: { account: Account }) {
-  return (
-    <span className={`grid size-4 place-items-center rounded-full border-2 ${ACCOUNTS[account].ring}`}>
-      <span className={`size-1.5 rounded-full ${ACCOUNTS[account].dot}`} />
-    </span>
-  );
+/** "Work · me@contoso.com · Microsoft 365" */
+function accountTitle(a: AccountView) {
+  return `${a.label} · ${a.email} · ${a.provider}`;
 }
 
 function SettingsAvatar({ onClick }: { onClick?: () => void }) {
