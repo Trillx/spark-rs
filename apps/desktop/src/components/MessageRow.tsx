@@ -1,0 +1,195 @@
+import {
+  ArrowDownLeft,
+  Check,
+  Circle,
+  CircleCheck,
+  Clock,
+  Ellipsis,
+  Paperclip,
+  Pin,
+  Trash2,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
+import { useEffect, useRef } from "react";
+import type { Message } from "../types";
+import { formatListDate } from "../lib/format";
+import { hint } from "../lib/shortcuts";
+import Avatar from "./Avatar";
+
+export interface RowActions {
+  open: (id: number) => void;
+  done: (m: Message) => void;
+  pin: (m: Message) => void;
+  snooze: (m: Message) => void;
+  aside: (m: Message) => void;
+  trash: (m: Message) => void;
+  priority: (m: Message) => void;
+  read: (m: Message) => void;
+  /** Opens the Command Center for this row. */
+  more: (m: Message) => void;
+}
+
+/**
+ * Split-view row, about 70px: unread dot, 26px avatar with the
+ * account ring, sender / subject / snippet. Hover shows a Done circle in
+ * the leading column and swaps the date for the row actions.
+ */
+export default function MessageRow({
+  message: m,
+  selected,
+  actions,
+  inPriorityCard = false,
+}: {
+  message: Message;
+  selected: boolean;
+  actions: RowActions;
+  /** Rows on the peach Priority card hover in its own tint. */
+  inPriorityCard?: boolean;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (selected) ref.current?.scrollIntoView({ block: "nearest" });
+  }, [selected]);
+
+  const done = m.state === "done";
+  const snoozed = m.state === "snoozed" && m.snoozedUntil;
+  const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
+  return (
+    <div
+      ref={ref}
+      role="option"
+      aria-selected={selected}
+      onClick={() => actions.open(m.id)}
+      className={`group grid h-[70px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 ${
+        selected ? "bg-row-selected" : hover
+      }`}
+    >
+      <span className="flex h-5 items-center justify-center">
+        {done ? (
+          <LeadingButton title="Move to Inbox" filled onClick={() => actions.done(m)} />
+        ) : (
+          <>
+            {m.unread && <span className="size-2 rounded-full bg-primary group-hover:hidden" />}
+            <span className="hidden group-hover:contents">
+              <LeadingButton title={hint("Done", "done")} onClick={() => actions.done(m)} />
+            </span>
+          </>
+        )}
+      </span>
+      <span className={done ? "opacity-50" : ""}>
+        <Avatar name={m.from} account={m.account} />
+      </span>
+      <div className={`min-w-0 pl-2.5 ${done ? "text-text-2" : ""}`}>
+        <div className="flex h-5 items-center gap-1">
+          <span className={`truncate text-sm leading-5 ${m.unread ? "font-semibold" : "font-medium"}`}>{m.from}</span>
+          <span
+            className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${
+              snoozed ? "text-priority" : "text-text-2"
+            }`}
+          >
+            {snoozed ? (
+              <>
+                <Clock size={12} />
+                {m.snoozedUntil!.split(" · ")[0]}
+              </>
+            ) : (
+              formatListDate(m.timestamp)
+            )}
+          </span>
+          <div className="ml-auto hidden shrink-0 items-center gap-0.5 pl-2 group-hover:flex">
+            {m.state !== "deleted" && (
+              <HoverButton title={hint("Move to Trash", "trash")} Icon={Trash2} onClick={() => actions.trash(m)} />
+            )}
+            <HoverButton
+              title={hint(m.priority ? "Remove from Priority" : "Mark as Priority", "priority")}
+              Icon={Zap}
+              active={m.priority}
+              activeClass="fill-current text-priority"
+              onClick={() => actions.priority(m)}
+            />
+            <HoverButton
+              title={hint(m.unread ? "Mark as Read" : "Mark as Unread", "read")}
+              Icon={Circle}
+              active={m.unread}
+              activeClass="fill-current text-primary"
+              onClick={() => actions.read(m)}
+            />
+            <HoverButton
+              title={hint(m.pinned ? "Unpin" : "Pin", "pin")}
+              Icon={Pin}
+              active={m.pinned}
+              activeClass="fill-current text-pin"
+              onClick={() => actions.pin(m)}
+            />
+            <HoverButton
+              title={m.state === "aside" ? "Move back to Inbox" : hint("Set Aside", "aside")}
+              Icon={ArrowDownLeft}
+              onClick={() => actions.aside(m)}
+            />
+            <HoverButton title={hint("Snooze", "snooze")} Icon={Clock} onClick={() => actions.snooze(m)} />
+            <HoverButton title="More" Icon={Ellipsis} onClick={() => actions.more(m)} />
+          </div>
+        </div>
+        <div className="flex items-center gap-1 text-[13px] font-medium leading-5">
+          {m.priority ? (
+            <Zap size={13} className="shrink-0 fill-current text-priority" aria-label="Priority" />
+          ) : m.pinned ? (
+            <Pin size={13} className="shrink-0 fill-current text-pin" aria-label="Pinned" />
+          ) : null}
+          <span className="truncate">{m.subject || <i className="font-normal">No subject</i>}</span>
+          {m.attachment && <Paperclip size={12} className="shrink-0 rotate-45 text-text-2" aria-label="Has attachment" />}
+        </div>
+        <div className="truncate text-[13px] leading-5 text-text-2">{m.snippet || "No content"}</div>
+      </div>
+    </div>
+  );
+}
+
+/** The leading column's Done circle: outline on hover, filled for Done mail. */
+function LeadingButton({ title, filled = false, onClick }: { title: string; filled?: boolean; onClick: () => void }) {
+  return (
+    <button
+      title={title}
+      aria-label={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className={`grid size-[18px] place-items-center rounded-full ${
+        filled ? "bg-primary text-primary-content" : "text-text-2 hover:text-primary"
+      }`}
+    >
+      {filled ? <Check size={12} strokeWidth={2.5} /> : <CircleCheck size={18} />}
+    </button>
+  );
+}
+
+function HoverButton({
+  title,
+  Icon,
+  onClick,
+  active = false,
+  activeClass = "",
+}: {
+  title: string;
+  Icon: LucideIcon;
+  onClick: () => void;
+  active?: boolean;
+  activeClass?: string;
+}) {
+  return (
+    <button
+      title={title}
+      aria-label={title}
+      aria-pressed={active || undefined}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      className="grid size-5 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content"
+    >
+      <Icon size={14} className={active ? activeClass : ""} />
+    </button>
+  );
+}

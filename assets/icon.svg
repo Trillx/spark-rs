@@ -1,4 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#e11d48"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="26" font-weight="600" fill="#ffffff">SR</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="256" y2="256">
+      <stop offset="0" stop-color="#f5f5f4"/>
+      <stop offset="1" stop-color="#d6d3d1"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <path d="M72 56 Q72 66 82 66 Q72 66 72 76 Q72 66 62 66 Q72 66 72 56 Z" fill="#1c1917"/>
+  <path d="M188 45 Q188 58 201 58 Q188 58 188 71 Q188 58 175 58 Q188 58 188 45 Z" fill="#1c1917"/>
+  <rect x="44" y="92" width="168" height="116" rx="18" fill="none" stroke="#1c1917" stroke-width="12"/>
+  <path d="M50 104 L128 164 L206 104" fill="none" stroke="#1c1917" stroke-width="12" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M134 68 L74 140 L128 140 L122 188 L182 116 L128 116 Z" fill="#f59e0b" stroke="url(#bg)" stroke-width="10" stroke-linejoin="round"/>
 </svg>

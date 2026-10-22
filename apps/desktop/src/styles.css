@@ -1,0 +1,253 @@
+@import "tailwindcss";
+
+/* Only the custom themes below; they carry default / prefersdark. */
+@plugin "daisyui" {
+  themes: false;
+}
+
+@plugin "daisyui/theme" {
+  name: "spark-light";
+  default: true;
+  prefersdark: false;
+  color-scheme: light;
+
+  --color-base-100: #ffffff;
+  --color-base-200: #f5f6f8;
+  --color-base-300: #edeff2;
+  --color-base-content: #141414;
+
+  --color-primary: #007cff;
+  --color-primary-content: #ffffff;
+  --color-secondary: #6866f7;
+  --color-secondary-content: #ffffff;
+  --color-accent: #4139f5;
+  --color-accent-content: #ffffff;
+  --color-neutral: #282a2e;
+  --color-neutral-content: #aeb8c5;
+
+  --color-info: #157efb;
+  --color-info-content: #ffffff;
+  --color-success: #01b363;
+  --color-success-content: #ffffff;
+  --color-warning: #ff8a00;
+  --color-warning-content: #ffffff;
+  --color-error: #e43535;
+  --color-error-content: #ffffff;
+
+  --radius-selector: 0.375rem;
+  --radius-field: 0.375rem;
+  --radius-box: 0.5rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+  name: "spark-dark";
+  default: false;
+  prefersdark: true;
+  color-scheme: dark;
+
+  --color-base-100: #1f2124;
+  --color-base-200: #282a2e;
+  --color-base-300: #2f3237;
+  --color-base-content: #dee3eb;
+
+  --color-primary: #439fff;
+  --color-primary-content: #ffffff;
+  --color-secondary: #8c8aff;
+  --color-secondary-content: #141414;
+  --color-accent: #6b5cf6;
+  --color-accent-content: #ffffff;
+  --color-neutral: #282a2e;
+  --color-neutral-content: #aeb8c5;
+
+  --color-info: #46a2ff;
+  --color-info-content: #141414;
+  --color-success: #42be20;
+  --color-success-content: #141414;
+  --color-warning: #ff8a00;
+  --color-warning-content: #141414;
+  --color-error: #e04242;
+  --color-error-content: #ffffff;
+
+  --radius-selector: 0.375rem;
+  --radius-field: 0.375rem;
+  --radius-box: 0.5rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
+/* Spark-specific tokens that daisyUI has no slot for. */
+:root,
+[data-theme="spark-light"] {
+  --spark-text-2: #66707e;
+  --spark-text-3: #aeb8c5;
+  --spark-hairline: rgba(0, 8, 30, 0.08);
+  --spark-splitter: rgba(0, 8, 30, 0.14);
+  --spark-row-selected: #e5f2ff;
+  --spark-row-hover: #f5f6f8;
+  --spark-popover: #ffffff;
+  --spark-card: #ffffff; /* elevation3: message cards */
+  --spark-token-contact: #b4dcff;
+  --spark-token-attachment: #e7fbe1;
+  --spark-sidebar-rail: #1f2124;
+  --spark-sidebar-hover: rgba(255, 255, 255, 0.1);
+  --spark-sidebar-active: #0053cf; /* rail */
+  --spark-sidebar-selected: #0053cf; /* expanded rows */
+  --spark-command-bg: #145190;
+  --spark-command-row: #276cb6;
+  --spark-tooltip: #2f3237;
+  --spark-ai-tint: linear-gradient(to left, rgba(106, 0, 255, 0.07), rgba(21, 193, 251, 0.07));
+  --spark-shadow-popup: 0 10px 40px rgba(0, 0, 0, 0.15);
+  --spark-priority-fill: #fff4e5; /* yellow0 */
+  --spark-priority-line: #ffe2bf; /* yellow1 */
+  --spark-chip: #edeff2; /* gray1: quick replies, Gatekeeper Block */
+  --spark-ai-time: #9453ef; /* purple100 */
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="spark-light"]) {
+    --spark-text-2: #868d97;
+    --spark-text-3: #66707e;
+    --spark-hairline: rgba(255, 255, 255, 0.1);
+    --spark-splitter: rgba(255, 255, 255, 0.14);
+    --spark-row-selected: #193350;
+    --spark-row-hover: #282a2e;
+    --spark-popover: #2f3237;
+    --spark-card: #282a2e;
+    --spark-token-contact: #163c66;
+    --spark-token-attachment: #253a24;
+    --spark-sidebar-rail: #141414;
+    --spark-tooltip: #f0f6ff;
+    --spark-ai-tint: linear-gradient(to left, rgba(106, 0, 255, 0.16), rgba(21, 193, 251, 0.12));
+    --spark-shadow-popup: 0 10px 40px rgba(0, 0, 0, 0.45);
+    --spark-priority-fill: #332e27;
+    --spark-priority-line: #473b23;
+    --spark-chip: #2f3237;
+    --spark-ai-time: #b471fa;
+  }
+}
+[data-theme="spark-dark"] {
+  --spark-text-2: #868d97;
+  --spark-text-3: #66707e;
+  --spark-hairline: rgba(255, 255, 255, 0.1);
+  --spark-splitter: rgba(255, 255, 255, 0.14);
+  --spark-row-selected: #193350;
+  --spark-row-hover: #282a2e;
+  --spark-popover: #2f3237;
+  --spark-card: #282a2e;
+  --spark-token-contact: #163c66;
+  --spark-token-attachment: #253a24;
+  --spark-sidebar-rail: #141414;
+  --spark-sidebar-hover: rgba(255, 255, 255, 0.1);
+  --spark-sidebar-active: #0053cf; /* rail */
+  --spark-sidebar-selected: #0053cf; /* expanded rows */
+  --spark-command-bg: #145190;
+  --spark-command-row: #276cb6;
+  --spark-tooltip: #f0f6ff;
+  --spark-ai-tint: linear-gradient(to left, rgba(106, 0, 255, 0.16), rgba(21, 193, 251, 0.12));
+  --spark-shadow-popup: 0 10px 40px rgba(0, 0, 0, 0.45);
+  --spark-priority-fill: #332e27;
+  --spark-priority-line: #473b23;
+  --spark-chip: #2f3237;
+  --spark-ai-time: #b471fa;
+}
+
+@theme inline {
+  --font-sans: "Inter Variable", "Inter", -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  --color-text-2: var(--spark-text-2);
+  --color-text-3: var(--spark-text-3);
+  --color-hairline: var(--spark-hairline);
+  --color-splitter: var(--spark-splitter);
+  --color-row-selected: var(--spark-row-selected);
+  --color-row-hover: var(--spark-row-hover);
+  --color-popover: var(--spark-popover);
+  --color-card: var(--spark-card);
+  --color-token-contact: var(--spark-token-contact);
+  --color-token-attachment: var(--spark-token-attachment);
+  --color-sidebar-rail: var(--spark-sidebar-rail);
+  --color-sidebar-hover: var(--spark-sidebar-hover);
+  --color-sidebar-active: var(--spark-sidebar-active);
+  --color-sidebar-selected: var(--spark-sidebar-selected);
+  --color-command: var(--spark-command-bg);
+  --color-command-row: var(--spark-command-row);
+  --shadow-popup: var(--spark-shadow-popup);
+  --color-priority-fill: var(--spark-priority-fill);
+  --color-priority-line: var(--spark-priority-line);
+  --color-chip: var(--spark-chip);
+  --color-ai-time: var(--spark-ai-time);
+  /* Spark's yellow ramp, the same in both themes. */
+  --color-pin: #ffaa3b; /* yellow3 */
+  --color-priority: #ff8a00; /* yellow4 */
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    font-size: 14px;
+    line-height: 20px;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    /* Like Spark, chrome isn't selectable; inputs and message bodies opt back in. */
+    user-select: none;
+  }
+  input,
+  textarea,
+  [contenteditable] {
+    user-select: text;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #8a8a8a80;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@utility bg-ai-tint {
+  background-image: var(--spark-ai-tint);
+}
+
+/* The "+ai" mark: blue to purple text (accentBlue → purple100). */
+@utility text-ai {
+  background-image: linear-gradient(90deg, #157efb, #9453ef);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Undo toast countdown: the ring drains over the toast's lifetime. */
+@keyframes countdown {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: var(--ring-length);
+  }
+}
+.countdown-ring {
+  animation: countdown var(--ring-duration, 5s) linear forwards;
+}
+
+@keyframes spin-once {
+  to {
+    transform: rotate(1080deg);
+  }
+}
+.animate-sync {
+  animation: spin-once 3s cubic-bezier(0.4, 0, 0.2, 1);
+}
