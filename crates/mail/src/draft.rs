@@ -1,10 +1,15 @@
 //! Outgoing mail: the composer's draft and turning it into a MIME message.
 
-use lettre::message::header::{HeaderName, HeaderValue};
-use lettre::message::{Mailbox, Mailboxes};
+use lettre::message::header::{ContentType, HeaderName, HeaderValue};
+use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart};
 use serde::{Deserialize, Serialize};
 
+use crate::attachment::AttachmentData;
 use crate::{Error, Result};
+
+/// Most servers (Gmail, Microsoft 365) refuse messages whose attachments add
+/// up to more than this.
+pub const MAX_ATTACHMENTS_BYTES: u64 = 25 * 1024 * 1024;
 
 /// What the composer sends. Address fields are comma- or semicolon-separated
 /// `Name <address>` or bare addresses.
@@ -25,6 +30,46 @@ pub struct Draft {
     pub reply_to: Option<i64>,
     /// Unix ms: the end of the undo window, or the Send Later time.
     pub send_at: i64,
+    /// Files to attach, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<OutgoingAttachment>,
+}
+
+/// A file on an outgoing message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum OutgoingAttachment {
+    /// A file from this computer. The app copies it into the outbox when the
+    /// draft is queued; `path` is kept so an undone send can show it again.
+    File { path: String, name: String, size: u64 },
+    /// Attachment `index` of a stored message, fetched again from the server
+    /// when the draft goes out: a forward keeps the original's files.
+    Message {
+        message: i64,
+        index: usize,
+        name: String,
+        size: u64,
+    },
+}
+
+impl OutgoingAttachment {
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::File { size, .. } | Self::Message { size, .. } => *size,
+        }
+    }
+}
+
+/// Refuses attachments that add up to more than servers take.
+pub fn check_attachment_size(attachments: &[OutgoingAttachment]) -> Result<()> {
+    let total: u64 = attachments.iter().map(OutgoingAttachment::size).sum();
+    if total > MAX_ATTACHMENTS_BYTES {
+        return Err(Error::Config(format!(
+            "The attachments add up to {:.1} MB; mail servers take up to 25 MB.",
+            total as f64 / (1024.0 * 1024.0)
+        )));
+    }
+    Ok(())
 }
 
 /// The message being replied to.
@@ -100,11 +145,12 @@ pub fn quoted_body(body: &str, original: Option<&Original>) -> String {
     )
 }
 
-/// Builds the MIME message for SMTP.
+/// Builds the MIME message for SMTP, with `files` attached in order.
 pub fn build_message(
     from: Mailbox,
     draft: &Draft,
     original: Option<&Original>,
+    files: &[AttachmentData],
 ) -> Result<lettre::Message> {
     let to = recipients(&draft.to)?;
     let cc = recipients(&draft.cc)?;
@@ -144,9 +190,19 @@ pub fn build_message(
             refs,
         ));
     }
-    builder
-        .body(quoted_body(&draft.body, original))
-        .map_err(|e| Error::Config(format!("Couldn't build the message: {e}")))
+    let body = quoted_body(&draft.body, original);
+    let built = if files.is_empty() {
+        builder.body(body)
+    } else {
+        let mut mixed = MultiPart::mixed().singlepart(SinglePart::plain(body));
+        for f in files {
+            let content_type = ContentType::parse(&f.mime)
+                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("valid"));
+            mixed = mixed.singlepart(Attachment::new(f.name.clone()).body(f.bytes.clone(), content_type));
+        }
+        builder.multipart(mixed)
+    };
+    built.map_err(|e| Error::Config(format!("Couldn't build the message: {e}")))
 }
 
 #[cfg(test)]
@@ -163,6 +219,7 @@ mod tests {
             body: "Sounds good.".into(),
             reply_to: None,
             send_at: 0,
+            attachments: Vec::new(),
         }
     }
 
@@ -189,7 +246,7 @@ mod tests {
             text: "Shall we?\n\nA.".into(),
         };
         let from: Mailbox = "Me <me@gmail.com>".parse().unwrap();
-        let message = build_message(from, &draft("ana@x.com"), Some(&original)).unwrap();
+        let message = build_message(from, &draft("ana@x.com"), Some(&original), &[]).unwrap();
         let raw = String::from_utf8(message.formatted()).unwrap();
         assert!(raw.contains("In-Reply-To: <1@x.com>"), "{raw}");
         assert!(
@@ -207,6 +264,73 @@ mod tests {
     #[test]
     fn a_draft_needs_a_recipient() {
         let from: Mailbox = "me@gmail.com".parse().unwrap();
-        assert!(build_message(from, &draft(" "), None).is_err());
+        assert!(build_message(from, &draft(" "), None, &[]).is_err());
+    }
+
+    #[test]
+    fn files_go_out_as_a_mixed_multipart() {
+        let from: Mailbox = "me@gmail.com".parse().unwrap();
+        let files = [
+            AttachmentData {
+                name: "plan.pdf".into(),
+                mime: "application/pdf".into(),
+                bytes: b"%PDF-1.7
+".to_vec(),
+            },
+            AttachmentData {
+                name: "Résumé.txt".into(),
+                mime: "not a type".into(),
+                bytes: b"hi".to_vec(),
+            },
+        ];
+        let message = build_message(from, &draft("ana@x.com"), None, &files).unwrap();
+        let raw = message.formatted();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(parsed.body_text(0).unwrap().trim(), "Sounds good.");
+        let list = crate::attachment::describe(&parsed);
+        assert_eq!(list.len(), 2, "{}", String::from_utf8_lossy(&raw));
+        assert_eq!(list[0].name, "plan.pdf");
+        assert_eq!(list[0].mime, "application/pdf");
+        assert_eq!(list[1].name, "Résumé.txt", "non-ASCII names survive");
+        assert_eq!(list[1].mime, "application/octet-stream", "bad types fall back");
+        let pdf = crate::attachment::extract(&raw, 0, "plan.pdf").unwrap();
+        assert_eq!(pdf.bytes, b"%PDF-1.7
+");
+    }
+
+    #[test]
+    fn drafts_keep_their_attachments_through_json() {
+        let mut d = draft("ana@x.com");
+        d.attachments = vec![
+            OutgoingAttachment::File {
+                path: r"C:\x\plan.pdf".into(),
+                name: "plan.pdf".into(),
+                size: 10,
+            },
+            OutgoingAttachment::Message {
+                message: 7,
+                index: 1,
+                name: "photo.jpg".into(),
+                size: 20,
+            },
+        ];
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains(r#"{"kind":"message","message":7,"index":1,"name":"photo.jpg","size":20}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Draft>(&json).unwrap(), d);
+        // Drafts queued before attachments existed still read.
+        let old = r#"{"account":1,"to":"a@x.com","subject":"s","body":"b","sendAt":0}"#;
+        assert!(serde_json::from_str::<Draft>(old).unwrap().attachments.is_empty());
+    }
+
+    #[test]
+    fn attachments_over_25_mb_are_refused() {
+        let file = |size| OutgoingAttachment::File {
+            path: String::new(),
+            name: "big.zip".into(),
+            size,
+        };
+        assert!(check_attachment_size(&[file(MAX_ATTACHMENTS_BYTES)]).is_ok());
+        let err = check_attachment_size(&[file(MAX_ATTACHMENTS_BYTES), file(1)]).unwrap_err();
+        assert!(err.to_string().contains("25 MB"), "{err}");
     }
 }

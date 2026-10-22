@@ -26,7 +26,9 @@ import { useAccount } from "../lib/accounts";
 import { allowRemoteImages, remoteImagesAllowed, useMessageContent } from "../lib/content";
 import { LATER_PRESETS, formatFullDate, formatLater, parseAddress, presetDetail, type LaterPreset } from "../lib/format";
 import { hint, shortcutLabel, type ActionId } from "../lib/shortcuts";
+import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AiMark from "./AiMark";
+import { AttachmentList } from "./Attachments";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
 import { BlockedImagesBar, HtmlBody, TextBody, hasRemoteImages } from "./MessageBody";
@@ -51,6 +53,10 @@ export interface ThreadActions {
   forward: (m: Message) => void;
   accept: (m: Message) => void;
   block: (m: Message) => void;
+  /** Settle when done (errors are reported by the caller), so tiles can show progress. */
+  openAttachment: (m: Message, index: number) => Promise<void>;
+  saveAttachment: (m: Message, index: number) => Promise<void>;
+  saveAllAttachments: (m: Message) => Promise<void>;
 }
 
 /** Quick replies. They insert text until AI drafting exists. */
@@ -83,17 +89,17 @@ export default function ThreadView({
 }) {
   const screening = m.screening && m.state === "inbox";
   const summaryRef = useRef<HTMLElement>(null);
-  const closeTitle = singleColumn ? "Back to list (Esc)" : hint("Close", "close");
+  const closeTip: Tip = singleColumn ? { label: "Back to list", keys: "Esc" } : hint("Close", "close");
   const jumpToSummary = () => summaryRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
 
   return (
     <>
       {screening ? (
-        <GatekeeperToolbar message={m} closeTitle={closeTitle} actions={actions} />
+        <GatekeeperToolbar message={m} closeTip={closeTip} actions={actions} />
       ) : (
         <Toolbar
           message={m}
-          closeTitle={closeTitle}
+          closeTip={closeTip}
           summary={summary}
           onJumpToSummary={jumpToSummary}
           actions={actions}
@@ -139,13 +145,13 @@ export default function ThreadView({
 /** Thread toolbar: the `[← │ ✓]` segment, then the message actions. */
 function Toolbar({
   message: m,
-  closeTitle,
+  closeTip,
   summary,
   onJumpToSummary,
   actions,
 }: {
   message: Message;
-  closeTitle: string;
+  closeTip: Tip;
   summary?: SummaryState;
   onJumpToSummary: () => void;
   actions: ThreadActions;
@@ -154,40 +160,40 @@ function Toolbar({
   return (
     <div role="toolbar" aria-label="Email thread toolbar" className="flex h-12 shrink-0 items-center gap-0.5 px-3">
       <div className="mr-1.5 flex h-8 items-center rounded-lg border border-hairline">
-        <SegmentButton title={closeTitle} Icon={ArrowLeft} onClick={actions.close} />
+        <SegmentButton tip={closeTip} Icon={ArrowLeft} onClick={actions.close} />
         <span className="h-4 w-px bg-hairline" />
         <SegmentButton
-          title={isDone ? "Move to Inbox" : hint("Done", "done")}
+          tip={isDone ? "Move to Inbox" : hint("Done", "done", "done")}
           Icon={isDone ? Inbox : Check}
           onClick={() => actions.done(m)}
         />
       </div>
       {m.state !== "deleted" && (
-        <ToolbarButton title={hint("Move to Trash", "trash")} Icon={Trash2} onClick={() => actions.trash(m)} />
+        <ToolbarButton tip={hint("Move to Trash", "trash")} Icon={Trash2} onClick={() => actions.trash(m)} />
       )}
       <ToolbarButton
-        title={hint(m.priority ? "Remove from Priority" : "Mark as Priority", "priority")}
+        tip={m.priority ? hint("Remove from Priority", "priority") : hint("Mark as Priority", "priority", "priority")}
         Icon={Zap}
         active={m.priority}
         iconClass={m.priority ? "fill-current text-priority" : ""}
         onClick={() => actions.priority(m)}
       />
       <ToolbarButton
-        title={hint(m.unread ? "Mark as Read" : "Mark as Unread", "read")}
+        tip={hint(m.unread ? "Mark as Read" : "Mark as Unread", "read")}
         Icon={Circle}
         active={m.unread}
         iconClass={m.unread ? "fill-current text-primary" : ""}
         onClick={() => actions.read(m)}
       />
       <ToolbarButton
-        title={hint(m.pinned ? "Unpin" : "Pin", "pin")}
+        tip={m.pinned ? hint("Unpin", "pin") : hint("Pin", "pin", "pin")}
         Icon={Pin}
         active={m.pinned}
         iconClass={m.pinned ? "fill-current text-pin" : ""}
         onClick={() => actions.pin(m)}
       />
       <ToolbarButton
-        title={m.state === "aside" ? "Move back to Inbox" : hint("Set Aside", "aside")}
+        tip={m.state === "aside" ? "Move back to Inbox" : hint("Set Aside", "aside", "aside")}
         Icon={ArrowDownLeft}
         active={m.state === "aside"}
         iconClass={m.state === "aside" ? "text-primary" : ""}
@@ -197,7 +203,7 @@ function Toolbar({
         trigger={({ toggle, open }) => (
           <button
             className={`btn btn-ghost btn-sm gap-0.5 px-1.5 text-text-2 hover:text-base-content ${open ? "bg-base-content/10" : ""}`}
-            title={hint("Snooze", "snooze")}
+            {...tipAttrs(hint("Snooze", "snooze", "snooze"))}
             aria-label="Snooze"
             aria-haspopup="menu"
             aria-expanded={open}
@@ -219,7 +225,7 @@ function Toolbar({
           trigger={({ toggle, open }) => (
             <button
               className={`btn btn-ghost btn-sm btn-square text-text-2 hover:text-base-content ${open ? "bg-base-content/10" : ""}`}
-              title="More"
+              data-tip="More actions"
               aria-label="More"
               aria-haspopup="menu"
               aria-expanded={open}
@@ -258,7 +264,7 @@ function SummarizeButton({
           className={`ml-1 inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-xs font-medium leading-5 text-text-2 hover:bg-base-content/10 hover:text-base-content ${
             open ? "bg-base-content/10" : ""
           }`}
-          title={hint("+AI Summary", "summarize")}
+          {...tipAttrs(hint("+AI Summary", "summarize", "summary"))}
           aria-label="+AI Summary"
           aria-haspopup="dialog"
           aria-expanded={open}
@@ -285,7 +291,7 @@ function SummarizeButton({
                   key={key}
                   role="radio"
                   aria-checked={style === key}
-                  title={hint(label, STYLE_SHORTCUTS[key])}
+                  {...tipAttrs(hint(label, STYLE_SHORTCUTS[key]))}
                   onClick={() => setStyle(key)}
                   className={`flex flex-col items-center gap-1.5 rounded-xl border px-1 py-2.5 text-xs font-medium ${
                     style === key ? "border-primary bg-primary/5 text-primary" : "border-hairline hover:bg-row-hover"
@@ -349,17 +355,17 @@ function MessageMenuItems({ message: m, actions }: { message: Message; actions: 
 /** Shown instead of the toolbar for messages still in screening. */
 function GatekeeperToolbar({
   message: m,
-  closeTitle,
+  closeTip,
   actions,
 }: {
   message: Message;
-  closeTitle: string;
+  closeTip: Tip;
   actions: ThreadActions;
 }) {
   return (
     <div className="shrink-0 px-3 pb-2">
       <div className="flex h-12 items-center">
-        <ToolbarButton title={closeTitle} Icon={ArrowLeft} onClick={actions.close} />
+        <ToolbarButton tip={closeTip} Icon={ArrowLeft} onClick={actions.close} />
       </div>
       <div className="flex flex-wrap items-center gap-4 rounded-2xl border border-hairline px-4 py-3.5">
         <Avatar name={m.from} size="xl" />
@@ -373,12 +379,14 @@ function GatekeeperToolbar({
         <div className="flex gap-2">
           <button
             className="btn btn-sm border-0 bg-primary/10 px-5 text-primary shadow-none hover:bg-primary/20"
+            {...tipAttrs({ label: "Accept", card: "accept" })}
             onClick={() => actions.accept(m)}
           >
             Accept
           </button>
           <button
             className="btn btn-sm border-0 bg-error/10 px-5 text-error shadow-none hover:bg-error/20"
+            {...tipAttrs({ label: "Block", card: "block" })}
             onClick={() => actions.block(m)}
           >
             Block
@@ -407,7 +415,7 @@ function MessageCard({
       <header className="flex items-center gap-3 px-5 pb-1.5 pt-3.5">
         <Avatar name={m.from} size="lg" account={m.account} />
         <div className="min-w-0 flex-1 truncate text-sm leading-5">
-          <span className="font-bold" title={m.address}>
+          <span className="font-bold" data-tip={m.address}>
             {m.from}
           </span>
           {content && <Recipients content={content} account={account} />}
@@ -423,7 +431,7 @@ function MessageCard({
               className={`grid size-6 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content ${
                 open ? "bg-base-content/10" : ""
               }`}
-              title="Message actions"
+              data-tip="Message actions"
               aria-label="Message actions"
               aria-haspopup="menu"
               onClick={toggle}
@@ -446,11 +454,12 @@ function MessageCard({
       )}
       {content && <Body id={m.id} content={content} />}
       {content && content.attachments.length > 0 && (
-        <div className="flex flex-wrap gap-2 px-5 pb-4">
-          {content.attachments.map((name, i) => (
-            <AttachmentTile key={i} name={name} />
-          ))}
-        </div>
+        <AttachmentList
+          attachments={content.attachments}
+          onOpen={(i) => actions.openAttachment(m, i)}
+          onSave={(i) => actions.saveAttachment(m, i)}
+          onSaveAll={() => actions.saveAllAttachments(m)}
+        />
       )}
       {showReplyBar && (
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
@@ -464,8 +473,8 @@ function MessageCard({
             </button>
           ))}
           <span className="mx-1 h-5 w-px bg-hairline" />
-          <ToolbarButton title={hint("Reply", "reply")} Icon={Reply} onClick={() => actions.reply(m)} />
-          <ToolbarButton title={hint("Forward", "forward")} Icon={Forward} onClick={() => actions.forward(m)} />
+          <ToolbarButton tip={hint("Reply", "reply")} Icon={Reply} onClick={() => actions.reply(m)} />
+          <ToolbarButton tip={hint("Forward", "forward")} Icon={Forward} onClick={() => actions.forward(m)} />
         </footer>
       )}
     </article>
@@ -505,7 +514,7 @@ function Recipients({ content, account }: { content: MessageContent; account?: A
           {i > 0 && <span className="text-text-2">, </span>}
           <span
             className={`font-medium ${you ? "text-primary" : ""}`}
-            title={you && account ? `${account.email} (${account.label})` : raw}
+            data-tip={you && account ? `${account.email} (${account.label})` : raw}
           >
             {you ? "You" : name}
           </span>
@@ -532,27 +541,12 @@ function BodySkeleton() {
   );
 }
 
-function AttachmentTile({ name }: { name: string }) {
-  const ext = name.includes(".") ? name.split(".").pop()!.toUpperCase().slice(0, 4) : "FILE";
-  const tint =
-    ext === "PDF" ? "bg-error/10 text-error" : ext === "ZIP" ? "bg-warning/15 text-warning" : "bg-primary/10 text-primary";
-  return (
-    <div className="flex w-60 items-center gap-2.5 rounded-xl border border-hairline p-2" title={name}>
-      <span className={`grid size-9 shrink-0 place-items-center rounded-lg text-[10px] font-bold ${tint}`}>{ext}</span>
-      <div className="min-w-0">
-        <div className="truncate text-[13px] font-medium leading-5">{name}</div>
-        <div className="text-[11px] leading-4 text-text-2">{ext === "FILE" ? "Attachment" : `${ext} file`}</div>
-      </div>
-    </div>
-  );
-}
-
-function SegmentButton({ title, Icon, onClick }: { title: string; Icon: LucideIcon; onClick: () => void }) {
+function SegmentButton({ tip, Icon, onClick }: { tip: Tip; Icon: LucideIcon; onClick: () => void }) {
   return (
     <button
       className="grid h-full w-8 place-items-center text-text-2 first:rounded-l-lg last:rounded-r-lg hover:bg-base-content/5 hover:text-base-content"
-      title={title}
-      aria-label={title}
+      {...tipAttrs(tip)}
+      aria-label={tipLabel(tip)}
       onClick={onClick}
     >
       <Icon size={17} />
@@ -561,13 +555,13 @@ function SegmentButton({ title, Icon, onClick }: { title: string; Icon: LucideIc
 }
 
 function ToolbarButton({
-  title,
+  tip,
   Icon,
   onClick,
   active = false,
   iconClass = "",
 }: {
-  title: string;
+  tip: Tip;
   Icon: LucideIcon;
   onClick: () => void;
   active?: boolean;
@@ -576,8 +570,8 @@ function ToolbarButton({
   return (
     <button
       className="btn btn-ghost btn-sm btn-square text-text-2 hover:text-base-content"
-      title={title}
-      aria-label={title}
+      {...tipAttrs(tip)}
+      aria-label={tipLabel(tip)}
       aria-pressed={active || undefined}
       onClick={onClick}
     >

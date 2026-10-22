@@ -3,6 +3,7 @@
 
 mod ai;
 mod demo;
+mod files;
 mod live;
 mod mailbox;
 mod secrets;
@@ -12,6 +13,7 @@ use tauri::Manager;
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            files::clear_opened();
             let config_dir = app.path().app_config_dir()?;
             app.manage(ai::AiState::new(config_dir, ai::Keys::platform()));
             let live = live::Live::open(&app.path().app_local_data_dir()?)?;
@@ -37,6 +39,11 @@ fn main() {
             mailbox::send_message,
             mailbox::cancel_send,
             mailbox::open_external,
+            mailbox::open_attachment,
+            mailbox::save_attachment,
+            mailbox::save_all_attachments,
+            mailbox::pick_files,
+            mailbox::describe_files,
             ai::get_ai_settings,
             ai::save_ai_settings,
             ai::test_ai_connection,

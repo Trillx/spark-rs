@@ -1,8 +1,10 @@
 //! Turning raw messages into what the store keeps, and Spark's Smart Inbox
 //! categories (people, notifications, newsletters) from headers alone.
 
-use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
+use mail_parser::{Address, HeaderValue, MessageParser};
 use spark_store::{Category, Incoming};
+
+use crate::attachment;
 
 pub use mail_parser::decoders::html::html_to_text;
 
@@ -27,15 +29,7 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         .any(|part| part.is_text_html())
         .then(|| m.body_html(0).map(|h| h.into_owned()))
         .flatten();
-    let attachments = m
-        .attachments()
-        .filter(|part| {
-            !part
-                .content_disposition()
-                .is_some_and(|d| d.is_inline() && part.content_id().is_some())
-        })
-        .filter_map(|part| part.attachment_name().map(str::to_owned))
-        .collect();
+    let attachments = attachment::describe(&m);
 
     let signals = Signals {
         list: m.header("List-Id").is_some() || m.header("List-Unsubscribe").is_some(),
@@ -264,7 +258,10 @@ JVBERi0=\r\n\
         );
         assert_eq!(m.in_reply_to.as_deref(), Some("1@x.com"));
         assert_eq!(m.references.as_deref(), Some("0@x.com 1@x.com"));
-        assert_eq!(m.attachments, vec!["plan.pdf"]);
+        assert_eq!(m.attachments.len(), 1);
+        assert_eq!(m.attachments[0].name, "plan.pdf");
+        assert_eq!(m.attachments[0].mime, "application/pdf");
+        assert_eq!(m.attachments[0].size, 5);
         assert_eq!(m.snippet, "Sounds good.");
         assert_eq!(m.html, None);
         assert_eq!(m.category, Category::People);

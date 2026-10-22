@@ -4,8 +4,9 @@ import type { AccountView } from "../types";
 import { useAccounts } from "../lib/accounts";
 import { FOLDERS, type AccountFilter, type Folder, type SidebarCounts } from "../lib/layout";
 import { SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, clamp, startHorizontalDrag } from "../lib/panes";
-import { hint } from "../lib/shortcuts";
+import { hint, shortcutLabel } from "../lib/shortcuts";
 import AccountMark from "./AccountMark";
+import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 
 export type SidebarMode = "rail" | "overlay" | "locked";
 
@@ -106,7 +107,7 @@ function RailButton({
   onClick,
   children,
 }: {
-  title: string;
+  title: Tip;
   active?: boolean;
   /** Unread mail. */
   dot?: boolean;
@@ -117,8 +118,9 @@ function RailButton({
 }) {
   return (
     <button
-      title={title}
-      aria-label={title}
+      {...tipAttrs(title)}
+      data-tip-side="right"
+      aria-label={tipLabel(title)}
       aria-current={active || undefined}
       onClick={onClick}
       className={`relative grid size-[30px] shrink-0 place-items-center rounded-lg ${
@@ -221,7 +223,7 @@ function Expanded({
 
       {locked && (
         <div
-          title="Drag to resize, double-click to reset"
+          data-tip="Drag to resize, double-click to reset"
           className="absolute inset-y-0 -right-px w-[3px] cursor-col-resize hover:bg-primary"
           onPointerDown={(e) => startHorizontalDrag(e, (dx) => onResize(clamp(width + dx, SIDEBAR_MIN, SIDEBAR_MAX)))}
           onDoubleClick={() => onResize(SIDEBAR_DEFAULT)}
@@ -253,7 +255,8 @@ function SidebarRow({
 }) {
   return (
     <button
-      title={title}
+      data-tip={title}
+      data-tip-side="right"
       aria-current={active || undefined}
       onClick={onClick}
       className={`mb-0.5 flex h-[30px] w-full items-center gap-2 rounded-lg pr-2.5 text-left text-[13px] ${
@@ -263,7 +266,7 @@ function SidebarRow({
       <span className="grid w-5 shrink-0 place-items-center">{icon}</span>
       <span className="min-w-0 flex-1 truncate">{label}</span>
       {alert ? (
-        <span title={alert} className="text-error">
+        <span data-tip={alert} className="text-error">
           <CircleAlert size={14} aria-label={alert} />
         </span>
       ) : count > 0 && (
@@ -276,7 +279,7 @@ function SidebarRow({
 function SidebarIconButton({ title, onClick, children }: { title: string; onClick: () => void; children: ReactNode }) {
   return (
     <button
-      title={title}
+      data-tip={title}
       aria-label={title}
       onClick={onClick}
       className="grid size-[26px] place-items-center rounded-lg hover:bg-sidebar-hover hover:text-white"
@@ -300,7 +303,8 @@ function SettingsAvatar({ onClick }: { onClick?: () => void }) {
   if (!onClick) return face;
   return (
     <button
-      title="Settings"
+      {...tipAttrs({ label: "Settings", keys: shortcutLabel("settings") })}
+      data-tip-side="right"
       aria-label="Settings"
       className="grid size-[30px] place-items-center rounded-lg hover:bg-sidebar-hover"
       onClick={onClick}

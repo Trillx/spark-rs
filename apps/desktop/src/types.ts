@@ -67,9 +67,29 @@ export interface MessageContent {
   /** Display strings, e.g. "Ana Ruiz <ana@x.com>". */
   to: string[];
   cc: string[];
-  /** File names. */
-  attachments: string[];
+  attachments: Attachment[];
 }
+
+export interface Attachment {
+  name: string;
+  /** e.g. "application/pdf"; empty when unknown. */
+  mime: string;
+  /** Bytes; 0 when unknown. */
+  size: number;
+}
+
+/** A file picked or dropped to attach. */
+export interface LocalFile {
+  path: string;
+  name: string;
+  size: number;
+}
+
+/** A file on an outgoing message. Mirrors `OutgoingAttachment` on the Rust side. */
+export type OutgoingAttachment =
+  | { kind: "file"; path: string; name: string; size: number }
+  /** Attachment `index` of a stored message, fetched from the server when sending (forwards). */
+  | { kind: "message"; message: number; index: number; name: string; size: number };
 
 export interface OutgoingDraft {
   account: AccountId;
@@ -84,6 +104,7 @@ export interface OutgoingDraft {
   replyTo?: number;
   /** Unix ms: the end of the undo window for a normal send, or the Send Later time. */
   sendAt: number;
+  attachments: OutgoingAttachment[];
 }
 
 /** Payload of the `sync-status` event. */

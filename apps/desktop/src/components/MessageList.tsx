@@ -27,6 +27,7 @@ import { hint, shortcutLabel } from "../lib/shortcuts";
 import Dropdown, { MenuItem } from "./Dropdown";
 import MessageRow, { type RowActions } from "./MessageRow";
 import { GatekeeperCard, GroupRow, SmartInboxCard } from "./SmartInboxCard";
+import { tipAttrs } from "../lib/tooltip";
 
 export interface GatekeeperActions {
   accept: (m: Message) => void;
@@ -164,7 +165,7 @@ function Toolbar({
   if (view.search !== null) {
     return (
       <div role="toolbar" className="flex min-h-[58px] shrink-0 items-center gap-1 border-b border-hairline px-2">
-        <button className={iconButton} title="Close search (Esc)" aria-label="Close search" onClick={onSearchClose}>
+        <button className={iconButton} {...tipAttrs({ label: "Close search", keys: "Esc" })} aria-label="Close search" onClick={onSearchClose}>
           <ArrowLeft size={18} />
         </button>
         <label className="flex h-10 flex-1 items-center gap-2 rounded-md border border-hairline px-2.5 focus-within:border-2 focus-within:border-[#81beff] focus-within:px-[9px]">
@@ -201,7 +202,7 @@ function Toolbar({
     <div role="toolbar" className="flex min-h-[58px] shrink-0 items-center gap-1 border-b border-hairline pl-2 pr-2">
       {view.sub ? (
         <>
-          <button className={iconButton} title="Back (Esc)" aria-label="Back" onClick={onBack}>
+          <button className={iconButton} {...tipAttrs({ label: "Back", keys: "Esc" })} aria-label="Back" onClick={onBack}>
             <ArrowLeft size={18} />
           </button>
           <h2 className="min-w-0 truncate pl-1 text-base font-semibold">{model.title}</h2>
@@ -209,7 +210,7 @@ function Toolbar({
             <div className="ml-auto flex items-center gap-1">
               <button
                 className={iconButton}
-                title="Accept all"
+                data-tip="Accept all new senders"
                 aria-label="Accept all new senders"
                 onClick={() => gatekeeper.acceptAll(screening(model))}
               >
@@ -217,7 +218,7 @@ function Toolbar({
               </button>
               <button
                 className={iconButton}
-                title="Block all"
+                data-tip="Block all new senders"
                 aria-label="Block all new senders"
                 onClick={() => gatekeeper.blockAll(screening(model))}
               >
@@ -269,10 +270,10 @@ function Toolbar({
       {view.sub?.kind !== "gatekeeper" && (
         <div className="ml-auto flex items-center gap-1">
           {view.folder === "inbox" && !view.sub && <DoneSwitch on={view.showDone} onToggle={onToggleDone} />}
-          <button className={iconButton} title={hint("Search", "search")} aria-label="Search" onClick={onSearchOpen}>
+          <button className={iconButton} {...tipAttrs(hint("Search", "search"))} aria-label="Search" onClick={onSearchOpen}>
             <Search size={18} />
           </button>
-          <button className={iconButton} title={hint("Compose", "compose")} aria-label="Compose" onClick={onCompose}>
+          <button className={iconButton} {...tipAttrs(hint("Compose", "compose"))} aria-label="Compose" onClick={onCompose}>
             <Pen size={17} />
           </button>
         </div>
@@ -305,7 +306,7 @@ function DoneSwitch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
       role="switch"
       aria-checked={on}
       aria-label="Show emails marked as Done"
-      title={title}
+      {...tipAttrs(title)}
       onClick={onToggle}
       className="grid h-8 w-10 place-items-center rounded-md hover:bg-base-content/5"
     >
@@ -383,7 +384,7 @@ export function Splitter({ width, onResize }: { width: number; onResize: (width:
       aria-valuemin={LIST_MIN}
       aria-valuemax={LIST_MAX}
       aria-valuenow={width}
-      title="Drag to resize, double-click to reset"
+      data-tip="Drag to resize, double-click to reset"
       className="group absolute inset-y-0 -right-1.5 z-10 flex w-3 cursor-col-resize items-center justify-center"
       onPointerDown={(e) => startHorizontalDrag(e, (dx) => onResize(width + dx))}
       onDoubleClick={() => onResize(LIST_MIN)}

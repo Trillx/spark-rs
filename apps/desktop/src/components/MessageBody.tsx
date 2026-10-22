@@ -67,7 +67,7 @@ function linkify(text: string): ReactNode[] {
       openLink(url);
     };
     parts.push(
-      <a key={match.index} href={url} title={url} onClick={open} onAuxClick={open} className="text-primary hover:underline">
+      <a key={match.index} href={url} data-tip={url} onClick={open} onAuxClick={open} className="text-primary hover:underline">
         {url}
       </a>,
     );

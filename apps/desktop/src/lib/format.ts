@@ -167,6 +167,14 @@ export function parseAddress(text: string) {
   return { name: match[1].trim() || address, address };
 }
 
+/** "980 bytes", "322 KB", "4.2 MB". */
+export function formatBytes(n: number) {
+  if (n < 1024) return `${n} ${n === 1 ? "byte" : "bytes"}`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  const mb = n / (1024 * 1024);
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+}
+
 export function plural(n: number, one: string, many = `${one}s`) {
   return `${n} ${n === 1 ? one : many}`;
 }

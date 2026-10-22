@@ -418,7 +418,18 @@ fn graph_messages_are_keyed_by_remote_id() {
         to: vec!["Me <me@gmail.com>".into()],
         html: Some("<p>Hi</p>".into()),
         text: "Hi".into(),
-        attachments: vec!["a.pdf".into(), "b.png".into()],
+        attachments: vec![
+            Attachment {
+                name: "a.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 1234,
+                remote_id: Some("att1".into()),
+            },
+            Attachment {
+                name: "b.png".into(),
+                ..Default::default()
+            },
+        ],
         unread: true,
         ..Default::default()
     };
@@ -430,7 +441,7 @@ fn graph_messages_are_keyed_by_remote_id() {
     assert_eq!(row.attachment.as_deref(), Some("a.pdf"));
     let content = store.content(id).unwrap().unwrap();
     assert_eq!(content.html.as_deref(), Some("<p>Hi</p>"));
-    assert_eq!(content.attachments.len(), 2);
+    assert_eq!(content.attachments, m.attachments);
     assert_eq!(content.to, vec!["Me <me@gmail.com>"]);
 
     assert_eq!(store.observe_gone_remote(account, "AAMk1").unwrap(), 1);
@@ -443,8 +454,8 @@ fn graph_messages_are_keyed_by_remote_id() {
 #[test]
 fn queued_sends_can_be_cancelled_until_claimed() {
     let (mut store, account) = store_with_account();
-    let a = store.queue_send(account, "{\"a\":1}", 5_000).unwrap();
-    let b = store.queue_send(account, "{\"b\":1}", 5_000).unwrap();
+    let a = store.queue_send(account, "{\"a\":1}", 5_000, &[]).unwrap();
+    let b = store.queue_send(account, "{\"b\":1}", 5_000, &[]).unwrap();
     assert!(store.claim_due_sends(account, 4_000).unwrap().is_empty());
     assert!(store.cancel_send(a).unwrap());
     assert!(!store.cancel_send(a).unwrap());
@@ -459,4 +470,114 @@ fn queued_sends_can_be_cancelled_until_claimed() {
     assert_eq!(store.claim_due_sends(account, 9_000).unwrap().len(), 1);
     store.finish_send(b).unwrap();
     assert_eq!(store.requeue_interrupted_sends().unwrap(), 0);
+}
+
+#[test]
+fn queued_files_stay_with_their_draft_until_it_is_gone() {
+    let (mut store, account) = store_with_account();
+    let files = [
+        OutboxFile {
+            name: "plan.pdf".into(),
+            mime: "application/pdf".into(),
+            data: b"%PDF-1.7".to_vec(),
+        },
+        OutboxFile {
+            name: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            data: vec![0xff, 0xd8, 0xff],
+        },
+    ];
+    let id = store.queue_send(account, "{}", 5_000, &files).unwrap();
+    assert_eq!(store.outbox_files(id).unwrap(), files);
+
+    // Undo (cancel) and a finished send both drop the copies.
+    assert!(store.cancel_send(id).unwrap());
+    assert!(store.outbox_files(id).unwrap().is_empty());
+    let id = store.queue_send(account, "{}", 5_000, &files).unwrap();
+    store.claim_due_sends(account, 5_000).unwrap();
+    store.finish_send(id).unwrap();
+    let left: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM outbox_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[test]
+fn attachments_stored_as_bare_names_still_read() {
+    let (mut store, account) = store_with_account();
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    // Rows written before sizes and types were kept.
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET attachments = '[\"old.pdf\"]' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let content = store.content(id).unwrap().unwrap();
+    assert_eq!(
+        content.attachments,
+        vec![Attachment {
+            name: "old.pdf".into(),
+            ..Default::default()
+        }]
+    );
+    assert_eq!(
+        store.message(id).unwrap().unwrap().attachment.as_deref(),
+        Some("old.pdf")
+    );
+}
+
+#[test]
+fn locations_say_where_the_server_keeps_a_message() {
+    let (mut store, account) = store_with_account();
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, 7, "a@x.com"), false)
+            .unwrap(),
+    );
+    let at = store.location(id).unwrap().unwrap();
+    assert_eq!(at.account_id, account);
+    assert_eq!((at.mailbox.as_deref(), at.uid), (Some("INBOX"), Some(7)));
+    assert_eq!(at.remote_place, Place::Inbox);
+    assert_eq!(store.location(id + 100).unwrap(), None);
+}
+
+#[test]
+fn version_1_databases_gain_the_outbox_files_table() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v1-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v1.sqlite");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    let account = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "a@b.c",
+            name: "A",
+            label: "A",
+            config: "{}",
+        })
+        .unwrap();
+    let file = OutboxFile {
+        name: "a.txt".into(),
+        mime: "text/plain".into(),
+        data: b"hi".to_vec(),
+    };
+    let id = store
+        .queue_send(account.id, "{}", 0, std::slice::from_ref(&file))
+        .unwrap();
+    assert_eq!(store.outbox_files(id).unwrap(), vec![file]);
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

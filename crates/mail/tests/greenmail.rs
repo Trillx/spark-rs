@@ -12,11 +12,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures_util::TryStreamExt;
-use lettre::message::header::{HeaderName, HeaderValue};
-use spark_mail::draft::Draft;
+use lettre::message::header::{ContentType, HeaderName, HeaderValue};
+use lettre::message::{Attachment, MultiPart, SinglePart};
+use spark_mail::draft::{Draft, OutgoingAttachment};
 use spark_mail::imap::{self, Security, Server};
 use spark_mail::{Engine, Secrets, smtp};
-use spark_store::{AccountKind, Category, MessageState, Patch, Store, now_ms};
+use spark_store::{AccountKind, Category, MessageState, OutboxFile, Patch, Store, now_ms};
 
 #[derive(Default)]
 struct MemorySecrets(Mutex<HashMap<String, String>>);
@@ -189,6 +190,7 @@ async fn imap_round_trip() {
         body: "Sure, noon?".into(),
         reply_to: Some(lunch.id),
         send_at: now_ms(),
+        attachments: Vec::new(),
     };
     let queued = engine
         .store()
@@ -196,6 +198,7 @@ async fn imap_round_trip() {
             account.id,
             &serde_json::to_string(&draft).unwrap(),
             now_ms(),
+            &[],
         )
         .unwrap();
     let outcomes = engine.send_due(account.id).await.unwrap();
@@ -219,6 +222,104 @@ async fn imap_round_trip() {
         content.text.contains("> Body of Lunch?"),
         "{:?}",
         content.text
+    );
+
+    // A PDF comes in: listed with its size, and downloadable on demand,
+    // also after it was archived (found again by Message-ID).
+    let pdf = b"%PDF-1.7\n% quote\n".to_vec();
+    let quote = lettre::Message::builder()
+        .from("Vendor <quotes@vendor.example>".parse().unwrap())
+        .to(me.parse().unwrap())
+        .subject("Quote 42")
+        .message_id(None)
+        .multipart(
+            MultiPart::mixed()
+                .singlepart(SinglePart::plain(String::from("Quote attached.")))
+                .singlepart(
+                    Attachment::new("quote 42.pdf".into())
+                        .body(pdf.clone(), ContentType::parse("application/pdf").unwrap()),
+                ),
+        )
+        .unwrap();
+    smtp::send(&smtp, "sender", "pw", quote).await.unwrap();
+    engine.run(account.id, true).await.unwrap();
+    let quote = find(&engine, "Quote 42");
+    assert_eq!(quote.attachment.as_deref(), Some("quote 42.pdf"));
+    let listed = engine.store().content(quote.id).unwrap().unwrap().attachments;
+    assert_eq!(listed[0].mime, "application/pdf");
+    assert_eq!(listed[0].size, pdf.len() as u64);
+    assert_eq!(engine.attachment(quote.id, 0).await.unwrap().bytes, pdf);
+    back_in_time(
+        &engine,
+        quote.id,
+        Patch {
+            state: Some(MessageState::Done),
+            ..Default::default()
+        },
+    );
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
+    assert_eq!(engine.attachment(quote.id, 0).await.unwrap().bytes, pdf);
+
+    // Forwarding it with a file from disk: both go out, in order.
+    let forward = Draft {
+        account: account.id,
+        to: me.clone(),
+        cc: String::new(),
+        bcc: String::new(),
+        subject: "Fwd: Quote 42".into(),
+        body: "See the quote.".into(),
+        reply_to: None,
+        send_at: now_ms(),
+        attachments: vec![
+            OutgoingAttachment::Message {
+                message: quote.id,
+                index: 0,
+                name: "quote 42.pdf".into(),
+                size: pdf.len() as u64,
+            },
+            OutgoingAttachment::File {
+                path: "notes.txt".into(),
+                name: "notes.txt".into(),
+                size: 5,
+            },
+        ],
+    };
+    let notes = OutboxFile {
+        name: "notes.txt".into(),
+        mime: "text/plain".into(),
+        data: b"notes".to_vec(),
+    };
+    engine
+        .store()
+        .queue_send(
+            account.id,
+            &serde_json::to_string(&forward).unwrap(),
+            now_ms(),
+            &[notes],
+        )
+        .unwrap();
+    let outcomes = engine.send_due(account.id).await.unwrap();
+    assert!(
+        matches!(outcomes[0].result, Ok(true)),
+        "{:?}",
+        outcomes[0].result
+    );
+    engine.run(account.id, true).await.unwrap();
+    let forwarded = find(&engine, "Fwd: Quote 42");
+    let names: Vec<String> = engine
+        .store()
+        .content(forwarded.id)
+        .unwrap()
+        .unwrap()
+        .attachments
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+    assert_eq!(names, ["quote 42.pdf", "notes.txt"]);
+    assert_eq!(engine.attachment(forwarded.id, 0).await.unwrap().bytes, pdf);
+    assert_eq!(
+        engine.attachment(forwarded.id, 1).await.unwrap().bytes,
+        b"notes"
     );
 
     let _ = check.logout().await;

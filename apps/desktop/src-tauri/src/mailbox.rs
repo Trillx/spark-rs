@@ -1,14 +1,18 @@
 //! What the UI talks to: real accounts once one is added, the demo mailbox
 //! until then. Types here are the UI's shapes (`src/types.ts` mirrors them).
 
+use std::path::PathBuf;
+
 use serde::Serialize;
-use spark_mail::draft::{self, Draft};
+use spark_mail::attachment::{AttachmentData, mime_for};
+use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::gmail_servers;
 use spark_mail::imap::Server;
-use spark_store::{Account, AccountKind, Category, MessageState, Patch, now_ms};
-use tauri::{AppHandle, Emitter, State};
+use spark_store::{Account, AccountKind, Category, MessageState, OutboxFile, Patch, now_ms};
+use tauri::{AppHandle, Emitter, State, Window};
 
 use crate::demo::{self, DemoMailbox};
+use crate::files::{self, LocalFile};
 use crate::live::Live;
 
 pub struct Mailbox {
@@ -86,8 +90,20 @@ pub struct MessageContent {
     html: Option<String>,
     to: Vec<String>,
     cc: Vec<String>,
-    attachments: Vec<String>,
+    attachments: Vec<AttachmentView>,
 }
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentView {
+    name: String,
+    /// e.g. "application/pdf"; empty when unknown.
+    mime: String,
+    /// Bytes; 0 when unknown.
+    size: u64,
+}
+
+const DEMO_FILES: &str = "This is demo mail: its attachments are only names.";
 
 impl Mailbox {
     fn live(&self) -> bool {
@@ -209,7 +225,15 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
             html: None,
             to: vec!["You".into()],
             cc: Vec::new(),
-            attachments: m.attachment.into_iter().collect(),
+            attachments: m
+                .attachment
+                .into_iter()
+                .map(|name| AttachmentView {
+                    mime: mime_for(&name).into(),
+                    name,
+                    size: 0,
+                })
+                .collect(),
         });
     }
     let content = mailbox
@@ -224,8 +248,138 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
         html: content.html,
         to: content.to,
         cc: content.cc,
-        attachments: content.attachments,
+        attachments: content
+            .attachments
+            .into_iter()
+            .map(|a| AttachmentView {
+                name: a.name,
+                mime: a.mime,
+                size: a.size,
+            })
+            .collect(),
     })
+}
+
+/// The stored name of attachment `index`, checked before downloading.
+fn attachment_name(mailbox: &Mailbox, id: i64, index: usize) -> Result<String, String> {
+    if !mailbox.live() {
+        return Err(DEMO_FILES.into());
+    }
+    let content = mailbox.live.engine.store().content(id).map_err(text)?;
+    content
+        .and_then(|c| c.attachments.into_iter().nth(index))
+        .map(|a| a.name)
+        .ok_or_else(|| "That attachment isn't part of the email.".to_owned())
+}
+
+async fn download(mailbox: &Mailbox, id: i64, index: usize) -> Result<AttachmentData, String> {
+    mailbox
+        .live
+        .engine
+        .attachment(id, index)
+        .await
+        .map_err(text)
+}
+
+/// Downloads an attachment and opens it in its default app.
+#[tauri::command]
+pub async fn open_attachment(
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    index: usize,
+) -> Result<(), String> {
+    let name = attachment_name(&mailbox, id, index)?;
+    if files::is_risky(&name) {
+        return Err(format!(
+            "{name} could run a program, so spark-rs won't open it. Save it and check it first."
+        ));
+    }
+    let file = download(&mailbox, id, index).await?;
+    let dir = files::opened_dir().join(format!("{id}-{index}"));
+    std::fs::create_dir_all(&dir).map_err(text)?;
+    let path = dir.join(files::safe_file_name(&file.name));
+    files::write_downloaded(&path, &file.bytes)?;
+    open::that_detached(&path).map_err(|e| format!("Couldn't open {}: {e}", file.name))
+}
+
+/// Asks where to save an attachment, then downloads it there. False if the
+/// user cancelled.
+#[tauri::command]
+pub async fn save_attachment(
+    window: Window,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    index: usize,
+) -> Result<bool, String> {
+    let name = attachment_name(&mailbox, id, index)?;
+    let Some(target) = rfd::AsyncFileDialog::new()
+        .set_parent(&window)
+        .set_title("Save attachment")
+        .set_file_name(files::safe_file_name(&name))
+        .save_file()
+        .await
+    else {
+        return Ok(false);
+    };
+    let file = download(&mailbox, id, index).await?;
+    files::write_downloaded(target.path(), &file.bytes)?;
+    Ok(true)
+}
+
+/// Asks for a folder and saves every attachment there. Returns how many were
+/// saved; 0 if the user cancelled.
+#[tauri::command]
+pub async fn save_all_attachments(
+    window: Window,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+) -> Result<usize, String> {
+    if !mailbox.live() {
+        return Err(DEMO_FILES.into());
+    }
+    let count = mailbox
+        .live
+        .engine
+        .store()
+        .content(id)
+        .map_err(text)?
+        .map_or(0, |c| c.attachments.len());
+    let Some(folder) = rfd::AsyncFileDialog::new()
+        .set_parent(&window)
+        .set_title("Save attachments to")
+        .pick_folder()
+        .await
+    else {
+        return Ok(0);
+    };
+    let folder: PathBuf = folder.path().to_owned();
+    for index in 0..count {
+        let file = download(&mailbox, id, index).await?;
+        let path = files::unique_path(&folder, &files::safe_file_name(&file.name));
+        files::write_downloaded(&path, &file.bytes)?;
+    }
+    Ok(count)
+}
+
+/// The file picker for attaching files.
+#[tauri::command]
+pub async fn pick_files(window: Window) -> Vec<LocalFile> {
+    let picked = rfd::AsyncFileDialog::new()
+        .set_parent(&window)
+        .set_title("Attach files")
+        .pick_files()
+        .await
+        .unwrap_or_default();
+    picked.iter().filter_map(|f| files::describe(f.path())).collect()
+}
+
+/// Names and sizes of dropped files; folders are skipped.
+#[tauri::command]
+pub fn describe_files(paths: Vec<String>) -> Vec<LocalFile> {
+    paths
+        .iter()
+        .filter_map(|p| files::describe(p.as_ref()))
+        .collect()
 }
 
 #[tauri::command]
@@ -376,16 +530,30 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
         // The demo pretends; ids only need to be unique.
         return Ok(now_ms());
     }
-    // Catch typos now rather than after the undo window.
+    // Catch typos and oversized attachments now rather than after the undo window.
     for field in [&draft.to, &draft.cc, &draft.bcc] {
         draft::recipients(field).map_err(text)?;
+    }
+    draft::check_attachment_size(&draft.attachments).map_err(text)?;
+    // Copies of local files go into the outbox, so a later send doesn't
+    // depend on the originals.
+    let mut queued = Vec::new();
+    for a in &draft.attachments {
+        if let OutgoingAttachment::File { path, name, .. } = a {
+            let data = std::fs::read(path).map_err(|e| format!("Couldn't read {name}: {e}"))?;
+            queued.push(OutboxFile {
+                name: name.clone(),
+                mime: mime_for(name).into(),
+                data,
+            });
+        }
     }
     let json = serde_json::to_string(&draft).map_err(text)?;
     let id = mailbox
         .live
         .engine
         .store()
-        .queue_send(draft.account, &json, draft.send_at)
+        .queue_send(draft.account, &json, draft.send_at, &queued)
         .map_err(text)?;
     if draft.send_at <= now_ms() {
         mailbox.live.nudge(draft.account);

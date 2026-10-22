@@ -16,6 +16,7 @@ import type { Message } from "../types";
 import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
 import { hint } from "../lib/shortcuts";
 import Avatar from "./Avatar";
+import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 
 export interface RowActions {
   open: (id: number) => void;
@@ -84,7 +85,7 @@ export default function MessageRow({
         <div className="flex h-5 items-center gap-1">
           <span className={`truncate text-sm leading-5 ${m.unread ? "font-semibold" : "font-medium"}`}>{m.from}</span>
           <span
-            title={snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : undefined}
+            data-tip={snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : undefined}
             className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${
               snoozed ? "text-priority" : "text-text-2"
             }`}
@@ -129,7 +130,7 @@ export default function MessageRow({
               onClick={() => actions.aside(m)}
             />
             <HoverButton title={hint("Snooze", "snooze")} Icon={Clock} onClick={() => actions.snooze(m)} />
-            <HoverButton title="More" Icon={Ellipsis} onClick={() => actions.more(m)} />
+            <HoverButton title="More actions" Icon={Ellipsis} onClick={() => actions.more(m)} />
           </div>
         </div>
         <div className="flex items-center gap-1 text-[13px] font-medium leading-5">
@@ -148,11 +149,11 @@ export default function MessageRow({
 }
 
 /** The leading column's Done circle: outline on hover, filled for Done mail. */
-function LeadingButton({ title, filled = false, onClick }: { title: string; filled?: boolean; onClick: () => void }) {
+function LeadingButton({ title, filled = false, onClick }: { title: Tip; filled?: boolean; onClick: () => void }) {
   return (
     <button
-      title={title}
-      aria-label={title}
+      {...tipAttrs(title)}
+      aria-label={tipLabel(title)}
       onClick={(e) => {
         e.stopPropagation();
         onClick();
@@ -173,7 +174,7 @@ function HoverButton({
   active = false,
   activeClass = "",
 }: {
-  title: string;
+  title: Tip;
   Icon: LucideIcon;
   onClick: () => void;
   active?: boolean;
@@ -181,8 +182,8 @@ function HoverButton({
 }) {
   return (
     <button
-      title={title}
-      aria-label={title}
+      {...tipAttrs(title)}
+      aria-label={tipLabel(title)}
       aria-pressed={active || undefined}
       onClick={(e) => {
         e.stopPropagation();

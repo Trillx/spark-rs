@@ -248,7 +248,7 @@ function IconButton({
       className={`grid size-6 place-items-center rounded-full hover:bg-base-content/10 hover:text-base-content ${
         active ? "bg-base-content/10" : ""
       }`}
-      title={label}
+      data-tip={label}
       aria-label={label}
       aria-haspopup={label === "More" ? "menu" : undefined}
       onClick={onClick}

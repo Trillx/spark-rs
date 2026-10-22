@@ -7,11 +7,14 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use spark_store::{Category, Incoming, Pending, Place, Pushed, Store};
+use spark_store::{Attachment, Category, Incoming, Pending, Place, Pushed, Store};
 
+use crate::attachment::{AttachmentData, mime_for};
 use crate::draft::{Draft, recipients};
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::{Error, Result};
@@ -20,6 +23,11 @@ pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 /// How far back the first sync of a Microsoft account reaches.
 pub const FIRST_SYNC_DAYS: i64 = 30;
 const HOST: &str = "graph.microsoft.com";
+/// Graph takes attachments smaller than this in one request; bigger ones go
+/// up through an upload session.
+const INLINE_ATTACHMENT_MAX: usize = 3 * 1024 * 1024;
+/// Upload session chunks must be multiples of 320 KiB.
+const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
 
 const SELECT: &str = "subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,\
      bodyPreview,body,hasAttachments,internetMessageId,conversationId,inferenceClassification";
@@ -239,7 +247,7 @@ impl Graph {
                 if m.has_attachments == Some(true)
                     && !lock(store).has_remote_id(account_id, &m.id)?
                 {
-                    incoming.attachments = self.attachment_names(&m.id).await.unwrap_or_default();
+                    incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
                 }
                 if let spark_store::Added::New(_) = lock(store).add_incoming(&incoming, !first)? {
                     report.new += 1;
@@ -260,22 +268,26 @@ impl Graph {
         }
     }
 
-    pub async fn attachment_names(&self, id: &str) -> Result<Vec<String>> {
+    /// A message's attachments, not counting inline images.
+    pub async fn attachments(&self, id: &str) -> Result<Vec<Attachment>> {
         #[derive(Deserialize)]
         struct Page {
-            value: Vec<Named>,
+            value: Vec<Listed>,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct Named {
+        struct Listed {
+            id: Option<String>,
             name: Option<String>,
+            content_type: Option<String>,
+            size: Option<u64>,
             is_inline: Option<bool>,
         }
         let page: Page = self
             .json(self.request(
                 Method::GET,
                 &format!(
-                    "/me/messages/{}/attachments?$select=name,isInline",
+                    "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
                     path(id)
                 ),
             ))
@@ -284,8 +296,65 @@ impl Graph {
             .value
             .into_iter()
             .filter(|a| a.is_inline != Some(true))
-            .filter_map(|a| a.name)
+            .filter_map(|a| {
+                Some(Attachment {
+                    name: a.name?,
+                    mime: a.content_type.unwrap_or_default(),
+                    size: a.size.unwrap_or(0),
+                    remote_id: a.id,
+                })
+            })
             .collect())
+    }
+
+    /// Downloads `wanted`, attachment `index` of message `id` as the store
+    /// lists it: by its attachment id, else by position and name.
+    pub async fn attachment(
+        &self,
+        id: &str,
+        index: usize,
+        wanted: &Attachment,
+    ) -> Result<AttachmentData> {
+        let attachment_id = match &wanted.remote_id {
+            Some(attachment_id) => attachment_id.clone(),
+            None => {
+                let listed = self.attachments(id).await?;
+                listed
+                    .get(index)
+                    .filter(|a| a.name == wanted.name)
+                    .or_else(|| listed.iter().find(|a| a.name == wanted.name))
+                    .and_then(|a| a.remote_id.clone())
+                    .ok_or_else(|| {
+                        Error::Server(format!(
+                            "{} is no longer attached to the email.",
+                            wanted.name
+                        ))
+                    })?
+            }
+        };
+        let response = self
+            .send(self.request(
+                Method::GET,
+                &format!(
+                    "/me/messages/{}/attachments/{}/$value",
+                    path(id),
+                    path(&attachment_id)
+                ),
+            ))
+            .await?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::network(HOST, e))?;
+        Ok(AttachmentData {
+            name: wanted.name.clone(),
+            mime: if wanted.mime.is_empty() {
+                mime_for(&wanted.name).to_owned()
+            } else {
+                wanted.mime.clone()
+            },
+            bytes: bytes.to_vec(),
+        })
     }
 
     /// Sends local changes: read and flagged state, then the move for Done
@@ -343,7 +412,12 @@ impl Graph {
     /// Sends a new message, or a reply threaded under `reply_to` (a Graph
     /// message id). Replies go through createReply so Outlook adds the
     /// quoted original and threading itself.
-    pub async fn send_draft(&self, draft: &Draft, reply_to: Option<&str>) -> Result<()> {
+    pub async fn send_draft(
+        &self,
+        draft: &Draft,
+        reply_to: Option<&str>,
+        files: &[AttachmentData],
+    ) -> Result<()> {
         let to = graph_recipients(&draft.to)?;
         let cc = graph_recipients(&draft.cc)?;
         let bcc = graph_recipients(&draft.bcc)?;
@@ -356,12 +430,21 @@ impl Graph {
                 "body": { "contentType": "Text", "content": draft.body },
                 "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
             });
-            self.send(
-                self.request(Method::POST, "/me/sendMail")
-                    .json(&json!({ "message": message, "saveToSentItems": true })),
-            )
-            .await?;
-            return Ok(());
+            if files.is_empty() {
+                self.send(
+                    self.request(Method::POST, "/me/sendMail")
+                        .json(&json!({ "message": message, "saveToSentItems": true })),
+                )
+                .await?;
+                return Ok(());
+            }
+            // Attachments go on a draft, which is then sent.
+            let created: GraphMessage = self
+                .json(self.request(Method::POST, "/me/messages").json(&message))
+                .await?;
+            return self
+                .attach_and_send(&format!("/me/messages/{}", path(&created.id)), files)
+                .await;
         };
 
         let reply: GraphMessage = self
@@ -382,11 +465,85 @@ impl Graph {
         let draft_path = format!("/me/messages/{}", path(&reply.id));
         self.send(self.request(Method::PATCH, &draft_path).json(&update))
             .await?;
-        self.send(
-            self.request(Method::POST, &format!("{draft_path}/send"))
-                .json(&json!({})),
-        )
-        .await?;
+        self.attach_and_send(&draft_path, files).await
+    }
+
+    /// Adds `files` to a draft and sends it. If that fails, the draft is
+    /// deleted so it doesn't linger in Drafts.
+    async fn attach_and_send(&self, draft_path: &str, files: &[AttachmentData]) -> Result<()> {
+        let result = async {
+            for f in files {
+                self.attach(draft_path, f).await?;
+            }
+            self.send(
+                self.request(Method::POST, &format!("{draft_path}/send"))
+                    .json(&json!({})),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.send(self.request(Method::DELETE, draft_path)).await;
+        }
+        result
+    }
+
+    async fn attach(&self, draft_path: &str, f: &AttachmentData) -> Result<()> {
+        if f.bytes.len() < INLINE_ATTACHMENT_MAX {
+            self.send(
+                self.request(Method::POST, &format!("{draft_path}/attachments"))
+                    .json(&json!({
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": f.name,
+                        "contentType": f.mime,
+                        "contentBytes": STANDARD.encode(&f.bytes),
+                    })),
+            )
+            .await?;
+            return Ok(());
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UploadSession {
+            upload_url: String,
+        }
+        let session: UploadSession = self
+            .json(
+                self.request(
+                    Method::POST,
+                    &format!("{draft_path}/attachments/createUploadSession"),
+                )
+                .json(&json!({
+                    "AttachmentItem": {
+                        "attachmentType": "file",
+                        "name": f.name,
+                        "size": f.bytes.len(),
+                        "contentType": f.mime,
+                    }
+                })),
+            )
+            .await?;
+        let total = f.bytes.len();
+        for (i, chunk) in f.bytes.chunks(UPLOAD_CHUNK).enumerate() {
+            let start = i * UPLOAD_CHUNK;
+            let end = start + chunk.len() - 1;
+            // The upload URL carries its own authorization.
+            let response = http()
+                .put(&session.upload_url)
+                .header("Content-Range", format!("bytes {start}-{end}/{total}"))
+                .body(chunk.to_vec())
+                .send()
+                .await
+                .map_err(|e| Error::network(HOST, e))?;
+            if !response.status().is_success() {
+                return Err(Error::Server(format!(
+                    "Microsoft didn't accept {} ({}).",
+                    f.name,
+                    response.status()
+                )));
+            }
+        }
         Ok(())
     }
 }

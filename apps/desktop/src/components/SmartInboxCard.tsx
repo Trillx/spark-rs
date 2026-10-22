@@ -85,7 +85,7 @@ function PriorityCard({
 function CompleteAll({ label, count, onClick }: { label: string; count: number; onClick: () => void }) {
   return (
     <button
-      title={`Mark all as Done (${count})`}
+      data-tip={`Mark all ${count} as Done`}
       aria-label={`Mark all ${label} as Done`}
       onClick={onClick}
       className="grid size-7 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content"
@@ -152,7 +152,7 @@ export function GatekeeperCard({
       <header className="flex h-10 items-center gap-1.5 pl-2 pr-1">
         <button
           className="flex items-center gap-1.5 rounded-md px-1 py-0.5 text-[13px] font-medium text-text-2 hover:text-base-content"
-          title="Show all New Senders"
+          data-tip="Show all New Senders"
           onClick={onShowAll}
         >
           {GATEKEEPER.label}
@@ -168,7 +168,7 @@ export function GatekeeperCard({
             trigger={({ toggle, open }) => (
               <button
                 className={`${roundButton} ${open ? "bg-base-content/5" : ""}`}
-                title="More"
+                data-tip="More"
                 aria-label="New senders options"
                 aria-haspopup="menu"
                 onClick={toggle}
@@ -182,7 +182,7 @@ export function GatekeeperCard({
           </Dropdown>
           <button
             className={roundButton}
-            title={collapsed ? "Expand" : "Collapse"}
+            data-tip={collapsed ? "Expand" : "Collapse"}
             aria-label={collapsed ? "Expand new senders" : "Collapse new senders"}
             aria-expanded={!collapsed}
             onClick={() => setCollapsed((c) => !c)}
@@ -236,12 +236,16 @@ function SenderCard({
       <div className="mt-3 grid grid-cols-2 gap-1.5">
         <button
           className="btn btn-sm h-8 gap-1.5 rounded-lg border-0 bg-primary/10 font-medium text-primary shadow-none hover:bg-primary/20"
+          data-tip="Accept"
+          data-tip-card="accept"
           onClick={stop(onAccept)}
         >
           <ThumbsUp size={14} /> Accept
         </button>
         <button
           className="btn btn-sm h-8 gap-1.5 rounded-lg border-0 bg-chip font-medium text-base-content/80 shadow-none hover:brightness-95"
+          data-tip="Block"
+          data-tip-card="block"
           onClick={stop(onBlock)}
         >
           <ThumbsDown size={14} /> Block

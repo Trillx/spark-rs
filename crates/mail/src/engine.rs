@@ -10,7 +10,8 @@ use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
 use spark_store::{Account, AccountKind, NewAccount, Store, now_ms};
 
-use crate::draft::{self, Draft, Original};
+use crate::attachment::{self, AttachmentData};
+use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::oauth::{self, App};
@@ -250,7 +251,7 @@ impl Engine {
         let mut outcomes = Vec::new();
         for (id, json) in due {
             let result = match serde_json::from_str::<Draft>(&json) {
-                Ok(draft) => self.send_draft(account_id, &draft).await,
+                Ok(draft) => self.send_draft(account_id, id, &draft).await,
                 Err(e) => Err(Error::Config(format!(
                     "The queued message is unreadable: {e}"
                 ))),
@@ -275,13 +276,14 @@ impl Engine {
         Ok(outcomes)
     }
 
-    async fn send_draft(&self, account_id: i64, draft: &Draft) -> Result<()> {
+    async fn send_draft(&self, account_id: i64, outbox_id: i64, draft: &Draft) -> Result<()> {
         let account = self.account(account_id)?;
         let original = draft
             .reply_to
             .map(|id| self.original(id))
             .transpose()?
             .flatten();
+        let files = self.outgoing_files(outbox_id, draft).await?;
         match config(&account)? {
             AccountConfig::Imap {
                 username,
@@ -295,7 +297,8 @@ impl Engine {
                         .parse()
                         .map_err(|_| Error::Config("The account's address is invalid.".into()))?,
                 );
-                let message = draft::build_message(from, draft, original.as_ref().map(|(o, _)| o))?;
+                let message =
+                    draft::build_message(from, draft, original.as_ref().map(|(o, _)| o), &files)?;
                 smtp::send(&server, &username, &self.password(account_id)?, message).await?;
             }
             AccountConfig::Microsoft { client_id, tenant } => {
@@ -303,7 +306,7 @@ impl Engine {
                     .access_token(account_id, &App::new(&client_id, &tenant)?)
                     .await?;
                 let remote = original.as_ref().and_then(|(_, remote)| remote.as_deref());
-                Graph::new(&token).send_draft(draft, remote).await?;
+                Graph::new(&token).send_draft(draft, remote, &files).await?;
             }
         }
         // People you write to skip the Gatekeeper.
@@ -314,6 +317,73 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The draft's attachments in order: the copies queued with it, and
+    /// forwarded ones fetched again from the server.
+    async fn outgoing_files(&self, outbox_id: i64, draft: &Draft) -> Result<Vec<AttachmentData>> {
+        let mut queued = self.store().outbox_files(outbox_id)?.into_iter();
+        let mut files = Vec::with_capacity(draft.attachments.len());
+        for a in &draft.attachments {
+            match a {
+                OutgoingAttachment::File { name, .. } => {
+                    let f = queued.next().ok_or_else(|| {
+                        Error::Config(format!("{name} is missing from the outbox."))
+                    })?;
+                    files.push(AttachmentData {
+                        name: f.name,
+                        mime: f.mime,
+                        bytes: f.data,
+                    });
+                }
+                OutgoingAttachment::Message { message, index, .. } => {
+                    files.push(self.attachment(*message, *index).await?);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    /// Downloads attachment `index` of a stored message from its server.
+    pub async fn attachment(&self, message_id: i64, index: usize) -> Result<AttachmentData> {
+        let (at, wanted) = {
+            let store = self.store();
+            let gone = || Error::Config("That email is no longer here.".into());
+            let at = store.location(message_id)?.ok_or_else(gone)?;
+            let content = store.content(message_id)?.ok_or_else(gone)?;
+            let wanted = content.attachments.get(index).cloned().ok_or_else(|| {
+                Error::Config("That attachment isn't part of the email.".into())
+            })?;
+            (at, wanted)
+        };
+        let account = self.account(at.account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let password = self.password(account.id)?;
+                let state: imap::SyncState = from_json(&account.sync_state);
+                let mut session = imap::login(&server, &username, &password).await?;
+                let raw = imap::fetch_raw(&mut session, &state, &at).await;
+                let _ = session.logout().await;
+                let raw = raw?.ok_or(Error::Gone)?;
+                attachment::extract(&raw, index, &wanted.name).ok_or_else(|| {
+                    Error::Server(format!(
+                        "{} wasn't in the email on the server.",
+                        wanted.name
+                    ))
+                })
+            }
+            AccountConfig::Microsoft { client_id, tenant } => {
+                let remote = at.remote_id.ok_or(Error::Gone)?;
+                let token = self
+                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                    .await?;
+                Graph::new(&token).attachment(&remote, index, &wanted).await
+            }
+        }
     }
 
     /// The message being replied to, and its Graph id if it has one.

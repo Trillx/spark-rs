@@ -52,6 +52,7 @@ import type { ThemePref } from "../lib/theme";
 import type { AccountView, SyncStatus } from "../types";
 import AccountMark from "./AccountMark";
 import Dropdown, { MenuItem } from "./Dropdown";
+import { tipAttrs } from "../lib/tooltip";
 
 export type SettingsPage = "accounts" | "ai" | "appearance";
 
@@ -132,7 +133,7 @@ export default function Settings({
                       role="tab"
                       aria-selected={page === key}
                       tabIndex={page === key ? 0 : -1}
-                      title={label}
+                      data-tip={label}
                       onClick={() => onPage(key)}
                       className={`flex h-9 w-full items-center justify-center gap-3 rounded-lg px-3 text-[13px] md:justify-start ${
                         page === key ? "bg-row-selected font-medium" : "hover:bg-base-content/5"
@@ -153,7 +154,7 @@ export default function Settings({
             <h2 className="text-lg font-semibold">{title}</h2>
             <button
               className="btn btn-circle btn-ghost btn-sm ml-auto text-text-2"
-              title="Close (Esc)"
+              {...tipAttrs({ label: "Close", keys: "Esc" })}
               aria-label="Close settings"
               onClick={onClose}
             >
@@ -360,7 +361,7 @@ function AccountRow({ account: a, now, onChanged }: { account: AccountView; now:
             trigger={({ toggle, open }) => (
               <button
                 className={`btn btn-ghost btn-sm btn-square text-text-2 hover:text-base-content ${open ? "bg-base-content/10" : ""}`}
-                title="Account actions"
+                data-tip="Account actions"
                 aria-label={`${a.label} actions`}
                 aria-haspopup="menu"
                 aria-expanded={open}
@@ -1144,7 +1145,7 @@ function AiPage() {
             </datalist>
             <button
               className="btn btn-ghost btn-sm btn-square h-8 rounded-lg text-text-2"
-              title="Load the provider's models"
+              data-tip="Load the provider's models"
               aria-label="Load the provider's models"
               disabled={status.kind === "busy"}
               onClick={() => void loadModels()}

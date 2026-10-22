@@ -1,5 +1,7 @@
 // Spark-style shortcuts. Single keys only; no chords.
 
+import type { CardId, Tip } from "./tooltip";
+
 export type ActionId =
   | "next"
   | "prev"
@@ -116,9 +118,9 @@ export function shortcutLabel(id: ActionId) {
   return bindingLabel(SHORTCUTS[id][0]);
 }
 
-/** Tooltip text with the shortcut, e.g. "Done (E)". Spark shows hints in tooltips, not a footer. */
-export function hint(title: string, id: ActionId) {
-  return `${title} (${shortcutLabel(id)})`;
+/** A tooltip with the action's shortcut, optionally as a feature card. Spark shows hints in tooltips, not a footer. */
+export function hint(label: string, id: ActionId, card?: CardId): Tip {
+  return { label, keys: shortcutLabel(id), card };
 }
 
 /** Where single-key shortcuts must not fire. */

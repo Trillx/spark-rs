@@ -8,12 +8,19 @@ import {
   Paperclip,
   X,
 } from "lucide-react";
-import { useEffect, useRef, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
-import type { AccountId } from "../types";
+import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import { describeFiles, onFileDrag, pickFiles } from "../api";
+import type { AccountId, LocalFile, OutgoingAttachment } from "../types";
 import { useAccounts } from "../lib/accounts";
-import { LATER_PRESETS, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
+import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
+import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
+import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
+
+/** What mail servers take; the Rust side refuses more. */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const ATTACH_KEYS = IS_MAC ? "⇧⌘A" : "Ctrl+Shift+A";
 
 export interface Draft {
   title: string;
@@ -32,6 +39,8 @@ export interface Draft {
   replyTo?: number;
   /** `replyTo` is forwarded, not answered, so the message isn't sent as a reply. */
   forward?: boolean;
+  /** Files from disk, and a forwarded message's own attachments. */
+  attachments: OutgoingAttachment[];
 }
 
 export function emptyDraft(from: AccountId): Draft {
@@ -48,11 +57,12 @@ export function emptyDraft(from: AccountId): Draft {
     sendLater: null,
     remind: null,
     doneAfter: false,
+    attachments: [],
   };
 }
 
 export function draftHasContent(d: Draft) {
-  return [d.to, d.cc, d.bcc, d.subject, d.body].some((s) => s.trim());
+  return [d.to, d.cc, d.bcc, d.subject, d.body].some((s) => s.trim()) || d.attachments.length > 0;
 }
 
 /**
@@ -67,6 +77,7 @@ export default function Composer({
   onToggleFull,
   onClose,
   onSend,
+  onError,
 }: {
   draft: Draft;
   full: boolean;
@@ -76,9 +87,41 @@ export default function Composer({
   onToggleFull: () => void;
   onClose: () => void;
   onSend: () => void;
+  onError: (text: string) => void;
 }) {
   const toRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const [dropping, setDropping] = useState(false);
+  // File drops arrive through a listener set up once; it reads these.
+  const latest = useRef({ draft, onChange });
+  latest.current = { draft, onChange };
+
+  function addFiles(files: LocalFile[]) {
+    const { draft: current, onChange: change } = latest.current;
+    const fresh = files.filter((f) => !current.attachments.some((a) => a.kind === "file" && a.path === f.path));
+    if (fresh.length) change({ attachments: [...current.attachments, ...fresh.map((f) => ({ kind: "file" as const, ...f }))] });
+  }
+
+  async function attach() {
+    try {
+      addFiles(await pickFiles());
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
+  useEffect(
+    () =>
+      onFileDrag((e) => {
+        if (e.type === "drop") {
+          setDropping(false);
+          void describeFiles(e.paths).then(addFiles);
+        } else {
+          setDropping(e.type === "over");
+        }
+      }),
+    [],
+  );
 
   useEffect(() => {
     // Replies arrive with a recipient, so they start in the body.
@@ -95,8 +138,13 @@ export default function Composer({
     if (mod && e.key === "Enter") {
       e.preventDefault();
       onSend();
+    } else if (mod && e.shiftKey && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      void attach();
     }
   }
+
+  const attachedBytes = draft.attachments.reduce((sum, a) => sum + a.size, 0);
 
   const sendLabel = draft.sendLater ? "Schedule" : "Send";
   const accounts = useAccounts();
@@ -109,7 +157,7 @@ export default function Composer({
       aria-label={draft.title}
       onKeyDown={onKeyDown}
       style={full ? fullStyle : undefined}
-      className={`z-50 flex flex-col overflow-hidden border border-hairline bg-base-100 ${
+      className={`z-50 flex flex-col overflow-hidden border bg-base-100 transition-colors ${dropping ? "border-primary" : "border-hairline"} ${
         full
           ? "fixed bottom-0 top-8 rounded-tl-xl"
           : "fixed bottom-4 right-4 h-[min(540px,calc(100vh-64px))] w-[560px] max-w-[calc(100vw-32px)] rounded-xl shadow-popup"
@@ -178,6 +226,35 @@ export default function Composer({
         onChange={(e) => onChange({ body: e.target.value })}
       />
 
+      {draft.attachments.length > 0 && (
+        <div className="shrink-0 px-3 pb-2">
+          <ul aria-label="Attachments" className="flex max-h-[84px] flex-wrap gap-1.5 overflow-y-auto">
+            {draft.attachments.map((a, i) => (
+              <AttachmentChip
+                key={a.kind === "file" ? a.path : `${a.message}:${a.index}`}
+                name={a.name}
+                size={a.size}
+                onRemove={() => onChange({ attachments: draft.attachments.filter((_, j) => j !== i) })}
+              />
+            ))}
+          </ul>
+          {attachedBytes > MAX_ATTACHMENT_BYTES && (
+            <p className="mt-1.5 text-xs text-error">
+              The attachments add up to {formatBytes(attachedBytes)}; mail servers take up to 25 MB.
+            </p>
+          )}
+        </div>
+      )}
+
+      {dropping && (
+        <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center rounded-[inherit] border-2 border-dashed border-primary bg-primary/10">
+          <div className="flex flex-col items-center gap-2 rounded-2xl bg-base-100/90 px-6 py-4 text-primary shadow-popup">
+            <Paperclip size={26} className="rotate-45" />
+            <span className="text-sm font-semibold">Drop files to attach</span>
+          </div>
+        </div>
+      )}
+
       {(draft.sendLater || draft.remind) && (
         <div className="flex shrink-0 flex-wrap gap-1.5 px-3 pb-2">
           {draft.sendLater && (
@@ -194,14 +271,22 @@ export default function Composer({
       )}
 
       <div className="flex h-12 shrink-0 items-center gap-0.5 border-t border-hairline px-2">
-        <IconButton title={`Attach files (${IS_MAC ? "⇧⌘A" : "Ctrl+Shift+A"})`} onClick={() => {}}>
+        <IconButton
+          title={{ label: "Attach files", keys: ATTACH_KEYS, card: "attach" }}
+          active={draft.attachments.length > 0}
+          onClick={() => void attach()}
+        >
           <Paperclip size={17} />
         </IconButton>
         <Dropdown
           direction="up"
           width="w-64"
           trigger={({ toggle, open }) => (
-            <IconButton title="Send later" active={open || draft.sendLater !== null} onClick={toggle}>
+            <IconButton
+              title={{ label: "Send later", card: open ? undefined : "sendLater" }}
+              active={open || draft.sendLater !== null}
+              onClick={toggle}
+            >
               <CalendarClock size={17} />
             </IconButton>
           )}
@@ -222,7 +307,11 @@ export default function Composer({
           direction="up"
           width="w-64"
           trigger={({ toggle, open }) => (
-            <IconButton title="Remind me" active={open || draft.remind !== null} onClick={toggle}>
+            <IconButton
+              title={{ label: "Remind me", card: open ? undefined : "remind" }}
+              active={open || draft.remind !== null}
+              onClick={toggle}
+            >
               <BellRing size={17} />
             </IconButton>
           )}
@@ -240,7 +329,7 @@ export default function Composer({
           {draft.remind && <MenuItem label="No reminder" onSelect={() => onChange({ remind: null })} />}
         </Dropdown>
         <IconButton
-          title="Mark as Done after sending"
+          title={{ label: "Mark as Done after sending", card: "doneAfter" }}
           active={draft.doneAfter}
           onClick={() => onChange({ doneAfter: !draft.doneAfter })}
         >
@@ -255,7 +344,7 @@ export default function Composer({
             trigger={({ toggle }) => (
               <button
                 className="flex h-9 items-center gap-1.5 rounded-lg px-2 text-left hover:bg-row-hover"
-                title="From"
+                data-tip="Send from"
                 onClick={toggle}
               >
                 <span className="size-2 rounded-full" style={{ backgroundColor: account?.color }} />
@@ -281,7 +370,7 @@ export default function Composer({
           </Dropdown>
           <button
             className="btn btn-primary btn-sm px-5"
-            title={`${sendLabel} (${IS_MAC ? "⌘Enter" : "Ctrl+Enter"})`}
+            {...tipAttrs({ label: sendLabel, keys: IS_MAC ? "⌘Enter" : "Ctrl+Enter" })}
             onClick={onSend}
           >
             {sendLabel}
@@ -315,15 +404,15 @@ function IconButton({
   onClick,
   children,
 }: {
-  title: string;
+  title: Tip;
   active?: boolean;
   onClick: () => void;
   children: ReactNode;
 }) {
   return (
     <button
-      title={title}
-      aria-label={title}
+      {...tipAttrs(title)}
+      aria-label={tipLabel(title)}
       aria-pressed={active || undefined}
       onClick={onClick}
       className={`grid size-8 place-items-center rounded-lg ${

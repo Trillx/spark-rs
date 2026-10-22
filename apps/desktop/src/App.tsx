@@ -7,6 +7,7 @@ import {
   Circle,
   Clock,
   Copy,
+  Download,
   Forward,
   Inbox,
   LayoutGrid,
@@ -48,7 +49,10 @@ import {
   onMailboxChanged,
   onSendStatus,
   onSyncStatus,
+  openAttachment,
   patched,
+  saveAllAttachments,
+  saveAttachment,
   sendMessage,
   syncNow,
   updateMessage,
@@ -133,6 +137,7 @@ const ICONS = {
   block: { Icon: ThumbsDown, className: "text-text-2" },
   send: { Icon: Send, className: "text-primary" },
   copy: { Icon: Copy, className: "text-primary" },
+  download: { Icon: Download, className: "text-primary" },
   error: { Icon: CircleAlert, className: "text-error" },
 } satisfies Record<string, ToastIcon>;
 
@@ -591,6 +596,14 @@ export default function App() {
       from: m.account,
       replyTo: m.id,
       forward: true,
+      // The original's files go along; they're fetched from the server when it's sent.
+      attachments: (content?.attachments ?? []).map((a, index) => ({
+        kind: "message" as const,
+        message: m.id,
+        index,
+        name: a.name,
+        size: a.size,
+      })),
     });
   }
 
@@ -627,6 +640,7 @@ export default function App() {
         // A forward isn't a reply; it only carries replyTo for "Mark as Done after sending".
         replyTo: sent.forward ? undefined : sent.replyTo,
         sendAt: sent.sendLater?.at ?? Date.now() + TOAST_MS,
+        attachments: sent.attachments,
       });
     } catch (error) {
       undoDone?.();
@@ -993,7 +1007,27 @@ export default function App() {
     reply: (m, body) => reply(m, body),
     replyAll: (m) => void replyAll(m),
     forward: (m) => void forward(m),
+    openAttachment: (m, index) => openAttachment(m.id, index).catch(fileError),
+    saveAttachment: async (m, index) => {
+      try {
+        if (await saveAttachment(m.id, index)) showToast("Attachment saved", undefined, ICONS.download);
+      } catch (error) {
+        fileError(error);
+      }
+    },
+    saveAllAttachments: async (m) => {
+      try {
+        const saved = await saveAllAttachments(m.id);
+        if (saved > 0) showToast(`${plural(saved, "attachment")} saved`, undefined, ICONS.download);
+      } catch (error) {
+        fileError(error);
+      }
+    },
   };
+
+  function fileError(error: unknown) {
+    showToast(String(error), undefined, ICONS.error, { duration: ERROR_TOAST_MS });
+  }
 
   const showList = twoColumns || !openMessage;
   const showReader = twoColumns || openMessage !== null;
@@ -1086,6 +1120,7 @@ export default function App() {
             onToggleFull={() => setComposerFull((f) => !f)}
             onClose={closeComposer}
             onSend={send}
+            onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
           />
         )}
 

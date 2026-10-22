@@ -69,7 +69,7 @@ function CaptionButton({
   return (
     <button
       aria-label={label}
-      title={label}
+      data-tip={label}
       onClick={onClick}
       className={`grid h-8 w-10 place-items-center text-base-content/70 ${
         danger ? "hover:bg-[#e81123] hover:text-white" : "hover:bg-base-content/10 hover:text-base-content"

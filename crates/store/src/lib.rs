@@ -140,10 +140,46 @@ pub struct Incoming {
     pub date: i64,
     pub text: String,
     pub html: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<Attachment>,
     pub category: Category,
     pub unread: bool,
     pub flagged: bool,
+}
+
+/// A file attached to a stored message. Only what describes it is kept; the
+/// content is fetched from the server when the user opens or forwards it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub name: String,
+    /// e.g. "application/pdf"; empty when unknown.
+    #[serde(default)]
+    pub mime: String,
+    /// Decoded size in bytes; 0 when unknown.
+    #[serde(default)]
+    pub size: u64,
+    /// Graph's attachment id. IMAP attachments are found by position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
+}
+
+/// A file queued with an outgoing message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxFile {
+    pub name: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// Where the server keeps a stored message, for fetching it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    pub account_id: i64,
+    pub remote_id: Option<String>,
+    pub mailbox: Option<String>,
+    pub uid: Option<u32>,
+    pub message_id: Option<String>,
+    pub remote_place: Place,
 }
 
 /// What `add_incoming` did.
@@ -180,7 +216,7 @@ pub struct Content {
     pub html: Option<String>,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<Attachment>,
 }
 
 /// Threading headers of a stored message, for replies.
@@ -299,6 +335,20 @@ CREATE TABLE outbox (
 );
 ";
 
+/// Version 2: files attached to queued messages, copied in when queued so
+/// a later send doesn't depend on the originals.
+const SCHEMA_2: &str = "
+CREATE TABLE outbox_files (
+    id INTEGER PRIMARY KEY,
+    outbox_id INTEGER NOT NULL REFERENCES outbox(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    data BLOB NOT NULL
+);
+CREATE INDEX outbox_files_outbox ON outbox_files(outbox_id, position);
+";
+
 const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, unread, pinned, \
      priority, screening, from_name, from_address, subject, snippet, date, attachments";
 
@@ -318,6 +368,10 @@ impl Store {
         if version < 1 {
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            conn.execute_batch(SCHEMA_2)?;
+            conn.pragma_update(None, "user_version", 2)?;
         }
         Ok(Self { conn })
     }
@@ -655,7 +709,27 @@ impl Store {
                         html: r.get(1)?,
                         to: from_json(&r.get::<_, String>(2)?),
                         cc: from_json(&r.get::<_, String>(3)?),
-                        attachments: from_json(&r.get::<_, String>(4)?),
+                        attachments: attachments_from_json(&r.get::<_, String>(4)?),
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn location(&self, id: i64) -> Result<Option<Location>> {
+        self.conn
+            .query_row(
+                "SELECT account_id, remote_id, mailbox, uid, message_id, remote_place
+                 FROM messages WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(Location {
+                        account_id: r.get(0)?,
+                        remote_id: r.get(1)?,
+                        mailbox: r.get(2)?,
+                        uid: r.get(3)?,
+                        message_id: r.get(4)?,
+                        remote_place: parse_place(&r.get::<_, String>(5)?),
                     })
                 },
             )
@@ -849,13 +923,45 @@ impl Store {
 
     // ---- outbox ----
 
-    /// Queues a draft (JSON owned by the caller) to send at `send_at`.
-    pub fn queue_send(&self, account_id: i64, draft: &str, send_at: i64) -> Result<i64> {
-        self.conn.execute(
+    /// Queues a draft (JSON owned by the caller) and copies of its files to
+    /// send at `send_at`.
+    pub fn queue_send(
+        &mut self,
+        account_id: i64,
+        draft: &str,
+        send_at: i64,
+        files: &[OutboxFile],
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO outbox (account_id, draft, send_at) VALUES (?1, ?2, ?3)",
             params![account_id, draft, send_at],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        for (position, f) in files.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO outbox_files (outbox_id, position, name, mime, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, position as i64, f.name, f.mime, f.data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// The files queued with a draft, in the order they were attached.
+    pub fn outbox_files(&self, outbox_id: i64) -> Result<Vec<OutboxFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, mime, data FROM outbox_files WHERE outbox_id = ?1 ORDER BY position",
+        )?;
+        stmt.query_map([outbox_id], |r| {
+            Ok(OutboxFile {
+                name: r.get(0)?,
+                mime: r.get(1)?,
+                data: r.get(2)?,
+            })
+        })?
+        .collect()
     }
 
     /// Cancels a queued send; false once sending has started or finished.
@@ -949,7 +1055,7 @@ fn account_row(r: &Row) -> Result<Account> {
 }
 
 fn message_row(r: &Row) -> Result<Message> {
-    let attachments: Vec<String> = from_json(&r.get::<_, String>(14)?);
+    let attachments = attachments_from_json(&r.get::<_, String>(14)?);
     Ok(Message {
         id: r.get(0)?,
         account_id: r.get(1)?,
@@ -965,16 +1071,38 @@ fn message_row(r: &Row) -> Result<Message> {
         subject: r.get(11)?,
         snippet: r.get(12)?,
         date: r.get(13)?,
-        attachment: attachments.into_iter().next(),
+        attachment: attachments.into_iter().next().map(|a| a.name),
     })
 }
 
-fn json(list: &[String]) -> String {
-    serde_json::to_string(list).expect("strings serialize")
+fn json<T: Serialize + ?Sized>(value: &T) -> String {
+    serde_json::to_string(value).expect("plain data serializes")
 }
 
 fn from_json(text: &str) -> Vec<String> {
     serde_json::from_str(text).unwrap_or_default()
+}
+
+/// Attachments as stored: objects, or bare names in rows from before sizes
+/// and types were kept.
+fn attachments_from_json(text: &str) -> Vec<Attachment> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Name(String),
+        Full(Attachment),
+    }
+    let stored: Vec<Stored> = serde_json::from_str(text).unwrap_or_default();
+    stored
+        .into_iter()
+        .map(|s| match s {
+            Stored::Name(name) => Attachment {
+                name,
+                ..Default::default()
+            },
+            Stored::Full(a) => a,
+        })
+        .collect()
 }
 
 fn category_str(c: Category) -> &'static str {

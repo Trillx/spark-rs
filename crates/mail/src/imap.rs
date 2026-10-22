@@ -19,7 +19,7 @@ use async_imap::{Client, Session as ImapSession};
 use futures_util::TryStreamExt;
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
-use spark_store::{Added, Pending, Place, Pushed, Store};
+use spark_store::{Added, Location, Pending, Place, Pushed, Store};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -492,6 +492,54 @@ pub async fn push(
         pushed += 1;
     }
     Ok(pushed)
+}
+
+/// The whole raw message, wherever the server keeps it now: at its known
+/// mailbox and UID, else found by Message-ID in the folder it was last
+/// pushed to, then the inbox. `None` if it's gone.
+pub async fn fetch_raw(
+    session: &mut Session,
+    state: &SyncState,
+    at: &Location,
+) -> Result<Option<Vec<u8>>> {
+    if let (Some(mailbox), Some(uid)) = (&at.mailbox, at.uid) {
+        session.select(mailbox).await?;
+        if let Some(raw) = fetch_body(session, uid).await? {
+            return Ok(Some(raw));
+        }
+    }
+    let Some(message_id) = &at.message_id else {
+        return Ok(None);
+    };
+    let mut folders = vec![folder(state, at.remote_place)];
+    if folders[0] != INBOX {
+        folders.push(INBOX.into());
+    }
+    for mailbox in folders {
+        match session.select(&mailbox).await {
+            Ok(_) => {}
+            // The folder doesn't exist (yet).
+            Err(async_imap::error::Error::No(_)) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        let query = format!("HEADER Message-ID {}", quoted(message_id));
+        let found = session.uid_search(query).await?;
+        if let Some(uid) = found.into_iter().max()
+            && let Some(raw) = fetch_body(session, uid).await?
+        {
+            return Ok(Some(raw));
+        }
+    }
+    Ok(None)
+}
+
+async fn fetch_body(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
+    let fetched: Vec<Fetch> = session
+        .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+        .await?
+        .try_collect()
+        .await?;
+    Ok(fetched.iter().find_map(|f| f.body().map(<[u8]>::to_vec)))
 }
 
 async fn locate(

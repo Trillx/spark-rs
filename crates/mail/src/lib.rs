@@ -2,6 +2,7 @@
 //! server) and Microsoft Graph (Microsoft 365 with OAuth), feeding the same
 //! store. `engine` ties them together for the apps.
 
+pub mod attachment;
 pub mod draft;
 pub mod engine;
 pub mod graph;

@@ -1,9 +1,11 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import demo from "../demo/mailbox.json";
 import type {
   AccountId,
   AccountView,
+  LocalFile,
   Message,
   MessageContent,
   MessagePatch,
@@ -93,8 +95,57 @@ export function getMessageContent(id: number): Promise<MessageContent> {
     html: null,
     to: ["You"],
     cc: [],
-    attachments: m.attachment ? [m.attachment] : [],
+    attachments: m.attachment ? [{ name: m.attachment, mime: "", size: 0 }] : [],
   });
+}
+
+// ---- attachments ----
+
+/** Downloads attachment `index` and opens it in its default app. Program files are refused. */
+export function openAttachment(id: number, index: number): Promise<void> {
+  if (isTauri()) return invoke("open_attachment", { id, index });
+  return Promise.reject(DEMO_FILES);
+}
+
+/** Asks where to save, then downloads. False if the user cancelled the dialog. */
+export function saveAttachment(id: number, index: number): Promise<boolean> {
+  if (isTauri()) return invoke("save_attachment", { id, index });
+  return Promise.reject(DEMO_FILES);
+}
+
+/** Asks for a folder and saves every attachment there. Resolves to how many; 0 if cancelled. */
+export function saveAllAttachments(id: number): Promise<number> {
+  if (isTauri()) return invoke("save_all_attachments", { id });
+  return Promise.reject(DEMO_FILES);
+}
+
+/** The system file picker, for attaching. Empty if cancelled. */
+export function pickFiles(): Promise<LocalFile[]> {
+  if (isTauri()) return invoke("pick_files");
+  return Promise.reject("Run the desktop app to attach files.");
+}
+
+/** Names and sizes of dropped paths; folders are left out. */
+export function describeFiles(paths: string[]): Promise<LocalFile[]> {
+  if (isTauri()) return invoke("describe_files", { paths });
+  return Promise.resolve([]);
+}
+
+export type FileDrag = { type: "over" } | { type: "leave" } | { type: "drop"; paths: string[] };
+
+/**
+ * Files dragged over or dropped on the window. The desktop shell handles file
+ * drops itself (the page never sees them), so this is how the composer gets
+ * their paths. Returns the unsubscribe.
+ */
+export function onFileDrag(handler: (e: FileDrag) => void): () => void {
+  if (!isTauri()) return () => {};
+  const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
+    if (payload.type === "drop") handler({ type: "drop", paths: payload.paths });
+    else if (payload.type === "leave") handler({ type: "leave" });
+    else handler({ type: "over" });
+  });
+  return () => void stop.then((unlisten) => unlisten());
 }
 
 export function updateMessage(id: number, patch: MessagePatch): Promise<Message> {
@@ -163,6 +214,7 @@ export const onSendStatus = (handler: (event: SendStatusEvent) => void) => on("s
 // ---- browser preview (`npm run dev`) ----
 
 const DESKTOP_ONLY = "Run the desktop app to add accounts.";
+const DEMO_FILES = "This is demo mail: its attachments are only names.";
 
 /** Same as the Rust side's demo accounts. */
 const BROWSER_ACCOUNTS: AccountView[] = [
