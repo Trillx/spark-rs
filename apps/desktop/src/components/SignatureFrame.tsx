@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { useDarkTheme } from "../lib/theme";
-import { fitImage, resetFonts } from "../lib/signatures";
+import { fitImage, resetFonts, undoDarkMode } from "../lib/signatures";
 
 // A signature is HTML the user pasted from anywhere, so it's shown and
 // edited like an email: in a frame sandboxed without `allow-scripts`, under
@@ -146,6 +146,8 @@ const SignatureFrame = forwardRef<
       if (!d || d === wired || d.URL !== "about:srcdoc" || !d.body) return;
       unwire();
       wired = d;
+      // One copied from Outlook in dark mode, saved before it was turned back.
+      if (undoDarkMode(d.body) && editable) emit();
       const root = d.documentElement;
       const measure = () => setHeight(Math.ceil(root.getBoundingClientRect().height));
       const observer = new ResizeObserver(measure);
@@ -173,6 +175,11 @@ const SignatureFrame = forwardRef<
       };
       // Open menus close on an outside pointerdown, which a click in the frame wouldn't send.
       const onPointer = () => host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      // What's pasted may be from Outlook in dark mode.
+      const onInput = () => {
+        undoDarkMode(d.body);
+        emit();
+      };
       const onPaste = (e: ClipboardEvent) => {
         const image = [...(e.clipboardData?.files ?? [])].find((f) => f.type.startsWith("image/"));
         if (!image) return;
@@ -185,7 +192,7 @@ const SignatureFrame = forwardRef<
       d.addEventListener("click", onClick);
       d.addEventListener("pointerdown", onPointer);
       if (editable) {
-        d.addEventListener("input", emit);
+        d.addEventListener("input", onInput);
         d.addEventListener("paste", onPaste);
       }
       unwire = () => {
@@ -195,7 +202,7 @@ const SignatureFrame = forwardRef<
         d.removeEventListener("keydown", onKey);
         d.removeEventListener("click", onClick);
         d.removeEventListener("pointerdown", onPointer);
-        d.removeEventListener("input", emit);
+        d.removeEventListener("input", onInput);
         d.removeEventListener("paste", onPaste);
       };
     }

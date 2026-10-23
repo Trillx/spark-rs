@@ -90,7 +90,8 @@ const IMAGE_TYPES: &[&str] = &[
 /// Keeps what signatures are made of (text formatting, inline styles, links,
 /// images and tables) and drops the rest: scripts, styles sheets, event
 /// handlers, forms and frames. Links keep http(s), mailto and tel; images
-/// keep http(s), embedded raster images and `cid:` parts.
+/// keep http(s), embedded raster images and `cid:` parts. Colors from
+/// Outlook's dark mode are turned back (see [`undo_dark_mode`]).
 pub fn sanitize(html: &str) -> String {
     let tag_attributes: HashMap<&str, HashSet<&str>> = TAG_ATTRIBUTES
         .iter()
@@ -104,6 +105,9 @@ pub fn sanitize(html: &str) -> String {
         .url_relative(UrlRelative::Deny)
         .link_rel(None)
         .attribute_filter(|element, attribute, value| {
+            if attribute == "style" {
+                return Some(undo_dark_mode(value).into());
+            }
             let url = value.trim_start().to_ascii_lowercase();
             let keep = match (element, attribute) {
                 ("img", "src") => {
@@ -123,6 +127,139 @@ pub fn sanitize(html: &str) -> String {
         .to_string()
         .trim()
         .to_owned()
+}
+
+/// The lightness (CIELAB) Outlook's dark mode gives white, its background:
+/// #333's. Black text gets white's.
+const DARK_BACKGROUND: f64 = 21.25;
+
+/// An inline style with Outlook's dark mode taken out. A signature copied
+/// from Outlook in dark mode comes with its text lightened and backgrounds
+/// darkened, each color marked `!important`: on the light sheet a signature
+/// is shown on, and most recipients read it on, black text comes out white.
+/// Those colors get their lightness back, with the same hue. Only text that
+/// would get darker and backgrounds that would get lighter are changed.
+/// The signature editor does the same as it's pasted (`undoDarkMode`).
+pub fn undo_dark_mode(style: &str) -> String {
+    style
+        .split(';')
+        .map(|declaration| undo_dark_declaration(declaration).unwrap_or_else(|| declaration.into()))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn undo_dark_declaration(declaration: &str) -> Option<String> {
+    let (name, value) = declaration.split_once(':')?;
+    let text = match name.trim().to_ascii_lowercase().as_str() {
+        "color" => true,
+        "background" | "background-color" => false,
+        _ => return None,
+    };
+    let value = value.trim().to_ascii_lowercase();
+    let color = value
+        .strip_suffix("important")?
+        .trim_end()
+        .strip_suffix('!')?
+        .trim_end();
+    let (rgb, alpha) = parse_color(color)?;
+    // Dark mode maps lightness L to (100 - L) scaled into DARK_BACKGROUND..100.
+    let [dark, a, b] = lab(rgb);
+    let light = 100.0 - (dark - DARK_BACKGROUND) / (1.0 - DARK_BACKGROUND / 100.0);
+    ((light < dark) == text).then(|| {
+        let [r, g, b] = rgb_from_lab([light, a, b]);
+        match alpha {
+            Some(alpha) => format!("{name}: rgba({r}, {g}, {b}, {alpha})"),
+            None => format!("{name}: rgb({r}, {g}, {b})"),
+        }
+    })
+}
+
+/// `#rgb`, `#rrggbb`, `rgb()` or `rgba()`, with any alpha as it's written.
+fn parse_color(color: &str) -> Option<([u8; 3], Option<&str>)> {
+    if let Some(hex) = color.strip_prefix('#') {
+        if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let hex = match hex.len() {
+            3 => hex.chars().flat_map(|c| [c, c]).collect(),
+            6 => hex.to_owned(),
+            _ => return None,
+        };
+        let n = u32::from_str_radix(&hex, 16).ok()?;
+        return Some(([(n >> 16) as u8, (n >> 8) as u8, n as u8], None));
+    }
+    let args = color
+        .strip_prefix("rgba(")
+        .or_else(|| color.strip_prefix("rgb("))?
+        .strip_suffix(')')?;
+    let parts: Vec<&str> = args
+        .split([',', '/', ' '])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let channel = |p: &str| {
+        p.parse::<f64>()
+            .ok()
+            .map(|v| v.round().clamp(0.0, 255.0) as u8)
+    };
+    match parts[..] {
+        [r, g, b] => Some(([channel(r)?, channel(g)?, channel(b)?], None)),
+        [r, g, b, alpha] => Some(([channel(r)?, channel(g)?, channel(b)?], Some(alpha))),
+        _ => None,
+    }
+}
+
+/// sRGB (D65) to CIELAB.
+fn lab(rgb: [u8; 3]) -> [f64; 3] {
+    let [r, g, b] = rgb.map(|c| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    let x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047;
+    let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    let z = (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883;
+    let f = |t: f64| {
+        if t > 216.0 / 24389.0 {
+            t.cbrt()
+        } else {
+            (24389.0 / 27.0 * t + 16.0) / 116.0
+        }
+    };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// CIELAB to sRGB, clipped to what sRGB can show.
+fn rgb_from_lab([l, a, b]: [f64; 3]) -> [u8; 3] {
+    let fy = (l + 16.0) / 116.0;
+    let f = |t: f64| {
+        if t > 6.0 / 29.0 {
+            t.powi(3)
+        } else {
+            (116.0 * t - 16.0) * 27.0 / 24389.0
+        }
+    };
+    let (x, y, z) = (
+        f(fy + a / 500.0) * 0.95047,
+        f(fy),
+        f(fy - b / 200.0) * 1.08883,
+    );
+    [
+        3.2404542 * x - 1.5371385 * y - 0.4985314 * z,
+        -0.9692660 * x + 1.8760108 * y + 0.0415560 * z,
+        0.0556434 * x - 0.2040259 * y + 1.0572252 * z,
+    ]
+    .map(|c| {
+        let c = if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (c * 255.0).round().clamp(0.0, 255.0) as u8
+    })
 }
 
 /// The signature as plain text, line by line: for the text/plain version,
@@ -502,6 +639,51 @@ mod tests {
             clean.contains(r#"<img src="data:image/png;base64,iVBORw0KGgo=">"#),
             "{clean}"
         );
+    }
+
+    #[test]
+    fn colors_from_outlooks_dark_mode_are_turned_back() {
+        // As copied from Outlook in dark mode: black text, a purple name and a blue link.
+        let clean = sanitize(
+            r#"<p style="margin: 0in; color: rgb(255, 255, 255) !important;"><span style="font-size: 14pt; color: rgb(234, 161, 255) !important;"><b>Ana Ruiz</b></span></p><a href="https://x.com" style="color: rgb(127, 174, 255) !important; text-decoration: none">x.com</a>"#,
+        );
+        assert!(
+            clean.contains(r#"<p style="margin: 0in; color: rgb(0, 0, 0);">"#),
+            "{clean}"
+        );
+        assert!(
+            clean.contains(r#"style="font-size: 14pt; color: rgb(107, 42, 128);""#),
+            "{clean}"
+        );
+        assert!(
+            clean.contains(r#"style="color: rgb(0, 88, 160); text-decoration: none""#),
+            "{clean}"
+        );
+        assert_eq!(sanitize(&clean), clean, "it's done once");
+        assert_eq!(
+            undo_dark_mode("background-color:#333333!important;color:#FFF !IMPORTANT"),
+            "background-color: rgb(255, 255, 255);color: rgb(0, 0, 0)"
+        );
+        assert_eq!(
+            undo_dark_mode("background: rgba(51, 51, 51, 0.5) !important"),
+            "background: rgba(255, 255, 255, 0.5)"
+        );
+    }
+
+    #[test]
+    fn colors_only_turn_back_toward_a_light_sheet() {
+        for style in [
+            // Not from dark mode.
+            "color: rgb(255, 255, 255)",
+            // Dark text and light backgrounds read fine already.
+            "color: #333 !important",
+            "background-color: rgb(255, 255, 255) !important",
+            // Not a color it knows.
+            "color: white !important",
+            "background: url(data:image/png;base64,AA==) !important",
+        ] {
+            assert_eq!(undo_dark_mode(style), style);
+        }
     }
 
     #[test]

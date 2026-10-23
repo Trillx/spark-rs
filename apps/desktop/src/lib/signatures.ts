@@ -75,6 +75,66 @@ export function resetFonts(root: HTMLElement) {
   }
 }
 
+/** The lightness (CIELAB) Outlook's dark mode gives white, its background. */
+const DARK_BACKGROUND = 21.25;
+
+/**
+ * Turns back the colors of a signature copied from Outlook in dark mode:
+ * text it lightened and backgrounds it darkened, each marked `!important`.
+ * Like the Rust side's undo_dark_mode, so it shows as it'll be kept and
+ * sent. True if it changed anything.
+ */
+export function undoDarkMode(root: HTMLElement) {
+  let changed = false;
+  for (const el of root.querySelectorAll<HTMLElement>("[style]")) {
+    for (const [property, text] of [
+      ["color", true],
+      ["background-color", false],
+    ] as const) {
+      if (el.style.getPropertyPriority(property) !== "important") continue;
+      // The browser writes every color it parsed as rgb() or rgba().
+      const color = /^rgba?\(([\d.]+), ([\d.]+), ([\d.]+)(?:, ([\d.]+))?\)$/.exec(el.style.getPropertyValue(property));
+      if (!color) continue;
+      // Dark mode maps lightness L to (100 - L) scaled into DARK_BACKGROUND..100.
+      const [dark, a, b] = lab([+color[1], +color[2], +color[3]]);
+      const light = 100 - (dark - DARK_BACKGROUND) / (1 - DARK_BACKGROUND / 100);
+      if (light < dark !== text) continue;
+      const rgb = rgbFromLab([light, a, b]).join(", ");
+      el.style.setProperty(property, color[4] ? `rgba(${rgb}, ${color[4]})` : `rgb(${rgb})`);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** sRGB (D65) to CIELAB. */
+function lab(rgb: number[]) {
+  const [r, g, b] = rgb.map((c) => {
+    c /= 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  const f = (t: number) => (t > 216 / 24389 ? Math.cbrt(t) : ((24389 / 27) * t + 16) / 116);
+  const fx = f((0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047);
+  const fy = f(0.2126729 * r + 0.7151522 * g + 0.072175 * b);
+  const fz = f((0.0193339 * r + 0.119192 * g + 0.9503041 * b) / 1.08883);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+/** CIELAB to sRGB, clipped to what sRGB can show. */
+function rgbFromLab([l, a, b]: number[]) {
+  const fy = (l + 16) / 116;
+  const f = (t: number) => (t > 6 / 29 ? t ** 3 : ((116 * t - 16) * 27) / 24389);
+  const [x, y, z] = [f(fy + a / 500) * 0.95047, f(fy), f(fy - b / 200) * 1.08883];
+  return [
+    3.2404542 * x - 1.5371385 * y - 0.4985314 * z,
+    -0.969266 * x + 1.8760108 * y + 0.041556 * z,
+    0.0556434 * x - 0.2040259 * y + 1.0572252 * z,
+  ].map((c) => {
+    c = c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
+    return Math.min(255, Math.max(0, Math.round(c * 255)));
+  });
+}
+
 /** HTML as text, a line per block; like the Rust side's, for the browser preview. */
 export function htmlText(html: string) {
   const doc = new DOMParser().parseFromString(html, "text/html");
