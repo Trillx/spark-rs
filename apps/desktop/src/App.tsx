@@ -99,7 +99,7 @@ import { reduceSummary, startSummary, type SummaryState } from "./components/Sum
 import ThreadView, { type ThreadActions } from "./components/ThreadView";
 import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./components/UndoToast";
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
-import { AccountsContext, isDemoMode } from "./lib/accounts";
+import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { clearContent, loadContent } from "./lib/content";
 import { conversationOf, movesWith } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
@@ -987,8 +987,23 @@ export default function App() {
 
   const replySubject = (m: Message) => (/^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`);
 
+  const fromYou = (m: Message) => isFromYou(m, accounts.find((a) => a.id === m.account));
+
+  /** Addresses on `list` other than the account's own. */
+  function othersOn(m: Message, list: string[]) {
+    const own = accounts.find((a) => a.id === m.account)?.email.toLowerCase();
+    return list.filter((r) => r !== "You" && parseAddress(r).address.toLowerCase() !== own);
+  }
+
+  /** To the sender; on an email you sent, to the people you sent it to. */
   const reply = (m: Message) =>
-    compose({ title: "Reply", to: m.address, subject: replySubject(m), from: m.account, replyTo: m.id });
+    compose({
+      title: "Reply",
+      to: fromYou(m) ? othersOn(m, m.to ?? []).join(", ") : m.address,
+      subject: replySubject(m),
+      from: m.account,
+      replyTo: m.id,
+    });
 
   /** A quick-reply chip: a reply your AI provider writes, or without one set up, a stock line. */
   function quickReply(m: Message, chip: QuickReply) {
@@ -1032,16 +1047,18 @@ export default function App() {
     setWriting(null);
   }
 
-  /** The sender plus everyone else on To and Cc, minus this account's own address. */
+  /**
+   * The sender plus everyone else on To and Cc, minus this account's own
+   * address. On an email you sent, its own To and Cc.
+   */
   async function replyAll(m: Message) {
     const content = await loadContent(m.id).catch(() => null);
-    const own = accounts.find((a) => a.id === m.account)?.email.toLowerCase();
+    const sender = m.address.toLowerCase();
     const others = (list: string[]) =>
-      list.filter((r) => {
-        const address = parseAddress(r).address.toLowerCase();
-        return r !== "You" && address !== own && address !== m.address.toLowerCase();
-      });
-    const to = [m.address, ...others(content?.to ?? [])].join(", ");
+      othersOn(m, list).filter((r) => parseAddress(r).address.toLowerCase() !== sender);
+    const to = (
+      fromYou(m) ? othersOn(m, content?.to ?? m.to ?? []) : [m.address, ...others(content?.to ?? [])]
+    ).join(", ");
     const cc = others(content?.cc ?? []).join(", ");
     compose({
       title: "Reply all",
