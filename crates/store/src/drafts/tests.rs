@@ -56,6 +56,7 @@ fn save(store: &mut Store, account_id: i64, existing: Option<i64>, body: &str, n
                 subject: "Plan",
                 snippet: body,
                 text: body,
+                html: None,
                 in_reply_to: Some("1@x.com"),
                 references: Some("0@x.com 1@x.com"),
                 attachments: &attachments,

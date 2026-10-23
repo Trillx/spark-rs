@@ -1,10 +1,11 @@
 //! Outgoing mail: the composer's draft and turning it into a MIME message.
 
 use lettre::message::header::{ContentType, HeaderName, HeaderValue};
-use lettre::message::{Attachment, Mailbox, Mailboxes, MultiPart, SinglePart};
+use lettre::message::{Attachment, Mailbox, Mailboxes, MessageBuilder, MultiPart, SinglePart};
 use serde::{Deserialize, Serialize};
 
-use crate::attachment::AttachmentData;
+use crate::attachment::{AttachmentData, InlineImage};
+use crate::signature::{self, Parts, Quote};
 use crate::{Error, Result};
 
 /// Most servers (Gmail, Microsoft 365) refuse messages whose attachments add
@@ -13,7 +14,7 @@ pub const MAX_ATTACHMENTS_BYTES: u64 = 25 * 1024 * 1024;
 
 /// What the composer sends. Address fields are comma- or semicolon-separated
 /// `Name <address>` or bare addresses.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Draft {
     pub account: i64,
@@ -44,6 +45,137 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub references: Option<String>,
+    /// The signature below the body, as chosen (and maybe edited) for this
+    /// message: HTML, cleaned when the message is built. `None` sends
+    /// without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The saved signature it started as. Sending makes it the address's
+    /// most recent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_id: Option<i64>,
+    /// A forward's original, below the signature. Plain text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+}
+
+/// What a draft sends: its text and, with a signature, HTML too, plus the
+/// images the signature embeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bodies {
+    pub text: String,
+    pub html: Option<String>,
+    pub images: Vec<InlineImage>,
+}
+
+impl Draft {
+    /// The signature as it goes out: cleaned, and `None` if nothing's left.
+    pub fn clean_signature(&self) -> Option<String> {
+        let clean = signature::sanitize(self.signature.as_deref()?);
+        (!signature::text(&clean).is_empty() || clean.contains("<img")).then_some(clean)
+    }
+
+    /// The body, the signature, then the original: a reply's `original`
+    /// quoted, or a forward's `quote`. `body_style` styles the typed text in
+    /// the HTML.
+    pub fn bodies(&self, original: Option<&Original>, body_style: Option<&str>) -> Bodies {
+        self.bodies_with(original, body_style, true)
+    }
+
+    /// The draft as it's kept here while it's saved: no reply quote, and the
+    /// signature's images left in its HTML.
+    pub fn saved_bodies(&self) -> Bodies {
+        self.bodies_with(None, None, false)
+    }
+
+    fn bodies_with(
+        &self,
+        original: Option<&Original>,
+        body_style: Option<&str>,
+        embed: bool,
+    ) -> Bodies {
+        let (signature, images) = match self.clean_signature() {
+            Some(clean) if embed => {
+                let (html, images) = signature::embed_images(&clean);
+                (Some(html), images)
+            }
+            clean => (clean, Vec::new()),
+        };
+        let quote = match (original.filter(|o| !o.text.trim().is_empty()), &self.quote) {
+            (Some(o), _) => Some(Quote::Reply {
+                from: &o.from,
+                text: &o.text,
+            }),
+            (None, Some(q)) if !q.trim().is_empty() => Some(Quote::Plain(q)),
+            _ => None,
+        };
+        let parts = Parts {
+            body: &self.body,
+            signature: signature.as_deref(),
+            quote,
+        };
+        Bodies {
+            text: parts.text(),
+            html: signature.is_some().then(|| parts.html(body_style)),
+            images,
+        }
+    }
+}
+
+impl Bodies {
+    /// Text and HTML as alternatives, the HTML's images related to it;
+    /// `None` for text alone.
+    fn alternative(&self) -> Option<MultiPart> {
+        let html = SinglePart::html(self.html.clone()?);
+        let plain = SinglePart::plain(self.text.clone());
+        if self.images.is_empty() {
+            return Some(MultiPart::alternative().singlepart(plain).singlepart(html));
+        }
+        let mut related = MultiPart::related().singlepart(html);
+        for image in &self.images {
+            related = related.singlepart(
+                Attachment::new_inline(image.cid.clone())
+                    .body(image.bytes.clone(), content_type(&image.mime)),
+            );
+        }
+        Some(
+            MultiPart::alternative()
+                .singlepart(plain)
+                .multipart(related),
+        )
+    }
+
+    /// Finishes `builder` with these bodies and `files` attached in order:
+    /// a plain text message when that's all there is.
+    pub(crate) fn build(
+        &self,
+        builder: MessageBuilder,
+        files: &[AttachmentData],
+    ) -> std::result::Result<lettre::Message, lettre::error::Error> {
+        let content = self.alternative();
+        if files.is_empty() {
+            return match content {
+                Some(alternative) => builder.multipart(alternative),
+                None => builder.body(self.text.clone()),
+            };
+        }
+        let mut mixed = match content {
+            Some(alternative) => MultiPart::mixed().multipart(alternative),
+            None => MultiPart::mixed().singlepart(SinglePart::plain(self.text.clone())),
+        };
+        for f in files {
+            mixed = mixed.singlepart(
+                Attachment::new(f.name.clone()).body(f.bytes.clone(), content_type(&f.mime)),
+            );
+        }
+        builder.multipart(mixed)
+    }
+}
+
+/// `mime` as a content type, falling back to octet-stream.
+pub(crate) fn content_type(mime: &str) -> ContentType {
+    ContentType::parse(mime)
+        .unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("valid"))
 }
 
 /// A file on an outgoing message.
@@ -131,31 +263,6 @@ pub(crate) fn split_addresses(field: &str) -> Vec<&str> {
     parts
 }
 
-/// The reply text with the original quoted below it.
-pub fn quoted_body(body: &str, original: Option<&Original>) -> String {
-    let Some(original) = original.filter(|o| !o.text.trim().is_empty()) else {
-        return body.to_owned();
-    };
-    let quote: Vec<String> = original
-        .text
-        .trim_end()
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                ">".into()
-            } else {
-                format!("> {line}")
-            }
-        })
-        .collect();
-    format!(
-        "{}\n\n{} wrote:\n{}\n",
-        body.trim_end(),
-        original.from,
-        quote.join("\n")
-    )
-}
-
 /// A new Message-ID at `domain`, with its angle brackets.
 pub(crate) fn new_message_id(domain: &str) -> String {
     let mut random = [0u8; 16];
@@ -206,19 +313,10 @@ pub fn build_message(
             refs,
         ));
     }
-    let body = quoted_body(&draft.body, original);
-    let built = if files.is_empty() {
-        builder.body(body)
-    } else {
-        let mut mixed = MultiPart::mixed().singlepart(SinglePart::plain(body));
-        for f in files {
-            let content_type = ContentType::parse(&f.mime)
-                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("valid"));
-            mixed = mixed.singlepart(Attachment::new(f.name.clone()).body(f.bytes.clone(), content_type));
-        }
-        builder.multipart(mixed)
-    };
-    built.map_err(|e| Error::Config(format!("Couldn't build the message: {e}")))
+    draft
+        .bodies(original, None)
+        .build(builder, files)
+        .map_err(|e| Error::Config(format!("Couldn't build the message: {e}")))
 }
 
 #[cfg(test)]
@@ -239,6 +337,7 @@ mod tests {
             draft_id: None,
             in_reply_to: None,
             references: None,
+            ..Default::default()
         }
     }
 
@@ -278,6 +377,104 @@ mod tests {
             raw.contains("Sounds good.\r\n\r\nAna Ruiz wrote:\r\n> Shall we?\r\n>\r\n> A."),
             "{raw}"
         );
+    }
+
+    #[test]
+    fn a_signature_goes_out_as_text_and_html_above_the_quote() {
+        let original = Original {
+            message_id: Some("1@x.com".into()),
+            from: "Ana Ruiz".into(),
+            text: "Shall we?".into(),
+            ..Default::default()
+        };
+        let mut d = draft("ana@x.com");
+        d.signature =
+            Some(r#"<div><b>Me</b></div><div onclick="x()">ACME</div><script>x()</script>"#.into());
+        let from: Mailbox = "me@gmail.com".parse().unwrap();
+        let raw = build_message(from, &d, Some(&original), &[])
+            .unwrap()
+            .formatted();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(
+            parsed.body_text(0).unwrap().replace("\r\n", "\n"),
+            "Sounds good.\n\nMe\nACME\n\nAna Ruiz wrote:\n> Shall we?\n"
+        );
+        let html = parsed.body_html(0).unwrap();
+        let body = html.find("messageBodySection").unwrap();
+        let signature = html
+            .find("<div name=\"messageSignatureSection\"><div><b>Me</b></div><div>ACME</div></div>")
+            .unwrap();
+        let reply = html.find("messageReplySection").unwrap();
+        assert!(body < signature && signature < reply, "{html}");
+        assert!(
+            !html.contains("onclick") && !html.contains("script"),
+            "{html}"
+        );
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(raw.contains("multipart/alternative"), "{raw}");
+    }
+
+    #[test]
+    fn signature_images_travel_as_related_parts() {
+        let mut d = draft("ana@x.com");
+        d.signature = Some(
+            r#"<img src="data:image/png;base64,iVBORw0KGgo=" width="40"><div>Me</div>"#.into(),
+        );
+        let files = [AttachmentData {
+            name: "plan.pdf".into(),
+            mime: "application/pdf".into(),
+            bytes: b"%PDF".to_vec(),
+        }];
+        let from: Mailbox = "me@gmail.com".parse().unwrap();
+        let raw = build_message(from, &d, None, &files).unwrap().formatted();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains("multipart/mixed") && text.contains("multipart/related"),
+            "{text}"
+        );
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let html = parsed.body_html(0).unwrap();
+        let cid = html
+            .split("src=\"cid:")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(text.contains(&format!("Content-ID: <{cid}>")), "{text}");
+        let listed = crate::attachment::describe(&parsed);
+        assert_eq!(
+            listed.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["plan.pdf"],
+            "the image isn't a file"
+        );
+    }
+
+    #[test]
+    fn a_forward_keeps_its_original_below_the_signature() {
+        let mut d = draft("ana@x.com");
+        d.body = "FYI".into();
+        d.quote = Some("---------- Forwarded message ----------\nFrom: Bo".into());
+        assert_eq!(
+            d.bodies(None, None).text,
+            "FYI\n\n---------- Forwarded message ----------\nFrom: Bo"
+        );
+        d.signature = Some("<p>Me</p>".into());
+        let bodies = d.bodies(None, None);
+        assert_eq!(
+            bodies.text,
+            "FYI\n\nMe\n\n---------- Forwarded message ----------\nFrom: Bo"
+        );
+        assert!(bodies.html.unwrap().ends_with("<div name=\"messageReplySection\"><br>---------- Forwarded message ----------<br>From: Bo</div>"));
+    }
+
+    #[test]
+    fn an_empty_signature_is_left_out() {
+        let mut d = draft("ana@x.com");
+        d.signature = Some("<div><br></div><script>x</script>".into());
+        assert_eq!(d.clean_signature(), None);
+        let bodies = d.bodies(None, None);
+        assert_eq!((bodies.text.as_str(), bodies.html), ("Sounds good.", None));
     }
 
     #[test]

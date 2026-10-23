@@ -57,6 +57,8 @@ pub struct DraftSave<'a> {
     pub subject: &'a str,
     pub snippet: &'a str,
     pub text: &'a str,
+    /// The HTML version, when it has one (a signature).
+    pub html: Option<&'a str>,
     /// A reply's threading: the original's Message-ID, and References.
     pub in_reply_to: Option<&'a str>,
     pub references: Option<&'a str>,
@@ -144,7 +146,7 @@ impl Store {
                 tx.execute(
                     "UPDATE messages SET from_name = ?2, from_address = ?3, to_list = ?4,
                         cc_list = ?5, bcc_list = ?6, subject = ?7, snippet = ?8, date = ?9,
-                        text_body = ?10, html_body = NULL, in_reply_to = ?11, refs = ?12,
+                        text_body = ?10, html_body = ?14, in_reply_to = ?11, refs = ?12,
                         attachments = COALESCE(?13, attachments)
                      WHERE id = ?1",
                     params![
@@ -160,7 +162,8 @@ impl Store {
                         save.text,
                         save.in_reply_to,
                         save.references,
-                        attachments
+                        attachments,
+                        save.html
                     ],
                 )?;
                 id
@@ -179,6 +182,7 @@ impl Store {
                     snippet: save.snippet.to_owned(),
                     date: now,
                     text: save.text.to_owned(),
+                    html: save.html.map(str::to_owned),
                     attachments: save.attachments.to_vec(),
                     category: Category::People,
                     ..Default::default()

@@ -267,6 +267,7 @@ impl DemoMailbox {
             draft_id: Some(id),
             in_reply_to: None,
             references: None,
+            ..Default::default()
         })
     }
 

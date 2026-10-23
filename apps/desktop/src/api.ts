@@ -26,8 +26,12 @@ import type {
   PopupMeeting,
   Prefs,
   SendStatusEvent,
+  Signature,
+  SignaturesView,
+  DefaultSignature,
   SyncStatusEvent,
 } from "./types";
+import { htmlText } from "./lib/signatures";
 
 // Inside the app, data comes from the Rust side. In a plain browser
 // (`npm run dev`) we fall back to the same demo file so the UI can be
@@ -374,6 +378,8 @@ export function patched(message: Message, patch: MessagePatch): Message {
 /** Queues a message to go out at `draft.sendAt`. Returns its outbox id. A saved draft it came from leaves Drafts. */
 export function sendMessage(draft: OutgoingDraft): Promise<number> {
   if (isTauri()) return invoke("send_message", { draft });
+  const address = BROWSER_ACCOUNTS.find((a) => a.id === draft.account)?.email.toLowerCase();
+  if (address && draft.signature && draft.signatureId !== undefined) browserSignatureUsage.set(address, draft.signatureId);
   const id = ++browserOutbox;
   const i = browserMailbox.findIndex((m) => m.id === draft.draftId && isBrowserDraft(m));
   if (i >= 0) browserSending.set(id, browserMailbox.splice(i, 1)[0]);
@@ -424,6 +430,66 @@ export function discardDraft(id: number): Promise<void> {
   if (i >= 0) browserMailbox.splice(i, 1);
   browserDrafts.delete(id);
   return Promise.resolve();
+}
+
+// ---- signatures ----
+
+/** Saved signatures, and each sending address's default. */
+export function listSignatures(): Promise<SignaturesView> {
+  if (isTauri()) return invoke("list_signatures");
+  return Promise.resolve(
+    structuredClone({
+      signatures: browserSignatures,
+      defaults: BROWSER_ACCOUNTS.map((a) => ({ mailbox: a.email, signature: browserDefault(a.email) })),
+    }),
+  );
+}
+
+/** Saves signature `id`, or a new one. The HTML is cleaned first; resolves to the signature as kept. Rejects with a user-facing reason. */
+export function saveSignature(id: number | null, html: string): Promise<Signature> {
+  if (isTauri()) return invoke("save_signature", { id, html });
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  for (const el of doc.querySelectorAll("script, style, iframe, object, embed, form, input, button, link, meta")) el.remove();
+  for (const el of doc.body.querySelectorAll("*")) {
+    for (const attr of [...el.attributes]) if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+  }
+  const clean = doc.body.innerHTML.trim();
+  const text = htmlText(clean);
+  if (!text && !clean.includes("<img")) return Promise.reject("Write a signature first.");
+  const saved = { id: id ?? Math.max(0, ...browserSignatures.map((x) => x.id)) + 1, html: clean, text };
+  const i = browserSignatures.findIndex((x) => x.id === id);
+  if (i >= 0) browserSignatures[i] = saved;
+  else browserSignatures.push(saved);
+  return Promise.resolve(structuredClone(saved));
+}
+
+/** Addresses that defaulted to it go back to Most Recent. */
+export function deleteSignature(id: number): Promise<void> {
+  if (isTauri()) return invoke("delete_signature", { id });
+  browserSignatures = browserSignatures.filter((x) => x.id !== id);
+  for (const [address, d] of browserSignatureDefaults) if (d.type === "custom" && d.id === id) browserSignatureDefaults.delete(address);
+  return Promise.resolve();
+}
+
+export function setDefaultSignature(address: string, signature: DefaultSignature): Promise<void> {
+  if (isTauri()) return invoke("set_default_signature", { address, signature });
+  browserSignatureDefaults.set(address.toLowerCase(), signature);
+  return Promise.resolve();
+}
+
+/** The signature the composer starts with for `account`; for a reply, the one used last in that conversation. */
+export function resolveSignature(account: AccountId, replyTo?: number): Promise<Signature | null> {
+  if (isTauri()) return invoke("resolve_signature", { account, replyTo: replyTo ?? null });
+  const address = BROWSER_ACCOUNTS.find((a) => a.id === account)?.email ?? "";
+  const d = browserDefault(address);
+  const used = browserSignatureUsage.get(address.toLowerCase());
+  const pick =
+    d.type === "none"
+      ? undefined
+      : d.type === "custom"
+        ? browserSignatures.find((x) => x.id === d.id)
+        : (browserSignatures.find((x) => x.id === used) ?? browserSignatures.at(-1));
+  return Promise.resolve(pick ? structuredClone(pick) : null);
 }
 
 /** Opens an http(s) or mailto link in the system's handler. */
@@ -610,6 +676,13 @@ let browserOutbox = 0;
 const browserDrafts = new Map<number, OutgoingDraft>();
 /** Drafts out of Drafts while their send can be undone, by outbox id. */
 const browserSending = new Map<number, Message>();
+
+/** Signatures in the preview; defaults and the last one sent, by lowercased address. */
+let browserSignatures: Signature[] = [];
+const browserSignatureDefaults = new Map<string, DefaultSignature>();
+const browserSignatureUsage = new Map<string, number>();
+const browserDefault = (address: string): DefaultSignature =>
+  browserSignatureDefaults.get(address.toLowerCase()) ?? { type: "mostRecent" };
 
 const isBrowserDraft = (m: Message) =>
   m.folders?.some((id) => BROWSER_FOLDERS.some((f) => f.id === id && f.role === "drafts")) ?? false;

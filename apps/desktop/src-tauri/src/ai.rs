@@ -244,8 +244,9 @@ pub fn cancel_summary(state: State<'_, AiState>, id: i64) {
 
 /// Starts AI writing for the UI's composer number `composer` and returns at
 /// once; the text streams over `on_event`. `account` is the draft's, and
-/// `reference` the email it replies to or forwards. A new request for the same
-/// composer replaces a running one.
+/// `reference` the email it replies to or forwards. `signed`: the draft has a
+/// signature below, so what's written doesn't sign off. A new request for
+/// the same composer replaces a running one.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn compose_with_ai(
@@ -256,6 +257,7 @@ pub async fn compose_with_ai(
     action: ComposeAction,
     account: i64,
     reference: Option<Reference>,
+    signed: Option<bool>,
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     let email = match reference {
@@ -272,6 +274,7 @@ pub async fn compose_with_ai(
         &action,
         email.as_ref().map(|(mail, relation)| (mail, *relation)),
         name.as_deref(),
+        signed.unwrap_or(false),
     )?;
     state.start(app, RunKey::Composer(composer), request, on_event);
     Ok(())

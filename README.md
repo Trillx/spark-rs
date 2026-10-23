@@ -68,6 +68,16 @@ with the next sync, so it works offline. Opening a draft from Drafts edits
 it; sending it or Delete Draft removes it from the server too, and undoing
 the send keeps it. Sent and Drafts list who the mail is to.
 
+Signatures are in Settings → Signatures, where you write them or paste one
+in (or edit the HTML). Each address starts new mail with its default: Most
+recent (the signature last sent from it), No signature, or a particular one.
+A reply takes the signature you used last in that conversation. In the
+composer the signature sits under what you write and above the email you're
+replying to or forwarding: the arrows at its left switch to another one or
+hide it, and you can change it for that one email. Mail with a signature goes
+out as HTML as well as plain text, with the signature's images in the email.
+Agents' email gets the account's signature too, unless they leave it off.
+
 Attachments download when you open or save them, also from archived mail.
 Program files (`.exe`, `.js`, `.lnk` and the like) can only be saved, not
 opened, and downloaded files are marked as coming from the internet, so
@@ -189,7 +199,7 @@ trust the agents you use.
 ## Layout
 
 ```
-crates/store              SQLite storage: accounts, messages, folders, outbox, drafts (bundled SQLite with FTS5)
+crates/store              SQLite storage: accounts, messages, folders, outbox, drafts, signatures (bundled SQLite with FTS5)
 crates/mail               IMAP/SMTP and Microsoft Graph: sync, sending, Microsoft sign-in
 crates/ai                 bring-your-own-key AI client (Anthropic, OpenAI-compatible)
 crates/agent              how spark-cli reaches the running app (loopback port + token)

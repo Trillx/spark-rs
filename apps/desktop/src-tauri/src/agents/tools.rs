@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 use spark_mail::draft::{self, Draft};
+use spark_mail::signature;
 use spark_store::{Account, AccountKind, Category, MessageState, Patch, Store};
 
 use super::Access;
@@ -74,7 +75,7 @@ pub fn catalog() -> Value {
     json!({ "tools": [
         {
             "name": "list_accounts",
-            "description": "The user's email accounts shared with agents, and what agents may do in each: read, triage (also change messages) or send (also send email).",
+            "description": "The user's email accounts shared with agents, what agents may do in each: read, triage (also change messages) or send (also send email), and the signature send_email adds below what's written from each.",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
@@ -103,7 +104,7 @@ pub fn catalog() -> Value {
         },
         {
             "name": "send_email",
-            "description": format!("Sends a plain-text email from one of the user's accounts. Needs send access. It waits {} seconds in spark-rs's outbox, where the user can undo it. To reply, pass reply_to with the message id: the recipient and subject default to the original's.", SEND_DELAY_MS / 1000),
+            "description": format!("Sends a plain-text email from one of the user's accounts. Needs send access. It waits {} seconds in spark-rs's outbox, where the user can undo it. To reply, pass reply_to with the message id: the recipient and subject default to the original's. The account's signature (see list_accounts) goes below the body, so never end the body with a sign-off or the user's name; when the user wants a different closing, pass no_signature and write it yourself.", SEND_DELAY_MS / 1000),
             "inputSchema": { "type": "object", "properties": {
                 "account": { "type": "integer", "description": "The account to send from." },
                 "to": { "type": "string", "description": "Comma-separated addresses, e.g. Ana Ruiz <ana@example.com>, bob@example.com." },
@@ -111,6 +112,7 @@ pub fn catalog() -> Value {
                 "subject": { "type": "string" },
                 "body": { "type": "string", "description": "Plain text." },
                 "reply_to": { "type": "integer", "description": "The message id being replied to." },
+                "no_signature": { "type": "boolean", "description": "Send without the account's signature." },
             }, "required": ["account", "body"] },
         },
     ]})
@@ -211,15 +213,18 @@ fn list_accounts(cx: &mut Context) -> ToolResult {
         .into_iter()
         .filter(|a| cx.access(a.id) >= Access::Read)
         .map(|a| {
-            json!({
+            let signature = cx.store.signature_for(&a.email)?;
+            Ok(json!({
                 "id": a.id,
                 "email": a.email,
                 "label": a.label,
                 "provider": provider(a.kind),
                 "access": cx.access(a.id).name(),
-            })
+                "signature": signature.map(|s| s.text),
+            }))
         })
-        .collect();
+        .collect::<spark_store::Result<_>>()
+        .map_err(db)?;
     Ok((json!({ "accounts": accounts }), None))
 }
 
@@ -424,6 +429,15 @@ fn send_email(cx: &mut Context, args: &Value) -> ToolResult {
         draft::recipients(field).map_err(|e| e.to_string())?;
     }
     let body = args["body"].as_str().unwrap_or("").to_owned();
+    let signature = if args["no_signature"].as_bool().unwrap_or(false) {
+        None
+    } else {
+        match &original {
+            Some(m) => signature::for_reply(cx.store, &account.email, m.id),
+            None => cx.store.signature_for(&account.email),
+        }
+        .map_err(db)?
+    };
     let send_at = cx.now + SEND_DELAY_MS;
     let queued = Draft {
         account: account.id,
@@ -438,18 +452,27 @@ fn send_email(cx: &mut Context, args: &Value) -> ToolResult {
         draft_id: None,
         in_reply_to: None,
         references: None,
+        signature: signature.as_ref().map(|s| s.html.clone()),
+        signature_id: signature.as_ref().map(|s| s.id),
+        quote: None,
     };
     let json = serde_json::to_string(&queued).expect("drafts serialize");
     let id = cx
         .store
         .queue_send(account.id, &json, send_at, &[])
         .map_err(db)?;
+    if let Some(s) = &signature {
+        cx.store
+            .use_signature(&account.email, s.id, cx.now)
+            .map_err(db)?;
+    }
     Ok((
         json!({
             "queued": id,
             "from": account.email,
             "to": to,
             "subject": subject,
+            "signature": signature.map(|s| s.text),
             "sends_at": iso(send_at),
             "note": format!("It goes out in {} seconds unless the user undoes it in spark-rs.", SEND_DELAY_MS / 1000),
         }),
@@ -881,6 +904,45 @@ mod tests {
             json!({ "account": work, "to": "not an address", "body": "x" }),
         );
         assert!(bad.is_error);
+    }
+
+    #[test]
+    fn agents_send_with_the_accounts_signature_unless_told_not_to() {
+        let (mut store, work, _) = mailbox();
+        let signature = store
+            .add_signature("<div>Me</div><div>Work Inc.</div>", "Me\nWork Inc.", 1)
+            .unwrap();
+        let access = BTreeMap::from([(work, Access::Send)]);
+        let listed = ok(run(&mut store, &access, "list_accounts", json!({})));
+        assert_eq!(listed["accounts"][0]["signature"], "Me\nWork Inc.");
+        let queued = |store: &mut Store| {
+            let (_, json) = store
+                .claim_due_sends(work, i64::MAX)
+                .unwrap()
+                .pop()
+                .unwrap();
+            serde_json::from_str::<Draft>(&json).unwrap()
+        };
+
+        let sent = ok(run(
+            &mut store,
+            &access,
+            "send_email",
+            json!({ "account": work, "to": "ana@parts.com", "body": "Hi" }),
+        ));
+        assert_eq!(sent["signature"], "Me\nWork Inc.");
+        let draft = queued(&mut store);
+        assert_eq!(
+            (draft.signature, draft.signature_id),
+            (Some(signature.html.clone()), Some(signature.id))
+        );
+
+        let bare = json!({ "account": work, "to": "ana@parts.com", "body": "Hi\nBo", "no_signature": true });
+        assert_eq!(
+            ok(run(&mut store, &access, "send_email", bare))["signature"],
+            Value::Null
+        );
+        assert_eq!(queued(&mut store).signature, None);
     }
 
     #[test]

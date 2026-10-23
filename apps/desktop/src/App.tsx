@@ -29,6 +29,7 @@ import {
   Search,
   Send,
   Settings as SettingsIcon,
+  Signature,
   Sparkles,
   Text,
   ThumbsDown,
@@ -1159,7 +1160,8 @@ export default function App() {
     };
     settle({ status: "writing" });
     if (!text) show("");
-    composeWithAi(session, action, d.from, draftReference(d), onEvent).catch((error) =>
+    const signed = d.signature !== null && !d.signatureHidden;
+    composeWithAi(session, action, d.from, draftReference(d), signed, onEvent).catch((error) =>
       onEvent({ event: "error", data: { message: String(error) } }),
     );
   }
@@ -1223,7 +1225,8 @@ export default function App() {
     compose({
       title: "Forward",
       subject: /^fwd?:/i.test(m.subject) ? m.subject : `Fwd: ${m.subject}`,
-      body: `\n\n${header.join("\n")}\n\n${text.join("\n\n")}`,
+      // Below the note and the signature, as Spark lays it out.
+      quote: `${header.join("\n")}\n\n${text.join("\n\n")}`,
       from: m.account,
       replyTo: m.id,
       forward: true,
@@ -1653,6 +1656,13 @@ export default function App() {
         run: () => openSettings("notifications"),
       },
       {
+        id: "signature-settings",
+        label: "Signature settings",
+        keywords: "signatures sign off email footer composer",
+        Icon: Signature,
+        run: () => openSettings("signatures"),
+      },
+      {
         id: "agent-settings",
         label: "Agent settings",
         keywords: "ai agents claude code codex hermes mcp cli access",
@@ -1869,6 +1879,7 @@ export default function App() {
             onDiscard={() => void discardComposer()}
             onSend={send}
             onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
+            onSignatureSettings={() => openSettings("signatures")}
             ai={{
               writing: writing?.composer === composerKey ? writing : null,
               quickReplies: draftReference(draft)?.relation === "reply",

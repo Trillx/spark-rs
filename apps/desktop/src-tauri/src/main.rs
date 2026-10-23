@@ -14,6 +14,7 @@ mod meetings;
 mod notify;
 mod prefs;
 mod secrets;
+mod signatures;
 
 use tauri::Manager;
 
@@ -83,6 +84,11 @@ fn main() {
             mailbox::save_draft,
             mailbox::open_draft,
             mailbox::discard_draft,
+            signatures::list_signatures,
+            signatures::save_signature,
+            signatures::delete_signature,
+            signatures::set_default_signature,
+            signatures::resolve_signature,
             mailbox::open_external,
             mailbox::open_attachment,
             mailbox::save_attachment,

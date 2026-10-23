@@ -6,14 +6,24 @@ import {
   Maximize2,
   Minimize2,
   Paperclip,
+  Signature as SignatureIcon,
   Square,
   Trash2,
   Undo2,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
-import { describeFiles, onFileDrag, pickFiles } from "../api";
-import type { AccountId, LocalFile, OutgoingAttachment, OutgoingDraft } from "../types";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { describeFiles, onFileDrag, pickFiles, resolveSignature } from "../api";
+import type { AccountId, LocalFile, OutgoingAttachment, OutgoingDraft, Signature } from "../types";
 import { useAccounts } from "../lib/accounts";
 import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
@@ -22,6 +32,8 @@ import AiMenu, { type AiRequest } from "./AiMenu";
 import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
+import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
+import SignaturePicker from "./SignaturePicker";
 
 /** What mail servers take; the Rust side refuses more. */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -51,6 +63,16 @@ export interface Draft {
   /** A reply's threading when its original isn't stored here. */
   inReplyTo?: string;
   references?: string;
+  /** The signature below the body, as HTML (it can be edited for this message); null for none. */
+  signature: string | null;
+  /** The saved signature it started as. */
+  signatureId: number | null;
+  /** Hidden for this message: it's sent without it, and Add Signature brings it back. */
+  signatureHidden: boolean;
+  /** The account the signature was chosen for. Another From chooses again. */
+  signatureFor?: AccountId;
+  /** A forward's original, below the signature. */
+  quote?: string;
 }
 
 /**
@@ -91,16 +113,25 @@ export function emptyDraft(from: AccountId): Draft {
     remind: null,
     doneAfter: false,
     attachments: [],
+    signature: null,
+    signatureId: null,
+    signatureHidden: false,
   };
 }
 
+/** A signature alone isn't content: a new message with just one is empty. */
 export function draftHasContent(d: Draft) {
-  return [d.to, d.cc, d.bcc, d.subject, d.body].some((s) => s.trim()) || d.attachments.length > 0;
+  return [d.to, d.cc, d.bcc, d.subject, d.body, d.quote ?? ""].some((s) => s.trim()) || d.attachments.length > 0;
+}
+
+/** The signature the draft goes out with, if any. */
+function sentSignature(d: Draft) {
+  return d.signatureHidden ? null : d.signature;
 }
 
 /** What a saved draft keeps, to tell whether there's anything new to save. */
 export function draftKey(d: Draft) {
-  return JSON.stringify([d.from, d.to, d.cc, d.bcc, d.subject, d.body, d.attachments]);
+  return JSON.stringify([d.from, d.to, d.cc, d.bcc, d.subject, d.body, d.attachments, sentSignature(d), d.quote]);
 }
 
 /** The draft as the backend takes it, to save or to send at `sendAt`. */
@@ -119,6 +150,9 @@ export function outgoingDraft(d: Draft, sendAt: number, draftId = d.draftId): Ou
     draftId,
     inReplyTo: d.inReplyTo,
     references: d.references,
+    signature: sentSignature(d) ?? undefined,
+    signatureId: sentSignature(d) !== null ? (d.signatureId ?? undefined) : undefined,
+    quote: d.quote,
   };
 }
 
@@ -139,12 +173,18 @@ export function savedDraft(saved: OutgoingDraft): Draft {
     draftId: saved.draftId,
     inReplyTo: saved.inReplyTo,
     references: saved.references,
+    // It keeps the signature it was saved with, or none.
+    signature: saved.signature ?? null,
+    signatureId: saved.signatureId ?? null,
+    signatureFor: saved.account,
+    quote: saved.quote,
   };
 }
 
 /**
  * Compact floating composer, with a toggle that fills the reading pane.
- * Plain text only for now; the rich editor comes later.
+ * The body is plain text for now (the rich editor comes later); under it
+ * are the signature, which is HTML, and a forward's original.
  */
 export default function Composer({
   draft,
@@ -157,6 +197,7 @@ export default function Composer({
   onDiscard,
   onSend,
   onError,
+  onSignatureSettings,
   ai,
 }: {
   draft: Draft;
@@ -172,11 +213,15 @@ export default function Composer({
   onDiscard: () => void;
   onSend: () => void;
   onError: (text: string) => void;
+  /** Settings → Signatures. */
+  onSignatureSettings: () => void;
   /** While AI writes the body, it's read-only and can't be sent. */
   ai?: ComposerAi;
 }) {
   const toRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const quoteRef = useRef<HTMLTextAreaElement>(null);
+  const signatureRef = useRef<SignatureFrameHandle>(null);
   const [dropping, setDropping] = useState(false);
   // File drops arrive through a listener set up once; it reads these.
   const latest = useRef({ draft, onChange });
@@ -209,6 +254,26 @@ export default function Composer({
     [],
   );
 
+  // The signature for the From account: its default, or for a reply the one
+  // used last in the conversation. Choosing again replaces one edited here.
+  useEffect(() => {
+    const from = draft.from;
+    if (draft.signatureFor === from) return;
+    resolveSignature(from, draft.forward ? undefined : draft.replyTo).then(
+      (s) => {
+        if (latest.current.draft.from !== from) return;
+        latest.current.onChange({ signature: s?.html ?? null, signatureId: s?.id ?? null, signatureFor: from });
+      },
+      () => latest.current.onChange({ signatureFor: from }),
+    );
+  }, [draft.from, draft.signatureFor]);
+
+  function pickSignature(s: Signature) {
+    onChange({ signature: s.html, signatureId: s.id, signatureHidden: false, signatureFor: draft.from });
+    // Once the frame has the new signature.
+    window.setTimeout(() => signatureRef.current?.focus(), 50);
+  }
+
   useEffect(() => {
     // Replies arrive with a recipient, so they start in the body.
     if (draft.to) {
@@ -231,6 +296,24 @@ export default function Composer({
   }
 
   const attachedBytes = draft.attachments.reduce((sum, a) => sum + a.size, 0);
+  const showSignature = draft.signature !== null && !draft.signatureHidden;
+
+  // The body and a forward's original grow with their text; the area they're in scrolls.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    fit(bodyRef);
+    fit(quoteRef);
+  }, [draft.body, draft.quote, showSignature, full]);
+  useEffect(() => {
+    const area = scrollRef.current;
+    if (!area) return;
+    const observer = new ResizeObserver(() => {
+      fit(bodyRef);
+      fit(quoteRef);
+    });
+    observer.observe(area);
+    return () => observer.disconnect();
+  }, []);
 
   const writing = ai?.writing ?? null;
   const busy = writing?.status === "writing";
@@ -309,19 +392,74 @@ export default function Composer({
           }}
         />
       </Field>
-      <textarea
-        ref={bodyRef}
-        className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 text-sm leading-[1.57] outline-none placeholder:text-text-3"
-        placeholder={busy ? "" : "Enter text"}
-        value={draft.body}
-        readOnly={busy}
-        aria-busy={busy}
-        onChange={(e) => {
-          // Typing over AI's text makes it yours: no more Undo.
-          if (writing?.status === "done") ai?.dismiss();
-          onChange({ body: e.target.value });
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-y-auto"
+        onMouseDown={(e) => {
+          // Below everything is still the body's.
+          if (e.target !== e.currentTarget) return;
+          e.preventDefault();
+          const body = bodyRef.current;
+          body?.focus();
+          body?.setSelectionRange(body.value.length, body.value.length);
         }}
-      />
+      >
+        <textarea
+          ref={bodyRef}
+          aria-label="Message"
+          className={`block w-full resize-none overflow-hidden bg-transparent px-4 pb-2 pt-3 text-sm leading-[1.57] outline-none placeholder:text-text-3 ${
+            showSignature || draft.quote !== undefined ? "min-h-[4.5rem]" : "min-h-full"
+          }`}
+          placeholder={busy ? "" : "Enter text"}
+          value={draft.body}
+          readOnly={busy}
+          aria-busy={busy}
+          onChange={(e) => {
+            // Typing over AI's text makes it yours: no more Undo.
+            if (writing?.status === "done") ai?.dismiss();
+            onChange({ body: e.target.value });
+          }}
+        />
+        {showSignature && (
+          <div className="relative px-4 pb-3" data-signature>
+            <SignaturePicker
+              currentId={draft.signatureId}
+              onPick={pickSignature}
+              onHide={() => onChange({ signatureHidden: true })}
+              onSettings={onSignatureSettings}
+              trigger={({ open, toggle }) => (
+                <button
+                  aria-label="Choose signature"
+                  data-tip="Choose signature"
+                  aria-expanded={open}
+                  onClick={toggle}
+                  className={`absolute left-0.5 top-0.5 grid size-4 place-items-center rounded ${
+                    open ? "text-primary" : "text-text-3 hover:text-base-content"
+                  }`}
+                >
+                  <ChevronsUpDown size={12} />
+                </button>
+              )}
+            />
+            <SignatureFrame
+              ref={signatureRef}
+              html={draft.signature ?? ""}
+              placeholder="No signature"
+              onInput={(html) => onChange({ signature: html })}
+              onError={onError}
+            />
+          </div>
+        )}
+        {draft.quote !== undefined && (
+          <textarea
+            ref={quoteRef}
+            aria-label="Forwarded message"
+            className="block w-full resize-none overflow-hidden bg-transparent px-4 pb-3 text-sm leading-[1.57] outline-none"
+            value={draft.quote}
+            onChange={(e) => onChange({ quote: e.target.value })}
+          />
+        )}
+      </div>
 
       {ai && writing && (
         <div
@@ -483,6 +621,24 @@ export default function Composer({
         >
           <CircleCheck size={17} />
         </IconButton>
+        {!showSignature &&
+          (draft.signature !== null ? (
+            <IconButton title="Add signature" onClick={() => onChange({ signatureHidden: false })}>
+              <SignatureIcon size={17} />
+            </IconButton>
+          ) : (
+            <SignaturePicker
+              direction="up"
+              currentId={null}
+              onPick={pickSignature}
+              onSettings={onSignatureSettings}
+              trigger={({ open, toggle }) => (
+                <IconButton title="Add signature" active={open} onClick={toggle}>
+                  <SignatureIcon size={17} />
+                </IconButton>
+              )}
+            />
+          ))}
 
         <div className="ml-auto flex items-center gap-1.5">
           <IconButton title="Delete draft" onClick={onDiscard}>
@@ -531,6 +687,14 @@ export default function Composer({
       </div>
     </div>
   );
+}
+
+/** Sizes a textarea to its text. */
+function fit(ref: RefObject<HTMLTextAreaElement | null>) {
+  const el = ref.current;
+  if (!el) return;
+  el.style.height = "0px";
+  el.style.height = `${el.scrollHeight}px`;
 }
 
 function Field({ label, children }: { label?: string; children: ReactNode }) {

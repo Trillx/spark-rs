@@ -1,8 +1,19 @@
 import {
+  ArrowLeft,
   Bell,
+  Bold,
   Bot,
   Building2,
   Check,
+  ChevronRight,
+  ChevronsUpDown,
+  Code,
+  ImagePlus,
+  Italic,
+  Link,
+  RemoveFormatting,
+  Signature as SignatureIcon,
+  Underline,
   CircleAlert,
   CircleCheck,
   CircleX,
@@ -50,30 +61,47 @@ import {
   addImapAccount,
   addMicrosoftAccount,
   cancelSignIn,
+  deleteSignature,
   getAgents,
   getPrefs,
   openExternal,
   previewMeetingPopup,
   removeAccount,
+  listSignatures,
   renameAccount,
   savePrefs,
+  saveSignature,
   setAgentAccess,
+  setDefaultSignature,
   testNotification,
 } from "../api";
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo } from "../lib/format";
 import type { ThemePref } from "../lib/theme";
-import type { AccountView, AgentAccess, AgentsView, NotifyFor, Prefs, SyncStatus } from "../types";
+import { signatureLabel } from "../lib/signatures";
+import type {
+  AccountView,
+  AgentAccess,
+  AgentsView,
+  DefaultSignature,
+  NotifyFor,
+  Prefs,
+  Signature,
+  SignaturesView,
+  SyncStatus,
+} from "../types";
 import AccountMark from "./AccountMark";
 import Dropdown, { MenuItem } from "./Dropdown";
+import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import { tipAttrs } from "../lib/tooltip";
 
-export type SettingsPage = "accounts" | "ai" | "agents" | "notifications" | "appearance";
+export type SettingsPage = "accounts" | "signatures" | "ai" | "agents" | "notifications" | "appearance";
 
 /** Nav groups, in order. Only pages that exist so far. */
 const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
   [
     { key: "accounts", label: "Accounts", Icon: UsersRound },
+    { key: "signatures", label: "Signatures", Icon: SignatureIcon },
     { key: "ai", label: "AI", Icon: Sparkles },
     { key: "agents", label: "Agents", Icon: Bot },
   ],
@@ -187,6 +215,7 @@ export default function Settings({
           <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10">
             <div className="max-w-[560px]">
               {page === "accounts" && <AccountsPage onChanged={onAccountsChanged} />}
+              {page === "signatures" && <SignaturesPage />}
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "notifications" && <NotificationsPage />}
@@ -1285,6 +1314,334 @@ function ThemePreview({ kind }: { kind: ThemePref }) {
 }
 
 // ---- AI ----
+
+// ---- Signatures ----
+
+/**
+ * Spark's signature settings: what each address starts new mail with, and
+ * every signature, which opens in an editor.
+ */
+function SignaturesPage() {
+  const [view, setView] = useState<SignaturesView | null>(null);
+  const [editing, setEditing] = useState<{ id: number | null; html: string } | null>(null);
+  const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const accounts = useAccounts();
+
+  function load() {
+    listSignatures().then(setView, (error) => setStatus({ kind: "error", text: String(error) }));
+  }
+  useEffect(load, []);
+
+  if (editing) {
+    return (
+      <SignatureEditor
+        id={editing.id}
+        html={editing.html}
+        onDone={() => {
+          setEditing(null);
+          load();
+        }}
+      />
+    );
+  }
+  if (!view) return <StatusLine status={status} />;
+
+  async function changeDefault(mailbox: string, signature: DefaultSignature) {
+    if (!view) return;
+    const before = view;
+    setView({ ...view, defaults: view.defaults.map((d) => (d.mailbox === mailbox ? { ...d, signature } : d)) });
+    try {
+      await setDefaultSignature(mailbox, signature);
+      setStatus({ kind: "idle" });
+    } catch (error) {
+      setView(before);
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  return (
+    <>
+      <div className="mb-6 flex items-center gap-4">
+        <p className="flex-1 text-xs leading-[18px] text-text-2">
+          Your signature goes below what you write, above the email you're replying to. You can change, edit or hide it
+          in each email.
+        </p>
+        <button className="btn btn-primary btn-sm gap-1.5" onClick={() => setEditing({ id: null, html: "" })}>
+          <Plus size={14} />
+          Create signature
+        </button>
+      </div>
+      <Group title="Default signatures" note="Most recent is the signature last sent from that address.">
+        {view.defaults.map((d) => (
+          <Row
+            key={d.mailbox}
+            label={d.mailbox}
+            description={accounts.find((a) => a.email.toLowerCase() === d.mailbox.toLowerCase())?.label}
+          >
+            <DefaultSignaturePicker
+              mailbox={d.mailbox}
+              value={d.signature}
+              signatures={view.signatures}
+              onChange={(next) => void changeDefault(d.mailbox, next)}
+            />
+          </Row>
+        ))}
+      </Group>
+      {view.signatures.length > 0 && (
+        <Group title="All signatures">
+          {view.signatures.map((s, i) => {
+            const more = s.text.split("\n").filter((line) => line.trim()).slice(1);
+            return (
+              <button
+                key={s.id}
+                aria-label={`Signature ${i + 1}: ${signatureLabel(s)}`}
+                onClick={() => setEditing({ id: s.id, html: s.html })}
+                className="flex min-h-[52px] w-full items-center gap-3 px-4 py-2.5 text-left first:rounded-t-2xl last:rounded-b-2xl hover:bg-base-content/5"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[13px] font-medium leading-5">{signatureLabel(s)}</span>
+                  {more.length > 0 && (
+                    <span className="block truncate text-xs leading-[18px] text-text-2">{more.join(" · ")}</span>
+                  )}
+                </span>
+                <ChevronRight size={16} className="shrink-0 text-text-3" />
+              </button>
+            );
+          })}
+        </Group>
+      )}
+      <StatusLine status={status} />
+    </>
+  );
+}
+
+function defaultLabel(value: DefaultSignature, signatures: Signature[]) {
+  if (value.type === "none") return "No signature";
+  const chosen = value.type === "custom" ? signatures.find((s) => s.id === value.id) : undefined;
+  return chosen ? signatureLabel(chosen) : "Most recent";
+}
+
+function DefaultSignaturePicker({
+  mailbox,
+  value,
+  signatures,
+  onChange,
+}: {
+  mailbox: string;
+  value: DefaultSignature;
+  signatures: Signature[];
+  onChange: (value: DefaultSignature) => void;
+}) {
+  return (
+    <Dropdown
+      align="end"
+      width="w-60"
+      trigger={({ toggle, open }) => (
+        <button
+          className={`flex h-8 max-w-48 items-center gap-1.5 rounded-lg border border-hairline px-2.5 text-[13px] hover:bg-base-content/5 ${
+            open ? "bg-base-content/5" : ""
+          }`}
+          aria-label={`Default signature for ${mailbox}`}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          onClick={toggle}
+        >
+          <span className="truncate">{defaultLabel(value, signatures)}</span>
+          <ChevronsUpDown size={12} className="shrink-0 text-text-2" />
+        </button>
+      )}
+    >
+      <MenuItem label="Most recent" checked={value.type === "mostRecent"} onSelect={() => onChange({ type: "mostRecent" })} />
+      <MenuItem label="No signature" checked={value.type === "none"} onSelect={() => onChange({ type: "none" })} />
+      {signatures.length > 0 && <li role="separator" className="my-0.5 h-px bg-hairline" />}
+      {signatures.map((s) => (
+        <MenuItem
+          key={s.id}
+          label={signatureLabel(s)}
+          checked={value.type === "custom" && value.id === s.id}
+          onSelect={() => onChange({ type: "custom", id: s.id })}
+        />
+      ))}
+    </Dropdown>
+  );
+}
+
+/** What a typed link means: a web address, or an email address to write to. */
+function linkUrl(typed: string) {
+  const url = typed.trim();
+  if (!url) return null;
+  if (/^(https?:|mailto:|tel:)/i.test(url)) return url;
+  if (/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/.test(url)) return `mailto:${url}`;
+  return `https://${url}`;
+}
+
+/** Creating or editing a signature: rich text, or its HTML. */
+function SignatureEditor({ id, html: initial, onDone }: { id: number | null; html: string; onDone: () => void }) {
+  const [html, setHtml] = useState(initial);
+  const [source, setSource] = useState(false);
+  const [link, setLink] = useState<string | null>(null);
+  const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const frame = useRef<SignatureFrameHandle>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const busy = status.kind === "busy";
+
+  async function save() {
+    setStatus({ kind: "busy", what: "Saving…" });
+    try {
+      await saveSignature(id, html);
+      onDone();
+    } catch (error) {
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  async function remove() {
+    if (id === null) return onDone();
+    try {
+      await deleteSignature(id);
+      onDone();
+    } catch (error) {
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  async function addImage(file: File) {
+    try {
+      const { resized } = await frame.current!.insertImage(file);
+      setStatus(resized ? { kind: "ok", text: "The image was made smaller to fit in a signature." } : { kind: "idle" });
+    } catch (error) {
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  function addLink(e: FormEvent) {
+    e.preventDefault();
+    const url = linkUrl(link ?? "");
+    if (url) frame.current?.link(url);
+    setLink(null);
+  }
+
+  const tool = (label: string, keys: string | undefined, onClick: () => void, icon: ReactNode) => (
+    <button
+      className="btn btn-ghost btn-xs btn-square h-7 w-7 text-text-2 hover:text-base-content"
+      {...tipAttrs(keys ? { label, keys } : label)}
+      aria-label={label}
+      // Keeps the selection in the editor.
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+    >
+      {icon}
+    </button>
+  );
+
+  return (
+    <>
+      <button className="btn btn-ghost btn-sm -ml-2 mb-2 gap-1 text-text-2" onClick={onDone}>
+        <ArrowLeft size={14} />
+        Signatures
+      </button>
+      <h3 className="mb-3 px-1 text-[15px] font-semibold">{id === null ? "Create signature" : "Edit signature"}</h3>
+      <div className="overflow-hidden rounded-2xl border border-hairline">
+        <div role="toolbar" aria-label="Formatting" className="flex h-10 items-center gap-0.5 border-b border-hairline px-2">
+          {!source && (
+            <>
+              {tool("Bold", "Ctrl+B", () => frame.current?.exec("bold"), <Bold size={15} />)}
+              {tool("Italic", "Ctrl+I", () => frame.current?.exec("italic"), <Italic size={15} />)}
+              {tool("Underline", "Ctrl+U", () => frame.current?.exec("underline"), <Underline size={15} />)}
+              {tool("Add link", undefined, () => setLink(""), <Link size={15} />)}
+              {tool("Add image", undefined, () => fileRef.current?.click(), <ImagePlus size={15} />)}
+              {tool("Reset fonts", undefined, () => frame.current?.resetFonts(), <RemoveFormatting size={15} />)}
+            </>
+          )}
+          <button
+            className={`btn btn-ghost btn-xs ml-auto h-7 gap-1 px-2 font-medium ${source ? "bg-primary/10 text-primary" : "text-text-2"}`}
+            aria-pressed={source}
+            data-tip="Edit the HTML"
+            onClick={() => {
+              setLink(null);
+              setSource((on) => !on);
+            }}
+          >
+            <Code size={14} />
+            HTML
+          </button>
+        </div>
+        {link !== null && !source && (
+          <form onSubmit={addLink} className="flex items-center gap-2 border-b border-hairline px-3 py-2">
+            <input
+              autoFocus
+              aria-label="Link address"
+              className={`${INPUT} flex-1`}
+              placeholder="https://example.com or name@example.com"
+              value={link}
+              onChange={(e) => setLink(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Escape") return;
+                e.preventDefault();
+                e.stopPropagation();
+                setLink(null);
+              }}
+            />
+            <button type="submit" className="btn btn-primary btn-sm" disabled={!link.trim()}>
+              Add link
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setLink(null)}>
+              Cancel
+            </button>
+          </form>
+        )}
+        <div className="p-3">
+          {source ? (
+            <textarea
+              aria-label="Signature HTML"
+              spellCheck={false}
+              className="block h-56 w-full resize-y rounded-lg bg-base-200 p-2 font-mono text-xs leading-5 outline-none"
+              value={html}
+              onChange={(e) => setHtml(e.target.value)}
+            />
+          ) : (
+            <SignatureFrame
+              ref={frame}
+              html={html}
+              onInput={setHtml}
+              placeholder="Enter a text for signature…"
+              minHeight={140}
+              onError={(text) => setStatus({ kind: "error", text })}
+            />
+          )}
+        </div>
+      </div>
+      <input
+        ref={fileRef}
+        type="file"
+        accept="image/png,image/jpeg,image/gif,image/webp"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = "";
+          if (file) void addImage(file);
+        }}
+      />
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <StatusLine status={status} />
+        <div className="ml-auto flex gap-2">
+          {id !== null && (
+            <button className="btn btn-ghost btn-sm gap-1.5 text-error" disabled={busy} onClick={() => void remove()}>
+              <Trash2 size={14} />
+              Delete
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={onDone}>
+            Cancel
+          </button>
+          <button className="btn btn-primary btn-sm px-5" disabled={busy || !html.trim()} onClick={() => void save()}>
+            Save
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
 
 type Status =
   | { kind: "idle" }

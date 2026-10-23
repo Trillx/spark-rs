@@ -188,6 +188,7 @@ async fn imap_round_trip() {
     assert_eq!(find(&engine, "Report").state, MessageState::Done);
 
     // Replying to Ana: sent over SMTP, threaded into her conversation, and Ana is accepted.
+    // The signature goes between the reply and the quote, its logo as an inline part.
     let draft = Draft {
         account: account.id,
         to: format!("Me <{me}>"),
@@ -201,6 +202,11 @@ async fn imap_round_trip() {
         draft_id: None,
         in_reply_to: None,
         references: None,
+        signature: Some(
+            r#"<div><b>Me</b></div><div>ACME</div><img src="data:image/png;base64,iVBORw0KGgo=">"#
+                .into(),
+        ),
+        ..Default::default()
     };
     let queued = engine
         .store()
@@ -225,10 +231,19 @@ async fn imap_round_trip() {
     assert_eq!(reply.conversation, lunch.conversation);
     let content = engine.store().content(reply.id).unwrap().unwrap();
     assert!(
-        content.text.starts_with("Sure, noon?"),
+        content
+            .text
+            .replace("\r\n", "\n")
+            .starts_with("Sure, noon?\n\nMe\nACME\n\n"),
         "{:?}",
         content.text
     );
+    let html = content.html.as_deref().unwrap_or_default();
+    assert!(
+        html.contains("<div name=\"messageSignatureSection\"><div><b>Me</b></div><div>ACME</div><img src=\"cid:"),
+        "{html}"
+    );
+    assert!(content.attachments.is_empty(), "the logo isn't a file");
     assert!(
         content.text.contains("> Body of Lunch?"),
         "{:?}",
@@ -302,6 +317,7 @@ async fn imap_round_trip() {
         draft_id: None,
         in_reply_to: None,
         references: None,
+        ..Default::default()
     };
     let notes = OutboxFile {
         name: "notes.txt".into(),
@@ -815,6 +831,7 @@ async fn imap_drafts() {
         draft_id: None,
         in_reply_to: None,
         references: None,
+        ..Default::default()
     };
     let save = |draft: &Draft| {
         let mut store = engine.store();

@@ -19,10 +19,12 @@ mod calendar;
 mod conversations;
 mod drafts;
 mod search;
+mod signatures;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
 pub use rusqlite::Error;
+pub use signatures::{DefaultSignature, Signature};
 pub type Result<T> = rusqlite::Result<T>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +597,10 @@ impl Store {
             tx.execute_batch(search::SCHEMA_SEARCH)?;
             tx.pragma_update(None, "user_version", 9)?;
             tx.commit()?;
+        }
+        if version < 10 {
+            conn.execute_batch(signatures::SCHEMA_SIGNATURES)?;
+            conn.pragma_update(None, "user_version", 10)?;
         }
         Ok(Self { conn })
     }

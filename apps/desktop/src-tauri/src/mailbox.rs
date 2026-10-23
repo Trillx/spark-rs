@@ -178,6 +178,26 @@ impl Mailbox {
         (!name.is_empty()).then(|| name.to_owned())
     }
 
+    /// The address account `id` sends from.
+    pub fn account_email(&self, id: i64) -> Option<String> {
+        if !self.live() {
+            return demo::accounts()
+                .into_iter()
+                .find(|a| a.id == id)
+                .map(|a| a.email);
+        }
+        Some(self.live.engine.store().account(id).ok()??.email)
+    }
+
+    /// Every account's address, in order.
+    pub fn addresses(&self) -> Vec<String> {
+        if !self.live() {
+            return demo::accounts().into_iter().map(|a| a.email).collect();
+        }
+        let accounts = self.live.engine.store().accounts().unwrap_or_default();
+        accounts.into_iter().map(|a| a.email).collect()
+    }
+
     pub(crate) fn account_view(&self, account: Account) -> AccountView {
         AccountView {
             id: account.id,
@@ -790,7 +810,9 @@ pub fn sync_now(mailbox: State<'_, Mailbox>) {
 pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
     if !mailbox.live() {
         // The demo pretends.
-        return Ok(mailbox.demo.send(&draft));
+        let id = mailbox.demo.send(&draft);
+        signed(&mailbox, &draft)?;
+        return Ok(id);
     }
     // Catch typos and oversized attachments now rather than after the undo window.
     for field in [&draft.to, &draft.cc, &draft.bcc] {
@@ -810,10 +832,27 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
         store.hold_draft_for_send(id, saved).map_err(text)?;
     }
     drop(store);
+    signed(&mailbox, &draft)?;
     if draft.send_at <= now_ms() {
         mailbox.live.nudge(draft.account);
     }
     Ok(id)
+}
+
+/// A saved signature going out becomes its address's most recent.
+fn signed(mailbox: &Mailbox, draft: &Draft) -> Result<(), String> {
+    let (Some(id), Some(_)) = (draft.signature_id, draft.clean_signature()) else {
+        return Ok(());
+    };
+    let Some(address) = mailbox.account_email(draft.account) else {
+        return Ok(());
+    };
+    mailbox
+        .live
+        .engine
+        .store()
+        .use_signature(&address, id, now_ms())
+        .map_err(text)
 }
 
 /// True if the send was stopped in time. A saved draft it came from is

@@ -23,7 +23,7 @@ use spark_store::{
 use crate::attachment::{
     AttachmentData, INLINE_IMAGE_MAX, INLINE_TOTAL_MAX, InlineImage, cid_key, mime_for,
 };
-use crate::draft::{Draft, recipients};
+use crate::draft::{Bodies, Draft, recipients};
 use crate::invite::Invite;
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::{Error, OLDER_STEP, Result};
@@ -36,6 +36,8 @@ const HOST: &str = "graph.microsoft.com";
 /// Graph takes attachments smaller than this in one request; bigger ones go
 /// up through an upload session.
 const INLINE_ATTACHMENT_MAX: usize = 3 * 1024 * 1024;
+/// What Outlook writes in by default; typed text goes out in it.
+const OUTLOOK_BODY: &str = "font-family:Calibri,Arial,sans-serif;font-size:11pt";
 /// Upload session chunks must be multiples of 320 KiB.
 const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
 /// A folder shows its newest this many messages, until the user reaches
@@ -965,13 +967,14 @@ impl Graph {
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
             return Err(Error::Config("Add at least one recipient.".into()));
         }
+        let bodies = draft.bodies(None, Some(OUTLOOK_BODY));
         let Some(original) = reply_to else {
             let message = json!({
                 "subject": draft.subject.trim(),
-                "body": { "contentType": "Text", "content": draft.body },
+                "body": body(&bodies),
                 "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
             });
-            if files.is_empty() {
+            if files.is_empty() && bodies.images.is_empty() {
                 self.send(
                     self.request(Method::POST, "/me/sendMail")
                         .json(&json!({ "message": message, "saveToSentItems": true })),
@@ -984,7 +987,11 @@ impl Graph {
                 .json(self.request(Method::POST, "/me/messages").json(&message))
                 .await?;
             return self
-                .attach_and_send(&format!("/me/messages/{}", path(&created.id)), files)
+                .attach_and_send(
+                    &format!("/me/messages/{}", path(&created.id)),
+                    files,
+                    &bodies.images,
+                )
                 .await;
         };
 
@@ -998,21 +1005,34 @@ impl Graph {
             )
             .await?;
         let quoted = reply.body.map(|b| b.content).unwrap_or_default();
+        let ours = bodies
+            .html
+            .clone()
+            .unwrap_or_else(|| text_to_html(&draft.body));
         let update = json!({
             "subject": draft.subject.trim(),
-            "body": { "contentType": "HTML", "content": format!("{}{quoted}", text_to_html(&draft.body)) },
+            "body": { "contentType": "HTML", "content": format!("{ours}{quoted}") },
             "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
         });
         let draft_path = format!("/me/messages/{}", path(&reply.id));
         self.send(self.request(Method::PATCH, &draft_path).json(&update))
             .await?;
-        self.attach_and_send(&draft_path, files).await
+        self.attach_and_send(&draft_path, files, &bodies.images)
+            .await
     }
 
-    /// Adds `files` to a draft and sends it. If that fails, the draft is
-    /// deleted so it doesn't linger in Drafts.
-    async fn attach_and_send(&self, draft_path: &str, files: &[AttachmentData]) -> Result<()> {
+    /// Adds `files` and the signature's `images` to a draft and sends it.
+    /// If that fails, the draft is deleted so it doesn't linger in Drafts.
+    async fn attach_and_send(
+        &self,
+        draft_path: &str,
+        files: &[AttachmentData],
+        images: &[InlineImage],
+    ) -> Result<()> {
         let result = async {
+            for image in images {
+                self.attach_inline(draft_path, image).await?;
+            }
             for f in files {
                 self.attach(draft_path, f).await?;
             }
@@ -1028,6 +1048,25 @@ impl Graph {
             let _ = self.send(self.request(Method::DELETE, draft_path)).await;
         }
         result
+    }
+
+    /// An image the HTML shows by its `cid:`. Signature images are small
+    /// enough to go in one request.
+    async fn attach_inline(&self, draft_path: &str, image: &InlineImage) -> Result<()> {
+        let extension = image.mime.rsplit('/').next().unwrap_or("png");
+        self.send(
+            self.request(Method::POST, &format!("{draft_path}/attachments"))
+                .json(&json!({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": format!("image.{extension}"),
+                    "contentType": image.mime,
+                    "contentBytes": STANDARD.encode(&image.bytes),
+                    "isInline": true,
+                    "contentId": image.cid,
+                })),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn attach(&self, draft_path: &str, f: &AttachmentData) -> Result<()> {
@@ -1110,14 +1149,17 @@ fn move_destination(p: &Pending) -> Option<&str> {
 impl Graph {
     /// Saves a draft: `update` (a draft's id) changed in place, or a new
     /// one in Drafts with `files` attached. Returns its id and Message-ID.
-    /// A draft that's gone is made anew.
+    /// A draft that's gone is made anew, and so is one whose signature has
+    /// images: they're attached with the draft.
     pub async fn save_draft(
         &self,
         update: Option<&str>,
         draft: &Draft,
         files: &[AttachmentData],
     ) -> Result<(String, Option<String>)> {
-        let message = draft_message(draft);
+        let bodies = draft.bodies(None, Some(OUTLOOK_BODY));
+        let message = draft_message(draft, &bodies);
+        let update = update.filter(|_| bodies.images.is_empty());
         if let Some(id) = update {
             match self
                 .json::<GraphMessage>(
@@ -1135,11 +1177,19 @@ impl Graph {
             .json(self.request(Method::POST, "/me/messages").json(&message))
             .await?;
         let draft_path = format!("/me/messages/{}", path(&created.id));
-        for f in files {
-            if let Err(e) = self.attach(&draft_path, f).await {
-                let _ = self.send(self.request(Method::DELETE, &draft_path)).await;
-                return Err(e);
+        let attached = async {
+            for image in &bodies.images {
+                self.attach_inline(&draft_path, image).await?;
             }
+            for f in files {
+                self.attach(&draft_path, f).await?;
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(e) = attached {
+            let _ = self.send(self.request(Method::DELETE, &draft_path)).await;
+            return Err(e);
         }
         Ok((
             created.id,
@@ -1168,8 +1218,17 @@ impl Graph {
     }
 }
 
-/// A draft as Graph takes it. Addresses that don't parse yet are left out.
-pub fn draft_message(draft: &Draft) -> Value {
+/// A message body as Graph takes it: HTML with a signature, else text.
+fn body(bodies: &Bodies) -> Value {
+    match &bodies.html {
+        Some(html) => json!({ "contentType": "HTML", "content": html }),
+        None => json!({ "contentType": "Text", "content": bodies.text }),
+    }
+}
+
+/// A draft as Graph takes it, with its `bodies`. Addresses that don't parse
+/// yet are left out.
+pub fn draft_message(draft: &Draft, bodies: &Bodies) -> Value {
     let list = |field: &str| -> Vec<Value> {
         crate::drafts::recipients(field)
             .into_iter()
@@ -1184,7 +1243,7 @@ pub fn draft_message(draft: &Draft) -> Value {
     };
     json!({
         "subject": draft.subject.trim(),
-        "body": { "contentType": "Text", "content": draft.body },
+        "body": body(bodies),
         "toRecipients": list(&draft.to),
         "ccRecipients": list(&draft.cc),
         "bccRecipients": list(&draft.bcc),
@@ -1287,9 +1346,7 @@ fn text_to_html(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('\n', "<br>");
-    format!(
-        "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:11pt\">{escaped}</div><br>"
-    )
+    format!("<div style=\"{OUTLOOK_BODY}\">{escaped}</div><br>")
 }
 
 /// Graph ids can contain `/`, `+` and `=`; immutable ids are URL-safe base64.
@@ -1506,9 +1563,10 @@ pub(crate) mod tests {
             draft_id: Some(4),
             in_reply_to: None,
             references: None,
+            ..Default::default()
         };
         assert_eq!(
-            draft_message(&draft),
+            draft_message(&draft, &draft.bodies(None, Some(OUTLOOK_BODY))),
             json!({
                 "subject": "Plan",
                 "body": { "contentType": "Text", "content": "Draft text" },

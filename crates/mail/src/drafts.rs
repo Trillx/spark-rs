@@ -11,8 +11,8 @@ use async_imap::imap_proto::NameAttribute;
 use async_imap::types::{Fetch, Name};
 use futures_util::TryStreamExt;
 use lettre::address::Envelope;
-use lettre::message::header::{ContentType, HeaderName, HeaderValue};
-use lettre::message::{Attachment as MimeAttachment, Mailbox, MultiPart, SinglePart};
+use lettre::message::Mailbox;
+use lettre::message::header::{HeaderName, HeaderValue};
 use spark_store::{
     Account, Attachment, DraftCopy, DraftSave, DraftUpload, FolderRole, Location, OutboxFile, Store,
 };
@@ -22,6 +22,7 @@ use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::engine::Engine;
 use crate::graph::Graph;
 use crate::imap::{self, Session, SyncState};
+use crate::signature::{self, SIGNATURE_SECTION};
 use crate::{Error, Result, parse};
 
 /// What a round did with the account's drafts.
@@ -82,6 +83,8 @@ pub fn save(
             },
         })
         .collect();
+    // What it says in full, as it would on the server.
+    let bodies = draft.saved_bodies();
     let from_name = if account.name.is_empty() {
         &account.email
     } else {
@@ -98,8 +101,9 @@ pub fn save(
             cc: &display_list(&draft.cc),
             bcc: &display_list(&draft.bcc),
             subject: draft.subject.trim(),
-            snippet: &parse::snippet(&draft.body),
-            text: &draft.body,
+            snippet: &parse::snippet(&bodies.text),
+            text: &bodies.text,
+            html: bodies.html.as_deref(),
             in_reply_to: threading.as_ref().map(|(id, _)| id.as_str()),
             references: threading.as_ref().map(|(_, refs)| refs.as_str()),
             attachments: &attachments,
@@ -150,13 +154,14 @@ pub fn open(store: &Store, id: i64) -> Result<Option<Draft>> {
         (!refs.is_empty()).then(|| refs.join(" "))
     });
     let threads = reply_to.is_none();
+    let parts = stored_parts(store, &text, content.html.as_deref())?;
     Ok(Some(Draft {
         account: m.account_id,
         to: field(&content.to),
         cc: field(&content.cc),
         bcc: field(&content.bcc),
         subject: m.subject,
-        body: text,
+        body: parts.body,
         reply_to,
         send_at: 0,
         attachments: content
@@ -173,7 +178,62 @@ pub fn open(store: &Store, id: i64) -> Result<Option<Draft>> {
         draft_id: Some(id),
         in_reply_to: in_reply_to.filter(|_| threads),
         references: references.filter(|_| threads),
+        signature: parts.signature,
+        signature_id: parts.signature_id,
+        quote: parts.quote,
     }))
+}
+
+/// The line a forward's original starts with (the composer writes it).
+const FORWARDED: &str = "---------- Forwarded message ----------";
+
+/// A stored draft's text, split around its signature.
+#[derive(Debug, Default, PartialEq)]
+struct StoredParts {
+    body: String,
+    signature: Option<String>,
+    signature_id: Option<i64>,
+    /// A forward's original, below the signature.
+    quote: Option<String>,
+}
+
+/// Splits a stored draft's text around the signature its HTML has, if any.
+/// One whose text matches a saved signature comes back as that signature,
+/// with its own images rather than the message's.
+fn stored_parts(store: &Store, text: &str, html: Option<&str>) -> Result<StoredParts> {
+    let whole = || match text.find(FORWARDED) {
+        Some(at) if at == 0 || text[..at].ends_with('\n') => StoredParts {
+            body: text[..at].trim_end().to_owned(),
+            quote: Some(text[at..].trim_end().to_owned()),
+            ..Default::default()
+        },
+        _ => StoredParts {
+            body: text.to_owned(),
+            ..Default::default()
+        },
+    };
+    let Some(found) = html.and_then(|h| signature::section(h, SIGNATURE_SECTION)) else {
+        return Ok(whole());
+    };
+    let found_text = signature::text(found);
+    let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let saved = store
+        .signatures()?
+        .into_iter()
+        .find(|s| !found_text.is_empty() && squeeze(&s.text) == squeeze(&found_text));
+    let (body, quote) = match signature::find_text(text, &found_text) {
+        Some((start, end)) => (text[..start].trim_end(), text[end..].trim()),
+        // Only images: nothing to find in the text.
+        None if found_text.is_empty() => (text.trim_end(), ""),
+        // Not where it should be: leave the text as it is.
+        None => return Ok(whole()),
+    };
+    Ok(StoredParts {
+        body: body.to_owned(),
+        signature_id: saved.as_ref().map(|s| s.id),
+        signature: Some(saved.map_or_else(|| found.trim().to_owned(), |s| s.html)),
+        quote: (!quote.is_empty()).then(|| quote.to_owned()),
+    })
 }
 
 /// Stored display strings as an address field, quoting names with commas.
@@ -270,8 +330,8 @@ pub fn new_message_id(domain: &str) -> String {
 }
 
 /// The draft as a message for the Drafts folder: like a sent one, but with
-/// Bcc kept, recipients optional, and the body as typed (the original is
-/// quoted when it's sent).
+/// Bcc kept, recipients optional, and no reply quote (the original is
+/// quoted when it's sent). A forward's original is kept below the signature.
 pub fn mime(
     from: Mailbox,
     draft: &Draft,
@@ -310,19 +370,7 @@ pub fn mime(
             references.join(" "),
         ));
     }
-    let built = if files.is_empty() {
-        builder.body(draft.body.clone())
-    } else {
-        let mut mixed = MultiPart::mixed().singlepart(SinglePart::plain(draft.body.clone()));
-        for f in files {
-            let content_type = ContentType::parse(&f.mime)
-                .unwrap_or_else(|_| ContentType::parse("application/octet-stream").expect("valid"));
-            mixed = mixed.singlepart(
-                MimeAttachment::new(f.name.clone()).body(f.bytes.clone(), content_type),
-            );
-        }
-        builder.multipart(mixed)
-    };
+    let built = draft.bodies(None, None).build(builder, files);
     Ok(built.map_err(|e| invalid(&e))?.formatted())
 }
 
@@ -691,6 +739,7 @@ mod tests {
             draft_id: None,
             in_reply_to: Some("1@x.com".into()),
             references: Some("0@x.com 1@x.com".into()),
+            ..Default::default()
         }
     }
 
@@ -838,6 +887,107 @@ mod tests {
             }]
         );
         assert!(open(&store, id + 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn signatures_and_forwards_come_back_from_the_stored_copy() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&spark_store::NewAccount {
+                kind: spark_store::AccountKind::Imap,
+                email: "me@x.com",
+                name: "",
+                label: "x",
+                config: "{}",
+            })
+            .unwrap();
+        store
+            .replace_folders(
+                account.id,
+                &[spark_store::RemoteFolder {
+                    remote_id: "Drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let saved = store
+            .add_signature(
+                r#"<div>Me</div><img src="data:image/png;base64,iVBORw0KGgo=">"#,
+                "Me",
+                1,
+            )
+            .unwrap();
+        let forward = Draft {
+            account: account.id,
+            to: "bo@x.com".into(),
+            subject: "Fwd: Plan".into(),
+            body: "FYI".into(),
+            signature: Some(saved.html.clone()),
+            signature_id: Some(saved.id),
+            quote: Some("---------- Forwarded message ----------\nFrom: Bo\n\nThe plan".into()),
+            ..Default::default()
+        };
+        let id = save(&mut store, &account, &forward, &[], 1_000).unwrap();
+        let upload = store.draft_uploads(account.id, i64::MAX).unwrap().remove(0);
+        store
+            .draft_uploaded(
+                &upload,
+                &DraftCopy {
+                    uid: Some(3),
+                    mailbox: Some("Drafts".into()),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+        // From the stored copy: the saved signature, with its own image.
+        let opened = open(&store, id).unwrap().unwrap();
+        assert_eq!(opened.body, "FYI");
+        assert_eq!(
+            (opened.signature.as_deref(), opened.signature_id),
+            (Some(saved.html.as_str()), Some(saved.id))
+        );
+        assert_eq!(opened.quote, forward.quote);
+
+        // A server copy's parts, read from the MIME the server keeps, with a
+        // signature that isn't saved here.
+        let other = Draft {
+            signature: Some("<div><b>Someone</b></div><div>Else</div>".into()),
+            signature_id: None,
+            ..forward.clone()
+        };
+        let from: Mailbox = "me@x.com".parse().unwrap();
+        let raw = mime(from, &other, "d1@x.com", None, &[]).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let text = parsed.body_text(0).unwrap().replace("\r\n", "\n");
+        let parts = stored_parts(&store, &text, parsed.body_html(0).as_deref()).unwrap();
+        assert_eq!(parts.body, "FYI");
+        assert_eq!(
+            parts.signature.as_deref(),
+            Some("<div><b>Someone</b></div><div>Else</div>")
+        );
+        assert_eq!(parts.signature_id, None);
+        assert_eq!(parts.quote, forward.quote);
+
+        // Without a signature, a forward still splits at its header.
+        let plain = stored_parts(
+            &store,
+            "FYI\n\n---------- Forwarded message ----------\nFrom: Bo",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (plain.body.as_str(), plain.quote.as_deref()),
+            (
+                "FYI",
+                Some("---------- Forwarded message ----------\nFrom: Bo")
+            )
+        );
+        let typed = stored_parts(&store, "Just text", None).unwrap();
+        assert_eq!((typed.body.as_str(), typed.quote), ("Just text", None));
     }
 
     #[test]

@@ -162,15 +162,17 @@ export function cancelSummary(id: number): Promise<void> {
  * `account` and about `reference`; the text arrives on `onEvent`. Resolves
  * once it has started.
  */
+/** `signed`: the draft has a signature below, so what's written doesn't sign off. */
 export function composeWithAi(
   composer: number,
   action: ComposeAction,
   account: AccountId,
   reference: Reference | null,
+  signed: boolean,
   onEvent: (event: AiEvent) => void,
 ): Promise<void> {
   if (isTauri()) {
-    return invoke("compose_with_ai", { composer, action, account, reference, onEvent: channel(onEvent) });
+    return invoke("compose_with_ai", { composer, action, account, reference, signed, onEvent: channel(onEvent) });
   }
   browserStream(`composer:${composer}`, browserComposed(action), onEvent);
   return Promise.resolve();

@@ -294,6 +294,31 @@ export interface OutgoingDraft {
   /** Threading for a reply whose original isn't stored (a draft from the server). */
   inReplyTo?: string;
   references?: string;
+  /** The signature below the body, as HTML; absent sends without one. */
+  signature?: string;
+  /** The saved signature it started as; sending makes it the address's most recent. */
+  signatureId?: number;
+  /** A forward's original, below the signature. Plain text. */
+  quote?: string;
+}
+
+/** A saved signature. Mirrors `Signature` on the Rust side. */
+export interface Signature {
+  id: number;
+  /** Cleaned HTML. */
+  html: string;
+  /** As plain text, line by line; empty for one that's only an image. */
+  text: string;
+}
+
+/** Which signature an address starts new mail with. */
+export type DefaultSignature = { type: "mostRecent" } | { type: "none" } | { type: "custom"; id: number };
+
+export interface SignaturesView {
+  /** Oldest first. */
+  signatures: Signature[];
+  /** Each sending address's default, in account order. */
+  defaults: { mailbox: string; signature: DefaultSignature }[];
 }
 
 /** Payload of the `sync-status` event. */
