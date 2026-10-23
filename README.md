@@ -46,7 +46,10 @@ sending work mail to an AI provider for summaries, may not be allowed.
 993 and 465 use TLS from the start; 143 and 587 use STARTTLS.
 
 What syncs: the inbox (the newest 300 messages on Gmail/IMAP, the last 30
-days on Microsoft 365), checked every two minutes and on demand. Done,
+days on Microsoft 365), checked every two minutes and on demand. Scrolling
+to the end of a list brings in older mail, 100 messages at a time (on
+Microsoft 365, mail from before the first 30 days doesn't pick up changes
+made in other apps, such as being read or moved). Done,
 Delete, read and pinned go back to the server after the 6-second undo
 window; Done archives (All Mail on Gmail). Snooze, Set Aside, Priority and
 new-sender screening stay on this computer.
@@ -105,8 +108,9 @@ Moving an email to a folder moves it on the server once the undo window
 passes. On Gmail, folders are labels: moving between them swaps the labels,
 and the email keeps its other labels.
 
-A folder shows its newest 200 messages. Folders in the sidebar stay in sync,
-as does the one that's open; others are fetched when opened.
+A folder shows its newest 200 messages, and 100 more each time you scroll
+to the end. Folders in the sidebar stay in sync, as does the one that's
+open; others are fetched when opened.
 
 ## AI agents
 

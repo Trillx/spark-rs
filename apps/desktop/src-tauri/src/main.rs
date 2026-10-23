@@ -46,6 +46,7 @@ fn main() {
             mailbox::watch_folders,
             mailbox::sync_folders,
             mailbox::refresh_folders,
+            mailbox::load_older,
             mailbox::create_folder,
             mailbox::rename_folder,
             mailbox::delete_folder,

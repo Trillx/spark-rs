@@ -27,6 +27,7 @@ pub fn accounts() -> Vec<AccountView> {
         provider,
         demo: true,
         sync: SyncView::default(),
+        has_older: false,
     };
     vec![
         account(
@@ -82,6 +83,7 @@ pub fn folders() -> Vec<FolderView> {
             role: f.role,
             selectable: true,
             synced: true,
+            has_older: false,
         })
         .collect()
 }

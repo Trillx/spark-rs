@@ -5,8 +5,10 @@
 //! The first inbox sync takes the newest messages (up to a limit) and
 //! remembers the lowest UID taken as the floor; later syncs look at
 //! everything from the floor up, so new mail and mail moved back into the
-//! inbox both show up, while older mail stays on the server. Other folders
-//! are synced only when the user wants them, and only their newest messages.
+//! inbox both show up, while older mail stays on the server until the user
+//! scrolls to it: reaching back fetches the next messages below the floor
+//! and lowers it. Other folders are synced only when the user wants them,
+//! and only their newest messages, a window that reaching back widens.
 
 use std::collections::HashSet;
 use std::io;
@@ -30,7 +32,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
-use crate::{Error, Result, parse, utf7};
+use crate::{Error, OLDER_STEP, Result, parse, utf7};
 
 pub const INBOX: &str = "INBOX";
 /// Messages fetched on the first sync of an account.
@@ -87,6 +89,9 @@ pub struct SyncState {
     pub uid_validity: Option<u32>,
     /// Lowest inbox UID that is synced.
     pub floor: Option<u32>,
+    /// The inbox has nothing below the floor: no older mail to reach back for.
+    #[serde(default)]
+    pub complete: bool,
     pub archive: Option<String>,
     pub trash: Option<String>,
 }
@@ -96,6 +101,13 @@ pub struct SyncState {
 #[serde(rename_all = "camelCase")]
 pub struct FolderState {
     pub uid_validity: Option<u32>,
+    /// How many of its newest messages the folder shows; `FOLDER_LIMIT`
+    /// until the user reaches further back.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The folder has no messages beyond the limit.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -423,9 +435,9 @@ fn folders_from(listed: &[Listed], state: &SyncState) -> Vec<RemoteFolder> {
     folders
 }
 
-/// Brings a folder's newest messages (up to `FOLDER_LIMIT`) into the store
-/// and makes them its list. Mail already stored (found by Message-ID) isn't
-/// downloaded again.
+/// Brings a folder's newest messages (up to its limit) into the store and
+/// makes them its list. Mail already stored (found by Message-ID) isn't
+/// downloaded again, so raising the limit fetches only the older ones.
 pub async fn sync_folder(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -450,9 +462,11 @@ pub async fn sync_folder(
     }
 
     // The newest messages by sequence number, with their flags.
+    let limit = state.limit.unwrap_or(FOLDER_LIMIT);
+    state.complete = mailbox.exists <= limit;
     let mut window: Vec<(u32, bool, bool)> = Vec::new();
     if mailbox.exists > 0 {
-        let first = mailbox.exists.saturating_sub(FOLDER_LIMIT) + 1;
+        let first = mailbox.exists.saturating_sub(limit) + 1;
         let fetched: Vec<Fetch> = session
             .fetch(format!("{first}:*"), "(UID FLAGS)")
             .await?
@@ -645,6 +659,7 @@ pub async fn sync_inbox(
                 .unwrap_or_else(|| mailbox.uid_next.unwrap_or(1))
         }
     };
+    let complete = present.iter().all(|uid| *uid >= floor);
     let present: HashSet<u32> = present.into_iter().filter(|uid| *uid >= floor).collect();
     let known = lock(store).uids(account_id, INBOX)?;
 
@@ -681,7 +696,52 @@ pub async fn sync_inbox(
         report.gone = lock(store).observe_gone_uids(account_id, INBOX, &gone)?;
     }
     state.floor = Some(floor);
+    state.complete = complete;
     Ok(report)
+}
+
+/// Reaches further back in the inbox: fetches the newest `OLDER_STEP`
+/// messages below the floor that aren't stored yet, and lowers the floor
+/// to the oldest of them, so later syncs track them like the rest. Stored
+/// as on a first sync: no screening. Returns how many were new. Does
+/// nothing before the first sync, or if the server renumbered the inbox
+/// (the next sync starts over).
+pub async fn older_inbox(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    account_id: i64,
+    state: &mut SyncState,
+) -> Result<usize> {
+    let Some(floor) = state.floor else {
+        return Ok(0);
+    };
+    let mailbox = session.select(INBOX).await?;
+    if mailbox.uid_validity != state.uid_validity {
+        return Ok(0);
+    }
+    let present = session.uid_search("ALL").await?;
+    let known = lock(store).uids(account_id, INBOX)?;
+    let mut older: Vec<u32> = present
+        .iter()
+        .copied()
+        .filter(|uid| *uid < floor && !known.contains(uid))
+        .collect();
+    older.sort_unstable_by(|a, b| b.cmp(a));
+    older.truncate(OLDER_STEP);
+
+    let mut stored = 0;
+    for batch in older.chunks(FETCH_BATCH) {
+        stored += fetch_new(session, store, account_id, batch, false)
+            .await?
+            .len();
+        // Lowered batch by batch (they're newest first), so mail stored
+        // before a failure is above the floor and the next sync doesn't
+        // take it for gone.
+        state.floor = batch.last().copied();
+    }
+    let floor = state.floor.unwrap_or(floor);
+    state.complete = present.iter().all(|uid| *uid >= floor);
+    Ok(stored)
 }
 
 async fn fetch_new(
@@ -1257,6 +1317,14 @@ mod tests {
             gmail: false,
         };
         assert_eq!(transfer(old, &state, "Travel"), Transfer::CopyAndExpunge);
+    }
+
+    #[test]
+    fn states_from_before_reaching_back_still_read() {
+        let state: SyncState = serde_json::from_str(r#"{"uidValidity":3,"floor":40}"#).unwrap();
+        assert_eq!((state.floor, state.complete), (Some(40), false));
+        let folder: FolderState = serde_json::from_str(r#"{"uidValidity":3}"#).unwrap();
+        assert_eq!((folder.limit, folder.complete), (None, false));
     }
 
     #[test]

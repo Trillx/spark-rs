@@ -17,6 +17,10 @@ use std::fmt::Display;
 
 pub use engine::{AccountConfig, Engine, Round, Secrets};
 
+/// How many messages further back the inbox or a folder reaches each time
+/// the user scrolls to the end of its list, as in Spark.
+pub const OLDER_STEP: usize = 100;
+
 /// Errors are phrased for the user; they never contain passwords or tokens.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

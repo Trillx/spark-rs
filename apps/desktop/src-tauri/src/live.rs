@@ -2,10 +2,11 @@
 //!
 //! A worker loops: send what's due, push local changes once they're past the
 //! undo window, and fetch new mail every couple of minutes or when asked,
-//! syncing the folders the UI watches along with it. The folder list is
-//! refreshed now and then. It tells the UI through events
-//! (`mailbox-changed`, `folders-changed`, `sync-status`, `send-status`), and
-//! the user through notifications for new mail.
+//! syncing the folders the UI watches along with it. Older mail is reached
+//! back for when the UI asks. The folder list is refreshed now and then. It
+//! tells the UI through events (`mailbox-changed`, `folders-changed`,
+//! `accounts-changed`, `sync-status`, `send-status`), and the user through
+//! notifications for new mail.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -14,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use spark_mail::engine::inbox_has_older;
 use spark_mail::{Engine, Error, Round};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
@@ -53,6 +55,13 @@ struct Asks {
     list_folders: AtomicBool,
     /// Folders to sync on the next round, whatever the timer says.
     folders: Mutex<HashSet<i64>>,
+    /// Reach further back in the inbox on the next round.
+    older_inbox: AtomicBool,
+    /// Folders to reach further back in on the next round.
+    older_folders: Mutex<HashSet<i64>>,
+    /// Told when the round that took the asks above is over. A waiter is
+    /// added after its asks, and taken before them.
+    older_waiters: Mutex<Vec<oneshot::Sender<()>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -194,6 +203,42 @@ impl Live {
         }
     }
 
+    /// Reaches further back in these accounts' inboxes and these folders
+    /// (of any account) on their accounts' next rounds, starting now. Each
+    /// receiver resolves, or is dropped, once the round of one of the
+    /// accounts involved is over.
+    pub fn load_older(&self, accounts: Vec<i64>, folders: Vec<i64>) -> Vec<oneshot::Receiver<()>> {
+        let mut owned: HashMap<i64, Vec<i64>> = HashMap::new();
+        {
+            let store = self.engine.store();
+            for id in folders {
+                if let Ok(Some(folder)) = store.folder(id) {
+                    owned.entry(folder.account_id).or_default().push(id);
+                }
+            }
+        }
+        let mut involved: HashSet<i64> = accounts.iter().copied().collect();
+        involved.extend(owned.keys());
+        let workers = self.workers.lock().unwrap();
+        let mut done = Vec::new();
+        for account_id in involved {
+            let Some(worker) = workers.get(&account_id) else {
+                continue;
+            };
+            if accounts.contains(&account_id) {
+                worker.asks.older_inbox.store(true, Ordering::Relaxed);
+            }
+            if let Some(ids) = owned.get(&account_id) {
+                worker.asks.older_folders.lock().unwrap().extend(ids);
+            }
+            let (tx, rx) = oneshot::channel();
+            worker.asks.older_waiters.lock().unwrap().push(tx);
+            worker.wake.notify_one();
+            done.push(rx);
+        }
+        done
+    }
+
     /// Wakes the account's worker, e.g. for a send that's already due.
     pub fn nudge(&self, account_id: i64) {
         if let Some(worker) = self.workers.lock().unwrap().get(&account_id) {
@@ -277,10 +322,19 @@ async fn work(
             Err(e) => eprintln!("spark-rs: sending for account {account_id}: {e}"),
         }
 
+        // Waiters first: their asks are in by then.
+        let waiters = std::mem::take(&mut *asks.older_waiters.lock().unwrap());
         let requested = asks.fetch.swap(false, Ordering::Relaxed);
         let list_asked = asks.list_folders.swap(false, Ordering::Relaxed);
         let mut folders: HashSet<i64> = std::mem::take(&mut *asks.folders.lock().unwrap());
-        let asked = requested || list_asked || !folders.is_empty();
+        let older_inbox = asks.older_inbox.swap(false, Ordering::Relaxed);
+        let older_folders = std::mem::take(&mut *asks.older_folders.lock().unwrap());
+        let asked = requested
+            || list_asked
+            || !folders.is_empty()
+            || older_inbox
+            || !older_folders.is_empty()
+            || !waiters.is_empty();
         let waiting = retry_at.is_some_and(|at| Instant::now() < at);
         if asked || !waiting {
             let fetch = requested || last_fetch.is_none_or(|at| at.elapsed() >= FETCH_EVERY);
@@ -298,7 +352,11 @@ async fn work(
                 fetch,
                 list_folders,
                 folders: folders.into_iter().collect(),
+                older_inbox,
+                older_folders: older_folders.into_iter().collect(),
             };
+            // Only inbox syncs move it.
+            let had_older = (fetch || older_inbox).then(|| has_older(&engine, account_id));
             match engine.run_round(account_id, &round).await {
                 Ok(report) => {
                     retry_at = None;
@@ -337,6 +395,13 @@ async fn work(
                     });
                 }
             }
+            // The account's `hasOlder` flipped, e.g. with its first sync.
+            if had_older.is_some_and(|had| had != has_older(&engine, account_id)) {
+                let _ = app.emit("accounts-changed", ());
+            }
+            for waiter in waiters {
+                let _ = waiter.send(());
+            }
         }
 
         tokio::select! {
@@ -344,6 +409,10 @@ async fn work(
             _ = tokio::time::sleep(TICK) => {}
         }
     }
+}
+
+fn has_older(engine: &Engine, account_id: i64) -> bool {
+    matches!(engine.store().account(account_id), Ok(Some(a)) if inbox_has_older(&a))
 }
 
 /// Network errors are usually just being offline.

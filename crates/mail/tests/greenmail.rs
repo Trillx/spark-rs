@@ -16,8 +16,9 @@ use futures_util::TryStreamExt;
 use lettre::message::header::{ContentType, HeaderName, HeaderValue};
 use lettre::message::{Attachment, MultiPart, SinglePart};
 use spark_mail::draft::{Draft, OutgoingAttachment};
+use spark_mail::engine::{folder_has_older, inbox_has_older};
 use spark_mail::imap::{self, Security, Server};
-use spark_mail::{Engine, Round, Secrets, drafts, smtp};
+use spark_mail::{Engine, OLDER_STEP, Round, Secrets, drafts, smtp};
 use spark_store::{
     AccountKind, Category, FolderRole, MessageState, OutboxFile, Patch, Store, now_ms,
 };
@@ -933,6 +934,176 @@ async fn imap_drafts() {
     assert!(engine.store().discard_draft(discarded).unwrap());
     engine.run(account.id, false).await.unwrap();
     assert!(drafts_on_server(&mut other).await.is_empty());
+
+    let _ = other.logout().await;
+}
+
+/// Appends messages "Old 0"… to `mailbox`, oldest first.
+async fn append_many(session: &mut imap::Session, mailbox: &str, count: usize) {
+    for n in 0..count {
+        session
+            .append(
+                mailbox,
+                None,
+                None,
+                raw(&format!("old{n}@x.com"), &format!("Old {n}")),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn account_state(engine: &Engine, account_id: i64) -> imap::SyncState {
+    let account = engine.store().account(account_id).unwrap().unwrap();
+    serde_json::from_str(&account.sync_state).unwrap()
+}
+
+#[tokio::test]
+async fn imap_inbox_reaches_back() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("older{}@example.com", now_ms());
+    let total = imap::FIRST_SYNC_LIMIT + OLDER_STEP + 20;
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    append_many(&mut other, "INBOX", total).await;
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    let has_older = || inbox_has_older(&engine.store().account(account.id).unwrap().unwrap());
+    assert!(!has_older(), "nothing synced yet");
+
+    // The first sync takes the newest 300, and knows there's more.
+    let report = engine.run(account.id, true).await.unwrap();
+    assert_eq!(report.new, imap::FIRST_SYNC_LIMIT);
+    let first = account_state(&engine, account.id);
+    assert!(!first.complete);
+    assert!(has_older());
+
+    // Reaching back: the next 100 below the floor, stored quietly.
+    let older = Round {
+        older_inbox: true,
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &older).await.unwrap();
+    assert_eq!(report.older, OLDER_STEP, "{report:?}");
+    assert!(report.changed());
+    assert!(report.arrived.is_empty() && report.new == 0);
+    let reached = account_state(&engine, account.id);
+    assert!(reached.floor < first.floor);
+    assert!(!reached.complete && has_older());
+    let old = find(&engine, "Old 20");
+    assert!(old.state == MessageState::Inbox && !old.screening);
+    let messages = engine.store().messages().unwrap();
+    assert!(messages.iter().all(|m| m.subject != "Old 19"));
+
+    // The last 20: nothing older is left.
+    let report = engine.run_round(account.id, &older).await.unwrap();
+    assert_eq!(report.older, 20);
+    assert!(account_state(&engine, account.id).complete);
+    assert!(!has_older());
+    assert_eq!(engine.store().messages().unwrap().len(), total);
+
+    // The next sync tracks them like the rest: none gone, flags followed.
+    other.select("INBOX").await.unwrap();
+    let uids = other
+        .uid_search("HEADER Message-ID \"old3@x.com\"")
+        .await
+        .unwrap();
+    let uid = uids.into_iter().next().unwrap();
+    let _: Vec<_> = other
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Seen)")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let report = engine.run(account.id, true).await.unwrap();
+    assert_eq!((report.new, report.gone), (0, 0), "{report:?}");
+    let old = find(&engine, "Old 3");
+    assert!(old.state == MessageState::Inbox && !old.unread);
+    assert!(account_state(&engine, account.id).complete);
+
+    // Nothing further back: reaching back changes nothing.
+    let report = engine.run_round(account.id, &older).await.unwrap();
+    assert_eq!(report.older, 0);
+    assert!(!report.changed());
+
+    let _ = other.logout().await;
+}
+
+#[tokio::test]
+async fn imap_folders_reach_back() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("olderfolders{}@example.com", now_ms());
+    let total = imap::FOLDER_LIMIT as usize + 50;
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.create("Projects").await.unwrap();
+    append_many(&mut other, "Projects", total).await;
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    let list = Round {
+        list_folders: true,
+        ..Default::default()
+    };
+    engine.run_round(account.id, &list).await.unwrap();
+    let projects = folder_id(&engine, "Projects");
+    let folder = || engine.store().folder(projects).unwrap().unwrap();
+    let members = || {
+        let messages = engine.store().messages().unwrap();
+        messages
+            .iter()
+            .filter(|m| m.folders.contains(&projects))
+            .count()
+    };
+    assert!(!folder_has_older(&folder()), "not synced yet");
+
+    // Synced: the newest 200, and there's more.
+    let sync = Round {
+        folders: vec![projects],
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &sync).await.unwrap();
+    assert_eq!(report.folder_changes, imap::FOLDER_LIMIT as usize);
+    assert!(folder_has_older(&folder()));
+
+    // Reaching back brings in the other 50, and the folder list hears that
+    // nothing's left.
+    let older = Round {
+        older_folders: vec![projects],
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &older).await.unwrap();
+    assert_eq!(report.folder_changes, 50, "{report:?}");
+    assert!(report.folders_changed);
+    assert!(!folder_has_older(&folder()));
+    let state: imap::FolderState = serde_json::from_str(&folder().sync_state).unwrap();
+    assert_eq!(state.limit, Some(imap::FOLDER_LIMIT + OLDER_STEP as u32));
+    assert_eq!(members(), total);
+    assert_eq!(find(&engine, "Old 0").state, MessageState::Filed);
+
+    // Later syncs keep all of it.
+    let report = engine.run_round(account.id, &sync).await.unwrap();
+    assert_eq!(report.folder_changes, 0, "{report:?}");
+    assert!(!report.folders_changed);
+    assert_eq!(members(), total);
 
     let _ = other.logout().await;
 }

@@ -1,7 +1,8 @@
 //! The engine the apps drive: adding accounts, and per account one round of
 //! work at a time (send what's due, push local changes, fetch new mail,
-//! list and sync folders). Callers run rounds for an account one after
-//! another; different accounts can run in parallel.
+//! reach back for older mail, list and sync folders). Callers run rounds
+//! for an account one after another; different accounts can run in
+//! parallel.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,7 +17,7 @@ use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::oauth::{self, App};
-use crate::{Error, Result, smtp};
+use crate::{Error, OLDER_STEP, Result, smtp};
 
 /// How long a local change waits before it's pushed: longer than the UI's
 /// undo window, so an undone change never reaches the server.
@@ -62,6 +63,11 @@ pub struct Round {
     pub list_folders: bool,
     /// Stored folders (of any account; others are skipped) to sync.
     pub folders: Vec<i64>,
+    /// Reach `OLDER_STEP` messages further back in the inbox.
+    pub older_inbox: bool,
+    /// Stored folders (of any account; others are skipped) to reach
+    /// `OLDER_STEP` messages further back in, and so sync.
+    pub older_folders: Vec<i64>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -73,9 +79,12 @@ pub struct Report {
     /// except on an account's first sync, which brings in mail they've
     /// already seen elsewhere.
     pub arrived: Vec<i64>,
+    /// Older inbox mail brought in by reaching back. It's never `arrived`.
+    pub older: usize,
     /// Messages that came into or left synced folders.
     pub folder_changes: usize,
-    /// The folder list changed, or a folder was synced for the first time.
+    /// The folder list changed, a folder was synced for the first time, or
+    /// one now has (or no longer has) older mail beyond its list.
     pub folders_changed: bool,
     /// Folders that couldn't be synced this round, and why.
     pub folder_errors: Vec<String>,
@@ -86,7 +95,7 @@ pub struct Report {
 impl Report {
     /// Whether the message list needs reloading.
     pub fn changed(&self) -> bool {
-        self.new + self.gone + self.folder_changes + self.drafts > 0
+        self.new + self.gone + self.older + self.folder_changes + self.drafts > 0
     }
 
     fn drafts_pushed(&mut self, pushed: DraftsReport) {
@@ -244,9 +253,13 @@ impl Engine {
         .await
     }
 
-    /// `run`, plus listing the account's folders and syncing some of them.
-    /// A folder that can't be synced doesn't fail the round unless the
-    /// account itself is unreachable.
+    /// `run`, plus reaching back for older mail, listing the account's
+    /// folders and syncing some of them. A folder that can't be synced
+    /// doesn't fail the round unless the account itself is unreachable.
+    ///
+    /// Reaching back for older inbox mail moves the sync position, which a
+    /// round reads at its start and writes at its end: so it happens here,
+    /// in the account's round, and not on a connection of its own.
     pub async fn run_round(&self, account_id: i64, round: &Round) -> Result<Report> {
         let account = self.account(account_id)?;
         let pending = self.store().pending(account_id, now_ms(), SETTLE_MS)?;
@@ -257,11 +270,16 @@ impl Engine {
             .store()
             .folders()?
             .into_iter()
-            .filter(|f| f.account_id == account_id && f.selectable && round.folders.contains(&f.id))
+            .filter(|f| {
+                f.account_id == account_id
+                    && f.selectable
+                    && (round.folders.contains(&f.id) || round.older_folders.contains(&f.id))
+            })
             .collect();
         if pending.is_empty()
             && !draft_work
             && !round.fetch
+            && !round.older_inbox
             && !round.list_folders
             && folders.is_empty()
         {
@@ -293,6 +311,13 @@ impl Engine {
                     let sync = sync?;
                     report.synced(sync.new, sync.gone, sync.first);
                 }
+                if round.older_inbox {
+                    let older =
+                        imap::older_inbox(&mut session, &self.store, account_id, &mut state).await;
+                    // Keep the lowered floor even if part of it failed.
+                    self.store().set_sync_state(account_id, &to_json(&state))?;
+                    report.older = older?;
+                }
                 self.store().set_sync_state(account_id, &to_json(&state))?;
                 let mut listed = false;
                 if round.list_folders {
@@ -302,6 +327,10 @@ impl Engine {
                 }
                 for folder in &folders {
                     let mut folder_state: imap::FolderState = from_json(&folder.sync_state);
+                    if round.older_folders.contains(&folder.id) && !folder_state.complete {
+                        let limit = folder_state.limit.unwrap_or(imap::FOLDER_LIMIT);
+                        folder_state.limit = Some(limit + OLDER_STEP as u32);
+                    }
                     match imap::sync_folder(&mut session, &self.store, folder, &mut folder_state)
                         .await
                     {
@@ -333,13 +362,19 @@ impl Engine {
                     let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await?;
                     report.drafts_pushed(pushed);
                 }
+                let mut state: graph::SyncState = from_json(&account.sync_state);
                 if round.fetch {
-                    let mut state: graph::SyncState = from_json(&account.sync_state);
                     let sync = graph
                         .sync_inbox(&self.store, account_id, &mut state)
                         .await?;
                     self.store().set_sync_state(account_id, &to_json(&state))?;
                     report.synced(sync.new, sync.gone, sync.first);
+                }
+                if round.older_inbox {
+                    let older = graph.older_inbox(&self.store, account_id, &mut state).await;
+                    // Keep how far it got even if part of it failed.
+                    self.store().set_sync_state(account_id, &to_json(&state))?;
+                    report.older = older?;
                 }
                 let mut listed = false;
                 if round.list_folders {
@@ -348,9 +383,17 @@ impl Engine {
                     listed = true;
                 }
                 for folder in &folders {
-                    match graph.sync_folder(&self.store, folder).await {
+                    let mut folder_state: graph::FolderState = from_json(&folder.sync_state);
+                    if round.older_folders.contains(&folder.id) && !folder_state.complete {
+                        let limit = folder_state.limit.unwrap_or(graph::FOLDER_LIMIT);
+                        folder_state.limit = Some(limit + OLDER_STEP);
+                    }
+                    match graph
+                        .sync_folder(&self.store, folder, &mut folder_state)
+                        .await
+                    {
                         Ok(Some(changed)) => {
-                            self.folder_synced(folder, "{}", &mut report)?;
+                            self.folder_synced(folder, &to_json(&folder_state), &mut report)?;
                             report.folder_changes += changed;
                         }
                         Ok(None) => {
@@ -371,7 +414,8 @@ impl Engine {
 
     fn folder_synced(&self, folder: &Folder, state: &str, report: &mut Report) -> Result<()> {
         self.store().set_folder_synced(folder.id, state, now_ms())?;
-        if folder.synced_at.is_none() {
+        let complete = |state: &str| from_json::<Reach>(state).complete;
+        if folder.synced_at.is_none() || complete(&folder.sync_state) != complete(state) {
             report.folders_changed = true;
         }
         Ok(())
@@ -795,6 +839,36 @@ pub fn config(account: &Account) -> Result<AccountConfig> {
     })
 }
 
+/// Whether the server has inbox mail older than what's synced, for
+/// reaching back. False until the first sync.
+pub fn inbox_has_older(account: &Account) -> bool {
+    match config(account) {
+        Ok(AccountConfig::Imap { .. }) => {
+            let state: imap::SyncState = from_json(&account.sync_state);
+            state.floor.is_some() && !state.complete
+        }
+        Ok(AccountConfig::Microsoft { .. }) => {
+            let state: graph::SyncState = from_json(&account.sync_state);
+            state.delta_link.is_some() && !state.complete
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether the folder has messages older than its synced list. False until
+/// its first sync.
+pub fn folder_has_older(folder: &Folder) -> bool {
+    folder.synced_at.is_some() && !from_json::<Reach>(&folder.sync_state).complete
+}
+
+/// What both backends' folder states say about reaching back.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Reach {
+    /// Nothing older is left.
+    complete: bool,
+}
+
 /// Gmail's servers, for app-password accounts.
 pub fn gmail_servers() -> (Server, Server) {
     (
@@ -870,6 +944,57 @@ mod tests {
             r#"{"type":"microsoft","clientId":"c","tenant":"t"}"#
         );
         assert_eq!(serde_json::from_str::<AccountConfig>(&json).unwrap(), imap);
+    }
+
+    #[test]
+    fn older_mail_is_there_until_a_sync_says_otherwise() {
+        let imap = AccountConfig::Imap {
+            username: "me@x.com".into(),
+            imap: Server::new("imap.x.com", 993),
+            smtp: Server::new("smtp.x.com", 465),
+        };
+        let microsoft = AccountConfig::Microsoft {
+            client_id: "c".into(),
+            tenant: "t".into(),
+        };
+        let account = |config: &AccountConfig, sync_state: &str| Account {
+            id: 1,
+            kind: AccountKind::Imap,
+            email: "me@x.com".into(),
+            name: String::new(),
+            label: String::new(),
+            color: String::new(),
+            config: to_json(config),
+            sync_state: sync_state.into(),
+        };
+        // Not synced yet; synced before `complete` was kept; synced in full.
+        for (config, unsynced, synced) in [
+            (&imap, "{}", r#"{"uidValidity":3,"floor":40}"#),
+            (&microsoft, "{}", r#"{"deltaLink":"https://graph/delta"}"#),
+        ] {
+            assert!(!inbox_has_older(&account(config, unsynced)));
+            assert!(inbox_has_older(&account(config, synced)));
+            let complete = synced.replace('}', r#","complete":true}"#);
+            assert!(!inbox_has_older(&account(config, &complete)));
+        }
+
+        let folder = |sync_state: &str, synced_at| Folder {
+            id: 1,
+            account_id: 1,
+            remote_id: "Projects".into(),
+            parent_id: None,
+            name: "Projects".into(),
+            role: None,
+            selectable: true,
+            sync_state: sync_state.into(),
+            synced_at,
+        };
+        assert!(!folder_has_older(&folder("{}", None)));
+        assert!(folder_has_older(&folder(r#"{"uidValidity":3}"#, Some(5))));
+        assert!(!folder_has_older(&folder(
+            r#"{"limit":300,"complete":true}"#,
+            Some(5)
+        )));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Microsoft Graph for Microsoft 365 mailboxes: the inbox through delta
-//! queries, other folders' newest messages, flag and move changes, folder
+//! queries over its recent mail (older mail comes in as the user scrolls to
+//! it), other folders' newest messages, flag and move changes, folder
 //! management, and sending.
 //!
 //! Every request asks for immutable ids, so a message keeps its id when it
@@ -24,19 +25,23 @@ use crate::attachment::{
 };
 use crate::draft::{Draft, recipients};
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
-use crate::{Error, Result};
+use crate::{Error, OLDER_STEP, Result};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 /// How far back the first sync of a Microsoft account reaches.
 pub const FIRST_SYNC_DAYS: i64 = 30;
+const DAY_MS: i64 = 86_400_000;
 const HOST: &str = "graph.microsoft.com";
 /// Graph takes attachments smaller than this in one request; bigger ones go
 /// up through an upload session.
 const INLINE_ATTACHMENT_MAX: usize = 3 * 1024 * 1024;
 /// Upload session chunks must be multiples of 320 KiB.
 const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
-/// A folder shows its newest this many messages.
+/// A folder shows its newest this many messages, until the user reaches
+/// further back.
 pub const FOLDER_LIMIT: usize = 200;
+/// Graph's biggest page of messages.
+const MAX_PAGE: usize = 1000;
 /// More new messages than this in a folder are fetched in one listing
 /// rather than one by one.
 const FETCH_ONE_BY_ONE: usize = 10;
@@ -72,11 +77,45 @@ pub(crate) fn http() -> reqwest::Client {
         .clone()
 }
 
+/// Where an account's sync stands, kept as JSON in the store.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncState {
     pub delta_link: Option<String>,
+    /// Where the delta query's window starts (Unix ms); older mail comes
+    /// through `older_inbox`.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// The oldest inbox mail reached back for so far (Unix ms).
+    #[serde(default)]
+    pub older_than: Option<i64>,
+    /// Nothing older is left in the inbox.
+    #[serde(default)]
+    pub complete: bool,
 }
+
+/// Where a folder's sync stands, kept as JSON with the folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FolderState {
+    /// How many of its newest messages the folder shows; `FOLDER_LIMIT`
+    /// until the user reaches further back.
+    pub limit: Option<usize>,
+    /// The folder has no messages beyond the limit.
+    pub complete: bool,
+}
+
+/// A message as a listing gives it: enough to tell whether it's stored,
+/// and its flags.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Listed {
+    id: String,
+    received_date_time: Option<String>,
+    is_read: Option<bool>,
+    flag: Option<GraphFlag>,
+}
+const LISTED: &str = "id,receivedDateTime,isRead,flag";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
@@ -266,7 +305,11 @@ impl Graph {
         };
         let mut url = match &state.delta_link {
             Some(link) => link.clone(),
-            None => first_delta_url(spark_store::now_ms()),
+            None => {
+                let since = first_sync_since(spark_store::now_ms());
+                state.since = Some(since);
+                first_delta_url(since)
+            }
         };
         loop {
             let request = self
@@ -384,95 +427,56 @@ impl Graph {
         Ok(folders)
     }
 
-    /// Brings a folder's newest messages (up to `FOLDER_LIMIT`) into the
-    /// store and makes them its list. Returns how many came or went, or
-    /// `None` if the folder is gone.
+    /// Brings a folder's newest messages (up to its limit) into the store
+    /// and makes them its list. Returns how many came or went, or `None` if
+    /// the folder is gone.
     pub async fn sync_folder(
         &self,
         store: &Mutex<Store>,
         folder: &Folder,
+        state: &mut FolderState,
     ) -> Result<Option<usize>> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Listed {
-            id: String,
-            is_read: Option<bool>,
-            flag: Option<GraphFlag>,
-        }
         let account_id = folder.account_id;
-        let messages = format!("/me/mailFolders/{}/messages", path(&folder.remote_id));
-        let listing: Page<Listed> = match self
-            .json(self.request(
-                Method::GET,
-                &format!(
-                    "{messages}?$top={FOLDER_LIMIT}&$orderby=receivedDateTime+desc&$select=id,isRead,flag"
-                ),
-            ))
-            .await
-        {
-            Err(Error::Gone) => return Ok(None),
-            other => other?,
-        };
+        let limit = state.limit.unwrap_or(FOLDER_LIMIT);
+        let messages = format!(
+            "/me/mailFolders/{}/messages?$orderby=receivedDateTime+desc",
+            path(&folder.remote_id)
+        );
+        let mut listing: Vec<Listed> = Vec::new();
+        let mut next = Some(format!(
+            "{messages}&$top={}&$select={LISTED}",
+            limit.min(MAX_PAGE)
+        ));
+        let mut ended = false;
+        while let Some(url) = next.take() {
+            let page: Page<Listed> = match self.json(self.request(Method::GET, &url)).await {
+                Err(Error::Gone) => return Ok(None),
+                other => other?,
+            };
+            listing.extend(page.value);
+            match page.next_link {
+                Some(link) if listing.len() < limit => next = Some(link),
+                Some(_) => {}
+                None => ended = true,
+            }
+        }
+        state.complete = ended && listing.len() <= limit;
+        listing.truncate(limit);
         let (before, known): (HashSet<i64>, HashSet<String>) = {
             let store = lock(store);
             let mut known = HashSet::new();
-            for m in &listing.value {
+            for m in &listing {
                 if store.has_remote_id(account_id, &m.id)? {
                     known.insert(m.id.clone());
                 }
             }
             (store.folder_member_ids(folder.id)?, known)
         };
-
-        // The new ones in full: one by one, or the whole listing again.
-        let unknown: Vec<&str> = listing
-            .value
-            .iter()
-            .map(|m| m.id.as_str())
-            .filter(|id| !known.contains(*id))
-            .collect();
-        let mut full: HashMap<String, GraphMessage> = HashMap::new();
-        if unknown.len() > FETCH_ONE_BY_ONE {
-            let mut next = Some(format!(
-                "{messages}?$top=50&$orderby=receivedDateTime+desc&$select={SELECT}"
-            ));
-            while let Some(url) = next.take() {
-                let page: Page<GraphMessage> = self
-                    .json(
-                        self.request(Method::GET, &url)
-                            .header("Prefer", "outlook.body-content-type=\"html\""),
-                    )
-                    .await?;
-                full.extend(page.value.into_iter().map(|m| (m.id.clone(), m)));
-                if full.len() < FOLDER_LIMIT {
-                    next = page.next_link;
-                }
-            }
-        } else {
-            for id in &unknown {
-                match self
-                    .json::<GraphMessage>(
-                        self.request(
-                            Method::GET,
-                            &format!("/me/messages/{}?$select={SELECT}", path(id)),
-                        )
-                        .header("Prefer", "outlook.body-content-type=\"html\""),
-                    )
-                    .await
-                {
-                    Ok(m) => {
-                        full.insert(m.id.clone(), m);
-                    }
-                    // Moved or deleted since the listing.
-                    Err(Error::Gone) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+        let full = self.unknown_in_full(&messages, 0, &listing, &known).await?;
 
         let mut changed = 0;
         let mut members = Vec::new();
-        for listed in &listing.value {
+        for listed in &listing {
             let unread = !listed.is_read.unwrap_or(false);
             let flagged = listed
                 .flag
@@ -505,6 +509,147 @@ impl Graph {
         }
         changed += lock(store).set_folder_members(folder.id, &members)?;
         Ok(Some(changed))
+    }
+
+    /// The messages of a listing that aren't in `known`, in full: one by
+    /// one when there are few, else by listing again with bodies over the
+    /// stretch that holds them. `messages` is the listing's path with its
+    /// filter and order; `listed` what it listed from position `offset` on.
+    /// Messages moved or deleted since are left out.
+    async fn unknown_in_full(
+        &self,
+        messages: &str,
+        offset: usize,
+        listed: &[Listed],
+        known: &HashSet<String>,
+    ) -> Result<HashMap<String, GraphMessage>> {
+        let unknown = |m: &Listed| !known.contains(&m.id);
+        let mut full: HashMap<String, GraphMessage> = HashMap::new();
+        let (Some(first), Some(last)) = (
+            listed.iter().position(unknown),
+            listed.iter().rposition(unknown),
+        ) else {
+            return Ok(full);
+        };
+        if listed.iter().filter(|m| unknown(m)).count() > FETCH_ONE_BY_ONE {
+            let mut covered = offset + first;
+            let mut next = Some(format!(
+                "{messages}&$top=50&$skip={covered}&$select={SELECT}"
+            ));
+            while let Some(url) = next.take() {
+                let page: Page<GraphMessage> = self
+                    .json(
+                        self.request(Method::GET, &url)
+                            .header("Prefer", "outlook.body-content-type=\"html\""),
+                    )
+                    .await?;
+                covered += page.value.len();
+                full.extend(page.value.into_iter().map(|m| (m.id.clone(), m)));
+                if covered <= offset + last {
+                    next = page.next_link;
+                }
+            }
+        } else {
+            for m in listed.iter().filter(|m| unknown(m)) {
+                match self
+                    .json::<GraphMessage>(
+                        self.request(
+                            Method::GET,
+                            &format!("/me/messages/{}?$select={SELECT}", path(&m.id)),
+                        )
+                        .header("Prefer", "outlook.body-content-type=\"html\""),
+                    )
+                    .await
+                {
+                    Ok(m) => {
+                        full.insert(m.id.clone(), m);
+                    }
+                    // Moved or deleted since the listing.
+                    Err(Error::Gone) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(full)
+    }
+
+    /// Reaches further back in the inbox than the delta query: stores the
+    /// next `OLDER_STEP` messages received before the oldest reached so far
+    /// (at first, before the delta window), as on a first sync: no
+    /// screening. Returns how many were new.
+    ///
+    /// The delta query only covers its own window, so changes made
+    /// elsewhere to mail this old (read, flagged, moved, deleted) don't
+    /// reach the store.
+    pub async fn older_inbox(
+        &self,
+        store: &Mutex<Store>,
+        account_id: i64,
+        state: &mut SyncState,
+    ) -> Result<usize> {
+        if state.delta_link.is_none() {
+            return Ok(0);
+        }
+        let before = match state.older_than {
+            // The rest of that second too: some of it may not be listed yet.
+            Some(oldest) => oldest + 1000,
+            // Accounts synced before `since` was kept had the default window.
+            None => state
+                .since
+                .unwrap_or_else(|| first_sync_since(spark_store::now_ms())),
+        };
+        let messages = format!(
+            "/me/mailFolders/inbox/messages?$filter=receivedDateTime+lt+{}&$orderby=receivedDateTime+desc",
+            iso_date(before)
+        );
+        let mut next = Some(format!("{messages}&$top={OLDER_STEP}&$select={LISTED}"));
+        let mut offset = 0;
+        let mut stored = 0;
+        while let Some(url) = next.take() {
+            let page: Page<Listed> = self.json(self.request(Method::GET, &url)).await?;
+            let known: HashSet<String> = {
+                let store = lock(store);
+                let mut known = HashSet::new();
+                for m in &page.value {
+                    if store.has_remote_id(account_id, &m.id)? {
+                        known.insert(m.id.clone());
+                    }
+                }
+                known
+            };
+            let full = self
+                .unknown_in_full(&messages, offset, &page.value, &known)
+                .await?;
+            for listed in &page.value {
+                let Some(m) = full.get(&listed.id) else {
+                    continue;
+                };
+                let mut incoming = to_incoming(account_id, m);
+                if m.has_attachments == Some(true) {
+                    incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
+                }
+                if let Added::New(_) = lock(store).add_incoming(&incoming, false)? {
+                    stored += 1;
+                }
+            }
+            offset += page.value.len();
+            if let Some(oldest) = page
+                .value
+                .iter()
+                .filter_map(|m| m.received_date_time.as_deref().and_then(parse_iso_date))
+                .min()
+            {
+                state.older_than = Some(state.older_than.map_or(oldest, |o| o.min(oldest)));
+            }
+            match page.next_link {
+                // Mail already stored doesn't count: an account whose
+                // window lagged behind lists past it.
+                Some(link) if stored < OLDER_STEP => next = Some(link),
+                Some(_) => {}
+                None => state.complete = true,
+            }
+        }
+        Ok(stored)
     }
 
     /// Creates a folder, in `parent` (a folder id) or at the top; returns its id.
@@ -1008,9 +1153,14 @@ pub fn draft_message(draft: &Draft) -> Value {
     })
 }
 
-/// The first delta request: the inbox's last `FIRST_SYNC_DAYS` days.
-pub fn first_delta_url(now_ms: i64) -> String {
-    let since = iso_date(now_ms - FIRST_SYNC_DAYS * 86_400_000);
+/// Where the first sync's window starts: `FIRST_SYNC_DAYS` before now.
+pub fn first_sync_since(now_ms: i64) -> i64 {
+    now_ms - FIRST_SYNC_DAYS * DAY_MS
+}
+
+/// The first delta request: the inbox's mail received since `since_ms`.
+pub fn first_delta_url(since_ms: i64) -> String {
+    let since = iso_date(since_ms);
     format!(
         "{GRAPH}/me/mailFolders/inbox/messages/delta?$select={SELECT}&$filter=receivedDateTime+ge+{since}"
     )
@@ -1181,7 +1331,7 @@ mod tests {
             Some(1_709_164_800_000)
         );
         assert_eq!(parse_iso_date("nonsense"), None);
-        let url = first_delta_url(ms);
+        let url = first_delta_url(first_sync_since(ms));
         assert!(
             url.ends_with("$filter=receivedDateTime+ge+2026-09-21T14:00:00Z"),
             "{url}"
@@ -1436,6 +1586,224 @@ mod tests {
         assert_eq!(cids, ["image001.png@01dd", "photo"]);
         assert_eq!(both[1].mime, "image/jpeg", "typed by its name");
         assert!(!seen.lock().unwrap().iter().any(|p| p.ends_with("/file")));
+    }
+
+    /// 2026-10-21 14:00 UTC.
+    const NEWEST: i64 = 1_792_591_200_000;
+
+    /// When message `n` of a stand-in mailbox arrived: an hour apart, the
+    /// first newest.
+    fn received(n: usize) -> i64 {
+        NEWEST - n as i64 * 3_600_000
+    }
+
+    /// A stand-in mailbox: 350 inbox messages `i0`… and 260 in folder `f1`
+    /// (`m0`…), newest first. Listings take `$filter` (`lt` only), `$skip`
+    /// and `$top`, give at most 100 a page, and link the next page.
+    fn mailbox(path: &str) -> Option<Value> {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let q: HashMap<&str, &str> = query.split('&').filter_map(|p| p.split_once('=')).collect();
+        let full = |id: &str, n: usize| {
+            json!({
+                "id": id, "subject": format!("Message {id}"), "isRead": true,
+                "receivedDateTime": iso_date(received(n)),
+                "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
+                "internetMessageId": format!("<{id}@contoso.com>"),
+                "body": { "contentType": "text", "content": "Hi" },
+            })
+        };
+        if let Some(id) = route.strip_prefix("/me/messages/") {
+            return Some(full(id, id[1..].parse().ok()?));
+        }
+        let (prefix, count) = match route {
+            "/me/mailFolders/inbox/messages" => ("i", 350),
+            "/me/mailFolders/f1/messages" => ("m", 260),
+            _ => return None,
+        };
+        let before = q
+            .get("$filter")
+            .and_then(|f| f.strip_prefix("receivedDateTime+lt+"))
+            .and_then(parse_iso_date)
+            .unwrap_or(i64::MAX);
+        let matching: Vec<usize> = (0..count).filter(|n| received(*n) < before).collect();
+        let skip: usize = q.get("$skip").map_or(0, |s| s.parse().unwrap());
+        let top: usize = q["$top"].parse().unwrap();
+        let page: Vec<usize> = matching
+            .iter()
+            .copied()
+            .skip(skip)
+            .take(top.min(100))
+            .collect();
+        let listing = q["$select"].starts_with("id,");
+        let value: Vec<Value> = page
+            .iter()
+            .map(|n| {
+                let id = format!("{prefix}{n}");
+                if listing {
+                    json!({ "id": id, "receivedDateTime": iso_date(received(*n)), "isRead": true })
+                } else {
+                    full(&id, *n)
+                }
+            })
+            .collect();
+        let mut reply = json!({ "value": value });
+        if skip + page.len() < matching.len() {
+            let rest: Vec<&str> = query
+                .split('&')
+                .filter(|p| !p.starts_with("$skip="))
+                .collect();
+            reply["@odata.nextLink"] = json!(format!(
+                "{route}?{}&$skip={}",
+                rest.join("&"),
+                skip + page.len()
+            ));
+        }
+        Some(reply)
+    }
+
+    fn microsoft_store() -> (Mutex<Store>, i64) {
+        let store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&spark_store::NewAccount {
+                kind: spark_store::AccountKind::Microsoft,
+                email: "me@contoso.com",
+                name: "",
+                label: "Work",
+                config: "{}",
+            })
+            .unwrap();
+        (Mutex::new(store), account.id)
+    }
+
+    /// The `$skip`s of the listings with bodies among `paths`.
+    fn full_listings(paths: &[String]) -> Vec<usize> {
+        paths
+            .iter()
+            .filter(|p| p.contains("messages?") && p.contains("$select=subject"))
+            .map(|p| {
+                let skip = p.split("$skip=").nth(1).expect("full listings skip");
+                skip.split('&').next().unwrap().parse().unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn folders_reach_back_by_raising_their_limit() {
+        let (base, seen) = stand_in(mailbox).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let folder = {
+            let mut s = lock(&store);
+            s.replace_folders(
+                account_id,
+                &[RemoteFolder {
+                    remote_id: "f1".into(),
+                    parent: None,
+                    name: "Projects".into(),
+                    role: None,
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+            s.folders().unwrap().remove(0)
+        };
+
+        // The newest 200, listed over two pages, then fetched in full.
+        let mut state = FolderState::default();
+        let changed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(changed.unwrap(), Some(200));
+        assert!(!state.complete, "60 more are on the server");
+        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert!(paths[0].contains("$top=200"), "{paths:?}");
+        assert_eq!(full_listings(&paths), [0, 50, 100, 150]);
+
+        // 100 further back: the rest, and only the rest is fetched in full.
+        state.limit = Some(FOLDER_LIMIT + OLDER_STEP);
+        let changed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(changed.unwrap(), Some(60));
+        assert!(state.complete);
+        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert_eq!(full_listings(&paths), [200, 250]);
+        assert_eq!(
+            lock(&store).folder_member_ids(folder.id).unwrap().len(),
+            260
+        );
+
+        // Nothing new: listed, nothing fetched.
+        let changed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(changed.unwrap(), Some(0));
+        assert!(full_listings(&seen.lock().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_inbox_reaches_back_past_the_delta_window() {
+        let (base, seen) = stand_in(mailbox).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        // An account whose delta window starts between i49 and i50, and
+        // which already has i50…i79 (as if the window had been wider).
+        let since = received(50) + 1_800_000;
+        for n in 50..80 {
+            let m = Incoming {
+                account_id,
+                remote_id: Some(format!("i{n}")),
+                date: received(n),
+                ..Default::default()
+            };
+            lock(&store).add_incoming(&m, false).unwrap();
+        }
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(since),
+            ..Default::default()
+        };
+
+        // Past the stored ones until at least 100 are new: two pages.
+        let stored = graph.older_inbox(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 70 + 100);
+        assert_eq!(state.older_than, Some(received(249)));
+        assert!(!state.complete);
+        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert!(
+            paths[0].contains(&format!(
+                "$filter=receivedDateTime+lt+{}&$orderby=receivedDateTime+desc",
+                iso_date(since)
+            )),
+            "{paths:?}"
+        );
+        assert_eq!(
+            full_listings(&paths),
+            [30, 80, 100, 150],
+            "from the first unknown, not the stored ones"
+        );
+        let messages = lock(&store).messages().unwrap();
+        let old = messages
+            .iter()
+            .find(|m| m.subject == "Message i200")
+            .unwrap();
+        assert!(!old.screening && old.state == spark_store::MessageState::Inbox);
+
+        // The next 100, which end the inbox; i249 is listed again, as mail
+        // of its second might not have been.
+        let stored = graph.older_inbox(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 100);
+        assert_eq!(state.older_than, Some(received(349)));
+        assert!(state.complete);
+        assert_eq!(lock(&store).messages().unwrap().len(), 300);
+
+        // Before the first sync there's nothing to reach back from.
+        let mut fresh = SyncState::default();
+        let stored = graph.older_inbox(&store, account_id, &mut fresh).await;
+        assert_eq!(stored.unwrap(), 0);
+        assert_eq!(fresh, SyncState::default());
+    }
+
+    #[test]
+    fn states_from_before_reaching_back_still_read() {
+        let state: SyncState = serde_json::from_str(r#"{"deltaLink":"https://x"}"#).unwrap();
+        assert!(state.since.is_none() && state.older_than.is_none() && !state.complete);
+        let folder: FolderState = serde_json::from_str("{}").unwrap();
+        assert_eq!(folder, FolderState::default());
     }
 
     #[test]

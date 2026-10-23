@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use spark_mail::attachment::{AttachmentData, mime_for};
 use spark_mail::draft::{self, Draft, OutgoingAttachment};
-use spark_mail::engine::gmail_servers;
+use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_store::{
     Account, AccountKind, Category, Folder, FolderRole, MessageState, OutboxFile, Patch, now_ms,
@@ -82,6 +82,9 @@ pub struct FolderView {
     pub selectable: bool,
     /// Its messages have been synced at least once.
     pub synced: bool,
+    /// It has messages older than the ones synced, which `load_older`
+    /// reaches back for.
+    pub has_older: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -96,6 +99,9 @@ pub struct AccountView {
     pub provider: &'static str,
     pub demo: bool,
     pub sync: SyncView,
+    /// The server has inbox mail older than what's synced, which
+    /// `load_older` reaches back for.
+    pub has_older: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -178,6 +184,7 @@ impl Mailbox {
                 AccountKind::Imap => "IMAP",
             },
             sync: self.live.status(account.id),
+            has_older: inbox_has_older(&account),
             email: account.email,
             name: account.name,
             label: account.label,
@@ -221,6 +228,7 @@ fn from_store(m: spark_store::Message) -> Message {
 
 fn folder_view(f: Folder) -> FolderView {
     FolderView {
+        has_older: folder_has_older(&f),
         id: f.id,
         account: f.account_id,
         name: f.name,
@@ -297,6 +305,26 @@ pub fn watch_folders(mailbox: State<'_, Mailbox>, ids: Vec<i64>) {
 #[tauri::command]
 pub fn sync_folders(mailbox: State<'_, Mailbox>, ids: Vec<i64>) {
     mailbox.live.sync_folders(ids);
+}
+
+/// Reaches 100 messages further back in these accounts' inboxes and these
+/// folders, e.g. when a list is scrolled near its end. Resolves once their
+/// accounts' rounds are over, even if one failed (that shows as a
+/// `sync-status` error); the UI then reloads.
+#[tauri::command]
+pub async fn load_older(
+    mailbox: State<'_, Mailbox>,
+    accounts: Vec<i64>,
+    folders: Vec<i64>,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        return Ok(());
+    }
+    for done in mailbox.live.load_older(accounts, folders) {
+        // A worker that stopped counts as done.
+        let _ = done.await;
+    }
+    Ok(())
 }
 
 /// Lists every account's folders again, e.g. when the folder picker opens.
