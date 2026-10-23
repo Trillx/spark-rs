@@ -40,14 +40,16 @@ import {
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   QUICK_REPLIES,
-  cancelQuickReply,
+  cancelCompose,
   cancelSummary,
-  draftQuickReply,
+  composeWithAi,
   getAiSettings,
   presetLabel,
   summarizeMessage,
   type AiEvent,
+  type ComposeAction,
   type QuickReply,
+  type Reference,
   type SummaryStyle,
 } from "./ai";
 import {
@@ -81,6 +83,7 @@ import {
   updateMessage,
   watchFolders,
 } from "./api";
+import type { AiRequest } from "./components/AiMenu";
 import CommandCenter, { type Command } from "./components/CommandCenter";
 import Composer, {
   draftHasContent,
@@ -190,8 +193,16 @@ import type {
 /** `targetId` points the actions at one row (its ⋯) rather than the current message. */
 type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetId: number };
 
-/** A quick reply AI is writing in the composer it opened (by `composerKey`). */
-type ReplyWriting = Writing & { composer: number; repliedTo: Message; chip: QuickReply };
+/** What AI does in a composer (by `composerKey`), and its body before AI started. */
+type ComposerWriting = Writing & { composer: number; request: AiRequest; before: string };
+
+/** `body` around `range`, and the trimmed text in it; the range's own outer whitespace stays outside. */
+function splitAround(body: string, [start, end]: [number, number]): [string, string, string] {
+  const picked = body.slice(start, end);
+  const lead = picked.length - picked.trimStart().length;
+  const trail = picked.length - picked.trimEnd().length;
+  return [body.slice(0, start + lead), picked.trim(), body.slice(end - trail)];
+}
 
 const INITIAL_VIEW: ListView = {
   folder: "inbox",
@@ -275,7 +286,9 @@ export default function App() {
   /** The composer as it stands, for callbacks that outlive a render (undo, autosave). */
   const composer = useRef({ draft, saved: draftSaved, key: composerKey });
   composer.current = { draft, saved: draftSaved, key: composerKey };
-  const [writing, setWriting] = useState<ReplyWriting | null>(null);
+  const [writing, setWriting] = useState<ComposerWriting | null>(null);
+  /** Counts AI runs in the composer, so a stopped or replaced run's late events are dropped. */
+  const writingRun = useRef(0);
   /** Drafts deleted while their Undo toast is up: hidden now, deleted when it's gone. */
   const [discarding, setDiscarding] = useState<ReadonlySet<number>>(new Set());
   const [palette, setPalette] = useState<Palette | null>(null);
@@ -1067,42 +1080,92 @@ export default function App() {
   /** A quick-reply chip: a reply your AI provider writes, or without one set up, a stock line. */
   function quickReply(m: Message, chip: QuickReply) {
     reply(m);
-    writeReply(m, chip, composer.current.key);
+    writeWithAi({ type: "quickReply", reply: chip });
   }
 
-  /** Streams a quick reply into composer `session`'s body; events after it closes are dropped. */
-  function writeReply(m: Message, chip: QuickReply, session: number) {
-    const fail = (message: string) => {
-      setDraft((d) => d && { ...d, body: "" });
-      setWriting((w) => w && { ...w, status: "error", message });
+  /** The email a draft replies to or forwards, and which, for AI. */
+  function draftReference(d: Draft): Reference | null {
+    if (d.replyTo === undefined) return null;
+    if (d.forward) return { id: d.replyTo, relation: "forward" };
+    const m = messages.find((x) => x.id === d.replyTo);
+    return { id: d.replyTo, relation: m && fromYou(m) ? "followUp" : "reply" };
+  }
+
+  /**
+   * Runs a +AI request in the open composer. A draft streams in place of the
+   * empty body; a rewrite replaces the request's range once its text starts
+   * arriving. If it fails, the body goes back to how it was.
+   */
+  function writeWithAi(request: AiRequest) {
+    const { draft: d, key: session } = composer.current;
+    if (!d) return;
+    const before = d.body;
+    const [head, text, tail] = "range" in request ? splitAround(before, request.range) : ["", "", ""];
+    const action: ComposeAction =
+      request.type === "rewrite"
+        ? { type: "rewrite", text, how: request.how }
+        : request.type === "refine"
+          ? { type: "refine", text, instructions: request.instructions }
+          : request;
+    const run = ++writingRun.current;
+    const base = { composer: session, request, before };
+    const settle = (next: Writing | null) => setWriting(next && { ...base, ...next });
+    const show = (written: string) => setDraft((d) => d && { ...d, body: head + written + tail });
+    const fail = (next: Writing) => {
+      setDraft((d) => d && { ...d, body: before });
+      settle(next);
     };
+    let written = "";
     const onEvent = (event: AiEvent) => {
-      if (composer.current.key !== session) return;
+      if (writingRun.current !== run) return;
       switch (event.event) {
         case "delta":
-          return setDraft((d) => d && { ...d, body: d.body + event.data.text });
-        case "done":
-          setDraft((d) => d && { ...d, body: d.body.trim() });
-          return setWriting(null);
+          written += event.data.text;
+          return show(written.trimStart());
+        case "done": {
+          show(written.trim());
+          const { truncated } = event.data;
+          // Replaced text can come back with Undo; a new draft just stays.
+          if (!text && !truncated) return settle(null);
+          return settle({ status: "done", message: truncated ? "Cut off at the length limit" : "Rewritten" });
+        }
         case "notConfigured":
-          setDraft((d) => d && { ...d, body: QUICK_REPLIES.find((q) => q.key === chip)!.text });
-          return setWriting(null);
+          if (request.type === "quickReply") {
+            show(QUICK_REPLIES.find((q) => q.key === request.reply)!.text);
+            return settle(null);
+          }
+          return fail({ status: "setup", message: event.data.message });
         case "refused":
-          return fail(`${aiProvider} declined to write this reply.`);
+          return fail({ status: "error", message: `${aiProvider} declined this request.` });
         case "error":
-          return fail(event.data.message);
+          return fail({ status: "error", message: event.data.message });
       }
     };
-    setDraft((d) => d && { ...d, body: "" });
-    setWriting({ status: "writing", composer: session, repliedTo: m, chip });
-    draftQuickReply(m, chip, session, onEvent).catch((error) =>
+    settle({ status: "writing" });
+    if (!text) show("");
+    composeWithAi(session, action, d.from, draftReference(d), onEvent).catch((error) =>
       onEvent({ event: "error", data: { message: String(error) } }),
     );
   }
 
   /** Stops AI writing in the composer, keeping what it wrote so far. */
   function stopWriting() {
-    if (writing?.status === "writing") void cancelQuickReply(writing.composer);
+    writingRun.current++;
+    if (writing?.status === "writing") void cancelCompose(writing.composer);
+    setWriting(null);
+  }
+
+  /** The Stop button: like stopWriting, but a stopped rewrite can still be undone. */
+  function stopAi() {
+    if (writing?.status !== "writing") return;
+    stopWriting();
+    if ("range" in writing.request) setWriting({ ...writing, status: "done", message: "Stopped" });
+  }
+
+  function undoAi() {
+    if (!writing) return;
+    const { before } = writing;
+    setDraft((d) => d && { ...d, body: before });
     setWriting(null);
   }
 
@@ -1772,10 +1835,19 @@ export default function App() {
             onDiscard={() => void discardComposer()}
             onSend={send}
             onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
-            writing={writing?.composer === composerKey ? writing : null}
-            onStopWriting={stopWriting}
-            onRetryWriting={() => writing && writeReply(writing.repliedTo, writing.chip, writing.composer)}
-            onDismissWriting={() => setWriting(null)}
+            ai={{
+              writing: writing?.composer === composerKey ? writing : null,
+              quickReplies: draftReference(draft)?.relation === "reply",
+              run: writeWithAi,
+              stop: stopAi,
+              retry: () => writing && writeWithAi(writing.request),
+              undo: undoAi,
+              dismiss: () => setWriting(null),
+              setUp: () => {
+                setWriting(null);
+                openSettings("ai");
+              },
+            }}
           />
         )}
 

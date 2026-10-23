@@ -101,12 +101,14 @@ export function Popover({
   trigger,
   children,
   align = "start",
+  direction = "down",
   label,
   className = "w-72",
 }: {
   trigger: (props: { open: boolean; toggle: () => void }) => ReactNode;
   children: (close: () => void) => ReactNode;
   align?: "start" | "end";
+  direction?: "down" | "up";
   label: string;
   className?: string;
 }) {
@@ -118,9 +120,9 @@ export function Popover({
         <div
           role="dialog"
           aria-label={label}
-          className={`absolute top-full z-[2020] mt-1 rounded-2xl border border-hairline bg-popover p-3 text-[13px] text-base-content shadow-popup ${className} ${
+          className={`absolute z-[2020] rounded-2xl border border-hairline bg-popover p-3 text-[13px] text-base-content shadow-popup ${className} ${
             align === "end" ? "right-0" : "left-0"
-          }`}
+          } ${direction === "up" ? "bottom-full mb-1" : "top-full mt-1"}`}
         >
           {children(() => setOpen(false))}
         </div>

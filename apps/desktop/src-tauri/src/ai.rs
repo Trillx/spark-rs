@@ -1,10 +1,11 @@
 //! Bring-your-own-key AI: the provider settings, the API key in the OS
-//! credential store, +AI Summary and Quick +AI Replies. The key stays on this
-//! side; the UI only learns whether one is stored.
+//! credential store, +AI Summary and the composer's +AI (Quick +AI Replies
+//! included). The key stays on this side; the UI only learns whether one is
+//! stored.
 
+mod compose;
 mod email;
 pub(crate) mod keys;
-mod reply;
 mod settings;
 mod stream;
 mod summary;
@@ -21,8 +22,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::mailbox::Mailbox;
+use compose::{ComposeAction, Reference};
 pub use keys::Keys;
-use reply::QuickReply;
 use settings::{AiSettings, Preset};
 use stream::AiEvent;
 use summary::SummaryStyle;
@@ -42,8 +43,8 @@ pub struct AiState {
 enum RunKey {
     /// A message's summary.
     Summary(i64),
-    /// The reply being written in a composer, by the UI's number for it.
-    Reply(u64),
+    /// What AI writes in a composer, by the UI's number for it.
+    Composer(u64),
 }
 
 struct Run {
@@ -241,31 +242,45 @@ pub fn cancel_summary(state: State<'_, AiState>, id: i64) {
     state.cancel(RunKey::Summary(id));
 }
 
-/// Starts writing a quick reply to message `id` in the UI's composer number
-/// `composer`, and returns at once; the text streams over `on_event`.
+/// Starts AI writing for the UI's composer number `composer` and returns at
+/// once; the text streams over `on_event`. `account` is the draft's, and
+/// `reference` the email it replies to or forwards. A new request for the same
+/// composer replaces a running one.
 #[tauri::command]
-pub async fn draft_quick_reply(
+#[allow(clippy::too_many_arguments)]
+pub async fn compose_with_ai(
     app: AppHandle,
     state: State<'_, AiState>,
     mailbox: State<'_, Mailbox>,
-    id: i64,
-    reply: QuickReply,
     composer: u64,
+    action: ComposeAction,
+    account: i64,
+    reference: Option<Reference>,
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
-    let mail = mailbox
-        .with_body(id)
-        .ok_or_else(|| format!("no message with id {id}"))?;
-    let name = mailbox.user_name(mail.account);
-    let request = reply::quick_reply_request(&mail, reply, name.as_deref());
-    state.start(app, RunKey::Reply(composer), request, on_event);
+    let email = match reference {
+        Some(r) => Some((
+            mailbox
+                .with_body(r.id)
+                .ok_or_else(|| format!("no message with id {}", r.id))?,
+            r.relation,
+        )),
+        None => None,
+    };
+    let name = mailbox.user_name(account);
+    let request = compose::compose_request(
+        &action,
+        email.as_ref().map(|(mail, relation)| (mail, *relation)),
+        name.as_deref(),
+    )?;
+    state.start(app, RunKey::Composer(composer), request, on_event);
     Ok(())
 }
 
-/// Stops writing a quick reply. The composer keeps whatever text already arrived.
+/// Stops AI writing in a composer. The UI decides what to keep.
 #[tauri::command]
-pub fn cancel_quick_reply(state: State<'_, AiState>, composer: u64) {
-    state.cancel(RunKey::Reply(composer));
+pub fn cancel_compose(state: State<'_, AiState>, composer: u64) {
+    state.cancel(RunKey::Composer(composer));
 }
 
 /// AI errors in words for the UI.

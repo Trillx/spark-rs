@@ -1,5 +1,5 @@
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
-import type { Message } from "./types";
+import type { AccountId, Message } from "./types";
 
 // Mirrors src-tauri/src/ai/*.rs and crates/ai. The API key goes in once and
 // never comes back: the Rust side only reports whether one is stored.
@@ -40,8 +40,32 @@ export type AiEvent =
   | { event: "error"; data: { message: string } }
   | { event: "notConfigured"; data: { message: string } };
 
-/** The quick-reply chips under a message (QuickReply in reply.rs). */
+/** The quick-reply chips (QuickReply in compose.rs). */
 export type QuickReply = "interested" | "notInterested" | "thanks";
+
+/** The +AI menu's edits (Rewrite in compose.rs). */
+export type Rewrite =
+  | "rephrase"
+  | "shorten"
+  | "expand"
+  | "proofread"
+  | "paragraphs"
+  | "friendly"
+  | "formal"
+  | "neutral";
+
+/** What the composer asks AI for (ComposeAction in compose.rs). */
+export type ComposeAction =
+  | { type: "write"; instructions: string }
+  | { type: "quickReply"; reply: QuickReply }
+  | { type: "rewrite"; text: string; how: Rewrite }
+  | { type: "refine"; text: string; instructions: string };
+
+/** The email a draft is about, and how (Reference in compose.rs). */
+export interface Reference {
+  id: number;
+  relation: "reply" | "followUp" | "forward";
+}
 
 /** `text` goes in instead when no AI provider is set up. */
 export const QUICK_REPLIES: { key: QuickReply; label: string; text: string }[] = [
@@ -134,25 +158,27 @@ export function cancelSummary(id: number): Promise<void> {
 }
 
 /**
- * Starts writing a quick reply to `message` for composer number `composer`;
- * the text arrives on `onEvent`. Resolves once it has started.
+ * Starts AI writing for composer number `composer`, whose draft is from
+ * `account` and about `reference`; the text arrives on `onEvent`. Resolves
+ * once it has started.
  */
-export function draftQuickReply(
-  message: Message,
-  reply: QuickReply,
+export function composeWithAi(
   composer: number,
+  action: ComposeAction,
+  account: AccountId,
+  reference: Reference | null,
   onEvent: (event: AiEvent) => void,
 ): Promise<void> {
   if (isTauri()) {
-    return invoke("draft_quick_reply", { id: message.id, reply, composer, onEvent: channel(onEvent) });
+    return invoke("compose_with_ai", { composer, action, account, reference, onEvent: channel(onEvent) });
   }
-  browserQuickReply(message, reply, composer, onEvent);
+  browserStream(`composer:${composer}`, browserComposed(action), onEvent);
   return Promise.resolve();
 }
 
-export function cancelQuickReply(composer: number): Promise<void> {
-  if (isTauri()) return invoke("cancel_quick_reply", { composer });
-  browserStop(`reply:${composer}`);
+export function cancelCompose(composer: number): Promise<void> {
+  if (isTauri()) return invoke("cancel_compose", { composer });
+  browserStop(`composer:${composer}`);
   return Promise.resolve();
 }
 
@@ -164,7 +190,7 @@ function channel(onEvent: (event: AiEvent) => void) {
 
 // ---- browser preview (`npm run dev`) ----
 // Nothing is sent anywhere: settings live in memory, a typed key only flips
-// `hasKey`, and summaries and replies are labeled stand-ins streamed word by word.
+// `hasKey`, and summaries and composer text are labeled stand-ins streamed word by word.
 
 const BROWSER_ONLY = "The browser preview doesn't call AI providers. Run the desktop app to test the connection.";
 
@@ -221,13 +247,17 @@ function browserSummarize(m: Message, style: SummaryStyle, onEvent: (event: AiEv
   browserStream(`summary:${m.id}`, text, onEvent);
 }
 
-function browserQuickReply(m: Message, reply: QuickReply, composer: number, onEvent: (event: AiEvent) => void) {
-  const chip = QUICK_REPLIES.find((q) => q.key === reply)!;
-  const name = m.from.split(/\s+/)[0];
-  const text =
-    `Hi ${name},\n\n${chip.text.trim()} (Preview only, not written by AI: ` +
-    `in the desktop app your provider writes this reply.)\n\nBest,`;
-  browserStream(`reply:${composer}`, text, onEvent);
+function browserComposed(action: ComposeAction) {
+  const note = "(Preview only, not written by AI: in the desktop app your provider writes this.)";
+  switch (action.type) {
+    case "write":
+      return `Hi,\n\nAn email about "${action.instructions.trim()}". ${note}\n\nBest,`;
+    case "quickReply":
+      return `Hi,\n\n${QUICK_REPLIES.find((q) => q.key === action.reply)!.text.trim()} ${note}\n\nBest,`;
+    case "rewrite":
+    case "refine":
+      return `${action.text.trim()} (Preview only, not rewritten by AI.)`;
+  }
 }
 
 /** Streams `text` word by word as `key`'s run, or says what's missing. */

@@ -8,6 +8,7 @@ import {
   Paperclip,
   Square,
   Trash2,
+  Undo2,
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
@@ -17,6 +18,7 @@ import { useAccounts } from "../lib/accounts";
 import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
+import AiMenu, { type AiRequest } from "./AiMenu";
 import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
@@ -51,8 +53,28 @@ export interface Draft {
   references?: string;
 }
 
-/** AI writing the body: under way, or failed with a message. */
-export type Writing = { status: "writing" } | { status: "error"; message: string };
+/**
+ * AI working on the body: under way, failed, waiting for a provider to be set
+ * up, or done replacing text that Undo brings back.
+ */
+export type Writing =
+  | { status: "writing" }
+  | { status: "error"; message: string }
+  | { status: "setup"; message: string }
+  | { status: "done"; message: string };
+
+/** The composer's +AI: its menu, and what AI is doing with the body. */
+export interface ComposerAi {
+  writing: Writing | null;
+  /** Offer the quick-reply chips while the body is empty. */
+  quickReplies: boolean;
+  run: (request: AiRequest) => void;
+  stop: () => void;
+  retry: () => void;
+  undo: () => void;
+  dismiss: () => void;
+  setUp: () => void;
+}
 
 export function emptyDraft(from: AccountId): Draft {
   return {
@@ -135,10 +157,7 @@ export default function Composer({
   onDiscard,
   onSend,
   onError,
-  writing = null,
-  onStopWriting,
-  onRetryWriting,
-  onDismissWriting,
+  ai,
 }: {
   draft: Draft;
   /** It's in Drafts as it stands. */
@@ -154,10 +173,7 @@ export default function Composer({
   onSend: () => void;
   onError: (text: string) => void;
   /** While AI writes the body, it's read-only and can't be sent. */
-  writing?: Writing | null;
-  onStopWriting?: () => void;
-  onRetryWriting?: () => void;
-  onDismissWriting?: () => void;
+  ai?: ComposerAi;
 }) {
   const toRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
@@ -216,6 +232,7 @@ export default function Composer({
 
   const attachedBytes = draft.attachments.reduce((sum, a) => sum + a.size, 0);
 
+  const writing = ai?.writing ?? null;
   const busy = writing?.status === "writing";
   const sendLabel = draft.sendLater ? "Schedule" : "Send";
   const accounts = useAccounts();
@@ -299,32 +316,54 @@ export default function Composer({
         value={draft.body}
         readOnly={busy}
         aria-busy={busy}
-        onChange={(e) => onChange({ body: e.target.value })}
+        onChange={(e) => {
+          // Typing over AI's text makes it yours: no more Undo.
+          if (writing?.status === "done") ai?.dismiss();
+          onChange({ body: e.target.value });
+        }}
       />
 
-      {writing && (
+      {ai && writing && (
         <div
           aria-live="polite"
           className={`mx-3 mb-2 flex min-h-9 shrink-0 items-center gap-2 rounded-lg px-3 py-1 text-xs ${
-            busy ? "bg-ai-tint" : "bg-error/10 text-error"
+            writing.status === "error" ? "bg-error/10 text-error" : "bg-ai-tint"
           }`}
         >
-          {busy ? (
+          {writing.status === "writing" ? (
             <>
               <AiMark className="animate-pulse text-sm" />
               <span className="flex-1 text-text-2">Generating…</span>
-              <button className="btn btn-ghost btn-xs h-6 gap-1 px-2 font-medium" onClick={onStopWriting}>
+              <button className="btn btn-ghost btn-xs h-6 gap-1 px-2 font-medium" onClick={ai.stop}>
                 <Square size={10} className="fill-current" />
                 Stop
+              </button>
+            </>
+          ) : writing.status === "done" ? (
+            <>
+              <AiMark className="text-sm" />
+              <span className="min-w-0 flex-1 text-text-2">{writing.message}</span>
+              <button className="btn btn-ghost btn-xs h-6 gap-1 px-2 font-medium" onClick={ai.undo}>
+                <Undo2 size={12} />
+                Undo
+              </button>
+              <button aria-label="Close" className="btn btn-ghost btn-xs btn-square h-6" onClick={ai.dismiss}>
+                <X size={13} />
               </button>
             </>
           ) : (
             <>
               <span className="min-w-0 flex-1 select-text">{writing.message}</span>
-              <button className="btn btn-ghost btn-xs h-6 px-2 font-medium" onClick={onRetryWriting}>
-                Try again
-              </button>
-              <button className="btn btn-ghost btn-xs h-6 px-2 font-medium" onClick={onDismissWriting}>
+              {writing.status === "setup" ? (
+                <button className="btn btn-primary btn-xs h-6 px-2 font-medium" onClick={ai.setUp}>
+                  Set up AI
+                </button>
+              ) : (
+                <button className="btn btn-ghost btn-xs h-6 px-2 font-medium" onClick={ai.retry}>
+                  Try again
+                </button>
+              )}
+              <button className="btn btn-ghost btn-xs h-6 px-2 font-medium" onClick={ai.dismiss}>
                 Close
               </button>
             </>
@@ -377,6 +416,9 @@ export default function Composer({
       )}
 
       <div className="flex h-12 shrink-0 items-center gap-0.5 border-t border-hairline px-2">
+        {ai && (
+          <AiMenu body={draft.body} bodyRef={bodyRef} quickReplies={ai.quickReplies} disabled={busy} onRun={ai.run} />
+        )}
         <IconButton
           title={{ label: "Attach files", keys: ATTACH_KEYS, card: "attach" }}
           active={draft.attachments.length > 0}

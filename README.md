@@ -40,7 +40,7 @@ Then choose **Microsoft 365** and enter the Application (client) ID and the
 Directory (tenant) ID, or your domain such as `contoso.onmicrosoft.com`.
 Your browser opens Microsoft's sign-in; when it's done the account appears.
 Check your company's rules first: using your own client on work mail, and
-sending work mail to an AI provider for summaries, may not be allowed.
+sending work mail to an AI provider for summaries and drafts, may not be allowed.
 
 **Other IMAP servers.** Choose **Other (IMAP)** and enter the servers. Ports
 993 and 465 use TLS from the start; 143 and 587 use STARTTLS.
