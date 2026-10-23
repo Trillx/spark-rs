@@ -171,8 +171,16 @@ full-text index of the mail it has stored (senders, recipients, subjects and
 text), so a search finds words anywhere in a message, ignoring case and
 accents. Each word matches the start of a word ("invo" finds "Invoice"),
 "quoted words" have to appear together, and `from:`, `has:attachment`,
-`is:unread` and `date:today` narrow the results, newest first. Only mail
-already on this computer is searched; spark-rs doesn't ask the server yet.
+`is:unread` and `date:today` narrow the results, newest first.
+
+Results from this computer show at once. A second after you stop typing, the
+search also goes to every account's server, as in Spark, for mail spark-rs
+hasn't fetched yet: Microsoft 365 through Graph's `$search`, Gmail in its own
+search syntax, and other IMAP servers with `SEARCH`. Up to 100 of the newest
+hits per place are fetched and stored, so they show in the results and are
+found locally from then on. Gmail and IMAP search the inbox and the archive
+folder; Microsoft 365 searches every folder except Deleted Items, Junk Email
+and Drafts. Searches with only filters, or for today's mail, stay local.
 
 ## AI agents
 

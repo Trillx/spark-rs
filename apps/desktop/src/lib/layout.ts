@@ -353,6 +353,15 @@ export function searchText(query: string) {
 }
 
 /**
+ * Whether a search goes to the mail servers too: it has words or a sender, and isn't for
+ * today's mail, which is all here.
+ */
+export function searchesServers(query: string) {
+  const { from, todayOnly, text } = parseQuery(query);
+  return !todayOnly && (text !== "" || from !== undefined);
+}
+
+/**
  * Free text plus `from:`, `has:attachment`, `is:unread` and `date:today`. The free text
  * matches what the search index found for it, in `hits`, and until it answers, the
  * message's sender, subject and snippet.

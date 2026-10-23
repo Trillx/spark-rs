@@ -1,9 +1,67 @@
 //! Full-text search over stored mail: an SQLite FTS5 index of each message's
 //! sender, recipients, subject and text, which triggers keep in step with the
 //! messages table. Words match the start of words in the mail, ignoring case
-//! and accents, so "invo" finds "Invoice" and "cafe" finds "Café".
+//! and accents, so "invo" finds "Invoice" and "cafe" finds "Café". `Query` is
+//! the search syntax around it, which the mail crate also puts to servers.
 
 use crate::{MESSAGE_COLUMNS, Message, Result, Store, message_row};
+
+/// A search as the search field and the agents' search tool take it: free
+/// text plus `from:`, `has:attachment` and `is:unread`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Query {
+    /// What's left for `Store::search`.
+    pub text: String,
+    /// Part of the sender's name or address, lowercase.
+    pub from: Option<String>,
+    pub has_attachment: bool,
+    pub unread_only: bool,
+}
+
+/// A word of a search's free text, or a quoted part of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Term {
+    Word(String),
+    Phrase(String),
+}
+
+impl Query {
+    pub fn parse(query: &str) -> Self {
+        let mut parsed = Query::default();
+        let mut words = Vec::new();
+        for word in query.split_whitespace() {
+            let lower = word.to_lowercase();
+            if let Some(from) = lower.strip_prefix("from:").filter(|f| !f.is_empty()) {
+                parsed.from = Some(from.to_owned());
+            } else if lower == "has:attachment" || lower == "has:attachments" {
+                parsed.has_attachment = true;
+            } else if lower == "is:unread" {
+                parsed.unread_only = true;
+            } else {
+                words.push(word);
+            }
+        }
+        parsed.text = words.join(" ");
+        parsed
+    }
+
+    /// The free text's words, and its quoted parts as phrases.
+    pub fn terms(&self) -> Vec<Term> {
+        terms(&self.text)
+    }
+
+    /// Whether a message the free text found passes the filters.
+    pub fn matches(&self, m: &Message) -> bool {
+        let from_ok = self.from.as_ref().is_none_or(|from| {
+            format!("{} {}", m.from_name, m.from_address)
+                .to_lowercase()
+                .contains(from)
+        });
+        from_ok
+            && (!self.has_attachment || m.attachment.is_some())
+            && (!self.unread_only || m.unread)
+    }
+}
 
 /// Version 9: the search index, filled from the mail already stored.
 pub(crate) const SCHEMA_SEARCH: &str = "
@@ -63,23 +121,37 @@ impl Store {
 /// The FTS5 query for what the user typed: each word as a prefix, each
 /// quoted part as a phrase, all of them required. Every term is an FTS5
 /// string, so operators and punctuation in the text are taken literally.
-/// An unclosed quote runs to the end.
 pub(crate) fn fts_query(text: &str) -> Option<String> {
-    let mut terms = Vec::new();
-    for (i, part) in text.split('"').enumerate() {
-        if i % 2 == 1 {
-            terms.extend(phrase(part));
-        } else {
-            terms.extend(part.split_whitespace().filter_map(phrase).map(|t| t + "*"));
-        }
-    }
+    let terms: Vec<String> = terms(text)
+        .into_iter()
+        .map(|t| match t {
+            Term::Word(word) => format!("\"{word}\"*"),
+            Term::Phrase(phrase) => format!("\"{phrase}\""),
+        })
+        .collect();
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
-/// `text` (which has no double quotes) as an FTS5 string, unless it has
-/// nothing the index keeps.
-fn phrase(text: &str) -> Option<String> {
-    text.chars()
-        .any(char::is_alphanumeric)
-        .then(|| format!("\"{}\"", text.trim()))
+/// The words of `text`, and its quoted parts as phrases, leaving out those
+/// without letters or digits (the index keeps none). An unclosed quote runs
+/// to the end.
+fn terms(text: &str) -> Vec<Term> {
+    let mut terms = Vec::new();
+    for (i, part) in text.split('"').enumerate() {
+        if i % 2 == 1 {
+            terms.extend(indexed(part).map(|p| Term::Phrase(p.to_owned())));
+        } else {
+            terms.extend(
+                part.split_whitespace()
+                    .filter_map(indexed)
+                    .map(|w| Term::Word(w.to_owned())),
+            );
+        }
+    }
+    terms
+}
+
+/// `text` trimmed, unless it has nothing the index keeps.
+fn indexed(text: &str) -> Option<&str> {
+    text.chars().any(char::is_alphanumeric).then(|| text.trim())
 }

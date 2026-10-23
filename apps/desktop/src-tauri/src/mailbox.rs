@@ -322,6 +322,29 @@ pub fn search_messages(
     Ok(Some(found.into_iter().map(|m| m.id).collect()))
 }
 
+/// Puts a search to every account's server and stores the mail they find
+/// that isn't stored yet, for `search_messages` to find; see
+/// `Live::search_servers`. Returns how many messages were new, so the UI
+/// knows to reload. 0 in the demo, and for a search a newer one cancelled,
+/// after telling the UI to reload what it stored before it stopped.
+#[tauri::command]
+pub async fn search_servers(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    query: String,
+) -> Result<usize, String> {
+    if !mailbox.live() {
+        return Ok(0);
+    }
+    match mailbox.live.search_servers(&query).await {
+        Some(new) => Ok(new),
+        None => {
+            let _ = app.emit("mailbox-changed", ());
+            Ok(0)
+        }
+    }
+}
+
 /// Every account's folders, accounts in order.
 #[tauri::command]
 pub fn list_folders(mailbox: State<'_, Mailbox>) -> Result<Vec<FolderView>, String> {

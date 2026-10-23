@@ -9,7 +9,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 use spark_mail::draft::{self, Draft};
 use spark_mail::signature;
-use spark_store::{Account, AccountKind, Category, MessageState, Patch, Store};
+use spark_store::{Account, AccountKind, Category, MessageState, Patch, Query, Store};
 
 use super::Access;
 
@@ -546,48 +546,6 @@ fn folder(m: &spark_store::Message) -> &'static str {
     }
 }
 
-/// The UI's search syntax: free text plus `from:`, `has:attachment` and
-/// `is:unread`.
-#[derive(Debug, Default, PartialEq)]
-struct Query {
-    text: String,
-    from: Option<String>,
-    has_attachment: bool,
-    unread_only: bool,
-}
-
-impl Query {
-    fn parse(query: &str) -> Self {
-        let mut parsed = Query::default();
-        let mut words = Vec::new();
-        for word in query.split_whitespace() {
-            let lower = word.to_lowercase();
-            if let Some(from) = lower.strip_prefix("from:").filter(|f| !f.is_empty()) {
-                parsed.from = Some(from.to_owned());
-            } else if lower == "has:attachment" || lower == "has:attachments" {
-                parsed.has_attachment = true;
-            } else if lower == "is:unread" {
-                parsed.unread_only = true;
-            } else {
-                words.push(word);
-            }
-        }
-        parsed.text = words.join(" ");
-        parsed
-    }
-
-    fn matches(&self, m: &spark_store::Message) -> bool {
-        let from_ok = self.from.as_ref().is_none_or(|from| {
-            format!("{} {}", m.from_name, m.from_address)
-                .to_lowercase()
-                .contains(from)
-        });
-        from_ok
-            && (!self.has_attachment || m.attachment.is_some())
-            && (!self.unread_only || m.unread)
-    }
-}
-
 fn message(cx: &Context, id: i64) -> Result<spark_store::Message, String> {
     cx.store
         .message(id)
@@ -943,18 +901,5 @@ mod tests {
             Value::Null
         );
         assert_eq!(queued(&mut store).signature, None);
-    }
-
-    #[test]
-    fn queries_parse_like_the_ui() {
-        assert_eq!(
-            Query::parse("bracket From:Ana has:attachment is:unread"),
-            Query {
-                text: "bracket".into(),
-                from: Some("ana".into()),
-                has_attachment: true,
-                unread_only: true,
-            }
-        );
     }
 }

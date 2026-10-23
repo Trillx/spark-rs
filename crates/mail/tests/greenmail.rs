@@ -1124,3 +1124,84 @@ async fn imap_folders_reach_back() {
 
     let _ = other.logout().await;
 }
+
+#[tokio::test]
+async fn imap_searches_reach_past_the_sync() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("search{}@example.com", now_ms());
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    // An invoice older than the first sync reaches, and 300 newer mails.
+    let invoice = raw("invoice@x.com", "Quarterly invoice");
+    other.append("INBOX", None, None, invoice).await.unwrap();
+    append_many(&mut other, "INBOX", imap::FIRST_SYNC_LIMIT).await;
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    let first = Round {
+        fetch: true,
+        list_folders: true,
+        ..Default::default()
+    };
+    engine.run_round(account.id, &first).await.unwrap();
+    assert!(engine.store().search("invoice").unwrap().is_empty());
+    // Archived elsewhere, in the Archive folder the first round made.
+    let archived = raw("archived@x.com", "Archived invoice");
+    other.append("Archive", None, None, archived).await.unwrap();
+
+    // Both are found and stored where they are; the archive folder isn't synced.
+    assert_eq!(
+        engine.search_server(account.id, "invoice").await.unwrap(),
+        2
+    );
+    let quarterly = find(&engine, "Quarterly invoice");
+    assert!(quarterly.state == MessageState::Inbox && !quarterly.screening);
+    assert_eq!(find(&engine, "Archived invoice").state, MessageState::Done);
+    assert_eq!(engine.store().search("invoice").unwrap().len(), 2);
+
+    // Asked again, the server finds nothing new.
+    assert_eq!(
+        engine.search_server(account.id, "invoice").await.unwrap(),
+        0
+    );
+    assert_eq!(engine.search_server(account.id, "Old").await.unwrap(), 0);
+    // Words from no mail, filters alone and senders that aren't there find nothing.
+    for query in ["zebra", "is:unread", "invoice from:bob"] {
+        assert_eq!(
+            engine.search_server(account.id, query).await.unwrap(),
+            0,
+            "{query}"
+        );
+    }
+
+    // The inbox sync leaves it be: it's below the floor, not gone.
+    let report = engine.run(account.id, true).await.unwrap();
+    assert_eq!((report.new, report.gone), (0, 0), "{report:?}");
+    assert_eq!(
+        find(&engine, "Quarterly invoice").state,
+        MessageState::Inbox
+    );
+
+    // Reaching back gets past it without fetching it again.
+    let older = Round {
+        older_inbox: true,
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &older).await.unwrap();
+    assert_eq!(report.older, 0, "{report:?}");
+    assert!(account_state(&engine, account.id).complete);
+    assert_eq!(
+        engine.store().messages().unwrap().len(),
+        imap::FIRST_SYNC_LIMIT + 2
+    );
+
+    let _ = other.logout().await;
+}

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
-use spark_store::{Account, AccountKind, Folder, Location, NewAccount, Store, now_ms};
+use spark_store::{Account, AccountKind, Folder, Location, NewAccount, Query, Store, now_ms};
 
 use crate::attachment::{self, AttachmentData, InlineImage};
 use crate::calendar::{Event, Response};
@@ -19,7 +19,7 @@ use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::invite::{self, Answer, Invite};
 use crate::oauth::{self, App};
-use crate::{Error, OLDER_STEP, Result, smtp};
+use crate::{Error, OLDER_STEP, Result, search, smtp};
 
 /// How long a local change waits before it's pushed: longer than the UI's
 /// undo window, so an undone change never reaches the server.
@@ -490,6 +490,43 @@ impl Engine {
             }
         }
         Ok(report)
+    }
+
+    /// Puts a search (in the search field's syntax) to the account's server
+    /// and stores the mail it finds that isn't stored yet, so the store's
+    /// search has it (see the `search` module). Returns how many messages
+    /// were new. It runs beside the account's rounds, on a connection of
+    /// its own.
+    pub async fn search_server(&self, account_id: i64, query: &str) -> Result<usize> {
+        let query = Query::parse(query);
+        if !search::worth_asking(&query) {
+            return Ok(0);
+        }
+        let account = self.account(account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let state: imap::SyncState = from_json(&account.sync_state);
+                let mut session =
+                    imap::login(&server, &username, &self.password(account_id)?).await?;
+                let found =
+                    imap::search_server(&mut session, &self.store, &account, &state, &query).await;
+                let _ = session.logout().await;
+                found
+            }
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let state: graph::SyncState = from_json(&account.sync_state);
+                self.graph(account_id, &client_id, &tenant)
+                    .await?
+                    .search_server(&self.store, account_id, &state, &query)
+                    .await
+            }
+        }
     }
 
     fn folder_synced(&self, folder: &Folder, state: &str, report: &mut Report) -> Result<()> {

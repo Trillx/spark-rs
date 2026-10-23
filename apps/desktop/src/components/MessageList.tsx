@@ -70,6 +70,8 @@ interface Props {
   scrollRef: RefObject<HTMLDivElement | null>;
   /** Set when the list can reach further back on the servers. */
   older: { loading: boolean; onNearEnd: () => void } | null;
+  /** The search is still being put to the mail servers. */
+  searchingServers: boolean;
 }
 
 const SEARCH_TIPS = [
@@ -117,12 +119,22 @@ export default function MessageList(props: Props) {
         {searching && !view.search!.trim() ? (
           <SearchTips onPick={(q) => props.onSearchChange(q)} />
         ) : searching && model.found === 0 ? (
-          <NoResults />
+          props.searchingServers ? (
+            <SearchingServers />
+          ) : (
+            <NoResults />
+          )
         ) : (
           <>
             {searching && (
-              <div className="flex h-9 items-center px-3 text-[13px] text-text-2">
+              <div className="flex h-9 items-center gap-2 px-3 text-[13px] text-text-2">
                 {plural(model.found ?? 0, "email")} found
+                {props.searchingServers && (
+                  <span
+                    className="loading loading-spinner loading-xs text-text-3"
+                    aria-label="Searching your mail servers"
+                  />
+                )}
               </div>
             )}
             {model.blocks.map((block, i) => {
@@ -524,6 +536,15 @@ function SearchTips({ onPick }: { onPick: (query: string) => void }) {
           <span className="text-text-2">{tip.text}</span>
         </button>
       ))}
+    </div>
+  );
+}
+
+function SearchingServers() {
+  return (
+    <div className="flex flex-col items-center px-6 pt-20 text-center text-sm text-text-2">
+      <span className="loading loading-spinner loading-md text-text-3" />
+      <p className="mt-3">Searching your mail servers…</p>
     </div>
   );
 }

@@ -246,6 +246,38 @@ fn search_takes_operators_and_punctuation_literally() {
 }
 
 #[test]
+fn queries_parse_like_the_ui() {
+    let query = Query::parse("bracket From:Ana \"price list\" has:attachment is:unread q4");
+    assert_eq!(
+        query,
+        Query {
+            text: "bracket \"price list\" q4".into(),
+            from: Some("ana".into()),
+            has_attachment: true,
+            unread_only: true,
+        }
+    );
+    assert_eq!(
+        query.terms(),
+        [
+            Term::Word("bracket".into()),
+            Term::Phrase("price list".into()),
+            Term::Word("q4".into()),
+        ]
+    );
+    // Punctuation alone is no term, and an unclosed quote runs to the end.
+    let odd = Query::parse("- (draft) \"price list from:");
+    assert_eq!(odd.from, None);
+    assert_eq!(
+        odd.terms(),
+        [
+            Term::Word("(draft)".into()),
+            Term::Phrase("price list from:".into()),
+        ]
+    );
+}
+
+#[test]
 fn search_forgets_removed_mail() {
     let (mut store, account) = store_with_account();
     let mut m = incoming(account, 1, "ana@parts.com");

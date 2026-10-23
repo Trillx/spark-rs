@@ -12,6 +12,7 @@ pub mod imap;
 pub mod invite;
 pub mod oauth;
 pub mod parse;
+pub mod search;
 pub mod signature;
 pub mod smtp;
 pub mod utf7;

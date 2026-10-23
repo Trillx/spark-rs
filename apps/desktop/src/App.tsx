@@ -184,7 +184,7 @@ import {
   type ActionId,
 } from "./lib/shortcuts";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
-import { useSearchHits } from "./lib/search";
+import { useSearchHits, useServerSearch } from "./lib/search";
 import type {
   AccountView,
   AgentSendingEvent,
@@ -331,6 +331,7 @@ export default function App() {
   const twoColumns = useTwoColumns(container, listWidthUsed);
 
   const hits = useSearchHits([view.search ?? "", ...layout.smartFolders.map((f) => f.query)], messages);
+  const searchingServers = useServerSearch(isDemoMode(accounts) ? null : view.search, reloadMessages);
   const ctx: ListContext = useMemo(
     () => ({ accounts, folders, smartFolders: layout.smartFolders, seen, hits }),
     [accounts, folders, layout.smartFolders, seen, hits],
@@ -1833,6 +1834,7 @@ export default function App() {
                 onSaveSearch={(query) => setSavingSearch(query)}
                 scrollRef={listScroll}
                 older={older && { loading: loadingOlder, onNearEnd: reachBack }}
+                searchingServers={searchingServers}
               />
               {twoColumns && (
                 <Splitter

@@ -16,7 +16,7 @@ use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spark_store::{
-    Added, Attachment, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed,
+    Added, Attachment, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed, Query,
     RemoteFolder, Store,
 };
 
@@ -26,6 +26,7 @@ use crate::attachment::{
 use crate::draft::{Bodies, Draft, recipients};
 use crate::invite::Invite;
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
+use crate::search::{self, SERVER_HITS};
 use crate::{Error, OLDER_STEP, Result};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -117,6 +118,9 @@ struct Listed {
     received_date_time: Option<String>,
     is_read: Option<bool>,
     flag: Option<GraphFlag>,
+    /// Only searches ask for it.
+    #[serde(default)]
+    parent_folder_id: Option<String>,
 }
 const LISTED: &str = "id,receivedDateTime,isRead,flag";
 
@@ -557,26 +561,31 @@ impl Graph {
             }
         } else {
             for m in listed.iter().filter(|m| unknown(m)) {
-                match self
-                    .json::<GraphMessage>(
-                        self.request(
-                            Method::GET,
-                            &format!("/me/messages/{}?$select={SELECT}", path(&m.id)),
-                        )
-                        .header("Prefer", "outlook.body-content-type=\"html\""),
-                    )
-                    .await
-                {
-                    Ok(m) => {
-                        full.insert(m.id.clone(), m);
-                    }
-                    // Moved or deleted since the listing.
-                    Err(Error::Gone) => {}
-                    Err(e) => return Err(e),
+                if let Some(m) = self.message_in_full(&m.id).await? {
+                    full.insert(m.id.clone(), m);
                 }
             }
         }
         Ok(full)
+    }
+
+    /// A message with its body; `None` if it was moved or deleted since it
+    /// was listed.
+    async fn message_in_full(&self, id: &str) -> Result<Option<GraphMessage>> {
+        match self
+            .json(
+                self.request(
+                    Method::GET,
+                    &format!("/me/messages/{}?$select={SELECT}", path(id)),
+                )
+                .header("Prefer", "outlook.body-content-type=\"html\""),
+            )
+            .await
+        {
+            Ok(m) => Ok(Some(m)),
+            Err(Error::Gone) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Reaches further back in the inbox than the delta query: stores the
@@ -651,6 +660,108 @@ impl Graph {
                 Some(link) if stored < OLDER_STEP => next = Some(link),
                 Some(_) => {}
                 None => state.complete = true,
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Puts a search to the mailbox (all its folders) and stores the newest
+    /// `SERVER_HITS` hits that aren't stored yet: inbox mail older than the
+    /// delta window as reaching back stores it (newer mail is the delta
+    /// query's), and mail in stored folders as their syncs do. Mail in
+    /// Deleted Items, Junk Email or Drafts, or in folders not listed, is
+    /// left out, as Spark does. Returns how many were new. Does nothing
+    /// before the first sync.
+    pub async fn search_server(
+        &self,
+        store: &Mutex<Store>,
+        account_id: i64,
+        state: &SyncState,
+        query: &Query,
+    ) -> Result<usize> {
+        let Some(kql) = search::kql(query) else {
+            return Ok(0);
+        };
+        if state.delta_link.is_none() {
+            return Ok(0);
+        }
+        let since = state
+            .since
+            .unwrap_or_else(|| first_sync_since(spark_store::now_ms()));
+        let inbox: GraphFolder = self
+            .json(self.request(Method::GET, "/me/mailFolders/inbox?$select=id"))
+            .await?;
+        let folders: HashMap<String, Folder> = lock(store)
+            .folders()?
+            .into_iter()
+            .filter(|f| {
+                f.account_id == account_id
+                    && !matches!(
+                        f.role,
+                        Some(FolderRole::Trash | FolderRole::Spam | FolderRole::Drafts)
+                    )
+            })
+            .map(|f| (f.remote_id.clone(), f))
+            .collect();
+        // Newest first, which is how Graph sorts what it finds.
+        let found = format!(
+            "/me/messages?$search={}&$top={SERVER_HITS}",
+            path(&format!("\"{kql}\""))
+        );
+        let listing: Page<Listed> = self
+            .json(self.request(
+                Method::GET,
+                &format!("{found}&$select={LISTED},parentFolderId"),
+            ))
+            .await?;
+        // Where each new one goes: the inbox (`None`) or a stored folder.
+        let mut wanted: Vec<(&Listed, Option<&Folder>)> = Vec::new();
+        {
+            let store = lock(store);
+            for m in &listing.value {
+                if store.has_remote_id(account_id, &m.id)? {
+                    continue;
+                }
+                let parent = m.parent_folder_id.as_deref().unwrap_or_default();
+                if parent == inbox.id {
+                    let received = m.received_date_time.as_deref().and_then(parse_iso_date);
+                    if received.is_some_and(|r| r < since) {
+                        wanted.push((m, None));
+                    }
+                } else if let Some(folder) = folders.get(parent) {
+                    wanted.push((m, Some(folder)));
+                }
+            }
+        }
+        let mut full: HashMap<String, GraphMessage> = HashMap::new();
+        if wanted.len() > FETCH_ONE_BY_ONE {
+            let page: Page<GraphMessage> = self
+                .json(
+                    self.request(Method::GET, &format!("{found}&$select={SELECT}"))
+                        .header("Prefer", "outlook.body-content-type=\"html\""),
+                )
+                .await?;
+            full.extend(page.value.into_iter().map(|m| (m.id.clone(), m)));
+        } else {
+            for (m, _) in &wanted {
+                if let Some(m) = self.message_in_full(&m.id).await? {
+                    full.insert(m.id.clone(), m);
+                }
+            }
+        }
+        let mut stored = 0;
+        for (listed, folder) in wanted {
+            let Some(m) = full.get(&listed.id) else {
+                continue;
+            };
+            let mut incoming = to_incoming(account_id, m);
+            self.complete(m, &mut incoming).await;
+            let added = match folder {
+                None => lock(store).add_incoming(&incoming, false)?,
+                Some(folder) => lock(store).add_folder_message(folder.id, &incoming)?,
+            };
+            if let Added::New(_) = added {
+                stored += 1;
             }
         }
         Ok(stored)
@@ -1894,6 +2005,168 @@ pub(crate) mod tests {
         let stored = graph.older_inbox(&store, account_id, &mut fresh).await;
         assert_eq!(stored.unwrap(), 0);
         assert_eq!(fresh, SyncState::default());
+    }
+
+    /// A stand-in mailbox for searches. "invoice" finds, newest first, `i3`
+    /// (inbox), `k4` (stored already), `m5` (folder f1), `t6` (Deleted
+    /// Items), `x7` (a folder not listed), `a8` (Archive) and `i20` (inbox);
+    /// "many" finds `i20`…`i31`. The digits say how many hours old each is.
+    fn searchable(path: &str) -> Option<Value> {
+        let (route, query) = path.split_once('?').unwrap_or((path, ""));
+        let full = |id: &str| {
+            let n: usize = id[1..].parse().unwrap();
+            json!({
+                "id": id, "subject": format!("Invoice {id}"), "isRead": false,
+                "receivedDateTime": iso_date(received(n)),
+                "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
+                "body": { "contentType": "text", "content": "The invoice" },
+            })
+        };
+        if route == "/me/mailFolders/inbox" {
+            return Some(json!({ "id": "inbox-id" }));
+        }
+        if let Some(id) = route.strip_prefix("/me/messages/") {
+            return Some(full(id));
+        }
+        let hits: Vec<(String, &str)> = if query.contains("invoice") {
+            [
+                ("i3", "inbox-id"),
+                ("k4", "inbox-id"),
+                ("m5", "f1"),
+                ("t6", "trash"),
+                ("x7", "elsewhere"),
+                ("a8", "archive"),
+                ("i20", "inbox-id"),
+            ]
+            .map(|(id, folder)| (id.to_owned(), folder))
+            .to_vec()
+        } else if query.contains("many") {
+            (20..32).map(|n| (format!("i{n}"), "inbox-id")).collect()
+        } else {
+            Vec::new()
+        };
+        let listing = query.contains("parentFolderId");
+        let value: Vec<Value> = hits
+            .iter()
+            .map(|(id, folder)| {
+                let mut m = full(id);
+                if listing {
+                    m = json!({ "id": id, "receivedDateTime": m["receivedDateTime"] });
+                }
+                m["parentFolderId"] = json!(folder);
+                m
+            })
+            .collect();
+        (route == "/me/messages").then(|| json!({ "value": value }))
+    }
+
+    #[tokio::test]
+    async fn searches_store_what_the_mailbox_finds_where_it_belongs() {
+        let (base, seen) = stand_in(searchable).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        {
+            let mut s = lock(&store);
+            let folder = |remote_id: &str, role| RemoteFolder {
+                remote_id: remote_id.into(),
+                parent: None,
+                name: remote_id.into(),
+                role,
+                selectable: true,
+            };
+            s.replace_folders(
+                account_id,
+                &[
+                    folder("f1", None),
+                    folder("archive", Some(FolderRole::Archive)),
+                    folder("trash", Some(FolderRole::Trash)),
+                ],
+            )
+            .unwrap();
+            let stored = Incoming {
+                account_id,
+                remote_id: Some("k4".into()),
+                ..Default::default()
+            };
+            s.add_incoming(&stored, false).unwrap();
+        }
+        // The delta query has the last 10 hours.
+        let state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(10)),
+            ..Default::default()
+        };
+
+        let query = Query::parse("Invoice from:ana@contoso.com");
+        let stored = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert_eq!(stored.unwrap(), 3);
+        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert!(
+            paths[1].starts_with(
+                "/me/messages?$search=%22invoice+AND+from%3Aana%40contoso.com%22&$top=100&$select=id,"
+            ),
+            "{paths:?}"
+        );
+        let fetched: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix("/me/messages/"))
+            .map(|p| p.split('?').next().unwrap())
+            .collect();
+        assert_eq!(
+            fetched,
+            ["m5", "a8", "i20"],
+            "one by one, only those stored"
+        );
+
+        let messages = lock(&store).messages().unwrap();
+        let state_of = |subject: &str| {
+            let m = messages.iter().find(|m| m.subject == subject).unwrap();
+            (m.state, m.screening)
+        };
+        use spark_store::MessageState::{Done, Filed, Inbox};
+        assert_eq!(state_of("Invoice i20"), (Inbox, false));
+        assert_eq!(state_of("Invoice m5"), (Filed, false));
+        assert_eq!(state_of("Invoice a8"), (Done, false));
+        assert_eq!(messages.len(), 4);
+        assert_eq!(lock(&store).search("invoice").unwrap().len(), 3);
+
+        // Again: nothing new to fetch.
+        let again = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert_eq!(again.unwrap(), 0);
+        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+
+        // Many new ones come in one listing with bodies.
+        let many = graph
+            .search_server(&store, account_id, &state, &Query::parse("many"))
+            .await;
+        assert_eq!(many.unwrap(), 11, "i20 was stored already");
+        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(paths[2].contains("$select=subject,"), "{paths:?}");
+
+        // Filters alone, or before the first sync, ask nothing.
+        let unread = Query::parse("is:unread");
+        assert_eq!(
+            graph
+                .search_server(&store, account_id, &state, &unread)
+                .await
+                .unwrap(),
+            0
+        );
+        let fresh = SyncState::default();
+        assert_eq!(
+            graph
+                .search_server(&store, account_id, &fresh, &query)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]

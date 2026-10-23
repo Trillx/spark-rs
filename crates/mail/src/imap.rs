@@ -25,13 +25,15 @@ use futures_util::TryStreamExt;
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use spark_store::{
-    Added, Folder, FolderRole, Incoming, Location, Pending, Place, Pushed, RemoteFolder, Store,
+    Account, AccountKind, Added, Folder, FolderRole, Incoming, Location, Pending, Place, Pushed,
+    Query, RemoteFolder, Store,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
+use crate::search::{self, SERVER_HITS};
 use crate::{Error, OLDER_STEP, Result, parse, utf7};
 
 pub const INBOX: &str = "INBOX";
@@ -691,7 +693,13 @@ pub async fn sync_inbox(
         }
     }
 
-    let gone: Vec<u32> = known.difference(&present).copied().collect();
+    // Mail a search brought in from below the floor isn't tracked until
+    // reaching back gets to it.
+    let gone: Vec<u32> = known
+        .iter()
+        .copied()
+        .filter(|uid| *uid >= floor && !present.contains(uid))
+        .collect();
     if !gone.is_empty() {
         report.gone = lock(store).observe_gone_uids(account_id, INBOX, &gone)?;
     }
@@ -701,11 +709,11 @@ pub async fn sync_inbox(
 }
 
 /// Reaches further back in the inbox: fetches the newest `OLDER_STEP`
-/// messages below the floor that aren't stored yet, and lowers the floor
-/// to the oldest of them, so later syncs track them like the rest. Stored
-/// as on a first sync: no screening. Returns how many were new. Does
-/// nothing before the first sync, or if the server renumbered the inbox
-/// (the next sync starts over).
+/// messages below the floor that aren't stored yet (a search may have
+/// stored some), and lowers the floor to the oldest of them, so later
+/// syncs track them like the rest. Stored as on a first sync: no
+/// screening. Returns how many were new. Does nothing before the first
+/// sync, or if the server renumbered the inbox (the next sync starts over).
 pub async fn older_inbox(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -721,27 +729,139 @@ pub async fn older_inbox(
     }
     let present = session.uid_search("ALL").await?;
     let known = lock(store).uids(account_id, INBOX)?;
-    let mut older: Vec<u32> = present
-        .iter()
-        .copied()
-        .filter(|uid| *uid < floor && !known.contains(uid))
-        .collect();
-    older.sort_unstable_by(|a, b| b.cmp(a));
-    older.truncate(OLDER_STEP);
+    let mut below: Vec<u32> = present.iter().copied().filter(|uid| *uid < floor).collect();
+    below.sort_unstable_by(|a, b| b.cmp(a));
+    // Down to the `OLDER_STEP`th one not stored yet: mail a search stored
+    // is passed, not fetched again.
+    let mut older = Vec::new();
+    let mut unknown = 0;
+    for uid in below {
+        if !known.contains(&uid) {
+            if unknown == OLDER_STEP {
+                break;
+            }
+            unknown += 1;
+        }
+        older.push(uid);
+    }
 
     let mut stored = 0;
     for batch in older.chunks(FETCH_BATCH) {
-        stored += fetch_new(session, store, account_id, batch, false)
+        let new: Vec<u32> = batch
+            .iter()
+            .copied()
+            .filter(|uid| !known.contains(uid))
+            .collect();
+        stored += fetch_new(session, store, account_id, &new, false)
             .await?
             .len();
         // Lowered batch by batch (they're newest first), so mail stored
-        // before a failure is above the floor and the next sync doesn't
-        // take it for gone.
+        // before a failure is above the floor, where syncs track it.
         state.floor = batch.last().copied();
     }
     let floor = state.floor.unwrap_or(floor);
     state.complete = present.iter().all(|uid| *uid >= floor);
     Ok(stored)
+}
+
+/// Puts a search to the server: the inbox below the floor (mail above it is
+/// the inbox sync's) and the archive folder (Gmail: All Mail, in Gmail's
+/// own syntax). The newest `SERVER_HITS` of each that aren't stored yet are
+/// stored, inbox mail as reaching back stores it and archived mail as the
+/// archive folder's sync does. Returns how many were new. A place that
+/// renumbered its UIDs is left to its next sync.
+pub async fn search_server(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    account: &Account,
+    state: &SyncState,
+    query: &Query,
+) -> Result<usize> {
+    let literal = search::has_non_ascii(query) && {
+        let server = session.capabilities().await?;
+        server.has_str("LITERAL+") || server.has_str("LITERAL-")
+    };
+    let keys = match account.kind {
+        AccountKind::Gmail => search::gmail_keys(query, literal),
+        _ => search::imap_keys(query, literal),
+    };
+    let Some(keys) = keys else {
+        return Ok(0);
+    };
+    let mut stored = 0;
+
+    if let Some(floor) = state.floor
+        && session.examine(INBOX).await?.uid_validity == state.uid_validity
+    {
+        let known = lock(store).uids(account.id, INBOX)?;
+        let hits = newest(session.uid_search(&keys).await?, |uid| {
+            uid < floor && !known.contains(&uid)
+        });
+        for batch in hits.chunks(FETCH_BATCH) {
+            stored += fetch_new(session, store, account.id, batch, false)
+                .await?
+                .len();
+        }
+    }
+
+    let archive = match &state.archive {
+        Some(mailbox) => lock(store)
+            .folders()?
+            .into_iter()
+            .find(|f| f.account_id == account.id && f.remote_id == *mailbox),
+        None => None,
+    };
+    let Some(folder) = archive else {
+        return Ok(stored);
+    };
+    let synced: FolderState = serde_json::from_str(&folder.sync_state).unwrap_or_default();
+    match session.examine(&folder.remote_id).await {
+        Ok(mailbox)
+            if synced.uid_validity.is_none() || mailbox.uid_validity == synced.uid_validity => {}
+        Ok(_) | Err(async_imap::error::Error::No(_)) => return Ok(stored),
+        Err(e) => return Err(e.into()),
+    }
+    let known = lock(store).folder_uids(folder.id)?;
+    let hits = newest(session.uid_search(&keys).await?, |uid| {
+        !known.contains_key(&uid)
+    });
+    for batch in hits.chunks(FETCH_BATCH) {
+        // Mail stored from elsewhere (the inbox, another label) is left as it is.
+        let heads: Vec<Fetch> = session
+            .uid_fetch(
+                uid_set(batch),
+                "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+            )
+            .await?
+            .try_collect()
+            .await?;
+        let mut unknown = Vec::new();
+        for f in &heads {
+            let Some(uid) = f.uid else { continue };
+            let stored_already = match f.header().and_then(parse::message_id) {
+                Some(id) => lock(store).has_message_id(account.id, &id)?,
+                None => false,
+            };
+            if !stored_already {
+                unknown.push(uid);
+            }
+        }
+        for mut m in fetch_messages(session, &unknown, &folder.remote_id).await? {
+            m.account_id = account.id;
+            if let Added::New(_) = lock(store).add_folder_message(folder.id, &m)? {
+                stored += 1;
+            }
+        }
+    }
+    Ok(stored)
+}
+
+/// The newest (highest) `SERVER_HITS` of a search's UIDs that are `wanted`.
+fn newest(found: HashSet<u32>, wanted: impl Fn(u32) -> bool) -> Vec<u32> {
+    let mut uids: Vec<u32> = found.into_iter().filter(|uid| wanted(*uid)).collect();
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    uids.truncate(SERVER_HITS);
+    uids
 }
 
 async fn fetch_new(

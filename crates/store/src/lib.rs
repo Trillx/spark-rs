@@ -24,6 +24,7 @@ mod signatures;
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
 pub use rusqlite::Error;
+pub use search::{Query, Term};
 pub use signatures::{DefaultSignature, Signature};
 pub type Result<T> = rusqlite::Result<T>;
 

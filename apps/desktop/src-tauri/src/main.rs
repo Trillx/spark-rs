@@ -52,6 +52,7 @@ fn main() {
             mailbox::list_accounts,
             mailbox::list_messages,
             mailbox::search_messages,
+            mailbox::search_servers,
             mailbox::list_folders,
             mailbox::watch_folders,
             mailbox::sync_folders,

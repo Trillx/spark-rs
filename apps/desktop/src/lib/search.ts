@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
-import { searchMessages } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { searchMessages, searchServers } from "../api";
 import type { Message } from "../types";
-import { searchText, type SearchHits } from "./layout";
+import { searchesServers, searchText, type SearchHits } from "./layout";
+
+/** How long a search rests before it goes to the mail servers, as in Spark. */
+const SERVER_DELAY_MS = 1000;
 
 /**
  * The search index's answers for the free text of `queries`, asked again when the mail
@@ -29,4 +32,37 @@ export function useSearchHits(queries: string[], messages: Message[]): SearchHit
   }, [texts, messages]);
 
   return hits;
+}
+
+/**
+ * Puts `query` (null: none) to the mail servers once it has rested, for mail that isn't stored
+ * yet, and calls `reload` when they found some. True from the first keystroke until they've
+ * answered, so the list says it's still searching rather than that nothing was found.
+ */
+export function useServerSearch(query: string | null, reload: () => Promise<void>): boolean {
+  const [asking, setAsking] = useState(false);
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+  const wanted = query !== null && searchesServers(query) ? query.trim() : "";
+
+  useEffect(() => {
+    if (!wanted) return;
+    let live = true;
+    setAsking(true);
+    const timer = setTimeout(() => {
+      searchServers(wanted)
+        .then((found) => (found > 0 ? reloadRef.current() : undefined))
+        .catch(() => {})
+        .finally(() => {
+          if (live) setAsking(false);
+        });
+    }, SERVER_DELAY_MS);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+      setAsking(false);
+    };
+  }, [wanted]);
+
+  return asking;
 }

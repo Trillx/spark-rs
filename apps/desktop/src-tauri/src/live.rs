@@ -3,7 +3,8 @@
 //! A worker loops: send what's due, push local changes once they're past the
 //! undo window, and fetch new mail every couple of minutes or when asked,
 //! syncing the folders the UI watches along with it. Older mail is reached
-//! back for when the UI asks. The folder list is refreshed now and then. It
+//! back for when the UI asks. The folder list is refreshed now and then.
+//! Searches go to every account's server at once, beside the workers. It
 //! tells the UI through events (`mailbox-changed`, `folders-changed`,
 //! `accounts-changed`, `sync-status`, `send-status`), and the user through
 //! notifications for new mail.
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::future::join_all;
 use serde::Serialize;
 use spark_mail::engine::inbox_has_older;
 use spark_mail::{Engine, Error, Round};
@@ -31,6 +33,8 @@ const FETCH_EVERY: Duration = Duration::from_secs(120);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const SNOOZE_CHECK: Duration = Duration::from_secs(15);
 const LIST_FOLDERS_EVERY: Duration = Duration::from_secs(15 * 60);
+/// How long a search waits for a server, as in Spark.
+const SEARCH_WAIT: Duration = Duration::from_secs(60);
 
 pub struct Live {
     pub engine: Arc<Engine>,
@@ -40,6 +44,8 @@ pub struct Live {
     sign_in: Mutex<Option<oneshot::Sender<()>>>,
     /// Folders (of any account) the UI wants in sync: on the sidebar or open.
     watched: Arc<Mutex<HashSet<i64>>>,
+    /// Cancels the server search in progress.
+    search: Notify,
 }
 
 struct Worker {
@@ -101,6 +107,7 @@ impl Live {
             status: Arc::new(Mutex::new(HashMap::new())),
             sign_in: Mutex::new(None),
             watched: Arc::new(Mutex::new(HashSet::new())),
+            search: Notify::new(),
         })
     }
 
@@ -237,6 +244,36 @@ impl Live {
             done.push(rx);
         }
         done
+    }
+
+    /// Puts a search to every account's server at once, storing the mail
+    /// they find that isn't stored yet. A server that fails or takes longer
+    /// than `SEARCH_WAIT` is left out. Returns how many messages were new,
+    /// or `None` if a new search cancelled this one.
+    pub async fn search_servers(&self, query: &str) -> Option<usize> {
+        self.search.notify_waiters();
+        let cancelled = self.search.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        let accounts = self.engine.store().accounts().unwrap_or_default();
+        let searches = join_all(accounts.iter().map(|account| async move {
+            let search = self.engine.search_server(account.id, query);
+            match tokio::time::timeout(SEARCH_WAIT, search).await {
+                Ok(Ok(new)) => new,
+                Ok(Err(e)) => {
+                    eprintln!("spark-rs: searching account {}: {e}", account.id);
+                    0
+                }
+                Err(_) => {
+                    eprintln!("spark-rs: searching account {}: no answer", account.id);
+                    0
+                }
+            }
+        }));
+        tokio::select! {
+            new = searches => Some(new.into_iter().sum()),
+            () = cancelled => None,
+        }
     }
 
     /// Wakes the account's worker, e.g. for a send that's already due.

@@ -124,6 +124,15 @@ export function searchMessages(query: string): Promise<number[] | null> {
   return Promise.resolve(null);
 }
 
+/**
+ * Puts a search to every account's server, which stores the mail they find that isn't stored
+ * yet. Resolves to how many messages were new, so the caller knows to reload; 0 outside the app.
+ */
+export function searchServers(query: string): Promise<number> {
+  if (isTauri()) return invoke("search_servers", { query });
+  return Promise.resolve(0);
+}
+
 export function getMessageContent(id: number): Promise<MessageContent> {
   if (isTauri()) return invoke("get_message_content", { id });
   const m = browserMailbox.find((x) => x.id === id);
