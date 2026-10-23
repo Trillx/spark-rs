@@ -98,6 +98,10 @@ export interface Prefs {
   keepRunning: boolean;
   /** Start in the background when the user signs in to Windows. */
   openAtLogin: boolean;
+  /** The meeting pop-up a minute before each meeting. */
+  meetingPopup: boolean;
+  /** Leave events with no one else and no call out of the pop-up. */
+  meetingPopupGuestsOnly: boolean;
 }
 
 /** What agents may do in an account; each level includes the ones before. */
@@ -230,6 +234,19 @@ export interface CalendarEvent {
   repeats: boolean;
   showAs: "free" | "tentative" | "busy" | "oof" | "workingElsewhere" | "unknown";
   private: boolean;
+}
+
+/** A meeting in the pop-up (src-tauri/src/meetings.rs). */
+export interface PopupMeeting {
+  /** The event's; negative for the sample from Settings. */
+  id: number;
+  title: string;
+  /** Unix ms. */
+  start: number;
+  end: number;
+  callLink?: string;
+  /** Who's in it besides the user, the organizer first. */
+  people: InvitePerson[];
 }
 
 /** The images an email's HTML embeds (`cid:` URLs): data URLs by Content-ID, lowercase without angle brackets. */

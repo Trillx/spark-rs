@@ -91,7 +91,15 @@ pub fn in_front(app: &AppHandle) -> bool {
 
 /// Closing the window hides it when Settings → Notifications says to keep
 /// running. The first time, a notification says where the app went.
+/// Otherwise it quits, even with the meeting pop-up open.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
+    if window.label() != "main" {
+        return;
+    }
+    if let WindowEvent::Destroyed = event {
+        window.app_handle().exit(0);
+        return;
+    }
     let WindowEvent::CloseRequested { api, .. } = event else {
         return;
     };

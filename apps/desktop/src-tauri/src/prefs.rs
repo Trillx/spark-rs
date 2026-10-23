@@ -1,6 +1,6 @@
 //! Settings → Notifications: which new mail shows a notification, its sound,
-//! and running in the background. Saved as `prefs.json` in the app's config
-//! directory.
+//! the meeting pop-up, and running in the background. Saved as `prefs.json`
+//! in the app's config directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use tauri::State;
 
 use crate::agents::Access;
 use crate::background;
+use crate::meetings::Meetings;
 
 const FILE_NAME: &str = "prefs.json";
 
@@ -38,6 +39,10 @@ pub struct Prefs {
     pub keep_running: bool,
     /// Starts in the background when the user signs in to Windows.
     pub open_at_login: bool,
+    /// The meeting pop-up (`meetings.rs`) a minute before each meeting.
+    pub meeting_popup: bool,
+    /// Leaves events with no one else and no call out of the pop-up.
+    pub meeting_popup_guests_only: bool,
     /// The "still running" notice has been shown, on the first close.
     pub told_keep_running: bool,
     /// What agents may do in each account, by account id; absent is none.
@@ -52,6 +57,8 @@ impl Default for Prefs {
             sound: true,
             keep_running: true,
             open_at_login: false,
+            meeting_popup: true,
+            meeting_popup_guests_only: true,
             told_keep_running: false,
             agent_access: BTreeMap::new(),
         }
@@ -130,17 +137,23 @@ pub fn get_prefs(state: State<'_, PrefsState>) -> Prefs {
 }
 
 #[tauri::command]
-pub fn save_prefs(state: State<'_, PrefsState>, prefs: Prefs) -> Result<Prefs, String> {
+pub fn save_prefs(
+    state: State<'_, PrefsState>,
+    meetings: State<'_, Meetings>,
+    prefs: Prefs,
+) -> Result<Prefs, String> {
     if prefs.open_at_login != state.get().open_at_login {
         background::set_open_at_login(prefs.open_at_login)?;
     }
-    state.update(|current| {
+    let saved = state.update(|current| {
         *current = Prefs {
             told_keep_running: current.told_keep_running,
             agent_access: std::mem::take(&mut current.agent_access),
             ..prefs
         }
-    })
+    });
+    meetings.changed();
+    saved
 }
 
 #[cfg(test)]
@@ -165,6 +178,7 @@ mod tests {
             }
         );
         assert!(prefs.sound && prefs.keep_running && !prefs.open_at_login);
+        assert!(prefs.meeting_popup && prefs.meeting_popup_guests_only);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import demo from "../demo/mailbox.json";
 import demoFolders from "../demo/folders.json";
 import type {
@@ -22,6 +23,7 @@ import type {
   MessageContent,
   MessagePatch,
   OutgoingDraft,
+  PopupMeeting,
   Prefs,
   SendStatusEvent,
   SyncStatusEvent,
@@ -160,6 +162,55 @@ export function refreshCalendars(start: number, end: number): Promise<void> {
 export function answerEvent(id: number, answer: InviteAnswer): Promise<void> {
   if (isTauri()) return invoke("answer_event", { id, answer });
   return Promise.resolve();
+}
+
+// ---- meeting pop-up ----
+// Its own window (popup.html); the Rust side decides what it shows.
+
+/** What the pop-up shows now. In the browser, a sample meeting starting in a minute. */
+export function meetingPopupMeetings(): Promise<PopupMeeting[]> {
+  if (isTauri()) return invoke("meeting_popup_meetings");
+  const start = Date.now() + 60_000;
+  return Promise.resolve([
+    {
+      id: -1,
+      title: "Design review: Inbox v3",
+      start,
+      end: start + 30 * 60_000,
+      callLink: "https://teams.microsoft.com/l/meetup-join/preview",
+      people: ["Hannah Cole", "Priya Raman", "Sam Okafor", "Kai Tanaka", "Alex Moreno"].map((name) => ({
+        name,
+        address: `${name.split(" ")[0].toLowerCase()}@acme.example`,
+      })),
+    },
+  ]);
+}
+
+export type PopupAct =
+  | { action: "join" | "snooze" | "dismiss" | "openCalendar"; id: number }
+  | { action: "dismissAll" | "openSettings" };
+
+/** Join also opens the call. */
+export function meetingPopupAct(act: PopupAct): Promise<void> {
+  if (isTauri()) return invoke("meeting_popup_act", { act });
+  return Promise.resolve();
+}
+
+/** Sizes the pop-up's window to its cards (CSS px). */
+export function fitMeetingPopup(width: number, height: number): Promise<void> {
+  if (isTauri()) return invoke("fit_meeting_popup", { width, height });
+  return Promise.resolve();
+}
+
+/** Moves the pop-up's window with the mouse, from a mousedown. */
+export function dragWindow() {
+  if (isTauri()) void getCurrentWindow().startDragging();
+}
+
+/** Shows a sample meeting in the pop-up, for Settings. */
+export function previewMeetingPopup(): Promise<void> {
+  if (isTauri()) return invoke("preview_meeting_popup");
+  return Promise.reject("Run the desktop app to see the pop-up.");
 }
 
 // ---- folders ----
@@ -436,6 +487,16 @@ export const onAgentSending = (handler: (event: AgentSendingEvent) => void) => o
 /** A new-mail notification was clicked: show this message. */
 export const onOpenMessage = (handler: (id: number) => void) => on("open-message", handler);
 
+/** The meeting pop-up's calendar button: show the calendar on the day of this time (Unix ms). */
+export const onOpenCalendar = (handler: (at: number) => void) => on("open-calendar", handler);
+
+/** The meeting pop-up's settings button: open this Settings page. */
+export const onOpenSettings = (handler: (page: "notifications") => void) => on("open-settings", handler);
+
+/** For the pop-up's window: what it shows changed. */
+export const onMeetingPopupChanged = (handler: (meetings: PopupMeeting[]) => void) =>
+  on("meeting-popup-changed", handler);
+
 // ---- browser preview (`npm run dev`) ----
 
 const DESKTOP_ONLY = "Run the desktop app to add accounts.";
@@ -578,7 +639,14 @@ function saveBrowserDraft(draft: OutgoingDraft): number {
 }
 
 /** The Rust side's defaults. */
-let browserPrefs: Prefs = { notify: "people", sound: true, keepRunning: true, openAtLogin: false };
+let browserPrefs: Prefs = {
+  notify: "people",
+  sound: true,
+  keepRunning: true,
+  openAtLogin: false,
+  meetingPopup: true,
+  meetingPopupGuestsOnly: true,
+};
 
 /** Snoozed mail whose time has come goes back to the Inbox, unread, as the Rust side does. */
 function wakeSnoozed(now = Date.now()) {

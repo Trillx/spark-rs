@@ -53,6 +53,7 @@ import {
   getAgents,
   getPrefs,
   openExternal,
+  previewMeetingPopup,
   removeAccount,
   renameAccount,
   savePrefs,
@@ -1077,6 +1078,15 @@ function NotificationsPage() {
     }
   }
 
+  async function preview() {
+    try {
+      await previewMeetingPopup();
+      setStatus({ kind: "idle" });
+    } catch (error) {
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
   if (!prefs) return <StatusLine status={status} />;
   const off = prefs.notify === "off";
 
@@ -1115,6 +1125,37 @@ function NotificationsPage() {
         <Row label="Test notification" description="Check how new mail will look and sound.">
           <button className="btn btn-sm h-8 rounded-lg" disabled={status.kind === "busy"} onClick={() => void test()}>
             Send test
+          </button>
+        </Row>
+      </Group>
+
+      <Group title="Meetings">
+        <Row
+          label="Meeting pop-up"
+          description="A card over your other windows a minute before each meeting, with the time left and a button to join the call."
+          htmlFor="meeting-popup"
+        >
+          <Switch
+            id="meeting-popup"
+            on={prefs.meetingPopup}
+            onToggle={() => void change({ meetingPopup: !prefs.meetingPopup })}
+          />
+        </Row>
+        <Row
+          label="Only meetings with others"
+          description="Leaves out events with no one else and no call link, like focus time."
+          htmlFor="meeting-popup-guests"
+        >
+          <Switch
+            id="meeting-popup-guests"
+            on={prefs.meetingPopupGuestsOnly}
+            disabled={!prefs.meetingPopup}
+            onToggle={() => void change({ meetingPopupGuestsOnly: !prefs.meetingPopupGuestsOnly })}
+          />
+        </Row>
+        <Row label="Preview" description="Shows a sample meeting in the pop-up.">
+          <button className="btn btn-sm h-8 rounded-lg" onClick={() => void preview()}>
+            Show
           </button>
         </Row>
       </Group>

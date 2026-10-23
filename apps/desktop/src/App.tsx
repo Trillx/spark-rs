@@ -66,7 +66,9 @@ import {
   onAgentSending,
   onFoldersChanged,
   onMailboxChanged,
+  onOpenCalendar,
   onOpenMessage,
+  onOpenSettings,
   onSendStatus,
   onSyncStatus,
   openAttachment,
@@ -299,6 +301,8 @@ export default function App() {
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null);
   /** The calendar shows in place of the list and the reader. */
   const [calendarOpen, setCalendarOpen] = useState(false);
+  /** A day the calendar was asked to show, by the meeting pop-up. */
+  const [calendarFocus, setCalendarFocus] = useState<{ at: number } | undefined>();
   const lastSettingsPage = useRef<SettingsPage>("accounts");
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
   /** Settings → Appearance → Minimize old emails. */
@@ -379,6 +383,8 @@ export default function App() {
     sendStatus,
     openFromNotification,
     agentSending,
+    openCalendarAt,
+    openSettings,
   });
   events.current = {
     reloadMessages,
@@ -388,6 +394,8 @@ export default function App() {
     sendStatus,
     openFromNotification,
     agentSending,
+    openCalendarAt,
+    openSettings,
   };
   useEffect(() => {
     const stops = [
@@ -399,6 +407,8 @@ export default function App() {
       onOpenMessage((id) => events.current.openFromNotification(id)),
       onAgentActivity((e) => showToast(e.text, undefined, ICONS.agent)),
       onAgentSending((e) => events.current.agentSending(e)),
+      onOpenCalendar((at) => events.current.openCalendarAt(at)),
+      onOpenSettings((page) => events.current.openSettings(page)),
     ];
     return () => stops.forEach((stop) => stop());
   }, []);
@@ -1327,6 +1337,15 @@ export default function App() {
     setSummary(m.id, () => undefined);
   }
 
+  /** The meeting pop-up's calendar button. */
+  function openCalendarAt(at: number) {
+    setSettingsPage(null);
+    setPalette(null);
+    setCalendarFocus({ at });
+    setCalendarOpen(true);
+    closeSidebar();
+  }
+
   // ---- settings ----
 
   function openSettings(page = lastSettingsPage.current) {
@@ -1733,6 +1752,7 @@ export default function App() {
     deleteList,
     drop: dropMessage,
     calendar: () => {
+      setCalendarFocus(undefined);
       setCalendarOpen(true);
       closeSidebar();
     },
@@ -1763,7 +1783,9 @@ export default function App() {
         <main className="relative flex min-w-0 flex-1">
           <DragStrip />
           <CaptionButtons />
-          {calendarOpen && <CalendarScreen demo={isDemoMode(accounts)} onClose={() => setCalendarOpen(false)} />}
+          {calendarOpen && (
+            <CalendarScreen demo={isDemoMode(accounts)} focus={calendarFocus} onClose={() => setCalendarOpen(false)} />
+          )}
           {showList && !calendarOpen && (
             <section
               aria-label="Message list"

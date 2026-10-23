@@ -1,0 +1,6 @@
+{
+  "identifier": "meeting-popup",
+  "description": "Permissions for the meeting pop-up: events from the app, and dragging it",
+  "windows": ["meeting-popup"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}

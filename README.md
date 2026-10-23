@@ -90,6 +90,17 @@ Microsoft 365 accounts added before the calendar arrived signed in without
 the calendar permission: add `Calendars.ReadWrite` to the app registration
 (see above), then choose Sign in on the calendar screen.
 
+A minute before each meeting, a pop-up shows at the top of the screen, over
+your other windows: who's in it, the time to go (then the time left), and
+Join, which opens the call. Its other buttons open the day in the calendar,
+copy the call link, snooze it for a minute and dismiss it; drag it to move it.
+It stays until the meeting ends unless you join or dismiss it. Only your main
+Microsoft 365 calendar pops up, without declined, canceled or all-day events,
+and by default without events that have no one else and no call link, like
+focus time. To catch meetings added since you last looked, spark-rs reads the
+next two hours of your calendar every five minutes. Settings → Notifications
+→ Meetings turns the pop-up off and shows a sample.
+
 ## Notifications and the tray
 
 Closing the window leaves spark-rs running in the notification area, still

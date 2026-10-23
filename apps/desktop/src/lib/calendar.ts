@@ -282,6 +282,28 @@ export function countdown(t: number, now: number) {
   return m ? `in ${h} h ${m} min` : `in ${h} h`;
 }
 
+/**
+ * The meeting pop-up's time, as Spark words it: "in 45 seconds", "in 1 minute",
+ * "27 minutes left", "1 hour 5 minutes left". Minutes round up.
+ */
+export function timeLeft(start: number, end: number, now: number) {
+  return now < start ? `in ${duration(start - now)}` : `${duration(end - now)} left`;
+}
+
+function duration(ms: number) {
+  const seconds = Math.max(0, Math.ceil(ms / 1000));
+  if (seconds < 60) return plural(seconds, "second");
+  const minutes = Math.ceil(seconds / 60);
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (!h) return plural(m, "minute");
+  return m ? `${plural(h, "hour")} ${plural(m, "minute")}` : plural(h, "hour");
+}
+
+function plural(n: number, unit: string) {
+  return `${n} ${unit}${n === 1 ? "" : "s"}`;
+}
+
 /** The next meeting to show in the side panel: timed, not declined or canceled, not over, today or tomorrow. */
 export function nextMeeting(events: CalendarEvent[], now: number) {
   const until = addDays(now, 2);

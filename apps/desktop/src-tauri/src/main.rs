@@ -9,6 +9,7 @@ mod demo;
 mod files;
 mod live;
 mod mailbox;
+mod meetings;
 mod notify;
 mod prefs;
 mod secrets;
@@ -25,6 +26,7 @@ fn main() {
             files::clear_opened();
             let config_dir = app.path().app_config_dir()?;
             app.manage(prefs::PrefsState::load(config_dir.clone()));
+            app.manage(meetings::Meetings::default());
             app.manage(ai::AiState::new(config_dir, ai::Keys::platform()));
             notify::register(app.handle());
             let live = live::Live::open(&app.path().app_local_data_dir()?)?;
@@ -37,9 +39,13 @@ fn main() {
                 eprintln!("spark-rs: agents can't connect: {e}");
             }
             background::setup(app)?;
+            meetings::start(app.handle());
             Ok(())
         })
-        .on_window_event(background::on_window_event)
+        .on_window_event(|window, event| {
+            background::on_window_event(window, event);
+            meetings::on_window_event(window, event);
+        })
         .invoke_handler(tauri::generate_handler![
             mailbox::list_accounts,
             mailbox::list_messages,
@@ -58,6 +64,10 @@ fn main() {
             calendar::refresh_calendars,
             calendar::answer_event,
             calendar::reconnect_account,
+            meetings::meeting_popup_meetings,
+            meetings::meeting_popup_act,
+            meetings::fit_meeting_popup,
+            meetings::preview_meeting_popup,
             mailbox::update_message,
             mailbox::add_gmail_account,
             mailbox::add_imap_account,

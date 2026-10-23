@@ -357,3 +357,16 @@
     animation: none;
   }
 }
+
+/* The meeting pop-up's window (popup.html) is transparent around its cards. */
+html[data-window="popup"],
+html[data-window="popup"] body {
+  background: transparent;
+}
+
+@keyframes popup-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}

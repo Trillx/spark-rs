@@ -75,11 +75,20 @@ const DEMO: Source = {
  * a side panel with a small month and the next meeting. Read-only apart
  * from answering invitations.
  */
-export default function CalendarScreen({ demo, onClose }: { demo: boolean; onClose: () => void }) {
+export default function CalendarScreen({
+  demo,
+  focus,
+  onClose,
+}: {
+  demo: boolean;
+  /** A time whose day to show; a new object shows it again. */
+  focus?: { at: number };
+  onClose: () => void;
+}) {
   const source = demo ? DEMO : LIVE;
   const accounts = useAccounts();
   const [kind, setKind] = useState<CalendarKind>(loadKind);
-  const [anchor, setAnchor] = useState(() => startOfDay(Date.now()));
+  const [anchor, setAnchor] = useState(() => startOfDay(focus?.at ?? Date.now()));
   const [hidden, setHidden] = useState(loadHidden);
   const [list, setList] = useState<CalendarList>({ calendars: [], accounts: [] });
   const [events, setEvents] = useState<CalendarEvent[]>([]);
@@ -168,6 +177,12 @@ export default function CalendarScreen({ demo, onClose }: { demo: boolean; onClo
     setWidth(el.clientWidth);
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    if (!focus) return;
+    setAnchor(startOfDay(focus.at));
+    setPreview(null);
+  }, [focus]);
 
   const changeKind = (next: CalendarKind) => {
     setKind(next);
