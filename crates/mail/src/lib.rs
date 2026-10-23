@@ -3,6 +3,7 @@
 //! store. `engine` ties them together for the apps.
 
 pub mod attachment;
+pub mod calendar;
 pub mod draft;
 pub mod drafts;
 pub mod engine;
@@ -16,7 +17,7 @@ pub mod utf7;
 
 use std::fmt::Display;
 
-pub use engine::{AccountConfig, Engine, Round, Secrets};
+pub use engine::{AccountConfig, CalendarStatus, Engine, Round, Secrets};
 
 /// How many messages further back the inbox or a folder reaches each time
 /// the user scrolls to the end of its list, as in Spark.

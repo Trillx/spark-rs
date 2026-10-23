@@ -862,7 +862,7 @@ fn utc_stamp(ms: i64) -> String {
 /// Calendars append a block of joining instructions to the description
 /// (Google between `-::~:~::~` rules, Teams and Zoom under a rule of
 /// underscores); the card shows the call link instead.
-fn without_boilerplate(description: &str) -> String {
+pub(crate) fn without_boilerplate(description: &str) -> String {
     let lines: Vec<&str> = description.lines().collect();
     let cut = lines
         .iter()
@@ -918,7 +918,7 @@ const MEETING_HOSTS: &[&str] = &[
 ];
 
 /// The first URL in `text` on a meeting host (or a subdomain of one).
-fn meeting_url(text: &str) -> Option<String> {
+pub(crate) fn meeting_url(text: &str) -> Option<String> {
     text.match_indices("https://").find_map(|(at, _)| {
         let rest = &text[at..];
         let end = rest

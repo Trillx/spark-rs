@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use spark_store::{Account, AccountKind, Folder, Location, NewAccount, Store, now_ms};
 
 use crate::attachment::{self, AttachmentData, InlineImage};
+use crate::calendar::{Event, Response};
 use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
@@ -52,7 +53,13 @@ pub enum AccountConfig {
         smtp: Server,
     },
     #[serde(rename_all = "camelCase")]
-    Microsoft { client_id: String, tenant: String },
+    Microsoft {
+        client_id: String,
+        tenant: String,
+        /// Signed in with the calendar permission (`oauth::CALENDAR_SCOPE`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        calendar: bool,
+    },
 }
 
 /// What a round does besides pushing local changes.
@@ -123,11 +130,32 @@ pub struct SendOutcome {
     pub result: Result<bool>,
 }
 
+/// Whether an account's calendar can show.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum CalendarStatus {
+    Ready,
+    /// Signed in before the calendar permission was asked for, or Microsoft
+    /// wants the user to sign in again.
+    SignIn,
+    /// Gmail and IMAP accounts, for now.
+    Unsupported,
+    /// The last refresh failed.
+    Error {
+        message: String,
+    },
+}
+
+/// The longest stretch of calendar fetched at once.
+const CALENDAR_STRETCH_MS: i64 = 400 * 86_400_000;
+
 pub struct Engine {
     store: Arc<Mutex<Store>>,
     secrets: Arc<dyn Secrets>,
     /// Microsoft access tokens and their expiry (Unix ms), in memory only.
     tokens: Mutex<HashMap<i64, (String, i64)>>,
+    /// How each account's last calendar refresh went.
+    calendars: Mutex<HashMap<i64, CalendarStatus>>,
 }
 
 impl Engine {
@@ -136,6 +164,7 @@ impl Engine {
             store,
             secrets,
             tokens: Mutex::new(HashMap::new()),
+            calendars: Mutex::new(HashMap::new()),
         }
     }
 
@@ -203,7 +232,7 @@ impl Engine {
         open_browser: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<Account> {
         let app = App::new(client_id, tenant)?;
-        let tokens = oauth::sign_in(&app, open_browser).await?;
+        let tokens = oauth::sign_in(&app, None, open_browser).await?;
         let me = Graph::new(&tokens.access_token).me().await?;
         let email = me
             .address()
@@ -215,6 +244,7 @@ impl Engine {
         let config = AccountConfig::Microsoft {
             client_id: app.client_id.clone(),
             tenant: app.tenant.clone(),
+            calendar: true,
         };
         let account = self.store().add_account(&NewAccount {
             kind: AccountKind::Microsoft,
@@ -229,6 +259,53 @@ impl Engine {
         }
         self.cache_token(account.id, &tokens);
         Ok(account)
+    }
+
+    /// Signs in to Microsoft again for an existing account, asking for the
+    /// calendar permission as new sign-ins do, and keeps the new sign-in.
+    /// It must be the same mailbox.
+    pub async fn reconnect_microsoft_account(
+        &self,
+        account_id: i64,
+        open_browser: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<Account> {
+        let account = self.account(account_id)?;
+        let AccountConfig::Microsoft {
+            client_id, tenant, ..
+        } = config(&account)?
+        else {
+            return Err(Error::Config(
+                "Only Microsoft 365 accounts sign in this way.".into(),
+            ));
+        };
+        let app = App::new(&client_id, &tenant)?;
+        let tokens = oauth::sign_in(&app, Some(&account.email), open_browser).await?;
+        let me = Graph::new(&tokens.access_token).me().await?;
+        if !me
+            .address()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&account.email))
+        {
+            return Err(Error::Auth(format!(
+                "That was another account. Sign in as {}.",
+                account.email
+            )));
+        }
+        let refresh = tokens.refresh_token.clone().ok_or_else(|| {
+            Error::Auth("Microsoft didn't allow staying signed in (no refresh token).".into())
+        })?;
+        self.secrets
+            .set(&token_key(account_id), &refresh)
+            .map_err(|e| Error::Config(format!("Couldn't save the sign-in: {e}")))?;
+        let config = AccountConfig::Microsoft {
+            client_id,
+            tenant,
+            calendar: true,
+        };
+        self.store()
+            .set_account_config(account_id, &to_json(&config))?;
+        self.cache_token(account_id, &tokens);
+        self.calendars_lock().remove(&account_id);
+        self.account(account_id)
     }
 
     /// Removes the account, its mail and its saved password or sign-in.
@@ -352,7 +429,9 @@ impl Engine {
                 }
                 let _ = session.logout().await;
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 let graph = Graph::new(
                     &self
                         .access_token(account_id, &App::new(&client_id, &tenant)?)
@@ -459,7 +538,9 @@ impl Engine {
                 }
                 remote_id
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 let graph = self.graph(account_id, &client_id, &tenant).await?;
                 let remote_id = graph
                     .create_folder(parent.as_ref().map(|p| p.remote_id.as_str()), name)
@@ -494,7 +575,9 @@ impl Engine {
                 let _ = session.logout().await;
                 renamed?
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 self.graph(account.id, &client_id, &tenant)
                     .await?
                     .rename_folder(&folder.remote_id, name)
@@ -533,7 +616,9 @@ impl Engine {
                 let _ = session.logout().await;
                 deleted?;
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 self.graph(account.id, &client_id, &tenant)
                     .await?
                     .delete_folder(&folder.remote_id)
@@ -621,7 +706,9 @@ impl Engine {
                     draft::build_message(from, draft, original.as_ref().map(|(o, _)| o), &files)?;
                 smtp::send(&server, &username, &self.password(account_id)?, message).await?;
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 let token = self
                     .access_token(account_id, &App::new(&client_id, &tenant)?)
                     .await?;
@@ -636,6 +723,94 @@ impl Engine {
                 store.accept_sender(account_id, m.email.as_ref())?;
             }
         }
+        Ok(())
+    }
+
+    /// Whether the account's calendar can show, as of its last refresh.
+    pub fn calendar_status(&self, account: &Account) -> CalendarStatus {
+        match config(account) {
+            Ok(AccountConfig::Microsoft { calendar: true, .. }) => self
+                .calendars_lock()
+                .get(&account.id)
+                .cloned()
+                .unwrap_or(CalendarStatus::Ready),
+            Ok(AccountConfig::Microsoft { .. }) => CalendarStatus::SignIn,
+            Ok(AccountConfig::Imap { .. }) => CalendarStatus::Unsupported,
+            Err(e) => CalendarStatus::Error {
+                message: e.to_string(),
+            },
+        }
+    }
+
+    /// Fetches the account's calendars and their events in [start, end)
+    /// (Unix ms, up to about a year at once) into the store. Accounts
+    /// without a calendar are skipped. The outcome is kept for
+    /// `calendar_status`; a calendar that can't be read (a shared one taken
+    /// away) is left as it was.
+    pub async fn refresh_calendar(&self, account_id: i64, start: i64, end: i64) -> Result<()> {
+        let account = self.account(account_id)?;
+        let AccountConfig::Microsoft {
+            client_id,
+            tenant,
+            calendar: true,
+        } = config(&account)?
+        else {
+            return Ok(());
+        };
+        let end = end.min(start + CALENDAR_STRETCH_MS);
+        let result = async {
+            let graph = self.graph(account_id, &client_id, &tenant).await?;
+            let listed = graph.calendars().await?;
+            self.store().replace_calendars(account_id, &listed)?;
+            let calendars = self.store().calendars()?;
+            for c in calendars.iter().filter(|c| c.account_id == account_id) {
+                match graph.events(&c.remote_id, start, end).await {
+                    Ok(events) => self.store().replace_events(c.id, start, end, &events)?,
+                    Err(Error::Gone | Error::Auth(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let status = match &result {
+            Ok(()) => CalendarStatus::Ready,
+            Err(Error::Auth(_)) => CalendarStatus::SignIn,
+            Err(e) => CalendarStatus::Error {
+                message: e.to_string(),
+            },
+        };
+        self.calendars_lock().insert(account_id, status);
+        result
+    }
+
+    /// Answers a stored event in its calendar, telling the organizer if
+    /// they asked to hear back, and keeps the answer.
+    pub async fn answer_event(&self, event_id: i64, answer: Answer) -> Result<()> {
+        let stored = self
+            .store()
+            .event(event_id)?
+            .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
+        let account = self.account(stored.account_id)?;
+        let AccountConfig::Microsoft {
+            client_id, tenant, ..
+        } = config(&account)?
+        else {
+            return Err(Error::Config(
+                "Only Microsoft 365 events can be answered here.".into(),
+            ));
+        };
+        let mut event = Event::from_json(&stored.data);
+        self.graph(account.id, &client_id, &tenant)
+            .await?
+            .answer_event(&stored.remote_id, answer, event.response_requested)
+            .await?;
+        event.response = match answer {
+            Answer::Accepted => Response::Accepted,
+            Answer::Tentative => Response::Tentative,
+            Answer::Declined => Response::Declined,
+        };
+        self.store().set_event_data(event_id, &event.to_json())?;
         Ok(())
     }
 
@@ -686,7 +861,9 @@ impl Engine {
                 smtp: server,
                 ..
             } => smtp::send(&server, &username, &self.password(account.id)?, message).await?,
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 let token = self
                     .access_token(account.id, &App::new(&client_id, &tenant)?)
                     .await?;
@@ -750,7 +927,9 @@ impl Engine {
                     ))
                 })
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 let remote = at.remote_id.ok_or(Error::Gone)?;
                 let token = self
                     .access_token(account.id, &App::new(&client_id, &tenant)?)
@@ -788,7 +967,9 @@ impl Engine {
                 let raw = self.fetch_raw(&account, &server, &username, &at).await?;
                 Ok(attachment::inline_images(&raw, &wanted))
             }
-            AccountConfig::Microsoft { client_id, tenant } => {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
                 let remote = at.remote_id.ok_or(Error::Gone)?;
                 let token = self
                     .access_token(account.id, &App::new(&client_id, &tenant)?)
@@ -865,7 +1046,11 @@ impl Engine {
                     "Sign in to Microsoft again: remove the account and add it back.".into(),
                 )
             })?;
-        let tokens = oauth::refresh(app, &refresh).await?;
+        let calendar = self
+            .account(account_id)
+            .and_then(|a| config(&a))
+            .is_ok_and(|c| matches!(c, AccountConfig::Microsoft { calendar: true, .. }));
+        let tokens = oauth::refresh(app, &refresh, calendar).await?;
         if let Some(rotated) = &tokens.refresh_token
             && rotated != &refresh
         {
@@ -880,6 +1065,12 @@ impl Engine {
     fn cache_token(&self, account_id: i64, tokens: &oauth::Tokens) {
         self.tokens_lock()
             .insert(account_id, (tokens.access_token.clone(), tokens.expires_at));
+    }
+
+    fn calendars_lock(&self) -> MutexGuard<'_, HashMap<i64, CalendarStatus>> {
+        self.calendars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn tokens_lock(&self) -> MutexGuard<'_, HashMap<i64, (String, i64)>> {
@@ -997,10 +1188,26 @@ mod tests {
         let microsoft = AccountConfig::Microsoft {
             client_id: "c".into(),
             tenant: "t".into(),
+            calendar: false,
         };
         assert_eq!(
             to_json(&microsoft),
-            r#"{"type":"microsoft","clientId":"c","tenant":"t"}"#
+            r#"{"type":"microsoft","clientId":"c","tenant":"t"}"#,
+            "accounts signed in before the calendar read the same"
+        );
+        let calendar = AccountConfig::Microsoft {
+            client_id: "c".into(),
+            tenant: "t".into(),
+            calendar: true,
+        };
+        let with_calendar = to_json(&calendar);
+        assert_eq!(
+            with_calendar,
+            r#"{"type":"microsoft","clientId":"c","tenant":"t","calendar":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AccountConfig>(&with_calendar).unwrap(),
+            calendar
         );
         assert_eq!(serde_json::from_str::<AccountConfig>(&json).unwrap(), imap);
     }
@@ -1015,6 +1222,7 @@ mod tests {
         let microsoft = AccountConfig::Microsoft {
             client_id: "c".into(),
             tenant: "t".into(),
+            calendar: false,
         };
         let account = |config: &AccountConfig, sync_state: &str| Account {
             id: 1,

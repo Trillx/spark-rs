@@ -84,6 +84,7 @@ import {
   watchFolders,
 } from "./api";
 import type { AiRequest } from "./components/AiMenu";
+import CalendarScreen from "./components/CalendarScreen";
 import CommandCenter, { type Command } from "./components/CommandCenter";
 import Composer, {
   draftHasContent,
@@ -296,6 +297,8 @@ export default function App() {
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
   const summaryRun = useRef(0);
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null);
+  /** The calendar shows in place of the list and the reader. */
+  const [calendarOpen, setCalendarOpen] = useState(false);
   const lastSettingsPage = useRef<SettingsPage>("accounts");
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
   /** Settings → Appearance → Minimize old emails. */
@@ -724,6 +727,7 @@ export default function App() {
 
   /** Opens a list, narrowed to an account if it has account rows. Server-backed lists sync now. */
   function selectList(folder: ListKey, account: AccountFilter = "all") {
+    setCalendarOpen(false);
     const narrowed = hasAccountRows(folder) ? account : "all";
     changeView({ folder, account: narrowed, sub: null, search: null });
     closeSidebar();
@@ -1728,6 +1732,10 @@ export default function App() {
     renameList,
     deleteList,
     drop: dropMessage,
+    calendar: () => {
+      setCalendarOpen(true);
+      closeSidebar();
+    },
   };
 
   const showList = twoColumns || !openMessage;
@@ -1748,13 +1756,15 @@ export default function App() {
           syncing={syncing}
           pickerOpen={pickerOpen}
           demo={isDemoMode(accounts)}
+          calendarOpen={calendarOpen}
           actions={sidebarActions}
         />
 
         <main className="relative flex min-w-0 flex-1">
           <DragStrip />
           <CaptionButtons />
-          {showList && (
+          {calendarOpen && <CalendarScreen demo={isDemoMode(accounts)} onClose={() => setCalendarOpen(false)} />}
+          {showList && !calendarOpen && (
             <section
               aria-label="Message list"
               className={`relative flex min-w-0 flex-col pt-8 ${twoColumns ? "shrink-0 border-r border-hairline" : "flex-1"}`}
@@ -1796,7 +1806,7 @@ export default function App() {
               )}
             </section>
           )}
-          {showReader && (
+          {showReader && !calendarOpen && (
             <section
               aria-label="Conversation"
               className="flex min-w-0 flex-1 flex-col pt-8"

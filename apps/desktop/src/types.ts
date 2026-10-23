@@ -176,6 +176,62 @@ export interface InviteCard {
   canAnswer: boolean;
 }
 
+/** Whether an account's calendar can show: `signIn` means its sign-in lacks calendar permission; `unsupported` is Gmail and IMAP for now. */
+export type CalendarStatus = "ready" | "signIn" | "unsupported" | "error";
+
+export interface CalendarAccountState {
+  account: AccountId;
+  status: CalendarStatus;
+  /** Why, for `error`. */
+  message?: string;
+}
+
+/** One calendar of an account. */
+export interface CalendarInfo {
+  id: number;
+  account: AccountId;
+  name: string;
+  /** Hex color, e.g. "#0ea5e9". Applied with inline styles. */
+  color: string;
+  isDefault: boolean;
+}
+
+export interface CalendarList {
+  calendars: CalendarInfo[];
+  /** Every account, in order, with whether its calendar can show. */
+  accounts: CalendarAccountState[];
+}
+
+/** The user's answer to an event; `organizer` for their own events, `none` before they answer. */
+export type EventResponse = "organizer" | "accepted" | "tentative" | "declined" | "none";
+
+export interface CalendarEvent {
+  id: number;
+  calendar: number;
+  account: AccountId;
+  title: string;
+  /** Unix ms; [start, end). All-day events give their days as written, read as UTC midnights. */
+  start: number;
+  end: number;
+  allDay: boolean;
+  location?: string;
+  /** A video call to join (Teams, Meet, Zoom, …). */
+  callLink?: string;
+  /** The description, as plain text. */
+  notes?: string;
+  /** The event in Outlook on the web. */
+  webLink?: string;
+  organizer?: InvitePerson;
+  /** Everyone else invited, rooms left out. */
+  attendees: InvitePerson[];
+  response: EventResponse;
+  canceled: boolean;
+  /** An occurrence of a recurring event. */
+  repeats: boolean;
+  showAs: "free" | "tentative" | "busy" | "oof" | "workingElsewhere" | "unknown";
+  private: boolean;
+}
+
 /** The images an email's HTML embeds (`cid:` URLs): data URLs by Content-ID, lowercase without angle brackets. */
 export type InlineImages = Record<string, string>;
 

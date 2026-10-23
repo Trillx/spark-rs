@@ -15,9 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+mod calendar;
 mod conversations;
 mod drafts;
 
+pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
 pub use rusqlite::Error;
 pub type Result<T> = rusqlite::Result<T>;
@@ -582,6 +584,10 @@ impl Store {
         if version < 7 {
             conn.execute_batch(SCHEMA_7)?;
             conn.pragma_update(None, "user_version", 7)?;
+        }
+        if version < 8 {
+            conn.execute_batch(calendar::SCHEMA_CALENDAR)?;
+            conn.pragma_update(None, "user_version", 8)?;
         }
         Ok(Self { conn })
     }

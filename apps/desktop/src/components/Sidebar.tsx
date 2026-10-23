@@ -45,6 +45,7 @@ import {
 } from "../lib/sidebar";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AccountMark from "./AccountMark";
+import CalendarIcon from "./CalendarIcon";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import FolderPicker from "./FolderPicker";
 
@@ -72,6 +73,7 @@ export interface SidebarActions {
   deleteList: (key: ListKey) => Promise<void>;
   /** A message dragged from the list onto a list here; `account` for an account row. */
   drop: (m: Message, key: ListKey, account?: AccountId) => void;
+  calendar: () => void;
 }
 
 interface Props {
@@ -88,6 +90,8 @@ interface Props {
   pickerOpen: boolean;
   /** Only the demo accounts: their folders can't be changed. */
   demo: boolean;
+  /** The calendar shows in place of the lists: no list is current. */
+  calendarOpen: boolean;
   actions: SidebarActions;
 }
 
@@ -111,7 +115,8 @@ export default function Sidebar(props: Props) {
     e.preventDefault();
     setMenu({ key, section, x: e.clientX, y: e.clientY });
   };
-  const view = { ...props, onMenu: openMenu };
+  // While the calendar shows, no list is current.
+  const view = { ...props, current: props.calendarOpen ? NO_LIST : props.current, onMenu: openMenu };
   useMessageDrop((m, target) => actions.drop(m, target.key, target.account));
 
   return (
@@ -147,6 +152,9 @@ export default function Sidebar(props: Props) {
 
 type ViewProps = Props & { onMenu: (key: ListKey, section: Section, e: MouseEvent) => void };
 
+/** `current` while the calendar is open: a smart folder that can't exist, so nothing matches it. */
+const NO_LIST: ListKey = "smart:";
+
 /** While a message is dragged: whether a row takes it (`target`), and whether it's under the pointer. */
 type RowDrop = { target?: DropTarget; over: boolean };
 
@@ -165,7 +173,7 @@ const DROP_OVER = "bg-primary/30 text-white ring-1 ring-inset ring-primary";
 /** The rail shows the top section, plus the open list when it's further down. */
 function railKeys(layout: SidebarLayout, current: ListKey): [ListKey, Section][] {
   const keys: [ListKey, Section][] = layout.favorites.map((k) => [k, "favorites"]);
-  if (current !== "inbox" && !layout.favorites.includes(current)) {
+  if (current !== "inbox" && current !== NO_LIST && !layout.favorites.includes(current)) {
     keys.push([current, layout.folders.includes(current) ? "folders" : "recents"]);
   }
   return keys;
@@ -183,6 +191,9 @@ function Rail(props: ViewProps) {
       <div data-tauri-drag-region className="h-8 w-full shrink-0" />
       <div className="flex min-h-0 shrink flex-col items-center gap-2 overflow-y-auto overflow-x-hidden">
         <RailInbox {...props} />
+        <RailButton title="Calendar" active={props.calendarOpen} onClick={actions.calendar}>
+          <CalendarIcon active={props.calendarOpen} />
+        </RailButton>
         {railKeys(layout, current).map(([key, section]) => {
           const i = info(key);
           if (!i) return null;
@@ -466,6 +477,13 @@ function Expanded(props: ViewProps) {
           toggle={accounts.length > 1 ? toggle("inbox", inboxOpen) : undefined}
         />
         {inboxOpen && accounts.map((a) => accountRow("inbox", a, counts.accounts[a.id] ?? 0))}
+        <SidebarRow
+          icon={<CalendarIcon active={props.calendarOpen} />}
+          label="Calendar"
+          count={0}
+          active={props.calendarOpen}
+          onClick={actions.calendar}
+        />
 
         {sectionRows("favorites", "mt-2")}
 

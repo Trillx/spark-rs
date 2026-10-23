@@ -5,6 +5,8 @@ import demo from "../demo/mailbox.json";
 import demoFolders from "../demo/folders.json";
 import type {
   AccountId,
+  CalendarEvent,
+  CalendarList,
   AgentAccess,
   AgentSendingEvent,
   AgentsView,
@@ -67,6 +69,16 @@ export function addMicrosoftAccount(clientId: string, tenant: string, label: str
   return Promise.reject(DESKTOP_ONLY);
 }
 
+/**
+ * Signs in to Microsoft again for an existing account, in the system
+ * browser, to grant the calendar permission. Resolves once it's done, which
+ * can take minutes; `cancelSignIn` abandons it.
+ */
+export function reconnectAccount(id: AccountId): Promise<AccountView> {
+  if (isTauri()) return invoke("reconnect_account", { id });
+  return Promise.reject(DESKTOP_ONLY);
+}
+
 /** Abandons a pending Microsoft sign-in; `addMicrosoftAccount` then rejects. */
 export function cancelSignIn(): Promise<void> {
   if (isTauri()) return invoke("cancel_sign_in");
@@ -116,6 +128,38 @@ export function answerInvite(id: number, answer: InviteAnswer): Promise<void> {
   if (isTauri()) return invoke("answer_invite", { id, answer });
   browserAnswers.set(id, answer);
   return new Promise((resolve) => setTimeout(resolve, 400));
+}
+
+// ---- calendar ----
+// Real accounts only: the demo calendar lives in the UI (lib/demoCalendar),
+// which knows the local time zone its events are placed in.
+
+/** The stored calendars, and each account's calendar status. */
+export function listCalendars(): Promise<CalendarList> {
+  if (isTauri()) return invoke("list_calendars");
+  return Promise.resolve({ calendars: [], accounts: [] });
+}
+
+/** Stored events overlapping [start, end) (Unix ms), from every calendar. */
+export function listEvents(start: number, end: number): Promise<CalendarEvent[]> {
+  if (isTauri()) return invoke("list_events", { start, end });
+  return Promise.resolve([]);
+}
+
+/**
+ * Fetches the calendars and their events in [start, end) from the servers.
+ * Resolves once stored; then list them again. Per-account failures show in
+ * `listCalendars`' account states rather than rejecting.
+ */
+export function refreshCalendars(start: number, end: number): Promise<void> {
+  if (isTauri()) return invoke("refresh_calendars", { start, end });
+  return Promise.resolve();
+}
+
+/** Answers an event through its calendar; the organizer is told. Resolves once the server has it. */
+export function answerEvent(id: number, answer: InviteAnswer): Promise<void> {
+  if (isTauri()) return invoke("answer_event", { id, answer });
+  return Promise.resolve();
 }
 
 // ---- folders ----

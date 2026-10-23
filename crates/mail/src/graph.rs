@@ -208,11 +208,11 @@ pub struct GraphFolder {
 }
 
 #[derive(Debug, Deserialize)]
-struct Page<T> {
+pub(crate) struct Page<T> {
     #[serde(default = "Vec::new")]
-    value: Vec<T>,
+    pub(crate) value: Vec<T>,
     #[serde(rename = "@odata.nextLink")]
-    next_link: Option<String>,
+    pub(crate) next_link: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,7 +243,7 @@ impl Graph {
         }
     }
 
-    fn request(&self, method: Method, url: &str) -> RequestBuilder {
+    pub(crate) fn request(&self, method: Method, url: &str) -> RequestBuilder {
         let url = if url.starts_with("http") {
             url.to_owned()
         } else {
@@ -255,7 +255,7 @@ impl Graph {
             .header("Prefer", "IdType=\"ImmutableId\"")
     }
 
-    async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response> {
+    pub(crate) async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response> {
         let response = request.send().await.map_err(|e| Error::network(HOST, e))?;
         let status = response.status();
         if status.is_success() {
@@ -280,7 +280,10 @@ impl Graph {
         })
     }
 
-    async fn json<T: for<'de> Deserialize<'de>>(&self, request: RequestBuilder) -> Result<T> {
+    pub(crate) async fn json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<T> {
         self.send(request)
             .await?
             .json()
@@ -1290,12 +1293,12 @@ fn text_to_html(text: &str) -> String {
 }
 
 /// Graph ids can contain `/`, `+` and `=`; immutable ids are URL-safe base64.
-fn path(id: &str) -> String {
+pub(crate) fn path(id: &str) -> String {
     url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
 }
 
 /// `2026-10-21T14:00:00Z` (Graph's format) from Unix ms.
-fn iso_date(ms: i64) -> String {
+pub(crate) fn iso_date(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);
@@ -1308,7 +1311,7 @@ fn iso_date(ms: i64) -> String {
 }
 
 /// Unix ms from `2026-10-21T14:00:00Z` or with fractional seconds.
-fn parse_iso_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_iso_date(s: &str) -> Option<i64> {
     let s = s.trim().trim_end_matches('Z');
     let (date, time) = s.split_once('T')?;
     let mut d = date.split('-').map(|p| p.parse::<i64>());
@@ -1352,7 +1355,7 @@ fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1526,7 +1529,9 @@ mod tests {
 
     /// A stand-in for Graph on a local port: answers each GET with
     /// `reply(path)` as JSON, or 404 for `None`, and records the paths.
-    async fn stand_in(
+    /// A local stand-in for Graph answering GETs and POSTs by path with
+    /// `reply` (404 for `None`); returns its base URL and the paths asked for.
+    pub(crate) async fn stand_in(
         reply: fn(&str) -> Option<Value>,
     ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

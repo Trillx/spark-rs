@@ -22,6 +22,19 @@ use crate::{Error, Result};
 pub const SCOPES: &str = "offline_access https://graph.microsoft.com/User.Read \
      https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send";
 
+/// Read the calendar and answer its invitations. Sign-ins ask for it; tokens
+/// are refreshed with it only for accounts that signed in since it was added,
+/// so older sign-ins keep working for mail.
+pub const CALENDAR_SCOPE: &str = "https://graph.microsoft.com/Calendars.ReadWrite";
+
+fn scopes(calendar: bool) -> String {
+    if calendar {
+        format!("{SCOPES} {CALENDAR_SCOPE}")
+    } else {
+        SCOPES.to_owned()
+    }
+}
+
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// An app registration in Microsoft Entra.
@@ -78,10 +91,11 @@ pub struct Tokens {
 }
 
 /// Opens Microsoft's sign-in page with `open_browser` and waits (up to 15
-/// minutes) for the browser to come back with a code. Dropping the future
-/// cancels it.
+/// minutes) for the browser to come back with a code. `login_hint` suggests
+/// the account to sign in as. Dropping the future cancels it.
 pub async fn sign_in(
     app: &App,
+    login_hint: Option<&str>,
     open_browser: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<Tokens> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -93,14 +107,15 @@ pub async fn sign_in(
     let verifier = random_token(32);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token(16);
-    let url = url::Url::parse_with_params(
+    let scope = scopes(true);
+    let mut url = url::Url::parse_with_params(
         &app.endpoint("authorize"),
         [
             ("client_id", app.client_id.as_str()),
             ("response_type", "code"),
             ("redirect_uri", &redirect_uri),
             ("response_mode", "query"),
-            ("scope", SCOPES),
+            ("scope", &scope),
             ("state", &state),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
@@ -108,6 +123,9 @@ pub async fn sign_in(
         ],
     )
     .expect("the authorize URL is valid");
+    if let Some(hint) = login_hint {
+        url.query_pairs_mut().append_pair("login_hint", hint);
+    }
     open_browser(url.as_str())
         .map_err(|e| Error::Config(format!("Couldn't open the browser: {e}")))?;
 
@@ -119,6 +137,7 @@ pub async fn sign_in(
     .map_err(|_| Error::Auth("Sign-in timed out. Try again.".into()))??;
     token_request(
         app,
+        &scope,
         &[
             ("grant_type", "authorization_code"),
             ("code", &code),
@@ -129,10 +148,12 @@ pub async fn sign_in(
     .await
 }
 
-/// Trades a refresh token for a new access token.
-pub async fn refresh(app: &App, refresh_token: &str) -> Result<Tokens> {
+/// Trades a refresh token for a new access token, with the calendar
+/// permission if the account has granted it.
+pub async fn refresh(app: &App, refresh_token: &str, calendar: bool) -> Result<Tokens> {
     token_request(
         app,
+        &scopes(calendar),
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -223,8 +244,8 @@ struct TokenResponse {
     error_description: Option<String>,
 }
 
-async fn token_request(app: &App, grant: &[(&str, &str)]) -> Result<Tokens> {
-    let mut form = vec![("client_id", app.client_id.as_str()), ("scope", SCOPES)];
+async fn token_request(app: &App, scope: &str, grant: &[(&str, &str)]) -> Result<Tokens> {
+    let mut form = vec![("client_id", app.client_id.as_str()), ("scope", scope)];
     form.extend_from_slice(grant);
     let response = crate::graph::http()
         .post(app.endpoint("token"))
@@ -341,7 +362,7 @@ mod tests {
         let app = App::new("client", "contoso.com").unwrap();
         let (url_tx, url_rx) = tokio::sync::oneshot::channel();
         let sign_in = tokio::spawn(async move {
-            sign_in(&app, |url| {
+            sign_in(&app, Some("me@contoso.com"), |url| {
                 url_tx.send(url.to_owned()).unwrap();
                 Ok(())
             })
@@ -356,6 +377,10 @@ mod tests {
         };
         assert_eq!(param("code_challenge_method"), "S256");
         assert_eq!(param("client_id"), "client");
+        assert_eq!(param("login_hint"), "me@contoso.com");
+        assert!(
+            param("scope").ends_with("Mail.Send https://graph.microsoft.com/Calendars.ReadWrite")
+        );
         let redirect = url::Url::parse(&param("redirect_uri")).unwrap();
         assert_eq!(redirect.host_str(), Some("localhost"));
 

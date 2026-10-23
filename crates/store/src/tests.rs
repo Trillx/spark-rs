@@ -500,6 +500,103 @@ fn invites_and_the_answer_sent_stay_with_their_email() {
     assert_eq!(content.rsvp.as_deref(), Some("accepted"));
 }
 
+fn calendar(remote_id: &str, name: &str) -> RemoteCalendar {
+    RemoteCalendar {
+        remote_id: remote_id.into(),
+        name: name.into(),
+        color: None,
+        is_default: false,
+    }
+}
+
+fn event(remote_id: &str, start: i64, end: i64) -> RemoteEvent {
+    RemoteEvent {
+        remote_id: remote_id.into(),
+        start,
+        end,
+        data: format!("{{\"title\":\"{remote_id}\"}}"),
+    }
+}
+
+#[test]
+fn calendars_keep_their_ids_and_go_with_their_events() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_calendars(
+            account,
+            &[calendar("a", "Calendar"), calendar("b", "Birthdays")],
+        )
+        .unwrap();
+    let before = store.calendars().unwrap();
+    assert_eq!(
+        before.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["Calendar", "Birthdays"]
+    );
+    store
+        .replace_events(before[1].id, 0, 100, &[event("x", 10, 20)])
+        .unwrap();
+
+    store
+        .replace_calendars(account, &[calendar("a", "Work")])
+        .unwrap();
+    let after = store.calendars().unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        (after[0].id, after[0].name.as_str()),
+        (before[0].id, "Work")
+    );
+    assert!(
+        store.events_between(0, 100).unwrap().is_empty(),
+        "its events went with it"
+    );
+}
+
+#[test]
+fn fetching_a_stretch_again_replaces_only_what_is_in_it() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_calendars(account, &[calendar("a", "Calendar")])
+        .unwrap();
+    let id = store.calendars().unwrap()[0].id;
+    store
+        .replace_events(
+            id,
+            0,
+            1000,
+            &[
+                event("early", 10, 20),
+                event("late", 900, 950),
+                event("long", 500, 2000),
+            ],
+        )
+        .unwrap();
+    store
+        .replace_events(id, 1000, 3000, &[event("next", 1500, 1600)])
+        .unwrap();
+    // "early" moved and "long" was deleted on the server; "late" is outside.
+    store
+        .replace_events(id, 0, 400, &[event("early", 30, 40)])
+        .unwrap();
+    store
+        .replace_events(id, 400, 1200, &[event("late", 900, 950)])
+        .unwrap();
+    let events = store.events_between(0, 3000).unwrap();
+    let listed: Vec<_> = events
+        .iter()
+        .map(|e| (e.remote_id.as_str(), e.start))
+        .collect();
+    assert_eq!(listed, [("early", 30), ("late", 900), ("next", 1500)]);
+    assert_eq!(events[0].account_id, account);
+    assert_eq!(
+        store.events_between(950, 1500).unwrap().len(),
+        0,
+        "[start, end) on both sides"
+    );
+
+    store.set_event_data(events[0].id, "{}").unwrap();
+    assert_eq!(store.event(events[0].id).unwrap().unwrap().data, "{}");
+}
+
 #[test]
 fn queued_sends_can_be_cancelled_until_claimed() {
     let (mut store, account) = store_with_account();

@@ -227,12 +227,15 @@ const STATUS: Record<InviteAnswer | "none", [LucideIcon, string, string]> = {
 };
 
 /** The organizer first, then the guests, each with their answer; past the first few, "N more". */
-function People({
+export function People({
   people,
   isMe,
+  chip = "bg-chip",
 }: {
   people: (InvitePerson & { organizer: boolean })[];
   isMe: (p: InvitePerson) => boolean;
+  /** The chips' background, for other surfaces than the card. */
+  chip?: string;
 }) {
   const [all, setAll] = useState(false);
   const shown = all || people.length <= PEOPLE_SHOWN + 1 ? people : people.slice(0, PEOPLE_SHOWN);
@@ -244,7 +247,7 @@ function People({
         return (
           <span
             key={i}
-            className="inline-flex h-7 max-w-full items-center gap-1.5 rounded-full bg-chip pl-0.5 pr-2"
+            className={`inline-flex h-7 max-w-full items-center gap-1.5 rounded-full pl-0.5 pr-2 ${chip}`}
             data-tip={`${p.address} · ${status}`}
           >
             <Avatar name={p.name} />
@@ -257,7 +260,7 @@ function People({
         );
       })}
       {shown.length < people.length && (
-        <button className="h-7 rounded-full bg-chip px-3 text-xs font-medium text-text-2 hover:brightness-95" onClick={() => setAll(true)}>
+        <button className={`h-7 rounded-full px-3 text-xs font-medium text-text-2 hover:brightness-95 ${chip}`} onClick={() => setAll(true)}>
           {people.length - shown.length} more
         </button>
       )}
@@ -266,7 +269,7 @@ function People({
 }
 
 /** Seven lines, with "Read more" if there's more. */
-function Description({ text }: { text: string }) {
+export function Description({ text }: { text: string }) {
   const ref = useRef<HTMLParagraphElement>(null);
   const [open, setOpen] = useState(false);
   const [clamped, setClamped] = useState(false);
@@ -325,7 +328,7 @@ function timeRange(invite: Invite) {
 }
 
 /** "Google Meet", "Microsoft Teams", "Zoom", …, else the link's host. */
-function callService(link: string) {
+export function callService(link: string) {
   let host = "";
   try {
     host = new URL(link).hostname.toLowerCase();

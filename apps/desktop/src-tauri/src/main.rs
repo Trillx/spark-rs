@@ -4,6 +4,7 @@
 mod agents;
 mod ai;
 mod background;
+mod calendar;
 mod demo;
 mod files;
 mod live;
@@ -52,6 +53,11 @@ fn main() {
             mailbox::delete_folder,
             mailbox::get_message_content,
             mailbox::answer_invite,
+            calendar::list_calendars,
+            calendar::list_events,
+            calendar::refresh_calendars,
+            calendar::answer_event,
+            calendar::reconnect_account,
             mailbox::update_message,
             mailbox::add_gmail_account,
             mailbox::add_imap_account,

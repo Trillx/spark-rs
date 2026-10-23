@@ -32,8 +32,8 @@ registrations → New registration). If you can't register apps, ask IT:
 - Platform: **Mobile and desktop applications**, redirect URI
   `http://localhost` (any port matches; spark-rs picks a free one).
 - API permissions, Microsoft Graph, delegated: `User.Read`,
-  `Mail.ReadWrite`, `Mail.Send`, `offline_access`. If your tenant requires
-  admin consent, IT has to grant it.
+  `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `offline_access`. If
+  your tenant requires admin consent, IT has to grant it.
 - No client secret: desktop apps are public clients.
 
 Then choose **Microsoft 365** and enter the Application (client) ID and the
@@ -74,6 +74,21 @@ the organizer at once (there's no undo window), and Change lets you pick
 another. Replies and cancellations show as a banner over the event. The email
 itself is behind the ⋯ button under the card. Answering doesn't change your
 own calendar: on Microsoft 365, Outlook keeps showing the meeting as tentative.
+
+## Calendar
+
+The Calendar button in the sidebar (it shows today's date) opens your
+Microsoft 365 calendars in Day, Week or Month view, with the calendars you
+pick under Calendars. Clicking an event shows its details, a Join button for
+Teams, Zoom or Meet calls, and Yes / Maybe / No, which answers it in your
+calendar and tells the organizer. The calendar is read from Microsoft when you
+open it, every five minutes while it's open, and as you move to other weeks;
+what was read stays on this computer, so it opens at once. Creating and
+editing events isn't there yet, and neither are Gmail calendars.
+
+Microsoft 365 accounts added before the calendar arrived signed in without
+the calendar permission: add `Calendars.ReadWrite` to the app registration
+(see above), then choose Sign in on the calendar screen.
 
 ## Notifications and the tray
 

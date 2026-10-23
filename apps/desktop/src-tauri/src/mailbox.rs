@@ -152,7 +152,7 @@ const DEMO_FILES: &str = "This is demo mail: its attachments are only names.";
 const DEMO_FOLDERS: &str = "These are demo folders: add an account to manage your own.";
 
 impl Mailbox {
-    fn live(&self) -> bool {
+    pub(crate) fn live(&self) -> bool {
         self.live.has_accounts()
     }
 
@@ -178,7 +178,7 @@ impl Mailbox {
         (!name.is_empty()).then(|| name.to_owned())
     }
 
-    fn account_view(&self, account: Account) -> AccountView {
+    pub(crate) fn account_view(&self, account: Account) -> AccountView {
         AccountView {
             id: account.id,
             kind: account.kind,
@@ -263,7 +263,7 @@ fn paragraphs(text: &str) -> Vec<String> {
     out
 }
 
-fn text(e: impl std::fmt::Display) -> String {
+pub(crate) fn text(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
