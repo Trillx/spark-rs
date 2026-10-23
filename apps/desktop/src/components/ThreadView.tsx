@@ -21,7 +21,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { Fragment, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { QUICK_REPLIES, SUMMARY_STYLES, type QuickReply, type SummaryStyle } from "../ai";
 import type { AccountView, Message, MessageContent } from "../types";
 import { isFromYou, useAccount } from "../lib/accounts";
@@ -39,6 +39,7 @@ import {
 import { hint, shortcutLabel, type ActionId } from "../lib/shortcuts";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AiMark from "./AiMark";
+import OverlayScroll from "./OverlayScroll";
 import { AttachmentList } from "./Attachments";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
@@ -94,6 +95,7 @@ export default function ThreadView({
   summary,
   aiProvider,
   actions,
+  scrollRef,
 }: {
   /** The email opened from the list, with its conversation's flags. Toolbar actions act on its conversation. */
   message: Message;
@@ -108,12 +110,20 @@ export default function ThreadView({
   /** Names the provider in a refusal, e.g. "Anthropic". */
   aiProvider: string;
   actions: ThreadActions;
+  /** The element that scrolls, for keyboard paging. */
+  scrollRef: RefObject<HTMLDivElement | null>;
 }) {
   const screening = m.screening && m.state === "inbox";
   const summaryRef = useRef<HTMLElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  /** Stops holding the place reading starts at, once the user moves around. */
+  const stopHolding = useRef(() => {});
+  /** Scrolled down: the subject shrinks to a line over a border, like Spark's header. */
+  const [scrolled, setScrolled] = useState(false);
   const closeTip: Tip = singleColumn ? { label: "Back to list", keys: "Esc" } : hint("Close", "close");
-  const jumpToSummary = () => summaryRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const jumpToSummary = () => {
+    stopHolding.current();
+    summaryRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
   const [start] = useState(() => conversation[readingStart(conversation, m.id, unread)]?.id);
   /** Collapsed cards. Emails that arrive while it's open aren't in it, so they show expanded. */
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => {
@@ -130,14 +140,51 @@ export default function ThreadView({
       if (!next.delete(id)) next.add(id);
       return next;
     });
-  const expandAll = () => setCollapsed(new Set());
+  const expandAll = () => {
+    stopHolding.current();
+    setCollapsed(new Set());
+  };
   /** Like Spark, the latest email stays open. */
-  const collapseAll = () => setCollapsed(new Set(conversation.filter((x) => x !== latest).map((x) => x.id)));
+  const collapseAll = () => {
+    stopHolding.current();
+    setCollapsed(new Set(conversation.filter((x) => x !== latest).map((x) => x.id)));
+  };
 
-  // Reading starts at the first expanded email, below the ones collapsed above it.
+  // Reading starts at the first expanded email, below the ones collapsed above
+  // it, with a little of the one before still in view. Like Spark, that place
+  // holds as bodies load and grow, until the user scrolls or clicks.
   useLayoutEffect(() => {
-    if (start === undefined || start === conversation[0]?.id) return;
-    scrollRef.current?.querySelector(`[data-message="${start}"]`)?.scrollIntoView({ block: "start" });
+    const el = scrollRef.current;
+    const target =
+      start === undefined || start === conversation[0]?.id
+        ? null
+        : el?.querySelector<HTMLElement>(`[data-message="${start}"]`);
+    if (!el || !target) return;
+    let placed = { top: -1, height: -1 };
+    const place = () => {
+      const top = target.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
+      el.scrollTop = Math.max(0, top - READING_CONTEXT);
+      placed = { top: el.scrollTop, height: el.scrollHeight };
+    };
+    // The browser moves the page when content above changes size; only a
+    // move with the same content is the user's.
+    const onScroll = () => {
+      if (el.scrollHeight === placed.height && Math.abs(el.scrollTop - placed.top) > 1) stop();
+    };
+    const resized = new ResizeObserver(place);
+    const stop = () => {
+      resized.disconnect();
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", stop);
+      el.removeEventListener("pointerdown", stop);
+    };
+    stopHolding.current = stop;
+    place();
+    resized.observe(el.firstElementChild ?? el);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("wheel", stop, { passive: true });
+    el.addEventListener("pointerdown", stop);
+    return stop;
   }, []); // Only when the conversation opens.
 
   return (
@@ -155,27 +202,41 @@ export default function ThreadView({
           actions={actions}
         />
       )}
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 pb-8">
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-3 pt-2">
-          <h1 className="select-text text-sm font-semibold leading-[22px]">
-            {conversation[0]?.subject || m.subject || "No subject"}
-          </h1>
-          {m.priority && (
-            <Pill className="bg-priority-fill text-priority">
-              <Zap size={12} className="fill-current" /> Priority
-            </Pill>
-          )}
-          {m.state === "snoozed" && m.snoozedUntil !== undefined && (
-            <Pill className="bg-priority-fill text-priority">
-              <Clock size={12} /> Snoozed until {formatLater(m.snoozedUntil)}
-            </Pill>
-          )}
-          {m.state === "aside" && (
-            <Pill className="bg-primary/10 text-primary">
-              <ArrowDownLeft size={12} /> Set aside
-            </Pill>
-          )}
-        </div>
+      <div
+        className={`mx-3 flex items-center gap-x-2 gap-y-1 border-b px-3 pb-3 pt-2 ${
+          scrolled ? "border-hairline" : "flex-wrap border-transparent"
+        }`}
+      >
+        <h1 className={`select-text text-sm font-semibold leading-[22px] ${scrolled ? "min-w-0 truncate" : ""}`}>
+          {conversation[0]?.subject || m.subject || "No subject"}
+        </h1>
+        {m.priority && (
+          <Pill className="bg-priority-fill text-priority">
+            <Zap size={12} className="fill-current" /> Priority
+          </Pill>
+        )}
+        {m.state === "snoozed" && m.snoozedUntil !== undefined && (
+          <Pill className="bg-priority-fill text-priority">
+            <Clock size={12} /> Snoozed until {formatLater(m.snoozedUntil)}
+          </Pill>
+        )}
+        {m.state === "aside" && (
+          <Pill className="bg-primary/10 text-primary">
+            <ArrowDownLeft size={12} /> Set aside
+          </Pill>
+        )}
+      </div>
+      <OverlayScroll
+        className="min-h-0 flex-1"
+        viewportClassName="px-3 pb-8"
+        viewportRef={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          // Once shrunk, it stays so until the top; it only shrinks when there's
+          // more to scroll than it gives back, so it can't flicker.
+          setScrolled((was) => el.scrollTop > 0 && (was || el.scrollHeight - el.clientHeight > HEADER_SLACK));
+        }}
+      >
         <div className="space-y-2">
           {conversation.map((x, i) => (
             <Fragment key={x.id}>
@@ -206,10 +267,15 @@ export default function ThreadView({
             onCopied={actions.summaryCopied}
           />
         )}
-      </div>
+      </OverlayScroll>
     </>
   );
 }
+
+/** Spark leaves about this much of the email before the one reading starts at in view. */
+const READING_CONTEXT = 100;
+/** More than the subject gives back when it shrinks to a line. */
+const HEADER_SLACK = 48;
 
 /** Spark's divider above the emails that were unread when the conversation opened. */
 function NewMessagesLine() {
@@ -724,7 +790,7 @@ function ToolbarButton({
 
 function Pill({ className, children }: { className: string; children: ReactNode }) {
   return (
-    <span className={`inline-flex h-[22px] items-center gap-1 rounded-full px-2 text-xs font-medium ${className}`}>
+    <span className={`inline-flex h-[22px] shrink-0 items-center gap-1 rounded-full px-2 text-xs font-medium ${className}`}>
       {children}
     </span>
   );

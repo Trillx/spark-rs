@@ -127,6 +127,16 @@ export function syncFolders(ids: number[]): Promise<void> {
   return Promise.resolve();
 }
 
+/**
+ * Reaches further back on the servers: 100 more messages in these accounts'
+ * inboxes and in these folders. Resolves once they're stored; reload the
+ * messages, accounts and folders (`hasOlder`) then.
+ */
+export function loadOlder(accounts: AccountId[], folders: number[]): Promise<void> {
+  if (isTauri()) return invoke("load_older", { accounts, folders });
+  return Promise.resolve();
+}
+
 /** Lists the folders on the servers again; changes arrive as `folders-changed`. */
 export function refreshFolders(): Promise<void> {
   if (isTauri()) return invoke("refresh_folders");
@@ -389,6 +399,7 @@ const BROWSER_ACCOUNTS: AccountView[] = [
     provider: "Gmail",
     demo: true,
     sync: { status: "idle" },
+    hasOlder: false,
   },
   {
     id: 2,
@@ -400,6 +411,7 @@ const BROWSER_ACCOUNTS: AccountView[] = [
     provider: "Microsoft 365",
     demo: true,
     sync: { status: "idle" },
+    hasOlder: false,
   },
 ];
 
@@ -414,6 +426,7 @@ const BROWSER_FOLDERS: FolderView[] = demoFolders.map((f) => ({
   role: "role" in f ? (f.role as FolderRole) : undefined,
   selectable: true,
   synced: true,
+  hasOlder: false,
 }));
 
 // Like DemoMailbox::load: each entry's age becomes a timestamp relative to now.

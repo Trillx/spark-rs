@@ -26,6 +26,8 @@ export interface AccountView {
   /** The built-in demo accounts, shown while no real account exists. */
   demo: boolean;
   sync: SyncStatus;
+  /** The server has inbox mail older than what's synced. */
+  hasOlder: boolean;
 }
 
 export type Category = "people" | "notifications" | "newsletters";
@@ -80,6 +82,8 @@ export interface FolderView {
   selectable: boolean;
   /** Its messages have been synced at least once. */
   synced: boolean;
+  /** It has messages older than the ones synced. */
+  hasOlder: boolean;
 }
 
 /** Which new mail shows a notification. `people` is Spark's smart notifications. */

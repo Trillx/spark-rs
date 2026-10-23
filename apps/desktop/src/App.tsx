@@ -58,6 +58,7 @@ import {
   listAccounts,
   listFolders,
   listMessages,
+  loadOlder,
   onAccountsChanged,
   onAgentActivity,
   onAgentSending,
@@ -175,6 +176,7 @@ import {
   shortcutLabel,
   type ActionId,
 } from "./lib/shortcuts";
+import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import type {
   AccountView,
   AgentSendingEvent,
@@ -290,6 +292,14 @@ export default function App() {
   const [toast, setToast] = useState<ToastData | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   const searchRef = useRef<HTMLInputElement>(null);
+  /** The list's and the reader's scrolling elements, for Page Up/Down, Home and End. */
+  const listScroll = useRef<HTMLDivElement>(null);
+  const readerScroll = useRef<HTMLDivElement>(null);
+  /** The pane clicked last: keyboard scrolling moves it. */
+  const scrollPane = useRef<"list" | "reader">("list");
+  /** Older mail is on its way for the open list. */
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const reaching = useRef(false);
 
   const windowWidth = useWindowWidth();
   const sidebarWidth = layout.width;
@@ -316,6 +326,7 @@ export default function App() {
     (id) => !folders.find((f) => f.id === id)?.synced,
   );
   const conversations = useMemo(() => indexConversations(messages, folders), [messages, folders]);
+  const older = olderSources(view, accounts, folders);
   const openMessage = messages.find((m) => m.id === openId) ?? null;
   const conversation = useMemo(
     () => (openMessage ? conversationOf(conversations, openMessage) : []),
@@ -398,6 +409,20 @@ export default function App() {
   }, [settingsPage]);
 
   // ---- data ----
+
+  /** The list is scrolled near its end: bring in older mail, as Spark does. */
+  function reachBack() {
+    if (!older || reaching.current) return;
+    reaching.current = true;
+    setLoadingOlder(true);
+    void loadOlder(older.accounts, older.folders)
+      .then(() => Promise.all([reloadMessages(), reloadAccounts(), reloadFolders()]))
+      .catch(() => {})
+      .finally(() => {
+        reaching.current = false;
+        setLoadingOlder(false);
+      });
+  }
 
   async function update(id: number, patch: MessagePatch) {
     setMessages((ms) => ms.map((m) => (m.id === id ? patched(m, patch) : m)));
@@ -1284,6 +1309,11 @@ export default function App() {
         return setMode("cards");
       case "modeSimple":
         return setMode("simple");
+      case "pageDown":
+      case "pageUp":
+      case "top":
+      case "bottom":
+        return scrollByKey(action);
     }
     const m = current;
     if (!m) return;
@@ -1339,6 +1369,19 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  /** Moves the pane clicked last: the list, or the reader (also when it's all that shows). */
+  function scrollByKey(action: "pageDown" | "pageUp" | "top" | "bottom") {
+    const list = listScroll.current;
+    const reader = readerScroll.current;
+    const inReader = reader !== null && (scrollPane.current === "reader" || list === null);
+    const el = inReader ? reader : list;
+    if (!el) return;
+    if (action === "top" || action === "bottom") return scrollToEnd(el, action);
+    const dir = action === "pageDown" ? 1 : -1;
+    if (inReader) pageReader(el, dir);
+    else pageList(el, dir);
+  }
 
   function toggleDone() {
     changeView({ showDone: !view.showDone }, true);
@@ -1653,6 +1696,7 @@ export default function App() {
               aria-label="Message list"
               className={`relative flex min-w-0 flex-col pt-8 ${twoColumns ? "shrink-0 border-r border-hairline" : "flex-1"}`}
               style={twoColumns ? { width: listWidthUsed } : undefined}
+              onPointerDownCapture={() => (scrollPane.current = "list")}
             >
               <MessageList
                 model={model}
@@ -1678,6 +1722,8 @@ export default function App() {
                 onAddAccounts={() => openSettings("accounts")}
                 loading={loading}
                 onSaveSearch={(query) => setSavingSearch(query)}
+                scrollRef={listScroll}
+                older={older && { loading: loadingOlder, onNearEnd: reachBack }}
               />
               {twoColumns && (
                 <Splitter
@@ -1688,7 +1734,11 @@ export default function App() {
             </section>
           )}
           {showReader && (
-            <section aria-label="Conversation" className="flex min-w-0 flex-1 flex-col pt-8">
+            <section
+              aria-label="Conversation"
+              className="flex min-w-0 flex-1 flex-col pt-8"
+              onPointerDownCapture={() => (scrollPane.current = "reader")}
+            >
               {openMessage ? (
                 <ThreadView
                   key={openMessage.id}
@@ -1700,6 +1750,7 @@ export default function App() {
                   summary={summaries.get(openMessage.id)}
                   aiProvider={aiProvider}
                   actions={threadActions}
+                  scrollRef={readerScroll}
                 />
               ) : (
                 <EmptyReader />
@@ -1817,6 +1868,26 @@ function previousValues(m: Message, patch: MessagePatch): MessagePatch {
 
 /** An account filter as an account id, or undefined for all of them. */
 const accountOf = (account: AccountFilter) => (account === "all" ? undefined : account);
+
+/**
+ * Where the list can reach further back on the servers: its accounts' inboxes,
+ * or its server folders; null when none has older mail. Search, the Unread
+ * cards and New senders don't reach back.
+ */
+function olderSources(view: ListView, accounts: AccountView[], folders: FolderView[]) {
+  if (view.search !== null) return null;
+  if (view.folder === "inbox") {
+    if ((view.mode === "cards" && !view.sub) || view.sub?.kind === "gatekeeper") return null;
+    const ids = accounts
+      .filter((a) => a.hasOlder && (view.account === "all" || a.id === view.account))
+      .map((a) => a.id);
+    return ids.length ? { accounts: ids, folders: [] } : null;
+  }
+  const ids = listFolderIds(view.folder, folders, accountOf(view.account)).filter(
+    (id) => folders.find((f) => f.id === id)?.hasOlder,
+  );
+  return ids.length ? { accounts: [], folders: ids } : null;
+}
 
 /** Every message a list shows: rows and the emails they stand for, card rows past the limit, Gatekeeper senders. */
 function listedIds(list: ListModel) {

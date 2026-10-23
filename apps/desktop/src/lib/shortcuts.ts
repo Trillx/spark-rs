@@ -28,7 +28,11 @@ export type ActionId =
   | "trash"
   | "modeFocused"
   | "modeCards"
-  | "modeSimple";
+  | "modeSimple"
+  | "pageDown"
+  | "pageUp"
+  | "top"
+  | "bottom";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -71,6 +75,10 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   modeFocused: [{ code: "Digit1", mod: true, alt: true }],
   modeCards: [{ code: "Digit2", mod: true, alt: true }],
   modeSimple: [{ code: "Digit3", mod: true, alt: true }],
+  pageDown: [{ key: "PageDown" }],
+  pageUp: [{ key: "PageUp" }],
+  top: [{ key: "Home" }, { key: "ArrowUp", mod: true }],
+  bottom: [{ key: "End" }, { key: "ArrowDown", mod: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {

@@ -274,6 +274,7 @@ export function GroupRow({ groupKey, items, onOpen }: { groupKey: GroupKey; item
     <div
       role="button"
       tabIndex={-1}
+      data-group={groupKey}
       onClick={onOpen}
       className="group grid min-h-[60px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 hover:bg-row-hover"
     >

@@ -65,8 +65,15 @@ function MessageRow({
   recipients?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const wasSelected = useRef(selected);
+  // Like Spark, only a row the cursor moves to scrolls into view: not one
+  // that was clicked (it's under the pointer), nor one already selected when
+  // its list opens, which keeps the list's place.
   useEffect(() => {
-    if (selected) ref.current?.scrollIntoView({ block: "nearest" });
+    if (selected && !wasSelected.current && !ref.current?.matches(":hover")) {
+      ref.current?.scrollIntoView({ block: "nearest" });
+    }
+    wasSelected.current = selected;
   }, [selected]);
 
   const done = m.state === "done";
@@ -78,6 +85,7 @@ function MessageRow({
     <div
       ref={ref}
       role="option"
+      data-row={m.id}
       aria-selected={selected}
       onClick={() => actions.open(m.id)}
       // Onto a sidebar list: a folder, Inbox, Archive, Trash or Pins.
