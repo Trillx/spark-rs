@@ -100,7 +100,7 @@ export function getMessageContent(id: number): Promise<MessageContent> {
   if (!m) return Promise.reject(`No message ${id}.`);
   return Promise.resolve({
     text: m.body ?? [],
-    html: null,
+    html: browserHtml.get(id) ?? null,
     to: m.to?.length ? m.to : ["You"],
     cc: [],
     attachments: m.attachment ? [{ name: m.attachment, mime: "", size: 0 }] : [],
@@ -418,7 +418,7 @@ const BROWSER_FOLDERS: FolderView[] = demoFolders.map((f) => ({
 
 // Like DemoMailbox::load: each entry's age becomes a timestamp relative to now.
 const loadedAt = Date.now();
-const browserMailbox: Message[] = demo.map(({ ageMinutes, account, ...m }) => ({
+const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, ...m }) => ({
   state: "inbox",
   unread: false,
   pinned: false,
@@ -429,6 +429,9 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, ...m }) => ({
   timestamp: loadedAt - ageMinutes * 60_000,
   folders: demoFolders.filter((f) => (f.members as number[]).includes(m.id)).map((f) => f.id),
 })) as Message[];
+
+/** The few demo messages with HTML of their own, like demo::html. */
+const browserHtml = new Map(demo.flatMap((m) => (m.html ? [[m.id, m.html] as const] : [])));
 
 let browserOutbox = 0;
 

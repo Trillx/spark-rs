@@ -186,7 +186,7 @@ async fn imap_round_trip() {
     assert_eq!(report.gone, 1);
     assert_eq!(find(&engine, "Report").state, MessageState::Done);
 
-    // Replying to Ana: sent over SMTP, threaded, and Ana is accepted.
+    // Replying to Ana: sent over SMTP, threaded into her conversation, and Ana is accepted.
     let draft = Draft {
         account: account.id,
         to: format!("Me <{me}>"),
@@ -221,6 +221,7 @@ async fn imap_round_trip() {
     engine.run(account.id, true).await.unwrap();
     let reply = find(&engine, "Re: Lunch?");
     assert!(!reply.screening, "your own mail is never screened");
+    assert_eq!(reply.conversation, lunch.conversation);
     let content = engine.store().content(reply.id).unwrap().unwrap();
     assert!(
         content.text.starts_with("Sure, noon?"),

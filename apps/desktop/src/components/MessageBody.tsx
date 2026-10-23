@@ -1,6 +1,7 @@
-import { ImageOff } from "lucide-react";
+import { Ellipsis, ImageOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { openExternal } from "../api";
+import { useDarkTheme } from "../lib/theme";
 import type { InlineImages } from "../types";
 
 // Email HTML is untrusted. It renders in an iframe sandboxed without
@@ -8,6 +9,11 @@ import type { InlineImages } from "../types";
 // own CSP that blocks every fetch except inline images until the user asks for
 // remote ones. `allow-same-origin` only lets this side size the frame and
 // catch link clicks; with scripts off, the email itself can't use it.
+//
+// In the dark theme an email is shown the way Spark shows it (see
+// `emailScheme`): in its own dark design if it has one, on a white sheet if
+// it's built to stay light, and otherwise with its colors adapted to the dark
+// card (`adaptColors`). A reply's quote of earlier mail folds behind "•••".
 
 const OPENABLE = new Set(["http:", "https:", "mailto:"]);
 /** A runaway layout (e.g. `100vh` content) stops growing here. */
@@ -59,17 +65,53 @@ export function BlockedImagesBar({ onLoad }: { onLoad: () => void }) {
   );
 }
 
-/** Plain-text paragraphs, with web addresses as links. */
-export function TextBody({ paragraphs }: { paragraphs: string[] }) {
+/** The "•••" under a reply that shows or hides its quote of earlier mail. */
+function QuoteToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void }) {
+  const label = shown ? "Hide quoted text" : "Show quoted text";
   return (
-    <div className="select-text space-y-3 break-words px-5 pb-5 pt-2 text-sm leading-[1.57]">
-      {paragraphs.map((paragraph, i) => (
-        <p key={i} className="whitespace-pre-line">
-          {linkify(paragraph)}
-        </p>
-      ))}
-    </div>
+    <button
+      className="mx-5 mb-4 grid h-4 w-7 place-items-center rounded-full bg-base-content/10 text-text-2 hover:bg-base-content/15 hover:text-base-content"
+      data-tip={label}
+      aria-label={label}
+      aria-expanded={shown}
+      onClick={onToggle}
+    >
+      <Ellipsis size={14} />
+    </button>
   );
+}
+
+/** Plain-text paragraphs, with web addresses as links. A reply's quote folds away unless `quotes` is off. */
+export function TextBody({ paragraphs, quotes = true }: { paragraphs: string[]; quotes?: boolean }) {
+  const [shown, setShown] = useState(false);
+  const cut = quotes ? quoteStart(paragraphs) : -1;
+  const visible = cut < 0 || shown ? paragraphs : paragraphs.slice(0, cut);
+  return (
+    <>
+      <div className={`select-text space-y-3 break-words px-5 pt-2 text-sm leading-[1.57] ${cut < 0 ? "pb-5" : "pb-3"}`}>
+        {visible.map((paragraph, i) => (
+          <p key={i} className={`whitespace-pre-line ${cut >= 0 && i >= cut ? "text-text-2" : ""}`}>
+            {linkify(paragraph)}
+          </p>
+        ))}
+      </div>
+      {cut >= 0 && <QuoteToggle shown={shown} onToggle={() => setShown((s) => !s)} />}
+    </>
+  );
+}
+
+/** How a plain-text reply's quote starts: an attribution line, Outlook's header, or "> " lines. */
+const TEXT_QUOTE = [
+  /^(?:On\b[^]{0,300}?|[^\n]{1,200}\s)wrote:\s*(?:\n|$)/,
+  /^-{2,}\s*Original Message\s*-{2,}/i,
+  /^From:[^\n]*\n(?:Sent|Date):/,
+  /^>/,
+];
+
+/** The paragraph a reply's quote starts at; -1 if there's none, or nothing before it. */
+function quoteStart(paragraphs: string[]) {
+  const i = paragraphs.findIndex((p) => TEXT_QUOTE.some((pattern) => pattern.test(p.trimStart())));
+  return i > 0 ? i : -1;
 }
 
 function linkify(text: string): ReactNode[] {
@@ -96,25 +138,37 @@ function linkify(text: string): ReactNode[] {
 
 /**
  * The email's HTML in a sandboxed frame sized to its content. Its embedded
- * images show once `inlineImages` has them; until then they're blank.
+ * images show once `inlineImages` has them; until then they're blank. A
+ * reply's quote folds away unless `quotes` is off.
  */
 export function HtmlBody({
   html,
   remoteImages,
   inlineImages,
+  quotes = true,
 }: {
   html: string;
   remoteImages: boolean;
   inlineImages: InlineImages | null;
+  quotes?: boolean;
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   /** Kept across the reloads that "Load images" and arriving embedded images cause, so the card doesn't jump. */
   const [height, setHeight] = useState(0);
-  const srcDoc = useMemo(() => frameDocument(html, remoteImages, inlineImages), [html, remoteImages, inlineImages]);
+  const [quoteShown, setQuoteShown] = useState(false);
+  const dark = useDarkTheme();
+  const frame = useMemo(
+    () => frameDocument(html, { remoteImages, inlineImages, quotes, card: dark ? cardColor() : null }),
+    [html, remoteImages, inlineImages, quotes, dark],
+  );
+  /** The quote's state for a document that loads later. */
+  const quoteShownRef = useRef(quoteShown);
+  quoteShownRef.current = quoteShown;
+  const wiredRef = useRef<{ doc: Document; measure: () => void } | null>(null);
 
   useEffect(() => {
-    const frame = frameRef.current;
-    if (!frame) return;
+    const frameEl = frameRef.current;
+    if (!frameEl) return;
     let wired: Document | null = null;
     let unwire = () => {};
     let measure = () => {};
@@ -124,11 +178,20 @@ export function HtmlBody({
     // Wire up as soon as the srcdoc document has a body, not at `load`,
     // which waits for every image.
     function wire() {
-      const doc = frame!.contentDocument;
+      const doc = frameEl!.contentDocument;
       if (!doc || doc === wired || doc.URL !== "about:srcdoc" || !doc.body) return;
       unwire();
       wired = doc;
       [measure, unwire] = wireFrame(doc, (h) => setHeight(Math.min(h, MAX_FRAME_HEIGHT)));
+      wiredRef.current = { doc, measure };
+      showQuote(doc, quoteShownRef.current);
+      const card = frame.adapt;
+      if (card) {
+        whenParsed(doc, () => {
+          adaptColors(doc, card);
+          measure();
+        });
+      }
     }
     const poll = () => {
       wire();
@@ -139,30 +202,56 @@ export function HtmlBody({
       measure();
     };
     poll();
-    frame.addEventListener("load", onLoad);
+    frameEl.addEventListener("load", onLoad);
     return () => {
       cancelAnimationFrame(raf);
-      frame.removeEventListener("load", onLoad);
+      frameEl.removeEventListener("load", onLoad);
       unwire();
+      wiredRef.current = null;
     };
-  }, [srcDoc]);
+  }, [frame]);
+
+  useEffect(() => {
+    const wired = wiredRef.current;
+    if (!wired) return;
+    showQuote(wired.doc, quoteShown);
+    wired.measure();
+  }, [quoteShown]);
 
   return (
-    // Light mode: the sheet blends into the card. Dark mode: a white inset sheet.
-    <div className="mx-5 mb-5 mt-2 overflow-hidden rounded-lg bg-white p-[var(--spark-email-inset)]">
-      <iframe
-        // A new frame per document, so a reload never wires up the old one.
-        key={remoteImages ? "remote" : "blocked"}
-        ref={frameRef}
-        title="Email content"
-        sandbox="allow-same-origin"
-        referrerPolicy="no-referrer"
-        srcDoc={srcDoc}
-        className="block w-full border-0"
-        style={{ height }}
-      />
-    </div>
+    <>
+      {/* The light theme's sheet blends into the card. In the dark theme, emails
+          that stay light sit on a white inset sheet; the rest take the card's color. */}
+      <div
+        className={`mx-5 mt-2 overflow-hidden rounded-lg ${frame.quoted ? "mb-2" : "mb-5"} ${
+          frame.sheet ? "bg-white p-[var(--spark-email-inset)]" : ""
+        }`}
+      >
+        <iframe
+          // A new frame per document, so a reload never wires up the old one.
+          key={remoteImages ? "remote" : "blocked"}
+          ref={frameRef}
+          title="Email content"
+          sandbox="allow-same-origin"
+          referrerPolicy="no-referrer"
+          srcDoc={frame.srcDoc}
+          className="block w-full border-0"
+          style={{ height }}
+        />
+      </div>
+      {frame.quoted && <QuoteToggle shown={quoteShown} onToggle={() => setQuoteShown((s) => !s)} />}
+    </>
   );
+}
+
+interface Frame {
+  srcDoc: string;
+  /** On a white sheet: in the light theme, and emails that stay light in the dark one. */
+  sheet: boolean;
+  /** The card color to adapt the email's colors to, for emails without a dark design of their own. */
+  adapt: Rgb | null;
+  /** A reply's quote of earlier mail is folded into `#spark-quoted`. */
+  quoted: boolean;
 }
 
 /**
@@ -170,10 +259,22 @@ export function HtmlBody({
  * email. Its own CSP, base, refresh and <link> tags are dropped (a policy can
  * only be tightened, but a refresh or prefetch would still reach the network).
  * Embedded images become data URLs; ones not (yet) fetched stay hidden by
- * FRAME_CSS rather than showing as broken.
+ * FRAME_CSS rather than showing as broken. `card` is the dark theme's card
+ * color, null in the light theme.
  */
-function frameDocument(html: string, remoteImages: boolean, inlineImages: InlineImages | null) {
+function frameDocument(
+  html: string,
+  {
+    remoteImages,
+    inlineImages,
+    quotes,
+    card,
+  }: { remoteImages: boolean; inlineImages: InlineImages | null; quotes: boolean; card: Rgb | null },
+): Frame {
   const doc = new DOMParser().parseFromString(html, "text/html");
+  // Before its <meta http-equiv> tags go: they count.
+  const scheme = card ? emailScheme(doc) : "light";
+  const dark = scheme !== "light";
   for (const el of doc.querySelectorAll("script, meta[http-equiv], base, link, iframe, frame, frameset, object, embed")) {
     el.remove();
   }
@@ -184,16 +285,24 @@ function frameDocument(html: string, remoteImages: boolean, inlineImages: Inline
       if (data) img.setAttribute("src", data);
     }
   }
+  preferColorScheme(doc, dark);
+  const quoted = quotes && foldQuote(doc);
   const imgSrc = remoteImages ? "data: cid: https: http:" : "data: cid:";
+  const css = card && dark ? FRAME_CSS + darkFrameCss(card, scheme === "adapt") : FRAME_CSS;
   doc.head.insertAdjacentHTML(
     "afterbegin",
     `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline'; font-src data:">` +
       `<meta name="referrer" content="no-referrer">` +
-      `<meta name="color-scheme" content="light">` +
+      `<meta name="color-scheme" content="${dark ? "dark" : "light"}">` +
       `<base target="_blank">` +
-      `<style>${FRAME_CSS}</style>`,
+      `<style>${css}</style>`,
   );
-  return `<!doctype html>${doc.documentElement.outerHTML}`;
+  return {
+    srcDoc: `<!doctype html>${doc.documentElement.outerHTML}`,
+    sheet: !dark,
+    adapt: card && scheme === "adapt" ? card : null,
+    quoted,
+  };
 }
 
 // `:root:root` outranks the email's own html/body rules, so the document's
@@ -207,7 +316,252 @@ img[src^="cid:" i] { visibility: hidden; }
 table { max-width: 100%; }
 pre { white-space: pre-wrap; }
 a { color: #007cff; }
+#spark-quoted[hidden] { display: none !important; }
 `;
+
+/**
+ * The dark theme's defaults: the card's color and light text. An email being
+ * adapted stays hidden until `adaptColors` has run, so it doesn't flash white.
+ */
+function darkFrameCss(card: Rgb, adapting: boolean) {
+  return `
+:root:root { color-scheme: dark; ${adapting ? "visibility: hidden;" : ""} }
+body { background: ${cssColor(card)}; color: #dee3eb; }
+a { color: #439fff; }
+`;
+}
+
+/** How an email is shown in the dark theme: its own dark design, kept light, or adapted. */
+type Scheme = "native" | "light" | "adapt";
+
+/**
+ * Spark's test. An email that lists dark in `supported-color-schemes` has a
+ * dark design of its own. One built to stay light keeps a white sheet: its
+ * styles only apply for one color scheme (`media` on a <style>), it's an
+ * Outlook-style template (X-UA-Compatible) that doesn't declare dark, or it's
+ * from Amazon or Apple, whose layouts break when recolored. The rest adapt.
+ */
+function emailScheme(doc: Document): Scheme {
+  const meta = (name: string) => doc.querySelector(`meta[name="${name}" i]`)?.getAttribute("content")?.toLowerCase() ?? "";
+  if (meta("supported-color-schemes").includes("dark")) return "native";
+  const styles = [...doc.querySelectorAll("style")].map((s) => s.textContent ?? "").join("\n");
+  const declaresDark = meta("color-scheme").includes("dark") || /(?:supported-)?color-scheme\s*:[^;}]*dark/i.test(styles);
+  const light =
+    [...doc.querySelectorAll("style[media], link[media]")].some((el) =>
+      /prefers-color-scheme/i.test(el.getAttribute("media")!),
+    ) ||
+    (doc.querySelector('meta[http-equiv="X-UA-Compatible" i]') !== null && !declaresDark) ||
+    doc.querySelector('img[src*="ssl-images-amazon"]') !== null ||
+    doc.getElementById("aapl-desktop") !== null ||
+    doc.getElementById("aapl-mobile") !== null;
+  return light ? "light" : "adapt";
+}
+
+/**
+ * Answers the email's `prefers-color-scheme` queries with the app's theme
+ * rather than the system's: Spark renders mail inside its own page, where
+ * they follow the app.
+ */
+function preferColorScheme(doc: Document, dark: boolean) {
+  const query = /\(\s*prefers-color-scheme\s*:\s*(dark|light)\s*\)/gi;
+  // Always-true and always-false queries.
+  const answer = (_: string, scheme: string) => ((scheme.toLowerCase() === "dark") === dark ? "(color)" : "(monochrome)");
+  for (const style of doc.querySelectorAll("style")) {
+    const text = style.textContent ?? "";
+    const answered = text.replace(query, answer);
+    if (answered !== text) style.textContent = answered;
+    const media = style.getAttribute("media");
+    if (media) style.setAttribute("media", media.replace(query, answer));
+  }
+}
+
+/** Where mail apps' replies start their quote of earlier mail. */
+const QUOTE_MARKERS = [
+  // Gmail
+  ".gmail_quote_container",
+  ".gmail_quote",
+  // Outlook on the web and new Outlook, then Outlook for Windows' header block
+  "#divRplyFwdMsg",
+  "#appendonsend",
+  "[id^='mail-editor-reference-message-container']",
+  "div[style*='border-top:solid #E1E1E1' i]",
+  "div[style*='border-top:solid #B5C4DF' i]",
+  // Thunderbird and Apple Mail
+  ".moz-cite-prefix",
+  "blockquote[type='cite' i]",
+  // Yahoo, Proton, Zoho
+  ".yahoo_quoted",
+  ".protonmail_quote",
+  ".zmail_extra",
+].join(", ");
+
+/**
+ * Moves a reply's quote of earlier mail, from its marker to the end, into a
+ * hidden `#spark-quoted` at the end of the body. Only when something comes
+ * before it, so a reply that's all quote still shows. Returns whether it did.
+ */
+function foldQuote(doc: Document) {
+  const body = doc.body;
+  let start = body.querySelector(QUOTE_MARKERS);
+  if (!start || !body.lastChild) return false;
+  // Outlook rules a line above its header block.
+  if (start.previousElementSibling?.tagName === "HR") start = start.previousElementSibling;
+  const before = doc.createRange();
+  before.setStart(body, 0);
+  before.setEndBefore(start);
+  if (!before.toString().trim() && !before.cloneContents().querySelector("img")) return false;
+  const quote = doc.createRange();
+  quote.setStartBefore(start);
+  quote.setEndAfter(body.lastChild);
+  const folded = doc.createElement("div");
+  folded.id = "spark-quoted";
+  folded.hidden = true;
+  folded.append(quote.extractContents());
+  body.append(folded);
+  return true;
+}
+
+function showQuote(doc: Document, shown: boolean) {
+  const folded = doc.getElementById("spark-quoted");
+  if (folded) folded.hidden = !shown;
+}
+
+/** Runs `then` once the document is fully parsed, so all of its styles apply. */
+function whenParsed(doc: Document, then: () => void) {
+  if (doc.readyState === "loading") doc.addEventListener("DOMContentLoaded", then, { once: true });
+  else then();
+}
+
+// ---- adapting colors to the dark theme ----
+
+type Rgb = { r: number; g: number; b: number };
+
+/** Spark's reference dark background, for when the card's color can't be read. */
+const SPARK_DARK: Rgb = { r: 31, g: 33, b: 36 };
+
+/** The message card's color in the current theme. */
+function cardColor(): Rgb {
+  const card = getComputedStyle(document.documentElement).getPropertyValue("--spark-card").trim();
+  return card ? rgbOf(card) : SPARK_DARK;
+}
+
+/**
+ * Spark's dark mode for an email without one of its own. Text that doesn't
+ * reach 4.5:1 contrast with the card gets lighter, and a background that then
+ * doesn't reach it with its text gets darker, both by CIELAB lightness so
+ * the hue stays. Every color is read before any changes. Shows the document,
+ * which `darkFrameCss` hid until now.
+ */
+function adaptColors(doc: Document, card: Rgb) {
+  try {
+    const view = doc.defaultView;
+    if (!view) return;
+    const elements = [doc.body, ...doc.body.querySelectorAll("*")].filter(
+      (el): el is HTMLElement => el instanceof view.HTMLElement,
+    );
+    const computed = elements.map((el) => {
+      const style = view.getComputedStyle(el);
+      return [style.color, style.backgroundColor] as const;
+    });
+    const parsed = new Map<string, Rgb>();
+    const rgb = (color: string) => {
+      let value = parsed.get(color);
+      if (!value) parsed.set(color, (value = rgbOf(color)));
+      return value;
+    };
+    elements.forEach((el, i) => {
+      const [color, background] = computed[i];
+      let text = rgb(color);
+      if (!readable(text, card)) {
+        text = shift(text, card, card);
+        el.style.setProperty("color", cssColor(text), "important");
+      }
+      // A transparent background reads as black, which light text is readable on.
+      const fill = rgb(background);
+      if (!readable(fill, text)) el.style.setProperty("background-color", cssColor(shift(fill, text, card)), "important");
+    });
+  } finally {
+    doc.documentElement.style.setProperty("visibility", "visible");
+  }
+}
+
+/**
+ * `color` with its CIELAB lightness moved to the side of the scale away
+ * from `against`: below the middle if `against` is light, above it if dark.
+ * The scale is compressed above the card's own lightness, so nothing gets
+ * darker than the card.
+ */
+function shift(color: Rgb, against: Rgb, card: Rgb): Rgb {
+  const floor = lab(card).l;
+  const { l, a, b } = lab(color);
+  const middle = (100 + floor) / 2;
+  let lightness = l * ((100 - floor) / 100) + floor;
+  if (lab(against).l > middle) {
+    lightness = Math.min(lightness, 2 * middle - lightness);
+    lightness = ((lightness - floor) * (50 - floor)) / (middle - floor) + floor;
+  } else {
+    lightness = Math.max(lightness, 2 * middle - lightness);
+    lightness = 100 - ((100 - lightness) * (50 - floor)) / (100 - middle);
+  }
+  return rgbFromLab(lightness, a, b);
+}
+
+/** WCAG AA for body text: a contrast ratio of at least 4.5:1. */
+function readable(one: Rgb, other: Rgb) {
+  const [light, dark] = [luminance(one), luminance(other)].sort((x, y) => y - x);
+  return (light + 0.05) / (dark + 0.05) >= 4.5;
+}
+
+function luminance({ r, g, b }: Rgb) {
+  const linear = (c: number) => (c / 255 <= 0.03928 ? c / 255 / 12.92 : ((c / 255 + 0.055) / 1.055) ** 2.4);
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+/** sRGB to CIELAB under D65. */
+function lab({ r, g, b }: Rgb) {
+  const linear = (c: number) => (c / 255 > 0.04045 ? ((c / 255 + 0.055) / 1.055) ** 2.4 : c / 255 / 12.92);
+  const [lr, lg, lb] = [linear(r), linear(g), linear(b)];
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const x = f((0.4124564 * lr + 0.3575761 * lg + 0.1804375 * lb) / 0.95047);
+  const y = f(0.2126729 * lr + 0.7151522 * lg + 0.072175 * lb);
+  const z = f((0.0193339 * lr + 0.119192 * lg + 0.9503041 * lb) / 1.08883);
+  return { l: 116 * y - 16, a: 500 * (x - y), b: 200 * (y - z) };
+}
+
+function rgbFromLab(l: number, a: number, b: number): Rgb {
+  const fy = (l + 16) / 116;
+  const unf = (t: number) => (t ** 3 > 0.008856 ? t ** 3 : (t - 16 / 116) / 7.787);
+  const x = unf(a / 500 + fy) * 0.95047;
+  const y = unf(fy);
+  const z = unf(fy - b / 200) * 1.08883;
+  const channel = (c: number) => {
+    const encoded = c > 0.0031308 ? 1.055 * c ** (1 / 2.4) - 0.055 : 12.92 * c;
+    return Math.round(255 * Math.min(Math.max(encoded, 0), 1));
+  };
+  return {
+    r: channel(3.2404542 * x - 1.5371385 * y - 0.4985314 * z),
+    g: channel(-0.969266 * x + 1.8760108 * y + 0.041556 * z),
+    b: channel(0.0556434 * x - 0.2040259 * y + 1.0572252 * z),
+  };
+}
+
+/** A hex or computed `rgb()`/`rgba()` color's channels; alpha is ignored, as in Spark. */
+function rgbOf(color: string): Rgb {
+  const hex = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(color.trim())?.[1];
+  if (hex) {
+    const n = parseInt(hex.length === 3 ? [...hex].map((h) => h + h).join("") : hex, 16);
+    return { r: n >> 16, g: (n >> 8) & 255, b: n & 255 };
+  }
+  const [r = 0, g = 0, b = 0] = (/rgba?\(([^)]*)\)/i.exec(color)?.[1] ?? "")
+    .split(/[\s,/]+/)
+    .filter(Boolean)
+    .map(Number);
+  return { r, g, b };
+}
+
+function cssColor({ r, g, b }: Rgb) {
+  return `rgb(${r}, ${g}, ${b})`;
+}
 
 /**
  * Sizes the frame to its document and routes its clicks and keys to the app.

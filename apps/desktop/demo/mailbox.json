@@ -19,7 +19,8 @@
     "from": "Priya Raman", "address": "priya@acme.example", "ageMinutes": 1500,
     "subject": "Re: Q4 roadmap review",
     "snippet": "Moved it to Thursday 2pm — does that still work for you?",
-    "body": ["Moved the roadmap review to Thursday at 2pm since half the team is out Wednesday.", "Does that still work for you? If not I can do Friday morning.", "Priya"]
+    "body": ["Moved the roadmap review to Thursday at 2pm since half the team is out Wednesday.", "Does that still work for you? If not I can do Friday morning.", "Priya"],
+    "html": "<div dir=\"ltr\"><div>Moved the roadmap review to Thursday at 2pm since half the team is out Wednesday.</div><div><br></div><div>Does that still work for you? If not I can do Friday morning.</div><div><br></div><div>Priya</div></div><br><div class=\"gmail_quote\"><div dir=\"ltr\" class=\"gmail_attr\">On Wed, Oct 21, 2026 at 4:05 PM Hannah Cole &lt;hannah@acme.example&gt; wrote:<br></div><blockquote class=\"gmail_quote\" style=\"margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex\"><div dir=\"ltr\">Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?<div><br></div><div>Hannah</div></div></blockquote></div>"
   },
   {
     "id": 4, "account": "personal", "category": "people", "priority": true, "unread": true,
@@ -120,12 +121,13 @@
     "from": "The Pragmatic Weekly", "address": "hello@pragmaticweekly.example", "ageMinutes": 1450,
     "subject": "How small teams ship desktop apps",
     "snippet": "Three teams on choosing a UI toolkit, and what they would do differently.",
-    "body": ["Three small teams on how they chose a desktop UI toolkit, and what they would do differently next time."]
+    "body": ["Three small teams on how they chose a desktop UI toolkit, and what they would do differently next time."],
+    "html": "<!doctype html><html><head><style>\n.wrap{background:#eef1f5;padding:24px 12px;font-family:Georgia,serif}\n.sheet{max-width:560px;margin:0 auto;background:#ffffff;border-radius:6px;overflow:hidden}\n.mast{background:#13294b;color:#ffffff;padding:20px 28px;font:600 13px/1.4 Helvetica,Arial,sans-serif;letter-spacing:.08em;text-transform:uppercase}\n.body{padding:24px 28px;color:#1f2933;font-size:16px;line-height:1.6}\nh1{font:700 24px/1.25 Helvetica,Arial,sans-serif;color:#111827;margin:0 0 12px}\n.lede{color:#52606d}\n.pick{border-left:3px solid #ff6b35;background:#fff4ec;padding:12px 16px;margin:20px 0;color:#7a3413}\n.cta{display:inline-block;background:#ff6b35;color:#ffffff;text-decoration:none;font:600 14px Helvetica,Arial,sans-serif;padding:10px 18px;border-radius:4px}\n.foot{background:#f3f4f6;color:#6b7280;font:12px/1.5 Helvetica,Arial,sans-serif;padding:16px 28px}\n.foot a{color:#6b7280}\n</style></head><body><div class=\"wrap\"><div class=\"sheet\">\n<div class=\"mast\">The Pragmatic Weekly · Issue 88</div>\n<div class=\"body\">\n<h1>How small teams ship desktop apps</h1>\n<p class=\"lede\">Three small teams on how they chose a desktop UI toolkit, and what they would do differently next time.</p>\n<p>The common thread: pick the stack your team can debug at 2am. Two of the three teams moved from a pure web wrapper to a native shell with a web UI, and none of them regret owning their own update channel.</p>\n<div class=\"pick\"><b>Editor's pick:</b> the team that cut their install size by 80% by dropping a bundled browser.</div>\n<p><a class=\"cta\" href=\"https://pragmaticweekly.example/88\">Read the full issue</a></p>\n<p>Also this week: <a href=\"https://pragmaticweekly.example/88#signing\" style=\"color:#1d4ed8\">code signing on a budget</a> and <a href=\"https://pragmaticweekly.example/88#arm\" style=\"color:#1d4ed8\">shipping for Windows on ARM</a>.</p>\n</div>\n<div class=\"foot\">You're getting this because you subscribed at pragmaticweekly.example. <a href=\"https://pragmaticweekly.example/unsubscribe\">Unsubscribe</a></div>\n</div></div></body></html>"
   },
   {
     "id": 18, "account": "personal", "category": "people", "state": "filed",
     "from": "Me", "address": "me@gmail.com", "to": ["Marcus Lee <marcus.lee@gmail.com>"], "ageMinutes": 190,
-    "subject": "Re: Saturday hike?",
+    "subject": "Re: Saturday hike?", "conversation": 2,
     "snippet": "I'm in! 8 works. I'll bring the good snacks, promise.",
     "body": ["I'm in! 8 works.", "I'll bring the good snacks, promise."]
   },
@@ -134,21 +136,21 @@
     "from": "Me", "address": "me@outlook.com",
     "to": ["Priya Raman <priya@acme.example>", "Sam Okafor <sam.okafor@acme.example>", "Hannah Cole <hannah@acme.example>", "kai@acme.example"],
     "ageMinutes": 1440,
-    "subject": "Re: Q4 roadmap review",
+    "subject": "Re: Q4 roadmap review", "conversation": 3,
     "snippet": "Thursday at 2 works for me. I'll bring the updated timeline.",
-    "body": ["Thursday at 2 works for me.", "I'll bring the updated timeline and the open questions from last week."]
+    "body": ["Thursday at 2 works for me.", "I'll bring the updated timeline and the open questions from last week.", "On Thu, Oct 22, 2026 at 10:40 AM Priya Raman <priya@acme.example> wrote:\n> Moved the roadmap review to Thursday at 2pm since half the team is out Wednesday.\n> Does that still work for you? If not I can do Friday morning."]
   },
   {
     "id": 20, "account": "personal", "category": "people", "state": "filed",
     "from": "Me", "address": "me@gmail.com", "to": ["Mom <mom@example.com>"], "ageMinutes": 1530,
-    "subject": "Re: Photos from the weekend",
+    "subject": "Re: Photos from the weekend", "conversation": 4,
     "snippet": "These are great! The dog one is going on the fridge.",
     "body": ["These are great! The dog one is going on the fridge.", "I'll call you Wednesday."]
   },
   {
     "id": 21, "account": "work", "category": "people", "state": "filed",
     "from": "Me", "address": "me@outlook.com", "to": ["Alex Moreno <alex@moreno-design.example>"], "ageMinutes": 300,
-    "subject": "Re: Invoice #1042",
+    "subject": "Re: Invoice #1042", "conversation": 5,
     "snippet": "Hi Alex, thanks for sending this over. Before I pass it to finance,",
     "body": ["Hi Alex,", "Thanks for sending this over. Before I pass it to finance, could you split the design and"]
   },
@@ -158,5 +160,21 @@
     "subject": "Packing list",
     "snippet": "Boots, rain jacket, headlamp, the good snacks",
     "body": ["Boots, rain jacket, headlamp, the good snacks"]
+  },
+  {
+    "id": 23, "account": "work", "category": "people", "state": "done", "conversation": 3,
+    "from": "Sam Okafor", "address": "sam.okafor@acme.example", "ageMinutes": 2950,
+    "to": ["Priya Raman <priya@acme.example>", "Hannah Cole <hannah@acme.example>", "kai@acme.example", "Me <me@outlook.com>"],
+    "subject": "Q4 roadmap review",
+    "snippet": "Booked Wednesday 10am for the Q4 roadmap review. Agenda is in the doc.",
+    "body": ["Hi all,", "Booked Wednesday 10am for the Q4 roadmap review. The agenda is in the shared doc; please add your open questions by Tuesday.", "Sam"]
+  },
+  {
+    "id": 24, "account": "work", "category": "people", "state": "done", "conversation": 3,
+    "from": "Hannah Cole", "address": "hannah@acme.example", "ageMinutes": 1900,
+    "to": ["Sam Okafor <sam.okafor@acme.example>", "Priya Raman <priya@acme.example>", "kai@acme.example", "Me <me@outlook.com>"],
+    "subject": "Re: Q4 roadmap review",
+    "snippet": "Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?",
+    "body": ["Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?", "Hannah"]
   }
 ]

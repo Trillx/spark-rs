@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+mod conversations;
 mod drafts;
 
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
@@ -225,6 +226,9 @@ pub struct Message {
     pub folder: Option<i64>,
     /// Who it's to, as display strings; Sent and Drafts list them.
     pub to: Vec<String>,
+    /// The conversation it's part of (see `conversations`): messages that
+    /// share it show together in the thread view.
+    pub conversation: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -517,7 +521,7 @@ const ARRIVING: &str = "changed_at != 0 AND state = 'filed' AND home_folder_id =
 const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, unread, pinned, \
      priority, screening, from_name, from_address, subject, snippet, date, attachments, \
      (SELECT group_concat(folder_id) FROM folder_members WHERE message_id = messages.id), \
-     CASE WHEN state = 'filed' THEN home_folder_id END, to_list";
+     CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id)";
 
 const FOLDER_COLUMNS: &str = "f.id, f.account_id, f.remote_id, p.id, f.name, f.role, f.selectable, \
      f.sync_state, f.synced_at";
@@ -554,6 +558,13 @@ impl Store {
         if version < 5 {
             conn.execute_batch(drafts::SCHEMA_DRAFTS)?;
             conn.pragma_update(None, "user_version", 5)?;
+        }
+        if version < 6 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(conversations::SCHEMA_CONVERSATIONS)?;
+            conversations::backfill(&tx)?;
+            tx.pragma_update(None, "user_version", 6)?;
+            tx.commit()?;
         }
         Ok(Self { conn })
     }
@@ -1700,7 +1711,16 @@ fn insert_message(
             json(&m.bcc),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    let threading = conversations::Threading {
+        message_id: m.message_id.as_deref(),
+        in_reply_to: m.in_reply_to.as_deref(),
+        references: m.references.as_deref(),
+        thread_id: m.thread_id.as_deref(),
+        subject: &m.subject,
+    };
+    conversations::link(conn, id, m.account_id, &threading)?;
+    Ok(id)
 }
 
 /// Drops a folder (already gone from the server). Filed mail it held and
@@ -1832,6 +1852,7 @@ fn message_row(r: &Row) -> Result<Message> {
             .unwrap_or_default(),
         folder: r.get(16)?,
         to: from_json(&r.get::<_, String>(17)?),
+        conversation: r.get(18)?,
     })
 }
 

@@ -201,6 +201,7 @@ mod tests {
             attachment: None,
             folders: Vec::new(),
             folder: None,
+            conversation: None,
         }
     }
 

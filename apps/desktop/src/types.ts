@@ -62,6 +62,8 @@ export interface Message {
   folders?: number[];
   /** The folder it was filed in, while `state` is `filed`. */
   folder?: number;
+  /** Messages of one conversation share it; without one, a message is a conversation of its own. */
+  conversation?: number;
 }
 
 /** What a server folder is for. User folders and labels have none. */

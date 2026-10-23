@@ -60,6 +60,10 @@ pub struct Message {
     /// While Filed: the folder it's kept in (its home).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder: Option<i64>,
+    /// Messages of one conversation share it; without one, a message is a
+    /// conversation of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<i64>,
 }
 
 /// A server folder or label, for the sidebar and folder picker.
@@ -200,6 +204,7 @@ fn from_store(m: spark_store::Message) -> Message {
         attachment: m.attachment,
         folders: m.folders,
         folder: m.folder,
+        conversation: Some(m.conversation),
     }
 }
 
@@ -358,7 +363,7 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
             .ok_or_else(|| format!("no message with id {id}"))?;
         return Ok(MessageContent {
             text: m.body.unwrap_or_default(),
-            html: None,
+            html: demo::html(id),
             to: if m.to.is_empty() {
                 vec!["You".into()]
             } else {
@@ -823,6 +828,7 @@ mod tests {
             folders: vec![4],
             folder: None,
             to: vec!["Me <me@x.com>".into()],
+            conversation: 2,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["account"], 7);

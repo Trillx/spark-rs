@@ -6,7 +6,7 @@
 //! Changes live in memory only.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use spark_mail::draft::{Draft, OutgoingAttachment};
@@ -114,6 +114,12 @@ struct DemoEntry {
     body: Vec<String>,
     #[serde(default)]
     attachment: Option<String>,
+    /// The message whose conversation it's part of.
+    #[serde(default)]
+    conversation: Option<i64>,
+    /// The email's own HTML, for the few demo messages that have one.
+    #[serde(default)]
+    html: Option<String>,
 }
 
 pub struct DemoMailbox(Mutex<Vec<Message>>, Mutex<DemoDrafts>);
@@ -197,6 +203,7 @@ impl DemoMailbox {
             }),
             folders: vec![drafts_folder.id],
             folder: Some(drafts_folder.id),
+            conversation: None,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -367,8 +374,24 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             snippet: e.snippet,
             body: Some(e.body),
             attachment: e.attachment,
+            conversation: e.conversation,
         })
         .collect()
+}
+
+/// The HTML of demo message `id`, if it has one.
+pub fn html(id: i64) -> Option<String> {
+    static HTML: OnceLock<HashMap<i64, String>> = OnceLock::new();
+    HTML.get_or_init(|| {
+        let entries: Vec<DemoEntry> = serde_json::from_str(include_str!("../../demo/mailbox.json"))
+            .expect("demo/mailbox.json is valid");
+        entries
+            .into_iter()
+            .filter_map(|e| Some((e.id, e.html?)))
+            .collect()
+    })
+    .get(&id)
+    .cloned()
 }
 
 #[cfg(test)]
@@ -382,8 +405,19 @@ mod tests {
         let messages = demo_messages(NOW_MS);
         assert!(messages.len() >= 12);
         // Mail is in the inbox unless it says otherwise, and filed mail is in a folder.
-        assert!(messages.iter().all(|m| m.state == MessageState::Inbox
-            || (m.state == MessageState::Filed && !m.folders.is_empty())));
+        assert!(messages.iter().any(|m| m.state == MessageState::Inbox));
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.state != MessageState::Filed || !m.folders.is_empty())
+        );
+        // Replies share a conversation with what they answer; a few emails have HTML.
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.conversation.is_some_and(|c| c != m.id))
+        );
+        assert!(messages.iter().any(|m| html(m.id).is_some()));
         assert!(
             messages
                 .iter()

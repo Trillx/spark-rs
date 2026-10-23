@@ -5,6 +5,8 @@ import {
   Ban,
   Check,
   ChevronDown,
+  ChevronsDownUp,
+  ChevronsUpDown,
   Circle,
   Clock,
   Ellipsis,
@@ -19,12 +21,21 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { SUMMARY_STYLES, type SummaryStyle } from "../ai";
 import type { AccountView, Message, MessageContent } from "../types";
 import { useAccount } from "../lib/accounts";
+import { readingStart } from "../lib/conversation";
 import { allowRemoteImages, remoteImagesAllowed, useInlineImages, useMessageContent } from "../lib/content";
-import { LATER_PRESETS, formatFullDate, formatLater, parseAddress, presetDetail, type LaterPreset } from "../lib/format";
+import {
+  LATER_PRESETS,
+  formatFullDate,
+  formatLater,
+  formatListDate,
+  parseAddress,
+  presetDetail,
+  type LaterPreset,
+} from "../lib/format";
 import { hint, shortcutLabel, type ActionId } from "../lib/shortcuts";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AiMark from "./AiMark";
@@ -73,14 +84,27 @@ const STYLE_SHORTCUTS: Record<SummaryStyle, ActionId> = {
   actionPoints: "summarizeActions",
 };
 
+/**
+ * The open conversation, Spark's way: one card per email, oldest first.
+ * Emails before the first one that was unread when it opened (or before the
+ * one opened, if that's earlier) start collapsed to a line; clicking a card's
+ * header collapses or expands it.
+ */
 export default function ThreadView({
   message: m,
+  conversation,
+  unread,
   singleColumn,
   summary,
   aiProvider,
   actions,
 }: {
+  /** The email opened from the list. Toolbar actions act on it (state changes on its whole conversation). */
   message: Message;
+  /** Its conversation, oldest first, `message` included. */
+  conversation: Message[];
+  /** Which of them were unread when the conversation opened. */
+  unread: ReadonlySet<number>;
   singleColumn: boolean;
   summary?: SummaryState;
   /** Names the provider in a refusal, e.g. "Anthropic". */
@@ -89,8 +113,34 @@ export default function ThreadView({
 }) {
   const screening = m.screening && m.state === "inbox";
   const summaryRef = useRef<HTMLElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const closeTip: Tip = singleColumn ? { label: "Back to list", keys: "Esc" } : hint("Close", "close");
   const jumpToSummary = () => summaryRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const [start] = useState(() => conversation[readingStart(conversation, m.id, unread)]?.id);
+  /** Collapsed cards. Emails that arrive while it's open aren't in it, so they show expanded. */
+  const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => {
+    const at = conversation.findIndex((x) => x.id === start);
+    return new Set(conversation.slice(0, Math.max(at, 0)).map((x) => x.id));
+  });
+  const firstNew = conversation.findIndex((x) => unread.has(x.id));
+  const several = conversation.length > 1;
+  const latest = conversation[conversation.length - 1];
+
+  const toggle = (id: number) =>
+    setCollapsed((c) => {
+      const next = new Set(c);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  const expandAll = () => setCollapsed(new Set());
+  /** Like Spark, the latest email stays open. */
+  const collapseAll = () => setCollapsed(new Set(conversation.filter((x) => x !== latest).map((x) => x.id)));
+
+  // Reading starts at the first expanded email, below the ones collapsed above it.
+  useLayoutEffect(() => {
+    if (start === undefined || start === conversation[0]?.id) return;
+    scrollRef.current?.querySelector(`[data-message="${start}"]`)?.scrollIntoView({ block: "start" });
+  }, []); // Only when the conversation opens.
 
   return (
     <>
@@ -102,12 +152,16 @@ export default function ThreadView({
           closeTip={closeTip}
           summary={summary}
           onJumpToSummary={jumpToSummary}
+          onExpandAll={several ? expandAll : undefined}
+          onCollapseAll={several ? collapseAll : undefined}
           actions={actions}
         />
       )}
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-8">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 pb-8">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-3 pt-2">
-          <h1 className="select-text text-sm font-semibold leading-[22px]">{m.subject || "No subject"}</h1>
+          <h1 className="select-text text-sm font-semibold leading-[22px]">
+            {conversation[0]?.subject || m.subject || "No subject"}
+          </h1>
           {m.priority && (
             <Pill className="bg-priority-fill text-priority">
               <Zap size={12} className="fill-current" /> Priority
@@ -124,7 +178,24 @@ export default function ThreadView({
             </Pill>
           )}
         </div>
-        <MessageCard message={m} showReplyBar={!screening} actions={actions} />
+        <div className="space-y-2">
+          {conversation.map((x, i) => (
+            <Fragment key={x.id}>
+              {i === firstNew && i > 0 && <NewMessagesLine />}
+              {collapsed.has(x.id) ? (
+                <CollapsedCard message={x} onExpand={() => toggle(x.id)} />
+              ) : (
+                <MessageCard
+                  message={x}
+                  showReplyBar={!screening}
+                  quickReplies={x === latest}
+                  onCollapse={several ? () => toggle(x.id) : undefined}
+                  actions={actions}
+                />
+              )}
+            </Fragment>
+          ))}
+        </div>
         {summary && (
           <SummaryCard
             ref={summaryRef}
@@ -142,18 +213,55 @@ export default function ThreadView({
   );
 }
 
+/** Spark's divider above the emails that were unread when the conversation opened. */
+function NewMessagesLine() {
+  return (
+    <div role="separator" className="flex items-center gap-2 py-1 text-[11px] font-medium leading-4 text-primary">
+      <span className="h-px w-20 bg-primary/40" />
+      New messages
+      <span className="h-px flex-1 bg-primary/40" />
+    </div>
+  );
+}
+
+/** An email collapsed to one line: who, the start of what they wrote, and when. */
+function CollapsedCard({ message: m, onExpand }: { message: Message; onExpand: () => void }) {
+  return (
+    <article data-message={m.id} className="scroll-mt-2 rounded-2xl border border-hairline bg-card">
+      <button
+        className="flex w-full items-center gap-3 rounded-2xl px-5 py-2.5 text-left hover:bg-base-content/[0.03]"
+        aria-expanded={false}
+        aria-label={`${m.from}: ${m.snippet}`}
+        onClick={onExpand}
+      >
+        <Avatar name={m.from} size="sm" account={m.account} />
+        <span className="shrink-0 text-sm font-bold leading-5">{m.from}</span>
+        <span className="min-w-0 flex-1 truncate text-[13px] leading-5 text-text-2">{m.snippet}</span>
+        <time className="shrink-0 text-xs leading-5 text-text-2" dateTime={new Date(m.timestamp).toISOString()}>
+          {formatListDate(m.timestamp)}
+        </time>
+      </button>
+    </article>
+  );
+}
+
 /** Thread toolbar: the `[← │ ✓]` segment, then the message actions. */
 function Toolbar({
   message: m,
   closeTip,
   summary,
   onJumpToSummary,
+  onExpandAll,
+  onCollapseAll,
   actions,
 }: {
   message: Message;
   closeTip: Tip;
   summary?: SummaryState;
   onJumpToSummary: () => void;
+  /** Only for a conversation of several emails. */
+  onExpandAll?: () => void;
+  onCollapseAll?: () => void;
   actions: ThreadActions;
 }) {
   const isDone = m.state === "done";
@@ -236,6 +344,13 @@ function Toolbar({
           )}
         >
           <MessageMenuItems message={m} actions={actions} />
+          {onExpandAll && onCollapseAll && (
+            <>
+              <li role="none" className="my-0.5 h-px bg-hairline" />
+              <MenuItem label="Expand all emails" icon={<ChevronsUpDown size={15} />} onSelect={onExpandAll} />
+              <MenuItem label="Collapse all emails" icon={<ChevronsDownUp size={15} />} onSelect={onCollapseAll} />
+            </>
+          )}
         </Dropdown>
       </div>
     </div>
@@ -397,22 +512,31 @@ function GatekeeperToolbar({
   );
 }
 
-/** One message: a one-line header, the body, attachments and the bottom bar. */
+/** One email: a one-line header, the body, attachments and the bottom bar. */
 function MessageCard({
   message: m,
   showReplyBar,
+  quickReplies,
+  onCollapse,
   actions,
 }: {
   message: Message;
   showReplyBar: boolean;
+  /** The quick replies, under the latest email. */
+  quickReplies: boolean;
+  /** Clicking the header collapses the card, in a conversation of several. */
+  onCollapse?: () => void;
   actions: ThreadActions;
 }) {
   const account = useAccount(m.account);
   const [state, retry] = useMessageContent(m.id);
   const content = state.status === "ready" ? state.content : null;
   return (
-    <article className="rounded-2xl border border-hairline bg-card">
-      <header className="flex items-center gap-3 px-5 pb-1.5 pt-3.5">
+    <article data-message={m.id} className="scroll-mt-2 rounded-2xl border border-hairline bg-card">
+      <header
+        className={`flex items-center gap-3 px-5 pb-1.5 pt-3.5 ${onCollapse ? "cursor-pointer" : ""}`}
+        onClick={onCollapse}
+      >
         <Avatar name={m.from} size="lg" account={m.account} />
         <div className="min-w-0 flex-1 truncate text-sm leading-5">
           <span className="font-bold" data-tip={m.address}>
@@ -423,25 +547,28 @@ function MessageCard({
         <time className="shrink-0 text-xs leading-5 text-text-2" dateTime={new Date(m.timestamp).toISOString()}>
           {formatFullDate(m.timestamp)}
         </time>
-        <Dropdown
-          align="end"
-          width="w-48"
-          trigger={({ toggle, open }) => (
-            <button
-              className={`grid size-6 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content ${
-                open ? "bg-base-content/10" : ""
-              }`}
-              data-tip="Message actions"
-              aria-label="Message actions"
-              aria-haspopup="menu"
-              onClick={toggle}
-            >
-              <Ellipsis size={16} />
-            </button>
-          )}
-        >
-          <MessageMenuItems message={m} actions={actions} />
-        </Dropdown>
+        {/* Its clicks and menu stay out of the header's collapse. */}
+        <div className="contents" onClick={(e) => e.stopPropagation()}>
+          <Dropdown
+            align="end"
+            width="w-48"
+            trigger={({ toggle, open }) => (
+              <button
+                className={`grid size-6 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content ${
+                  open ? "bg-base-content/10" : ""
+                }`}
+                data-tip="Message actions"
+                aria-label="Message actions"
+                aria-haspopup="menu"
+                onClick={toggle}
+              >
+                <Ellipsis size={16} />
+              </button>
+            )}
+          >
+            <MessageMenuItems message={m} actions={actions} />
+          </Dropdown>
+        </div>
       </header>
       {state.status === "loading" && <BodySkeleton />}
       {state.status === "error" && (
@@ -452,7 +579,7 @@ function MessageCard({
           </button>
         </div>
       )}
-      {content && <Body id={m.id} content={content} />}
+      {content && <Body id={m.id} content={content} quotes={!isForward(m.subject)} />}
       {content && content.attachments.length > 0 && (
         <AttachmentList
           attachments={content.attachments}
@@ -463,16 +590,20 @@ function MessageCard({
       )}
       {showReplyBar && (
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
-          {QUICK_REPLIES.map(({ label, body }) => (
-            <button
-              key={label}
-              className="h-7 rounded-md bg-chip px-3 text-xs font-medium text-base-content/80 hover:brightness-95"
-              onClick={() => actions.reply(m, body)}
-            >
-              {label}
-            </button>
-          ))}
-          <span className="mx-1 h-5 w-px bg-hairline" />
+          {quickReplies && (
+            <>
+              {QUICK_REPLIES.map(({ label, body }) => (
+                <button
+                  key={label}
+                  className="h-7 rounded-md bg-chip px-3 text-xs font-medium text-base-content/80 hover:brightness-95"
+                  onClick={() => actions.reply(m, body)}
+                >
+                  {label}
+                </button>
+              ))}
+              <span className="mx-1 h-5 w-px bg-hairline" />
+            </>
+          )}
           <ToolbarButton tip={hint("Reply", "reply")} Icon={Reply} onClick={() => actions.reply(m)} />
           <ToolbarButton tip={hint("Forward", "forward")} Icon={Forward} onClick={() => actions.forward(m)} />
         </footer>
@@ -481,14 +612,18 @@ function MessageCard({
   );
 }
 
-/** The email's HTML in the sandboxed frame (embedded images fetched, remote ones on request), else its text. */
-function Body({ id, content }: { id: number; content: MessageContent }) {
+/**
+ * The email's HTML in the sandboxed frame (embedded images fetched, remote
+ * ones on request), else its text. A reply's quote folds away unless `quotes`
+ * is off, as it is for a forward, whose quote is the point.
+ */
+function Body({ id, content, quotes }: { id: number; content: MessageContent; quotes: boolean }) {
   const [images, setImages] = useState(() => remoteImagesAllowed(id));
   const html = content.html;
   const blocked = useMemo(() => html !== null && hasRemoteImages(html), [html]);
   const embeds = useMemo(() => html !== null && hasInlineImages(html), [html]);
   const inlineImages = useInlineImages(id, embeds);
-  if (html === null) return <TextBody paragraphs={content.text} />;
+  if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} />;
   return (
     <>
       {blocked && !images && (
@@ -499,9 +634,14 @@ function Body({ id, content }: { id: number; content: MessageContent }) {
           }}
         />
       )}
-      <HtmlBody html={html} remoteImages={images} inlineImages={inlineImages} />
+      <HtmlBody html={html} remoteImages={images} inlineImages={inlineImages} quotes={quotes} />
     </>
   );
+}
+
+/** "Fwd:", "FW:", "WG:" (German), "TR:" (French), "RV:" (Spanish), "ENC:" (Portuguese). */
+function isForward(subject: string) {
+  return /^\s*(?:fwd?|wg|tr|rv|enc)\s*:/i.test(subject);
 }
 
 /** " to You, Ana Ruiz cc Ben": names only, the full address in each tooltip. */

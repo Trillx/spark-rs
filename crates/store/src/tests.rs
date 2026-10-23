@@ -1590,3 +1590,134 @@ fn version_3_databases_gain_home_folders() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Message `uid`, replying to the messages `replies_to` (oldest first).
+fn reply(account_id: i64, uid: u32, subject: &str, replies_to: &[u32]) -> Incoming {
+    let ids: Vec<String> = replies_to
+        .iter()
+        .map(|r| format!("{r}@example.com"))
+        .collect();
+    Incoming {
+        subject: subject.into(),
+        in_reply_to: ids.last().cloned(),
+        references: Some(ids.join(" ")).filter(|r| !r.is_empty()),
+        ..incoming(account_id, uid, "ana@example.com")
+    }
+}
+
+fn conversation(store: &Store, id: i64) -> i64 {
+    store.message(id).unwrap().unwrap().conversation
+}
+
+fn add(store: &mut Store, m: Incoming) -> i64 {
+    new_id(store.add_incoming(&m, false).unwrap())
+}
+
+#[test]
+fn replies_join_the_conversation_of_what_they_answer() {
+    let (mut store, account) = store_with_account();
+    let plan = add(&mut store, reply(account, 1, "Plan", &[]));
+    let answer = add(&mut store, reply(account, 2, "Re: Plan", &[1]));
+    let forward = add(&mut store, reply(account, 3, "Fwd: RE: Plan", &[1, 2]));
+    let lunch = add(&mut store, reply(account, 4, "Lunch?", &[]));
+    // Replying to the plan about something else starts a conversation of its own.
+    let elsewhere = add(&mut store, reply(account, 5, "Re: Budget", &[1, 2]));
+
+    assert_eq!(conversation(&store, plan), plan);
+    assert_eq!(conversation(&store, answer), plan);
+    assert_eq!(conversation(&store, forward), plan);
+    assert_eq!(conversation(&store, lunch), lunch);
+    assert_eq!(conversation(&store, elsewhere), elsewhere);
+    let listed = store.messages().unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|m| m.id == answer && m.conversation == plan)
+    );
+}
+
+#[test]
+fn mail_that_links_two_conversations_merges_them() {
+    let (mut store, account) = store_with_account();
+    // Replies to messages that aren't stored, so nothing links them yet.
+    let first = add(&mut store, reply(account, 5, "Re: Plan", &[9]));
+    let second = add(&mut store, reply(account, 6, "Re: Plan", &[8]));
+    assert_ne!(conversation(&store, first), conversation(&store, second));
+
+    let both = add(&mut store, reply(account, 7, "Re: Plan", &[8, 9]));
+    for id in [first, second, both] {
+        assert_eq!(conversation(&store, id), first);
+    }
+}
+
+#[test]
+fn server_conversations_group_mail_within_one_account() {
+    let (mut store, account) = store_with_account();
+    let other = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: "me@outlook.com",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let graph = |account_id: i64, uid: u32, subject: &str| Incoming {
+        message_id: None,
+        thread_id: Some("AAQkADAwATM".into()),
+        subject: subject.into(),
+        ..incoming(account_id, uid, "ana@example.com")
+    };
+    let plan = add(&mut store, graph(account, 1, "Plan"));
+    // The server keeps a renamed reply in the conversation.
+    let renamed = add(&mut store, graph(account, 2, "Updated plan"));
+    let other_account = add(&mut store, graph(other, 3, "Plan"));
+
+    assert_eq!(conversation(&store, renamed), plan);
+    assert_eq!(conversation(&store, other_account), other_account);
+}
+
+#[test]
+fn version_5_databases_gain_conversations() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v5-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v5.sqlite");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        for schema in [SCHEMA, SCHEMA_2, SCHEMA_3, SCHEMA_4, drafts::SCHEMA_DRAFTS] {
+            conn.execute_batch(schema).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, kind, email, name, label, color, config, position)
+             VALUES (1, 'imap', 'a@b.c', 'A', 'A', '#000', '{}', 0);
+             INSERT INTO messages (id, account_id, message_id, in_reply_to, refs, from_name,
+                 from_address, to_list, cc_list, subject, snippet, date, text_body, attachments,
+                 category, state, unread, pinned, remote_place, remote_unread, remote_pinned)
+             VALUES
+                 (1, 1, '1@x.com', NULL, NULL, '', '', '[]', '[]', 'Plan', '', 0, '', '[]',
+                  'people', 'inbox', 0, 0, 'inbox', 0, 0),
+                 (2, 1, '2@x.com', NULL, NULL, '', '', '[]', '[]', 'Lunch', '', 0, '', '[]',
+                  'people', 'inbox', 0, 0, 'inbox', 0, 0),
+                 (3, 1, '3@x.com', '1@x.com', '1@x.com', '', '', '[]', '[]', 'Re: Plan', '', 0,
+                  '', '[]', 'people', 'inbox', 0, 0, 'inbox', 0, 0);",
+        )
+        .unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!([1, 2, 3].map(|id| conversation(&store, id)), [1, 2, 1]);
+    // Mail arriving later still finds the old conversations.
+    let later = add(&mut store, reply(1, 4, "Re: Lunch", &[]));
+    assert_eq!(conversation(&store, later), later);
+    let threaded = Incoming {
+        in_reply_to: Some("2@x.com".into()),
+        references: Some("2@x.com".into()),
+        ..reply(1, 5, "Re: Lunch", &[])
+    };
+    let answer = add(&mut store, threaded);
+    assert_eq!(conversation(&store, answer), 2);
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -96,6 +96,7 @@ import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./component
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode } from "./lib/accounts";
 import { clearContent, loadContent } from "./lib/content";
+import { conversationOf, movesWith } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
 import {
   LATER_PRESETS,
@@ -234,6 +235,8 @@ export default function App() {
   /** The list cursor. In split view it follows the open thread. */
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [openId, setOpenId] = useState<number | null>(null);
+  /** Which emails of the open conversation were unread when it opened: reading starts there. */
+  const [openedUnread, setOpenedUnread] = useState<ReadonlySet<number>>(new Set());
   const [folders, setFolders] = useState<FolderView[]>([]);
   const [layout, setLayout] = useState<SidebarLayout>(loadLayout);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => (layout.locked ? "locked" : "rail"));
@@ -295,6 +298,10 @@ export default function App() {
     (id) => !folders.find((f) => f.id === id)?.synced,
   );
   const openMessage = messages.find((m) => m.id === openId) ?? null;
+  const conversation = useMemo(
+    () => (openMessage ? conversationOf(messages, openMessage, folders) : []),
+    [messages, openMessage, folders],
+  );
   const selected = messages.find((m) => m.id === selectedId && model.order.includes(m.id)) ?? null;
   /** What message shortcuts and commands act on. */
   const current = openMessage ?? selected;
@@ -586,9 +593,13 @@ export default function App() {
     setOpenId(id);
     setSeen((s) => (s[0] === id ? s : [id, ...s.filter((x) => x !== id)].slice(0, SEEN_MAX)));
     const m = list.find((x) => x.id === id);
-    if (m?.unread) {
-      setSticky((s) => new Set(s).add(id));
-      void update(id, { unread: false });
+    // Opening a conversation reads all of it. Opening it again (clicking its
+    // row while it's open) keeps where reading started.
+    const unread = m ? conversationOf(list, m, folders).filter((x) => x.unread) : [];
+    if (id !== openId) setOpenedUnread(new Set(unread.map((x) => x.id)));
+    if (unread.length) {
+      setSticky((s) => new Set([...s, ...unread.map((x) => x.id)]));
+      for (const x of unread) void update(x.id, { unread: false });
     }
   }
 
@@ -768,14 +779,17 @@ export default function App() {
 
   // ---- message actions ----
 
+  /** What moving `m` moves: the open conversation's emails in the same place as it (see `movesWith`), else just `m`. */
+  const together = (m: Message) => (m.id === openId ? movesWith(conversation, m) : [m]);
+
   const actions = {
     done: (m: Message) =>
       m.state === "done"
-        ? act([m], { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
-        : act([m], { state: "done" }, "Marked as Done", ICONS.done),
+        ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
+        : act(together(m), { state: "done" }, "Marked as Done", ICONS.done),
     trash: (m: Message) => {
       if (isDraft(m, folders)) discardListed(m);
-      else if (m.state !== "deleted") act([m], { state: "deleted" }, "Moved to Trash", ICONS.trash);
+      else if (m.state !== "deleted") act(together(m), { state: "deleted" }, "Moved to Trash", ICONS.trash);
     },
     pin: (m: Message) => act([m], { pinned: !m.pinned }, m.pinned ? "Unpinned" : "Pinned", ICONS.pin),
     priority: (m: Message) =>
@@ -784,11 +798,11 @@ export default function App() {
       act([m], { unread: !m.unread }, m.unread ? "Marked as Read" : "Marked as Unread", ICONS.read),
     aside: (m: Message) =>
       m.state === "aside"
-        ? act([m], { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
-        : act([m], { state: "aside" }, "Set aside", ICONS.aside),
+        ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
+        : act(together(m), { state: "aside" }, "Set aside", ICONS.aside),
     snooze: (m: Message, p: LaterPreset) =>
       act(
-        [m],
+        together(m),
         { state: "snoozed", snoozedUntil: laterTime(p) },
         `Snoozed until ${p.label.toLowerCase()}`,
         ICONS.snooze,
@@ -1567,6 +1581,8 @@ export default function App() {
                 <ThreadView
                   key={openMessage.id}
                   message={openMessage}
+                  conversation={conversation}
+                  unread={openedUnread}
                   singleColumn={!twoColumns}
                   summary={summaries.get(openMessage.id)}
                   aiProvider={aiProvider}

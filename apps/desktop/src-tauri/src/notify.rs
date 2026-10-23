@@ -352,6 +352,7 @@ mod tests {
             folders: Vec::new(),
             folder: None,
             to: Vec::new(),
+            conversation: id,
         }
     }
 
