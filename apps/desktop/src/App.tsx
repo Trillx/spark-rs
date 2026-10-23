@@ -706,6 +706,8 @@ export default function App() {
         if (!m) return;
         setSettingsPage(null);
         setPalette(null);
+        setCalendarOpen(false);
+        closeSidebar();
         changeView(
           { folder: "inbox", sub: null, search: null, account: view.account === m.account ? m.account : "all" },
           true,
