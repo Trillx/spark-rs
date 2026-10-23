@@ -32,13 +32,23 @@ export const SUMMARY_STYLES: { key: SummaryStyle; label: string; title: string }
   { key: "actionPoints", label: "Action Points", title: "Action Points Summary" },
 ];
 
-/** Any number of deltas, then exactly one of the others. */
-export type SummaryEvent =
+/** A streamed answer (stream.rs): any number of deltas, then exactly one of the others. */
+export type AiEvent =
   | { event: "delta"; data: { text: string } }
   | { event: "done"; data: { model: string; inputTokens: number; outputTokens: number; truncated: boolean } }
   | { event: "refused"; data: { category: string | null } }
   | { event: "error"; data: { message: string } }
   | { event: "notConfigured"; data: { message: string } };
+
+/** The quick-reply chips under a message (QuickReply in reply.rs). */
+export type QuickReply = "interested" | "notInterested" | "thanks";
+
+/** `text` goes in instead when no AI provider is set up. */
+export const QUICK_REPLIES: { key: QuickReply; label: string; text: string }[] = [
+  { key: "interested", label: "Interested", text: "Thanks, I'm interested. " },
+  { key: "notInterested", label: "Not interested", text: "Thanks for reaching out, but I'm not interested." },
+  { key: "thanks", label: "Thanks", text: "Thanks!" },
+];
 
 export const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 export const OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -110,34 +120,58 @@ export function listAiModels(): Promise<string[]> {
 export function summarizeMessage(
   message: Message,
   style: SummaryStyle,
-  onEvent: (event: SummaryEvent) => void,
+  onEvent: (event: AiEvent) => void,
 ): Promise<void> {
-  if (isTauri()) {
-    const channel = new Channel<SummaryEvent>();
-    channel.onmessage = onEvent;
-    return invoke("summarize_message", { id: message.id, style, onEvent: channel });
-  }
+  if (isTauri()) return invoke("summarize_message", { id: message.id, style, onEvent: channel(onEvent) });
   browserSummarize(message, style, onEvent);
   return Promise.resolve();
 }
 
 export function cancelSummary(id: number): Promise<void> {
   if (isTauri()) return invoke("cancel_summary", { id });
-  window.clearInterval(browser.streams.get(id));
-  browser.streams.delete(id);
+  browserStop(`summary:${id}`);
   return Promise.resolve();
+}
+
+/**
+ * Starts writing a quick reply to `message` for composer number `composer`;
+ * the text arrives on `onEvent`. Resolves once it has started.
+ */
+export function draftQuickReply(
+  message: Message,
+  reply: QuickReply,
+  composer: number,
+  onEvent: (event: AiEvent) => void,
+): Promise<void> {
+  if (isTauri()) {
+    return invoke("draft_quick_reply", { id: message.id, reply, composer, onEvent: channel(onEvent) });
+  }
+  browserQuickReply(message, reply, composer, onEvent);
+  return Promise.resolve();
+}
+
+export function cancelQuickReply(composer: number): Promise<void> {
+  if (isTauri()) return invoke("cancel_quick_reply", { composer });
+  browserStop(`reply:${composer}`);
+  return Promise.resolve();
+}
+
+function channel(onEvent: (event: AiEvent) => void) {
+  const events = new Channel<AiEvent>();
+  events.onmessage = onEvent;
+  return events;
 }
 
 // ---- browser preview (`npm run dev`) ----
 // Nothing is sent anywhere: settings live in memory, a typed key only flips
-// `hasKey`, and summaries are a labeled stand-in streamed word by word.
+// `hasKey`, and summaries and replies are labeled stand-ins streamed word by word.
 
 const BROWSER_ONLY = "The browser preview doesn't call AI providers. Run the desktop app to test the connection.";
 
 const browser = {
   settings: null as { preset: Preset; config: ProviderConfig } | null,
   keys: new Set<Preset>(),
-  streams: new Map<number, number>(),
+  streams: new Map<string, number>(),
 };
 
 function browserView(s: { preset: Preset; config: ProviderConfig }): AiSettings {
@@ -177,32 +211,50 @@ function browserMissing(): string | null {
   return null;
 }
 
-function browserSummarize(m: Message, style: SummaryStyle, onEvent: (event: SummaryEvent) => void) {
-  const missing = browserMissing();
-  if (missing) {
-    onEvent({ event: "notConfigured", data: { message: missing } });
-    return;
-  }
+function browserSummarize(m: Message, style: SummaryStyle, onEvent: (event: AiEvent) => void) {
   const firstLine = m.body?.find((p) => p.trim().length > 20) ?? m.snippet;
   const text =
     style === "actionPoints"
       ? `- Preview only, not written by AI.\n- Reply to ${m.from} about "${m.subject}".`
       : `Preview only, not written by AI: ${m.from} wrote about "${m.subject}".\n` +
         `- ${firstLine.trim()}\n- In the desktop app this card shows your provider's summary.`;
+  browserStream(`summary:${m.id}`, text, onEvent);
+}
+
+function browserQuickReply(m: Message, reply: QuickReply, composer: number, onEvent: (event: AiEvent) => void) {
+  const chip = QUICK_REPLIES.find((q) => q.key === reply)!;
+  const name = m.from.split(/\s+/)[0];
+  const text =
+    `Hi ${name},\n\n${chip.text.trim()} (Preview only, not written by AI: ` +
+    `in the desktop app your provider writes this reply.)\n\nBest,`;
+  browserStream(`reply:${composer}`, text, onEvent);
+}
+
+/** Streams `text` word by word as `key`'s run, or says what's missing. */
+function browserStream(key: string, text: string, onEvent: (event: AiEvent) => void) {
+  const missing = browserMissing();
+  if (missing) {
+    onEvent({ event: "notConfigured", data: { message: missing } });
+    return;
+  }
   const words = text.split(/(?<=\s)/);
   let i = 0;
-  window.clearInterval(browser.streams.get(m.id));
+  browserStop(key);
   const timer = window.setInterval(() => {
     if (i < words.length) {
       onEvent({ event: "delta", data: { text: words[i++] } });
       return;
     }
-    window.clearInterval(timer);
-    browser.streams.delete(m.id);
+    browserStop(key);
     onEvent({
       event: "done",
       data: { model: "browser-preview", inputTokens: 0, outputTokens: 0, truncated: false },
     });
   }, 35);
-  browser.streams.set(m.id, timer);
+  browser.streams.set(key, timer);
+}
+
+function browserStop(key: string) {
+  window.clearInterval(browser.streams.get(key));
+  browser.streams.delete(key);
 }

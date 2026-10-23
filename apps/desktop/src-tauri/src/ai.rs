@@ -1,9 +1,12 @@
 //! Bring-your-own-key AI: the provider settings, the API key in the OS
-//! credential store, and +AI Summary. The key stays on this side; the UI only
-//! learns whether one is stored.
+//! credential store, +AI Summary and Quick +AI Replies. The key stays on this
+//! side; the UI only learns whether one is stored.
 
+mod email;
 pub(crate) mod keys;
+mod reply;
 mod settings;
+mod stream;
 mod summary;
 
 use std::collections::HashMap;
@@ -12,27 +15,38 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
-use spark_ai::{AiClient, AiError, ProviderConfig};
+use spark_ai::{AiClient, AiError, ChatRequest, ProviderConfig};
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
 use crate::mailbox::Mailbox;
 pub use keys::Keys;
+use reply::QuickReply;
 use settings::{AiSettings, Preset};
-use summary::{SummaryEvent, SummaryStyle};
+use stream::AiEvent;
+use summary::SummaryStyle;
 
 pub struct AiState {
     config_dir: PathBuf,
     keys: Keys,
     /// Serializes writes to `ai.json`.
     saving: Mutex<()>,
-    /// In-flight summaries by message id, so they can be stopped or replaced.
-    summaries: Mutex<HashMap<i64, SummaryRun>>,
+    /// What's streaming, so it can be stopped or replaced.
+    runs: Mutex<HashMap<RunKey, Run>>,
     next_run: AtomicU64,
 }
 
-struct SummaryRun {
+/// One run at a time for each of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RunKey {
+    /// A message's summary.
+    Summary(i64),
+    /// The reply being written in a composer, by the UI's number for it.
+    Reply(u64),
+}
+
+struct Run {
     run: u64,
     task: JoinHandle<()>,
 }
@@ -67,7 +81,7 @@ impl AiState {
             config_dir,
             keys,
             saving: Mutex::new(()),
-            summaries: Mutex::default(),
+            runs: Mutex::default(),
             next_run: AtomicU64::new(0),
         }
     }
@@ -125,17 +139,49 @@ impl AiState {
         Ok(models)
     }
 
-    fn cancel(&self, id: i64) {
-        if let Some(running) = self.summaries.lock().unwrap().remove(&id) {
+    /// Streams `request` over `on_event` as the run for `key`, replacing one
+    /// already running. Without a usable provider it sends the one event that
+    /// says why.
+    fn start(&self, app: AppHandle, key: RunKey, request: ChatRequest, on_event: Channel<AiEvent>) {
+        let (client, api_key) = match self.client(true) {
+            Ok(ready) => ready,
+            Err(unready) => {
+                let _ = on_event.send(match unready {
+                    Unready::NotConfigured(message) => AiEvent::NotConfigured { message },
+                    Unready::Failed(message) => AiEvent::Error { message },
+                });
+                return;
+            }
+        };
+        self.cancel(key);
+        let run = self.next_run.fetch_add(1, Ordering::Relaxed);
+        // Held until the handle is stored, so a fast run can't finish before it's registered.
+        let mut runs = self.runs.lock().unwrap();
+        let task = tauri::async_runtime::spawn(async move {
+            let model = client.config().model.clone();
+            let result = client
+                .complete(&request, |text| {
+                    let _ = on_event.send(AiEvent::Delta { text: text.into() });
+                })
+                .await
+                .map_err(|e| redact(describe(&e), api_key.as_deref()));
+            let _ = on_event.send(AiEvent::finished(result, &model));
+            app.state::<AiState>().finish(key, run);
+        });
+        runs.insert(key, Run { run, task });
+    }
+
+    fn cancel(&self, key: RunKey) {
+        if let Some(running) = self.runs.lock().unwrap().remove(&key) {
             running.task.abort();
         }
     }
 
-    /// Drops a finished run's handle, unless a newer run for the message replaced it.
-    fn finish(&self, id: i64, run: u64) {
-        let mut summaries = self.summaries.lock().unwrap();
-        if summaries.get(&id).is_some_and(|r| r.run == run) {
-            summaries.remove(&id);
+    /// Drops a finished run's handle, unless a newer run replaced it.
+    fn finish(&self, key: RunKey, run: u64) {
+        let mut runs = self.runs.lock().unwrap();
+        if runs.get(&key).is_some_and(|r| r.run == run) {
+            runs.remove(&key);
         }
     }
 }
@@ -179,47 +225,47 @@ pub async fn summarize_message(
     mailbox: State<'_, Mailbox>,
     id: i64,
     style: Option<SummaryStyle>,
-    on_event: Channel<SummaryEvent>,
+    on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     let mail = mailbox
         .with_body(id)
         .ok_or_else(|| format!("no message with id {id}"))?;
-    let (client, key) = match state.client(true) {
-        Ok(ready) => ready,
-        Err(unready) => {
-            let event = match unready {
-                Unready::NotConfigured(message) => SummaryEvent::NotConfigured { message },
-                Unready::Failed(message) => SummaryEvent::Error { message },
-            };
-            let _ = on_event.send(event);
-            return Ok(());
-        }
-    };
     let request = summary::summary_request(&mail, style.unwrap_or_default());
-
-    state.cancel(id);
-    let run = state.next_run.fetch_add(1, Ordering::Relaxed);
-    // Held until the handle is stored, so a fast run can't finish before it's registered.
-    let mut summaries = state.summaries.lock().unwrap();
-    let task = tauri::async_runtime::spawn(async move {
-        let model = client.config().model.clone();
-        let result = client
-            .complete(&request, |text| {
-                let _ = on_event.send(SummaryEvent::Delta { text: text.into() });
-            })
-            .await
-            .map_err(|e| redact(describe(&e), key.as_deref()));
-        let _ = on_event.send(SummaryEvent::finished(result, &model));
-        app.state::<AiState>().finish(id, run);
-    });
-    summaries.insert(id, SummaryRun { run, task });
+    state.start(app, RunKey::Summary(id), request, on_event);
     Ok(())
 }
 
 /// Stops a running summary. The UI keeps whatever text already arrived.
 #[tauri::command]
 pub fn cancel_summary(state: State<'_, AiState>, id: i64) {
-    state.cancel(id);
+    state.cancel(RunKey::Summary(id));
+}
+
+/// Starts writing a quick reply to message `id` in the UI's composer number
+/// `composer`, and returns at once; the text streams over `on_event`.
+#[tauri::command]
+pub async fn draft_quick_reply(
+    app: AppHandle,
+    state: State<'_, AiState>,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    reply: QuickReply,
+    composer: u64,
+    on_event: Channel<AiEvent>,
+) -> Result<(), String> {
+    let mail = mailbox
+        .with_body(id)
+        .ok_or_else(|| format!("no message with id {id}"))?;
+    let name = mailbox.user_name(mail.account);
+    let request = reply::quick_reply_request(&mail, reply, name.as_deref());
+    state.start(app, RunKey::Reply(composer), request, on_event);
+    Ok(())
+}
+
+/// Stops writing a quick reply. The composer keeps whatever text already arrived.
+#[tauri::command]
+pub fn cancel_quick_reply(state: State<'_, AiState>, composer: u64) {
+    state.cancel(RunKey::Reply(composer));
 }
 
 /// AI errors in words for the UI.

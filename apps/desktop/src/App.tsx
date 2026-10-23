@@ -39,11 +39,15 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
+  QUICK_REPLIES,
+  cancelQuickReply,
   cancelSummary,
+  draftQuickReply,
   getAiSettings,
   presetLabel,
   summarizeMessage,
-  type SummaryEvent,
+  type AiEvent,
+  type QuickReply,
   type SummaryStyle,
 } from "./ai";
 import {
@@ -84,6 +88,7 @@ import Composer, {
   outgoingDraft,
   savedDraft,
   type Draft,
+  type Writing,
 } from "./components/Composer";
 import { PromptDialog } from "./components/Dialog";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
@@ -176,6 +181,9 @@ import type {
 /** `targetId` points the actions at one row (its ⋯) rather than the current message. */
 type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetId: number };
 
+/** A quick reply AI is writing in the composer it opened (by `composerKey`). */
+type ReplyWriting = Writing & { composer: number; repliedTo: Message; chip: QuickReply };
+
 const INITIAL_VIEW: ListView = {
   folder: "inbox",
   account: "all",
@@ -258,6 +266,7 @@ export default function App() {
   /** The composer as it stands, for callbacks that outlive a render (undo, autosave). */
   const composer = useRef({ draft, saved: draftSaved, key: composerKey });
   composer.current = { draft, saved: draftSaved, key: composerKey };
+  const [writing, setWriting] = useState<ReplyWriting | null>(null);
   /** Drafts deleted while their Undo toast is up: hidden now, deleted when it's gone. */
   const [discarding, setDiscarding] = useState<ReadonlySet<number>>(new Set());
   const [palette, setPalette] = useState<Palette | null>(null);
@@ -855,6 +864,7 @@ export default function App() {
 
   /** `saved` is the new draft's `draftKey` if it's in Drafts as it is. An open composer's changes are saved. */
   function openComposer(next: Draft, saved: string | null = null) {
+    stopWriting();
     const open = composer.current;
     if (open.draft && draftHasContent(open.draft) && draftKey(open.draft) !== open.saved) {
       void storeDraft(open.draft, open.key).then(reloadMessages, (error) => draftError(error, open.draft!));
@@ -961,6 +971,7 @@ export default function App() {
   /** The composer's Delete Draft: it closes, and its saved draft goes too. Undo brings both back. */
   async function discardComposer() {
     if (!draft) return;
+    stopWriting();
     const closed = draft;
     const session = composerKey;
     setDraft(null);
@@ -976,8 +987,50 @@ export default function App() {
 
   const replySubject = (m: Message) => (/^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`);
 
-  const reply = (m: Message, body = "") =>
-    compose({ title: "Reply", to: m.address, subject: replySubject(m), body, from: m.account, replyTo: m.id });
+  const reply = (m: Message) =>
+    compose({ title: "Reply", to: m.address, subject: replySubject(m), from: m.account, replyTo: m.id });
+
+  /** A quick-reply chip: a reply your AI provider writes, or without one set up, a stock line. */
+  function quickReply(m: Message, chip: QuickReply) {
+    reply(m);
+    writeReply(m, chip, composer.current.key);
+  }
+
+  /** Streams a quick reply into composer `session`'s body; events after it closes are dropped. */
+  function writeReply(m: Message, chip: QuickReply, session: number) {
+    const fail = (message: string) => {
+      setDraft((d) => d && { ...d, body: "" });
+      setWriting((w) => w && { ...w, status: "error", message });
+    };
+    const onEvent = (event: AiEvent) => {
+      if (composer.current.key !== session) return;
+      switch (event.event) {
+        case "delta":
+          return setDraft((d) => d && { ...d, body: d.body + event.data.text });
+        case "done":
+          setDraft((d) => d && { ...d, body: d.body.trim() });
+          return setWriting(null);
+        case "notConfigured":
+          setDraft((d) => d && { ...d, body: QUICK_REPLIES.find((q) => q.key === chip)!.text });
+          return setWriting(null);
+        case "refused":
+          return fail(`${aiProvider} declined to write this reply.`);
+        case "error":
+          return fail(event.data.message);
+      }
+    };
+    setDraft((d) => d && { ...d, body: "" });
+    setWriting({ status: "writing", composer: session, repliedTo: m, chip });
+    draftQuickReply(m, chip, session, onEvent).catch((error) =>
+      onEvent({ event: "error", data: { message: String(error) } }),
+    );
+  }
+
+  /** Stops AI writing in the composer, keeping what it wrote so far. */
+  function stopWriting() {
+    if (writing?.status === "writing") void cancelQuickReply(writing.composer);
+    setWriting(null);
+  }
 
   /** The sender plus everyone else on To and Cc, minus this account's own address. */
   async function replyAll(m: Message) {
@@ -1033,6 +1086,7 @@ export default function App() {
   /** Closing keeps the draft in Drafts; one emptied out is deleted there. */
   async function closeComposer() {
     if (!draft) return;
+    stopWriting();
     const closed = draft;
     const session = composerKey;
     const unchanged = draftKey(closed) === draftSaved;
@@ -1060,7 +1114,7 @@ export default function App() {
    * Later time). Undo cancels it in the outbox and reopens the composer.
    */
   async function send() {
-    if (!draft) return;
+    if (!draft || writing?.status === "writing") return;
     if (!draft.to.trim()) {
       showToast("Add at least one recipient");
       return;
@@ -1114,7 +1168,7 @@ export default function App() {
   function summarize(m: Message, style: SummaryStyle = "short") {
     const run = ++summaryRun.current;
     setSummary(m.id, () => startSummary(run, style));
-    const onEvent = (event: SummaryEvent) => setSummary(m.id, (s) => (s?.run === run ? reduceSummary(s, event) : s));
+    const onEvent = (event: AiEvent) => setSummary(m.id, (s) => (s?.run === run ? reduceSummary(s, event) : s));
     summarizeMessage(m, style, onEvent).catch((error) =>
       onEvent({ event: "error", data: { message: String(error) } }),
     );
@@ -1468,7 +1522,8 @@ export default function App() {
     deleteSummary,
     summaryCopied: () => showToast("Summary Copied", undefined, ICONS.copy),
     openAiSettings: () => openSettings("ai"),
-    reply: (m, body) => reply(m, body),
+    reply: (m) => reply(m),
+    quickReply,
     replyAll: (m) => void replyAll(m),
     forward: (m) => void forward(m),
     openAttachment: (m, index) => openAttachment(m.id, index).catch(fileError),
@@ -1608,6 +1663,10 @@ export default function App() {
             onDiscard={() => void discardComposer()}
             onSend={send}
             onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
+            writing={writing?.composer === composerKey ? writing : null}
+            onStopWriting={stopWriting}
+            onRetryWriting={() => writing && writeReply(writing.repliedTo, writing.chip, writing.composer)}
+            onDismissWriting={() => setWriting(null)}
           />
         )}
 

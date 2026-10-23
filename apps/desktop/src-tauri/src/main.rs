@@ -76,6 +76,8 @@ fn main() {
             ai::list_ai_models,
             ai::summarize_message,
             ai::cancel_summary,
+            ai::draft_quick_reply,
+            ai::cancel_quick_reply,
             prefs::get_prefs,
             prefs::save_prefs,
             notify::test_notification,

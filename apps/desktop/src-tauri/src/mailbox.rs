@@ -146,7 +146,7 @@ impl Mailbox {
         self.live.has_accounts()
     }
 
-    /// A message with its text, for +AI Summary.
+    /// A message with its text, for the +AI prompts.
     pub fn with_body(&self, id: i64) -> Option<Message> {
         if !self.live() {
             return self.demo.get(id);
@@ -155,6 +155,17 @@ impl Mailbox {
         let mut message = from_store(store.message(id).ok()??);
         message.body = Some(paragraphs(&store.content(id).ok()??.text));
         Some(message)
+    }
+
+    /// The user's own name on an account, to sign the replies AI writes. The
+    /// demo accounts have none.
+    pub fn user_name(&self, account: i64) -> Option<String> {
+        if !self.live() {
+            return None;
+        }
+        let account = self.live.engine.store().account(account).ok()??;
+        let name = account.name.trim();
+        (!name.is_empty()).then(|| name.to_owned())
     }
 
     fn account_view(&self, account: Account) -> AccountView {

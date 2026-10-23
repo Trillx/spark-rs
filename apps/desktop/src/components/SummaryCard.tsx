@@ -1,6 +1,6 @@
 import { Copy, Ellipsis, RotateCcw, Settings2, Square, Trash2, X } from "lucide-react";
 import { forwardRef, type ReactNode } from "react";
-import { SUMMARY_STYLES, type SummaryEvent, type SummaryStyle } from "../ai";
+import { SUMMARY_STYLES, type AiEvent, type SummaryStyle } from "../ai";
 import { formatFullDate } from "../lib/format";
 import AiMark from "./AiMark";
 import Dropdown, { MenuItem } from "./Dropdown";
@@ -25,7 +25,7 @@ export function startSummary(run: number, style: SummaryStyle): SummaryState {
 }
 
 /** Folds one streamed event into the card's state. A refusal discards the partial text. */
-export function reduceSummary(state: SummaryState, event: SummaryEvent): SummaryState {
+export function reduceSummary(state: SummaryState, event: AiEvent): SummaryState {
   switch (event.event) {
     case "delta":
       return { ...state, text: state.text + event.data.text };

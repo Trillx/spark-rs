@@ -22,7 +22,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { SUMMARY_STYLES, type SummaryStyle } from "../ai";
+import { QUICK_REPLIES, SUMMARY_STYLES, type QuickReply, type SummaryStyle } from "../ai";
 import type { AccountView, Message, MessageContent } from "../types";
 import { useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
@@ -59,7 +59,9 @@ export interface ThreadActions {
   deleteSummary: (m: Message) => void;
   summaryCopied: () => void;
   openAiSettings: () => void;
-  reply: (m: Message, body?: string) => void;
+  reply: (m: Message) => void;
+  /** Opens a reply that AI writes for the chip. */
+  quickReply: (m: Message, chip: QuickReply) => void;
   replyAll: (m: Message) => void;
   forward: (m: Message) => void;
   accept: (m: Message) => void;
@@ -69,13 +71,6 @@ export interface ThreadActions {
   saveAttachment: (m: Message, index: number) => Promise<void>;
   saveAllAttachments: (m: Message) => Promise<void>;
 }
-
-/** Quick replies. They insert text until AI drafting exists. */
-const QUICK_REPLIES = [
-  { label: "Interested", body: "Thanks, I'm interested. " },
-  { label: "Not interested", body: "Thanks for reaching out, but I'm not interested." },
-  { label: "Thanks", body: "Thanks!" },
-];
 
 const STYLE_ICONS: Record<SummaryStyle, LucideIcon> = { short: Text, detailed: AlignLeft, actionPoints: ListChecks };
 const STYLE_SHORTCUTS: Record<SummaryStyle, ActionId> = {
@@ -592,11 +587,11 @@ function MessageCard({
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
           {quickReplies && (
             <>
-              {QUICK_REPLIES.map(({ label, body }) => (
+              {QUICK_REPLIES.map(({ key, label }) => (
                 <button
-                  key={label}
+                  key={key}
                   className="h-7 rounded-md bg-chip px-3 text-xs font-medium text-base-content/80 hover:brightness-95"
-                  onClick={() => actions.reply(m, body)}
+                  onClick={() => actions.quickReply(m, key)}
                 >
                   {label}
                 </button>

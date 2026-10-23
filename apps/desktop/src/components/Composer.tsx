@@ -6,6 +6,7 @@ import {
   Maximize2,
   Minimize2,
   Paperclip,
+  Square,
   Trash2,
   X,
 } from "lucide-react";
@@ -15,6 +16,7 @@ import type { AccountId, LocalFile, OutgoingAttachment, OutgoingDraft } from "..
 import { useAccounts } from "../lib/accounts";
 import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
+import AiMark from "./AiMark";
 import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
@@ -48,6 +50,9 @@ export interface Draft {
   inReplyTo?: string;
   references?: string;
 }
+
+/** AI writing the body: under way, or failed with a message. */
+export type Writing = { status: "writing" } | { status: "error"; message: string };
 
 export function emptyDraft(from: AccountId): Draft {
   return {
@@ -130,6 +135,10 @@ export default function Composer({
   onDiscard,
   onSend,
   onError,
+  writing = null,
+  onStopWriting,
+  onRetryWriting,
+  onDismissWriting,
 }: {
   draft: Draft;
   /** It's in Drafts as it stands. */
@@ -144,6 +153,11 @@ export default function Composer({
   onDiscard: () => void;
   onSend: () => void;
   onError: (text: string) => void;
+  /** While AI writes the body, it's read-only and can't be sent. */
+  writing?: Writing | null;
+  onStopWriting?: () => void;
+  onRetryWriting?: () => void;
+  onDismissWriting?: () => void;
 }) {
   const toRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
@@ -193,7 +207,7 @@ export default function Composer({
     const mod = IS_MAC ? e.metaKey : e.ctrlKey;
     if (mod && e.key === "Enter") {
       e.preventDefault();
-      onSend();
+      if (!busy) onSend();
     } else if (mod && e.shiftKey && e.key.toLowerCase() === "a") {
       e.preventDefault();
       void attach();
@@ -202,6 +216,7 @@ export default function Composer({
 
   const attachedBytes = draft.attachments.reduce((sum, a) => sum + a.size, 0);
 
+  const busy = writing?.status === "writing";
   const sendLabel = draft.sendLater ? "Schedule" : "Send";
   const accounts = useAccounts();
   const account = accounts.find((a) => a.id === draft.from) ?? accounts[0];
@@ -280,10 +295,42 @@ export default function Composer({
       <textarea
         ref={bodyRef}
         className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 text-sm leading-[1.57] outline-none placeholder:text-text-3"
-        placeholder="Enter text"
+        placeholder={busy ? "" : "Enter text"}
         value={draft.body}
+        readOnly={busy}
+        aria-busy={busy}
         onChange={(e) => onChange({ body: e.target.value })}
       />
+
+      {writing && (
+        <div
+          aria-live="polite"
+          className={`mx-3 mb-2 flex min-h-9 shrink-0 items-center gap-2 rounded-lg px-3 py-1 text-xs ${
+            busy ? "bg-ai-tint" : "bg-error/10 text-error"
+          }`}
+        >
+          {busy ? (
+            <>
+              <AiMark className="animate-pulse text-sm" />
+              <span className="flex-1 text-text-2">Generating…</span>
+              <button className="btn btn-ghost btn-xs h-6 gap-1 px-2 font-medium" onClick={onStopWriting}>
+                <Square size={10} className="fill-current" />
+                Stop
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="min-w-0 flex-1 select-text">{writing.message}</span>
+              <button className="btn btn-ghost btn-xs h-6 px-2 font-medium" onClick={onRetryWriting}>
+                Try again
+              </button>
+              <button className="btn btn-ghost btn-xs h-6 px-2 font-medium" onClick={onDismissWriting}>
+                Close
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       {draft.attachments.length > 0 && (
         <div className="shrink-0 px-3 pb-2">
@@ -433,6 +480,7 @@ export default function Composer({
           <button
             className="btn btn-primary btn-sm px-5"
             {...tipAttrs({ label: sendLabel, keys: IS_MAC ? "⌘Enter" : "Ctrl+Enter" })}
+            disabled={busy}
             onClick={onSend}
           >
             {sendLabel}
