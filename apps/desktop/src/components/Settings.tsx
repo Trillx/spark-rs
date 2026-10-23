@@ -94,6 +94,8 @@ export default function Settings({
   onClose,
   theme,
   onTheme,
+  minimize,
+  onMinimize,
   onAccountsChanged,
 }: {
   page: SettingsPage;
@@ -101,6 +103,9 @@ export default function Settings({
   onClose: () => void;
   theme: ThemePref;
   onTheme: (theme: ThemePref) => void;
+  /** Minimize old emails in a conversation. */
+  minimize: boolean;
+  onMinimize: (on: boolean) => void;
   /** After an add, rename or remove, so the list updates without waiting for the event. */
   onAccountsChanged: () => void;
 }) {
@@ -184,7 +189,9 @@ export default function Settings({
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "notifications" && <NotificationsPage />}
-              {page === "appearance" && <AppearancePage theme={theme} onTheme={onTheme} />}
+              {page === "appearance" && (
+                <AppearancePage theme={theme} onTheme={onTheme} minimize={minimize} onMinimize={onMinimize} />
+              )}
             </div>
           </div>
         </section>
@@ -1150,30 +1157,52 @@ const THEMES: { key: ThemePref; label: string; Icon: LucideIcon }[] = [
   { key: "dark", label: "Dark", Icon: Moon },
 ];
 
-function AppearancePage({ theme, onTheme }: { theme: ThemePref; onTheme: (theme: ThemePref) => void }) {
+function AppearancePage({
+  theme,
+  onTheme,
+  minimize,
+  onMinimize,
+}: {
+  theme: ThemePref;
+  onTheme: (theme: ThemePref) => void;
+  minimize: boolean;
+  onMinimize: (on: boolean) => void;
+}) {
   return (
-    <section className="mb-7">
-      <h3 className="mb-2 px-1 text-[13px] font-semibold text-text-2">Theme</h3>
-      <div role="radiogroup" aria-label="Theme" className="grid grid-cols-3 gap-3">
-        {THEMES.map(({ key, label, Icon }) => (
-          <button
-            key={key}
-            role="radio"
-            aria-checked={theme === key}
-            onClick={() => onTheme(key)}
-            className={`rounded-2xl border p-2 text-left ${
-              theme === key ? "border-primary ring-1 ring-primary" : "border-hairline hover:border-splitter"
-            }`}
-          >
-            <ThemePreview kind={key} />
-            <span className="mt-2 flex items-center gap-1.5 px-1 text-[13px] font-medium">
-              <Icon size={14} className="text-text-2" />
-              {label}
-            </span>
-          </button>
-        ))}
-      </div>
-    </section>
+    <>
+      <section className="mb-7">
+        <h3 className="mb-2 px-1 text-[13px] font-semibold text-text-2">Theme</h3>
+        <div role="radiogroup" aria-label="Theme" className="grid grid-cols-3 gap-3">
+          {THEMES.map(({ key, label, Icon }) => (
+            <button
+              key={key}
+              role="radio"
+              aria-checked={theme === key}
+              onClick={() => onTheme(key)}
+              className={`rounded-2xl border p-2 text-left ${
+                theme === key ? "border-primary ring-1 ring-primary" : "border-hairline hover:border-splitter"
+              }`}
+            >
+              <ThemePreview kind={key} />
+              <span className="mt-2 flex items-center gap-1.5 px-1 text-[13px] font-medium">
+                <Icon size={14} className="text-text-2" />
+                {label}
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <Group title="Conversations">
+        <Row
+          label="Minimize old emails"
+          description="Emails before the first new one in a conversation show as one line each. Click one to read it."
+          htmlFor="minimize-old"
+        >
+          <Switch id="minimize-old" on={minimize} onToggle={() => onMinimize(!minimize)} />
+        </Row>
+      </Group>
+    </>
   );
 }
 

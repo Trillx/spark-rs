@@ -35,20 +35,28 @@ export interface RowActions {
 
 /**
  * Split-view row, about 70px: unread dot, 26px avatar with the
- * account ring, sender / subject / snippet. Hover shows a Done circle in
- * the leading column and swaps the date for the row actions. Memoized: a
- * list has thousands, and most renders change none of them.
+ * account ring, sender / subject / snippet. A row stands for a conversation:
+ * its newest email in the list, with who wrote in it and a count badge.
+ * Hover shows a Done circle in the leading column and swaps the date for the
+ * row actions. Memoized: a list has thousands, and most renders change none
+ * of them.
  */
 export default memo(MessageRow);
 
 function MessageRow({
   message: m,
+  count = 1,
+  names,
   selected,
   actions,
   inPriorityCard = false,
   recipients = false,
 }: {
   message: Message;
+  /** Emails in its conversation; two or more show a badge. */
+  count?: number;
+  /** Who wrote in the conversation, in place of the sender. */
+  names?: string;
   selected: boolean;
   actions: RowActions;
   /** Rows on the peach Priority card hover in its own tint. */
@@ -103,7 +111,7 @@ function MessageRow({
               {to.more > 0 && <span className="shrink-0 text-[13px] text-text-2">+{to.more}</span>}
             </span>
           ) : (
-            <span className={`truncate text-sm leading-5 ${weight}`}>{m.from}</span>
+            <span className={`truncate text-sm leading-5 ${weight}`}>{names ?? m.from}</span>
           )}
           <span
             data-tip={snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : undefined}
@@ -161,6 +169,14 @@ function MessageRow({
             <Pin size={13} className="shrink-0 fill-current text-pin" aria-label="Pinned" />
           ) : null}
           <span className="truncate">{m.subject || <i className="font-normal">No subject</i>}</span>
+          {count > 1 && (
+            <span
+              aria-label={`${count} emails`}
+              className="h-4 min-w-5 shrink-0 rounded-[3px] bg-chip px-1 text-center text-[11px] font-semibold leading-4 text-text-2"
+            >
+              {count > 99 ? "99+" : count}
+            </span>
+          )}
           {m.attachment && <Paperclip size={12} className="shrink-0 rotate-45 text-text-2" aria-label="Has attachment" />}
         </div>
         <div className="truncate text-[13px] leading-5 text-text-2">{m.snippet || "No content"}</div>

@@ -81,25 +81,28 @@ const STYLE_SHORTCUTS: Record<SummaryStyle, ActionId> = {
 
 /**
  * The open conversation, Spark's way: one card per email, oldest first.
- * Emails before the first one that was unread when it opened (or before the
- * one opened, if that's earlier) start collapsed to a line; clicking a card's
- * header collapses or expands it.
+ * With "Minimize old emails" on, emails before the first one that was unread
+ * when it opened (or before the one opened, if that's earlier) start
+ * collapsed to a line; clicking a card's header collapses or expands it.
  */
 export default function ThreadView({
   message: m,
   conversation,
   unread,
+  minimize,
   singleColumn,
   summary,
   aiProvider,
   actions,
 }: {
-  /** The email opened from the list. Toolbar actions act on it (state changes on its whole conversation). */
+  /** The email opened from the list, with its conversation's flags. Toolbar actions act on its conversation. */
   message: Message;
   /** Its conversation, oldest first, `message` included. */
   conversation: Message[];
   /** Which of them were unread when the conversation opened. */
   unread: ReadonlySet<number>;
+  /** Settings → Appearance → Minimize old emails. Off, every email starts expanded. */
+  minimize: boolean;
   singleColumn: boolean;
   summary?: SummaryState;
   /** Names the provider in a refusal, e.g. "Anthropic". */
@@ -114,7 +117,7 @@ export default function ThreadView({
   const [start] = useState(() => conversation[readingStart(conversation, m.id, unread)]?.id);
   /** Collapsed cards. Emails that arrive while it's open aren't in it, so they show expanded. */
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => {
-    const at = conversation.findIndex((x) => x.id === start);
+    const at = minimize ? conversation.findIndex((x) => x.id === start) : 0;
     return new Set(conversation.slice(0, Math.max(at, 0)).map((x) => x.id));
   });
   const firstNew = conversation.findIndex((x) => unread.has(x.id));

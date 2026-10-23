@@ -101,7 +101,14 @@ import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./component
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { clearContent, loadContent } from "./lib/content";
-import { conversationOf, movesWith } from "./lib/conversation";
+import {
+  asThread,
+  conversationOf,
+  indexConversations,
+  loadMinimize,
+  movesWith,
+  saveMinimize,
+} from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
 import {
   LATER_PRESETS,
@@ -276,6 +283,8 @@ export default function App() {
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null);
   const lastSettingsPage = useRef<SettingsPage>("accounts");
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
+  /** Settings → Appearance → Minimize old emails. */
+  const [minimize, setMinimize] = useState(loadMinimize);
   /** The configured provider's name, for "Anthropic declined…". */
   const [aiProvider, setAiProvider] = useState("The AI provider");
   const [toast, setToast] = useState<ToastData | null>(null);
@@ -306,12 +315,15 @@ export default function App() {
   const loading = listFolderIds(view.folder, folders, accountOf(view.account)).some(
     (id) => !folders.find((f) => f.id === id)?.synced,
   );
+  const conversations = useMemo(() => indexConversations(messages, folders), [messages, folders]);
   const openMessage = messages.find((m) => m.id === openId) ?? null;
   const conversation = useMemo(
-    () => (openMessage ? conversationOf(messages, openMessage, folders) : []),
-    [messages, openMessage, folders],
+    () => (openMessage ? conversationOf(conversations, openMessage) : []),
+    [conversations, openMessage],
   );
-  const selected = messages.find((m) => m.id === selectedId && model.order.includes(m.id)) ?? null;
+  /** The list row an email shows in, or the email itself if none does. */
+  const rowOf = (id: number) => model.rowOf.get(id) ?? id;
+  const selected = messages.find((m) => m.id === selectedId && model.order.includes(rowOf(m.id))) ?? null;
   /** What message shortcuts and commands act on. */
   const current = openMessage ?? selected;
   const searching = view.search !== null;
@@ -578,7 +590,7 @@ export default function App() {
     if (anchor === null || !ids.includes(anchor)) return;
     const gone = new Set(ids);
     const order = model.order;
-    const i = order.indexOf(anchor);
+    const i = order.indexOf(rowOf(anchor));
     const next =
       i < 0
         ? null
@@ -604,7 +616,8 @@ export default function App() {
     const m = list.find((x) => x.id === id);
     // Opening a conversation reads all of it. Opening it again (clicking its
     // row while it's open) keeps where reading started.
-    const unread = m ? conversationOf(list, m, folders).filter((x) => x.unread) : [];
+    const index = list === messages ? conversations : indexConversations(list, folders);
+    const unread = m ? conversationOf(index, m).filter((x) => x.unread) : [];
     if (id !== openId) setOpenedUnread(new Set(unread.map((x) => x.id)));
     if (unread.length) {
       setSticky((s) => new Set([...s, ...unread.map((x) => x.id)]));
@@ -653,7 +666,7 @@ export default function App() {
     const order = model.order;
     if (!order.length) return;
     const anchor = openId ?? selectedId;
-    const i = anchor === null ? -1 : order.indexOf(anchor);
+    const i = anchor === null ? -1 : order.indexOf(rowOf(anchor));
     const next = i < 0 ? order[0] : order[clamp(i + step, 0, order.length - 1)];
     if (twoColumns || openId !== null) follow(next);
     else setSelectedId(next);
@@ -788,8 +801,21 @@ export default function App() {
 
   // ---- message actions ----
 
-  /** What moving `m` moves: the open conversation's emails in the same place as it (see `movesWith`), else just `m`. */
-  const together = (m: Message) => (m.id === openId ? movesWith(conversation, m) : [m]);
+  // Rows and the thread toolbar act on whole conversations, as Spark does.
+
+  /** The conversation of `m`, which may be a list row's copy (`asThread`). */
+  const threadOf = (m: Message) => conversationOf(conversations, m);
+  /** What moving `m` moves: its conversation's emails in the same place (see `movesWith`). */
+  const together = (m: Message) => movesWith(threadOf(m), m);
+  /** `m` as stored, not a row's copy with the conversation's flags, so undo puts back its own. */
+  const own = (m: Message) => messages.find((x) => x.id === m.id) ?? m;
+
+  /** Pin and Priority mark the conversation: off for every email that has it, on for `m`. */
+  function flag(m: Message, key: "pinned" | "priority", on: string, off: string, icon: ToastIcon) {
+    const flagged = threadOf(m).filter((x) => x[key]);
+    if (flagged.length) act(flagged, { [key]: false }, off, icon);
+    else act([own(m)], { [key]: true }, on, icon);
+  }
 
   const actions = {
     done: (m: Message) =>
@@ -800,11 +826,14 @@ export default function App() {
       if (isDraft(m, folders)) discardListed(m);
       else if (m.state !== "deleted") act(together(m), { state: "deleted" }, "Moved to Trash", ICONS.trash);
     },
-    pin: (m: Message) => act([m], { pinned: !m.pinned }, m.pinned ? "Unpinned" : "Pinned", ICONS.pin),
-    priority: (m: Message) =>
-      act([m], { priority: !m.priority }, m.priority ? "Removed from Priority" : "Marked as Priority", ICONS.priority),
-    read: (m: Message) =>
-      act([m], { unread: !m.unread }, m.unread ? "Marked as Read" : "Marked as Unread", ICONS.read),
+    pin: (m: Message) => flag(m, "pinned", "Pinned", "Unpinned", ICONS.pin),
+    priority: (m: Message) => flag(m, "priority", "Marked as Priority", "Removed from Priority", ICONS.priority),
+    /** Reading marks the whole conversation read; unread marks `m`. */
+    read: (m: Message) => {
+      const unread = threadOf(m).filter((x) => x.unread);
+      if (unread.length) act(unread, { unread: false }, "Marked as Read", ICONS.read);
+      else act([own(m)], { unread: true }, "Marked as Unread", ICONS.read);
+    },
     aside: (m: Message) =>
       m.state === "aside"
         ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
@@ -820,12 +849,13 @@ export default function App() {
     block: (m: Message) => act([m], { state: "blocked" }, "Sender blocked", ICONS.block),
   };
 
+  /** A card's or sub-list's rows, each with its conversation. */
   function doneAll(items: Message[]) {
-    const targets = items.filter((m) => m.state !== "done");
+    const rows = items.filter((m) => m.state !== "done");
     act(
-      targets,
+      rows.flatMap(together),
       { state: "done" },
-      targets.length === 1 ? "Marked as Done" : `${targets.length} emails marked as Done`,
+      rows.length === 1 ? "Marked as Done" : `${rows.length} emails marked as Done`,
       ICONS.done,
     );
   }
@@ -845,19 +875,23 @@ export default function App() {
 
   const snoozeMenu = (m: Message) => setPalette({ kind: "snooze", targetId: m.id });
 
-  /** A message dragged onto a sidebar list: filed in a folder, or done, trashed, pinned or back in the Inbox. */
+  /**
+   * A row dragged onto a sidebar list: its conversation filed in a folder, or
+   * done, trashed or back in the Inbox; or the email pinned.
+   */
   function dropMessage(dragged: Message, key: ListKey, account?: number) {
     const m = messages.find((x) => x.id === dragged.id);
     const patch = m && dropPatch(m, key, folders, account);
     if (!m || !patch) return;
+    const moved = together(m);
     if (isDraft(m, folders)) discardListed(m);
     else if (patch.folder !== undefined) {
       const name = folders.find((f) => f.id === patch.folder)?.name ?? "the folder";
-      act([m], patch, `Moved to ${name}`, ICONS.folder);
-    } else if (key === "archive") act([m], patch, "Marked as Done", ICONS.done);
-    else if (key === "trash") act([m], patch, "Moved to Trash", ICONS.trash);
+      act(moved, patch, `Moved to ${name}`, ICONS.folder);
+    } else if (key === "archive") act(moved, patch, "Marked as Done", ICONS.done);
+    else if (key === "trash") act(moved, patch, "Moved to Trash", ICONS.trash);
     else if (key === "pins") act([m], patch, "Pinned", ICONS.pin);
-    else act([m], patch, "Moved to Inbox", ICONS.inbox);
+    else act(moved, patch, "Moved to Inbox", ICONS.inbox);
   }
 
   // ---- composer ----
@@ -1214,6 +1248,11 @@ export default function App() {
     setTheme(next);
   }
 
+  function changeMinimize(on: boolean) {
+    saveMinimize(on);
+    setMinimize(on);
+  }
+
   // ---- keyboard ----
 
   function run(action: ActionId) {
@@ -1308,7 +1347,8 @@ export default function App() {
   // ---- Command Center ----
 
   function actionCommands(targetId?: number): Command[] {
-    const m = targetId === undefined ? current : messages.find((x) => x.id === targetId);
+    const target = targetId === undefined ? current : messages.find((x) => x.id === targetId);
+    const m = target && asThread(target, threadOf(target));
     const messageCommands: Command[] = m
       ? [
           {
@@ -1652,9 +1692,10 @@ export default function App() {
               {openMessage ? (
                 <ThreadView
                   key={openMessage.id}
-                  message={openMessage}
+                  message={asThread(openMessage, conversation)}
                   conversation={conversation}
                   unread={openedUnread}
+                  minimize={minimize}
                   singleColumn={!twoColumns}
                   summary={summaries.get(openMessage.id)}
                   aiProvider={aiProvider}
@@ -1724,6 +1765,8 @@ export default function App() {
             onClose={() => setSettingsPage(null)}
             theme={theme}
             onTheme={changeTheme}
+            minimize={minimize}
+            onMinimize={changeMinimize}
             onAccountsChanged={() => void reloadAccounts()}
           />
         )}
@@ -1775,14 +1818,9 @@ function previousValues(m: Message, patch: MessagePatch): MessagePatch {
 /** An account filter as an account id, or undefined for all of them. */
 const accountOf = (account: AccountFilter) => (account === "all" ? undefined : account);
 
-/** Every message a list shows, including card rows past the limit and Gatekeeper senders. */
+/** Every message a list shows: rows and the emails they stand for, card rows past the limit, Gatekeeper senders. */
 function listedIds(list: ListModel) {
-  const ids = new Set<number>();
-  for (const block of list.blocks) {
-    if (block.kind === "row") ids.add(block.message.id);
-    else if (block.kind !== "period") for (const m of block.items) ids.add(m.id);
-  }
-  return ids;
+  return new Set(list.rowOf.keys());
 }
 
 /**

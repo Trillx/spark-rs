@@ -1,5 +1,6 @@
 import { Bell, MailOpen, Newspaper, Pin, UserPlus, Users, Zap, type LucideIcon } from "lucide-react";
 import type { AccountId, AccountView, FolderView, Message } from "../types";
+import { asThread, conversationOf, indexConversations, participantNames } from "./conversation";
 import { datePeriod } from "./format";
 import { showsRecipients } from "./recipients";
 import type { ActionId } from "./shortcuts";
@@ -47,6 +48,17 @@ export interface ListModel {
   found?: number;
   /** Rows name who mail is to rather than the sender (Sent, Drafts). */
   recipients?: boolean;
+  /** The row each listed email shows in. A row stands for a conversation, so several can share one. */
+  rowOf: ReadonlyMap<number, number>;
+  /** Each row's conversation, by row id. */
+  threads: ReadonlyMap<number, ThreadInfo>;
+}
+
+export interface ThreadInfo {
+  /** Its emails, as the thread view shows them. */
+  count: number;
+  /** Who wrote them, e.g. "Sam, Hannah, me". */
+  names: string;
 }
 
 export const INBOX_MODES: { key: InboxMode; label: string; action: ActionId }[] = [
@@ -149,8 +161,53 @@ function rowIds(blocks: ListBlock[]) {
   );
 }
 
-function model(title: string, blocks: ListBlock[], bulk: Message[] = []): ListModel {
-  return { title, blocks, order: rowIds(blocks), bulk };
+/**
+ * Turns a list's emails into its rows, one per conversation, Spark-style:
+ * the newest of a conversation's emails in the list stands for it, with the
+ * flags of the whole conversation (see `asThread`). `read` holds the emails
+ * read during this visit to the list.
+ */
+function listRows(messages: Message[], read: ReadonlySet<number>, ctx: ListContext) {
+  const conversations = indexConversations(messages, ctx.folders);
+  const own = new Set(ctx.accounts.map((a) => a.email.toLowerCase()));
+  /** The emails each row stands for, by row id. */
+  const members = new Map<number, number[]>();
+  const threads = new Map<number, ThreadInfo>();
+  /** Rows of conversations read during this visit, for `smartCards`. */
+  const sticky = new Set<number>();
+
+  /** `items` as rows, in the order of each conversation's first email there. */
+  function of(items: Message[]): Message[] {
+    const rows: Message[] = [];
+    const byConversation = new Map<readonly Message[], number[]>();
+    for (const m of items) {
+      const key = conversations.get(m.id) ?? [m];
+      const listed = byConversation.get(key);
+      if (listed) {
+        listed.push(m.id);
+        continue;
+      }
+      const conversation = conversationOf(conversations, m);
+      const ids = [m.id];
+      byConversation.set(key, ids);
+      members.set(m.id, ids);
+      threads.set(m.id, { count: conversation.length, names: participantNames(conversation, own) });
+      if (conversation.some((x) => read.has(x.id))) sticky.add(m.id);
+      rows.push(asThread(m, conversation));
+    }
+    return rows;
+  }
+
+  function model(title: string, blocks: ListBlock[], bulk: Message[] = []): ListModel {
+    const rowOf = new Map<number, number>();
+    for (const block of blocks) {
+      const shown = block.kind === "row" ? [block.message] : block.kind === "period" ? [] : block.items;
+      for (const m of shown) for (const id of members.get(m.id) ?? [m.id]) rowOf.set(id, m.id);
+    }
+    return { title, blocks, order: rowIds(blocks), bulk, rowOf, threads };
+  }
+
+  return { of, model, sticky };
 }
 
 /** Messages in any of these server folders. */
@@ -188,54 +245,65 @@ export function buildList(
   ctx: ListContext = EMPTY_CONTEXT,
 ): ListModel {
   const accounts = ctx.accounts;
+  const rows = listRows(messages, sticky, ctx);
   if (view.search !== null) {
-    if (!view.search.trim()) return model("Search", []);
-    const hits = messages.filter((m) => isLive(m) && matchesQuery(m, view.search!)).sort(newestFirst);
-    return { ...model("Search", hits.map((m) => ({ kind: "row", message: m }))), found: hits.length };
+    if (!view.search.trim()) return rows.model("Search", []);
+    const hits = rows.of(messages.filter((m) => isLive(m) && matchesQuery(m, view.search!)).sort(newestFirst));
+    return { ...rows.model("Search", hits.map((m) => ({ kind: "row", message: m }))), found: hits.length };
   }
 
   if (view.folder !== "inbox") {
     const all = listItems(messages, view.folder, ctx);
-    const items = view.account === "all" ? all : all.filter((m) => m.account === view.account);
+    const items = rows.of(view.account === "all" ? all : all.filter((m) => m.account === view.account));
     const label = listInfo(view.folder, ctx.folders, ctx.smartFolders)?.label ?? "Folder";
     const account = view.account !== "all" && accounts.find((a) => a.id === view.account)?.label;
     const title = account ? `${label} · ${account}` : label;
     // Recently Seen keeps the order they were opened in.
     const blocks: ListBlock[] =
       view.folder === "seen" ? items.map((m) => ({ kind: "row", message: m })) : withPeriods(items);
-    return { ...model(title, blocks), recipients: showsRecipients(view.folder, ctx.folders) };
+    return { ...rows.model(title, blocks), recipients: showsRecipients(view.folder, ctx.folders) };
   }
 
-  const { mail, screening } = inboxMessages(messages, view.account, view.showDone);
+  const inbox = inboxMessages(messages, view.account, view.showDone);
+  const mail = rows.of(inbox.mail);
+  const screening = inbox.screening;
   const title = (view.account !== "all" && accounts.find((a) => a.id === view.account)?.label) || "Inbox";
   const gatekeeper: ListBlock[] = screening.length ? [{ kind: "gatekeeper", items: screening, layout: "strip" }] : [];
 
   if (view.sub?.kind === "gatekeeper") {
-    return model(GATEKEEPER.label, screening.length ? [{ kind: "gatekeeper", items: screening, layout: "grid" }] : []);
+    return rows.model(
+      GATEKEEPER.label,
+      screening.length ? [{ kind: "gatekeeper", items: screening, layout: "grid" }] : [],
+    );
   }
 
   const sub = view.sub;
   if (sub) {
-    const items = sub.kind === "card" ? smartCards(mail, sticky)[sub.key] : mail.filter((m) => m.category === sub.key);
+    const items =
+      sub.kind === "card" ? smartCards(mail, rows.sticky)[sub.key] : mail.filter((m) => m.category === sub.key);
     const label = CARDS[sub.key].label;
-    return model(label, items.map((m) => ({ kind: "row", message: m })), items.filter((m) => m.state !== "done"));
+    return rows.model(
+      label,
+      items.map((m) => ({ kind: "row", message: m })),
+      items.filter((m) => m.state !== "done"),
+    );
   }
 
   if (view.mode === "cards") {
-    const cards = smartCards(mail, sticky);
+    const cards = smartCards(mail, rows.sticky);
     const blocks: ListBlock[] = [];
     for (const key of CARD_ORDER) {
       if (cards[key].length) blocks.push({ kind: "card", key, items: cards[key], total: cards[key].length });
       // New senders sit right under Priority.
       if (key === "priority") blocks.push(...gatekeeper);
     }
-    return model(title, blocks);
+    return rows.model(title, blocks);
   }
 
   if (view.mode === "focused") {
     // Unread Priority mail sits in a card on top; the rest is grouped by date,
     // with notifications and newsletters folded into one row each.
-    const priority = smartCards(mail, sticky).priority;
+    const priority = smartCards(mail, rows.sticky).priority;
     const rest = mail.filter((m) => !priority.includes(m));
     const items: (Message | Extract<ListBlock, { kind: "group" }>)[] = [];
     const grouped = new Set<GroupKey>();
@@ -251,10 +319,10 @@ export function buildList(
     const top: ListBlock[] = priority.length
       ? [{ kind: "card", key: "priority", items: priority, total: priority.length }]
       : [];
-    return model(title, [...top, ...gatekeeper, ...withPeriods(items)]);
+    return rows.model(title, [...top, ...gatekeeper, ...withPeriods(items)]);
   }
 
-  return model(title, [...gatekeeper, ...withPeriods(mail)]);
+  return rows.model(title, [...gatekeeper, ...withPeriods(mail)]);
 }
 
 /** Free text plus `from:`, `has:attachment`, `is:unread` and `date:today`. */
@@ -289,23 +357,36 @@ export interface SidebarCounts {
   listAccounts: Partial<Record<ListKey, Partial<Record<AccountId, number>>>>;
 }
 
-/** Sidebar counters, for the Inbox and the lists in `keys`. */
+/** Sidebar counters, for the Inbox and the lists in `keys`. Like the lists, they count conversations. */
 export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListContext = EMPTY_CONTEXT): SidebarCounts {
-  const unread = messages.filter((m) => m.state === "inbox" && !m.screening && m.unread);
+  const unread = oneEach(messages.filter((m) => m.state === "inbox" && !m.screening && m.unread));
   const lists: Partial<Record<ListKey, number>> = {};
   const listAccounts: SidebarCounts["listAccounts"] = {};
   for (const key of keys) {
     if (key === "inbox") continue;
     let counted: Message[];
-    if (key === "snoozed" || key === "aside" || key === "drafts") {
+    if (key === "drafts") {
       counted = listItems(messages, key, ctx);
+    } else if (key === "snoozed" || key === "aside") {
+      counted = oneEach(listItems(messages, key, ctx));
     } else if (key === "spam" || folderIdOf(key) !== undefined) {
-      counted = listItems(messages, key, ctx).filter((m) => m.unread && !m.screening);
+      counted = oneEach(listItems(messages, key, ctx).filter((m) => m.unread && !m.screening));
     } else continue;
     lists[key] = counted.length;
     if (hasAccountRows(key)) listAccounts[key] = perAccount(counted);
   }
   return { inbox: unread.length, accounts: perAccount(unread), lists, listAccounts };
+}
+
+/** One email per conversation. */
+function oneEach(messages: Message[]) {
+  const seen = new Set<string>();
+  return messages.filter((m) => {
+    const key = `${m.account} ${m.conversation ?? m.id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function perAccount(messages: Message[]) {

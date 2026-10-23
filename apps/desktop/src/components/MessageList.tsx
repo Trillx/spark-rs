@@ -75,11 +75,15 @@ const SEARCH_TIPS = [
 export default function MessageList(props: Props) {
   const { model, view, selectedId, rows } = props;
   const searching = view.search !== null;
+  /** The cursor's row: it may be on any email of the conversation the row stands for. */
+  const selectedRow = selectedId === null ? null : (model.rowOf.get(selectedId) ?? selectedId);
   const row = (m: Message, inPriorityCard = false) => (
     <MessageRow
       key={m.id}
       message={m}
-      selected={m.id === selectedId}
+      count={model.threads.get(m.id)?.count}
+      names={model.threads.get(m.id)?.names}
+      selected={m.id === selectedRow}
       actions={rows}
       inPriorityCard={inPriorityCard}
       recipients={model.recipients}

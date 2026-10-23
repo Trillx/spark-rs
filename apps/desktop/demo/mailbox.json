@@ -176,5 +176,13 @@
     "subject": "Re: Q4 roadmap review",
     "snippet": "Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?",
     "body": ["Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?", "Hannah"]
+  },
+  {
+    "id": 25, "account": "personal", "category": "people", "unread": true, "conversation": 2,
+    "from": "Marcus Lee", "address": "marcus.lee@gmail.com", "ageMinutes": 170,
+    "to": ["Me <me@gmail.com>"],
+    "subject": "Re: Saturday hike?",
+    "snippet": "Perfect. I'll pick you up at 7:45 — the trailhead lot fills up fast.",
+    "body": ["Perfect. I'll pick you up at 7:45 — the trailhead lot fills up fast.", "— M"]
   }
 ]
