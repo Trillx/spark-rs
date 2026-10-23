@@ -517,7 +517,7 @@ function MessageCard({
 }: {
   message: Message;
   showReplyBar: boolean;
-  /** The quick replies, under the latest email. */
+  /** The quick replies, under the latest email unless you sent it. */
   quickReplies: boolean;
   /** Clicking the header collapses the card, in a conversation of several. */
   onCollapse?: () => void;
@@ -526,6 +526,7 @@ function MessageCard({
   const account = useAccount(m.account);
   const [state, retry] = useMessageContent(m.id);
   const content = state.status === "ready" ? state.content : null;
+  const fromYou = account !== undefined && m.address.toLowerCase() === account.email.toLowerCase();
   return (
     <article data-message={m.id} className="scroll-mt-2 rounded-2xl border border-hairline bg-card">
       <header
@@ -585,7 +586,7 @@ function MessageCard({
       )}
       {showReplyBar && (
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
-          {quickReplies && (
+          {quickReplies && !fromYou && (
             <>
               {QUICK_REPLIES.map(({ key, label }) => (
                 <button
