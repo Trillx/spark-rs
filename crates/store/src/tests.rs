@@ -480,6 +480,27 @@ fn graph_messages_are_keyed_by_remote_id() {
 }
 
 #[test]
+fn invites_and_the_answer_sent_stay_with_their_email() {
+    let (mut store, account) = store_with_account();
+    let plain = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    let invite = Incoming {
+        invite: Some("{\"kind\":\"invitation\"}".into()),
+        ..incoming(account, 2, "a@x.com")
+    };
+    let id = new_id(store.add_incoming(&invite, false).unwrap());
+    let content = store.content(plain).unwrap().unwrap();
+    assert_eq!((content.invite, content.rsvp), (None, None));
+    store.set_rsvp(id, "accepted").unwrap();
+    let content = store.content(id).unwrap().unwrap();
+    assert_eq!(content.invite.as_deref(), Some("{\"kind\":\"invitation\"}"));
+    assert_eq!(content.rsvp.as_deref(), Some("accepted"));
+}
+
+#[test]
 fn queued_sends_can_be_cancelled_until_claimed() {
     let (mut store, account) = store_with_account();
     let a = store.queue_send(account, "{\"a\":1}", 5_000, &[]).unwrap();

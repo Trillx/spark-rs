@@ -135,6 +135,45 @@ export interface MessageContent {
   to: string[];
   cc: string[];
   attachments: Attachment[];
+  /** The calendar invite it carries; the thread shows it in place of the body. */
+  invite?: InviteCard;
+}
+
+/** What an invite email's calendar part is for (its METHOD). `event` is one to look at (PUBLISH). */
+export type InviteKind = "invitation" | "reply" | "cancellation" | "proposal" | "event";
+export type InviteAnswer = "accepted" | "tentative" | "declined";
+
+export interface InvitePerson {
+  /** Their name, else the address. */
+  name: string;
+  address: string;
+  /** Absent until they answer. */
+  answer?: InviteAnswer;
+}
+
+export interface InviteCard {
+  kind: InviteKind;
+  summary: string;
+  /** Unix ms. All-day and floating times are the times as written, read as UTC. */
+  start: number;
+  end?: number;
+  allDay: boolean;
+  /** No time zone: shown as written, wherever the reader is. */
+  floating: boolean;
+  /** A recurring event; answering answers the series. */
+  repeats: boolean;
+  location?: string;
+  description?: string;
+  /** A video call to join. */
+  callLink?: string;
+  organizer?: InvitePerson;
+  /** Everyone else invited, the user included. */
+  attendees: InvitePerson[];
+  canceled: boolean;
+  /** The user's answer: sent from here, else what the invitation records. */
+  answer?: InviteAnswer;
+  /** Someone else's invitation, still on. */
+  canAnswer: boolean;
 }
 
 /** The images an email's HTML embeds (`cid:` URLs): data URLs by Content-ID, lowercase without angle brackets. */

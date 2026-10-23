@@ -13,6 +13,9 @@ import type {
   FolderView,
   InlineImages,
   LocalFile,
+  InviteAnswer,
+  InviteCard,
+  InvitePerson,
   Message,
   MessageContent,
   MessagePatch,
@@ -104,7 +107,15 @@ export function getMessageContent(id: number): Promise<MessageContent> {
     to: m.to?.length ? m.to : ["You"],
     cc: [],
     attachments: m.attachment ? [{ name: m.attachment, mime: "", size: 0 }] : [],
+    invite: browserInvite(m),
   });
+}
+
+/** Answers the invitation a message carries, by email to its organizer; resolves once it's sent. */
+export function answerInvite(id: number, answer: InviteAnswer): Promise<void> {
+  if (isTauri()) return invoke("answer_invite", { id, answer });
+  browserAnswers.set(id, answer);
+  return new Promise((resolve) => setTimeout(resolve, 400));
 }
 
 // ---- folders ----
@@ -431,7 +442,7 @@ const BROWSER_FOLDERS: FolderView[] = demoFolders.map((f) => ({
 
 // Like DemoMailbox::load: each entry's age becomes a timestamp relative to now.
 const loadedAt = Date.now();
-const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, ...m }) => ({
+const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, invite: _invite, ...m }) => ({
   state: "inbox",
   unread: false,
   pinned: false,
@@ -445,6 +456,39 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, 
 
 /** The few demo messages with HTML of their own, like demo::html. */
 const browserHtml = new Map(demo.flatMap((m) => (m.html ? [[m.id, m.html] as const] : [])));
+
+const browserAnswers = new Map<number, InviteAnswer>();
+
+/** Like demo::invite: the demo message's invite, starting on the half hour `startMinutes` from now. */
+function browserInvite(m: Message): InviteCard | undefined {
+  const invite = demo.find((e) => e.id === m.id)?.invite;
+  if (!invite) return undefined;
+  const me = BROWSER_ACCOUNTS.find((a) => a.id === m.account)?.email;
+  const halfHour = 30 * 60_000;
+  const start = Math.floor((Date.now() + invite.startMinutes * 60_000) / halfHour) * halfHour;
+  const answer = browserAnswers.get(m.id);
+  const invitation = invite.kind === "invitation";
+  return {
+    kind: invite.kind as InviteCard["kind"],
+    summary: invite.summary,
+    start,
+    end: start + invite.minutes * 60_000,
+    allDay: false,
+    floating: false,
+    repeats: false,
+    location: invite.location,
+    description: invite.description,
+    callLink: invite.callLink,
+    organizer: invite.organizer as InvitePerson,
+    attendees: invite.attendees.map((a) => {
+      const person = a as InvitePerson;
+      return a.address === me ? { ...person, answer: answer ?? person.answer } : person;
+    }),
+    canceled: invite.kind === "cancellation",
+    answer: invitation ? answer : undefined,
+    canAnswer: invitation && invite.organizer.address !== me,
+  };
+}
 
 let browserOutbox = 0;
 

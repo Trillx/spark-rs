@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { getInlineImages, getMessageContent } from "../api";
-import type { InlineImages, MessageContent } from "../types";
+import type { InlineImages, InviteAnswer, MessageContent } from "../types";
 
 // Message bodies load on demand and stay cached while the app runs, so
 // reopening a thread (or forwarding it) is instant. Failed loads aren't cached.
@@ -41,6 +41,12 @@ export function loadContent(id: number): Promise<MessageContent> {
     pending.set(id, request);
   }
   return request;
+}
+
+/** An answer sent to the invitation a message carries, kept in its cached content for next time. */
+export function cacheInviteAnswer(id: number, answer: InviteAnswer) {
+  const content = cache.get(id);
+  if (content?.invite) cache.set(id, { ...content, invite: { ...content.invite, answer } });
 }
 
 /** After the account set changes, ids may now name other messages. */

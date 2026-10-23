@@ -5,6 +5,7 @@ use mail_parser::{Address, HeaderValue, MessageParser};
 use spark_store::{Category, Incoming};
 
 use crate::attachment;
+use crate::invite::Invite;
 
 pub use mail_parser::decoders::html::html_to_text;
 
@@ -60,6 +61,7 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         text,
         html,
         attachments,
+        invite: Invite::find(&m).map(|i| i.to_json()),
         ..Default::default()
     })
 }

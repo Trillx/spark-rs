@@ -9,6 +9,7 @@ use spark_mail::attachment::{AttachmentData, mime_for};
 use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
+use spark_mail::invite::{Answer, Card, Invite};
 use spark_store::{
     Account, AccountKind, Category, Folder, FolderRole, MessageState, OutboxFile, Patch, now_ms,
 };
@@ -132,6 +133,9 @@ pub struct MessageContent {
     to: Vec<String>,
     cc: Vec<String>,
     attachments: Vec<AttachmentView>,
+    /// The calendar invite it carries, shown as a card in place of the body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invite: Option<Card>,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,15 +422,34 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
                     size: 0,
                 })
                 .collect(),
+            invite: demo::invite(
+                id,
+                &demo::accounts()
+                    .into_iter()
+                    .find(|a| a.id == m.account)
+                    .map(|a| a.email)
+                    .unwrap_or_default(),
+                mailbox.demo.answer(id),
+            ),
         });
     }
-    let content = mailbox
-        .live
-        .engine
-        .store()
+    let store = mailbox.live.engine.store();
+    let content = store
         .content(id)
         .map_err(text)?
         .ok_or_else(|| format!("no message with id {id}"))?;
+    let invite = match content.invite.as_deref().and_then(Invite::from_json) {
+        Some(invite) => {
+            let account = store.message(id).map_err(text)?.map(|m| m.account_id);
+            let me = match account {
+                Some(account) => store.account(account).map_err(text)?.map(|a| a.email),
+                None => None,
+            };
+            let sent = content.rsvp.as_deref().and_then(Answer::parse);
+            Some(invite.card(&me.unwrap_or_default(), sent))
+        }
+        None => None,
+    };
     Ok(MessageContent {
         text: paragraphs(&content.text),
         html: content.html,
@@ -441,7 +464,28 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
                 size: a.size,
             })
             .collect(),
+        invite,
     })
+}
+
+/// Answers the invitation a message carries, by email to its organizer.
+/// Resolves once the reply is sent.
+#[tauri::command]
+pub async fn answer_invite(
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    answer: Answer,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        mailbox.demo.set_answer(id, answer);
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .answer_invite(id, answer)
+        .await
+        .map_err(text)
 }
 
 /// The stored name of attachment `index`, checked before downloading.

@@ -67,6 +67,14 @@ Office opens them in Protected View. Attach files with the paperclip,
 Ctrl+Shift+A, or by dropping them on the window; forwards keep the original's
 attachments. Messages over 10 MB are stored without their body or file list.
 
+Calendar invitations show as a card in place of the email: the date and time
+in your time zone, who's invited and how they answered, the call to join,
+the place and the description. Accept, Maybe or Decline emails your answer to
+the organizer at once (there's no undo window), and Change lets you pick
+another. Replies and cancellations show as a banner over the event. The email
+itself is behind the ⋯ button under the card. Answering doesn't change your
+own calendar: on Microsoft 365, Outlook keeps showing the meeting as tentative.
+
 ## Notifications and the tray
 
 Closing the window leaves spark-rs running in the notification area, still

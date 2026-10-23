@@ -43,6 +43,7 @@ import OverlayScroll from "./OverlayScroll";
 import { AttachmentList } from "./Attachments";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
+import InviteCard from "./InviteCard";
 import { BlockedImagesBar, HtmlBody, TextBody, hasInlineImages, hasRemoteImages } from "./MessageBody";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
 
@@ -645,7 +646,12 @@ function MessageCard({
           </button>
         </div>
       )}
-      {content && <Body id={m.id} content={content} quotes={!isForward(m.subject)} />}
+      {content &&
+        (content.invite ? (
+          <InviteBody id={m.id} content={content} account={account} />
+        ) : (
+          <Body id={m.id} content={content} quotes={!isForward(m.subject)} />
+        ))}
       {content && content.attachments.length > 0 && (
         <AttachmentList
           attachments={content.attachments}
@@ -701,6 +707,38 @@ function Body({ id, content, quotes }: { id: number; content: MessageContent; qu
         />
       )}
       <HtmlBody html={html} remoteImages={images} inlineImages={inlineImages} quotes={quotes} />
+    </>
+  );
+}
+
+/**
+ * An invite email: the event's card in place of the body, which mostly
+ * repeats it, so the email itself folds away behind "⋯" as the related message.
+ */
+function InviteBody({ id, content, account }: { id: number; content: MessageContent; account?: AccountView }) {
+  const [related, setRelated] = useState(false);
+  const hasBody = content.html !== null || content.text.some((p) => p.trim() !== "");
+  return (
+    <>
+      <InviteCard id={id} invite={content.invite!} account={account} />
+      {hasBody &&
+        (related ? (
+          <>
+            <Body id={id} content={content} quotes />
+            <button className="mx-5 mb-4 text-xs font-medium text-primary hover:underline" onClick={() => setRelated(false)}>
+              Hide related message
+            </button>
+          </>
+        ) : (
+          <button
+            className="mx-5 mb-4 grid h-5 w-8 place-items-center rounded-full bg-chip text-text-2 hover:brightness-95 hover:text-base-content"
+            data-tip="Related message"
+            aria-label="Show related message"
+            onClick={() => setRelated(true)}
+          >
+            <Ellipsis size={14} />
+          </button>
+        ))}
     </>
   );
 }

@@ -8,6 +8,7 @@ pub mod drafts;
 pub mod engine;
 pub mod graph;
 pub mod imap;
+pub mod invite;
 pub mod oauth;
 pub mod parse;
 pub mod smtp;

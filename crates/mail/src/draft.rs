@@ -155,6 +155,14 @@ pub fn quoted_body(body: &str, original: Option<&Original>) -> String {
     )
 }
 
+/// A new Message-ID at `domain`, with its angle brackets.
+pub(crate) fn new_message_id(domain: &str) -> String {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).expect("the OS provides randomness");
+    let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    format!("<{id}@{domain}>")
+}
+
 /// Builds the MIME message for SMTP, with `files` attached in order.
 pub fn build_message(
     from: Mailbox,
@@ -169,11 +177,8 @@ pub fn build_message(
         return Err(Error::Config("Add at least one recipient.".into()));
     }
     // Replies to this message thread by its Message-ID.
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).expect("the OS provides randomness");
-    let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
     let mut builder = lettre::Message::builder()
-        .message_id(Some(format!("<{id}@{}>", from.email.domain())))
+        .message_id(Some(new_message_id(from.email.domain())))
         .from(from)
         .subject(draft.subject.trim());
     for m in to {

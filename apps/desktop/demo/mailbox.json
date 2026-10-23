@@ -184,5 +184,39 @@
     "subject": "Re: Saturday hike?",
     "snippet": "Perfect. I'll pick you up at 7:45 — the trailhead lot fills up fast.",
     "body": ["Perfect. I'll pick you up at 7:45 — the trailhead lot fills up fast.", "— M"]
+  },
+  {
+    "id": 26, "account": "work", "category": "people", "unread": true,
+    "from": "Priya Raman", "address": "priya@acme.example", "ageMinutes": 35,
+    "to": ["Me <me@outlook.com>", "Sam Okafor <sam.okafor@acme.example>", "Hannah Cole <hannah@acme.example>", "alex@moreno-design.example"],
+    "subject": "Invitation: Q4 planning sync",
+    "snippet": "Let's lock the Q4 priorities before the offsite. Please skim the roadmap doc beforehand.",
+    "body": ["Let's lock the Q4 priorities before the offsite. Please skim the roadmap doc beforehand.", "Microsoft Teams meeting\nJoin: https://teams.microsoft.com/l/meetup-join/demo"],
+    "invite": {
+      "kind": "invitation", "summary": "Q4 planning sync", "startMinutes": 1500, "minutes": 45,
+      "location": "Microsoft Teams Meeting", "callLink": "https://teams.microsoft.com/l/meetup-join/demo",
+      "description": "Let's lock the Q4 priorities before the offsite. Please skim the roadmap doc beforehand.",
+      "organizer": { "name": "Priya Raman", "address": "priya@acme.example", "answer": "accepted" },
+      "attendees": [
+        { "name": "Me", "address": "me@outlook.com" },
+        { "name": "Sam Okafor", "address": "sam.okafor@acme.example", "answer": "accepted" },
+        { "name": "Hannah Cole", "address": "hannah@acme.example", "answer": "tentative" },
+        { "name": "Alex Moreno", "address": "alex@moreno-design.example" }
+      ]
+    }
+  },
+  {
+    "id": 27, "account": "personal", "category": "people",
+    "from": "Marcus Lee", "address": "marcus.lee@gmail.com", "ageMinutes": 150,
+    "to": ["Me <me@gmail.com>"],
+    "subject": "Accepted: Saturday hike",
+    "snippet": "Marcus Lee has accepted this invitation.",
+    "body": ["Marcus Lee has accepted this invitation."],
+    "invite": {
+      "kind": "reply", "summary": "Saturday hike", "startMinutes": 2700, "minutes": 240,
+      "location": "Pantoll trailhead, Mount Tamalpais",
+      "organizer": { "name": "Me", "address": "me@gmail.com", "answer": "accepted" },
+      "attendees": [{ "name": "Marcus Lee", "address": "marcus.lee@gmail.com", "answer": "accepted" }]
+    }
   }
 ]

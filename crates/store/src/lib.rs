@@ -156,6 +156,8 @@ pub struct Incoming {
     pub category: Category,
     pub unread: bool,
     pub flagged: bool,
+    /// The calendar invite it carries, JSON owned by the mail crate.
+    pub invite: Option<String>,
 }
 
 /// A file attached to a stored message. Only what describes it is kept; the
@@ -239,6 +241,10 @@ pub struct Content {
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
     pub attachments: Vec<Attachment>,
+    /// The calendar invite it carries (JSON owned by the mail crate), and
+    /// the answer to it sent from here.
+    pub invite: Option<String>,
+    pub rsvp: Option<String>,
 }
 
 /// Threading headers of a stored message, for replies.
@@ -509,6 +515,13 @@ UPDATE messages SET remote_folder_id = COALESCE(
 UPDATE messages SET home_folder_id = remote_folder_id WHERE state = 'filed';
 ";
 
+/// Version 7: the calendar invite an email carries, and the answer the
+/// user sent to it from here.
+const SCHEMA_7: &str = "
+ALTER TABLE messages ADD COLUMN invite TEXT;
+ALTER TABLE messages ADD COLUMN rsvp TEXT;
+";
+
 /// A message a pending local change takes out of folder `?1` (its server
 /// folder): until the change is pushed, syncs of that folder don't list it.
 const LEAVING: &str = "changed_at != 0 AND remote_place = 'folder' AND remote_folder_id = ?1
@@ -565,6 +578,10 @@ impl Store {
             conversations::backfill(&tx)?;
             tx.pragma_update(None, "user_version", 6)?;
             tx.commit()?;
+        }
+        if version < 7 {
+            conn.execute_batch(SCHEMA_7)?;
+            conn.pragma_update(None, "user_version", 7)?;
         }
         Ok(Self { conn })
     }
@@ -862,7 +879,7 @@ impl Store {
     pub fn content(&self, id: i64) -> Result<Option<Content>> {
         self.conn
             .query_row(
-                "SELECT text_body, html_body, to_list, cc_list, attachments, bcc_list
+                "SELECT text_body, html_body, to_list, cc_list, attachments, bcc_list, invite, rsvp
                  FROM messages WHERE id = ?1",
                 [id],
                 |r| {
@@ -873,10 +890,21 @@ impl Store {
                         cc: from_json(&r.get::<_, String>(3)?),
                         bcc: from_json(&r.get::<_, String>(5)?),
                         attachments: attachments_from_json(&r.get::<_, String>(4)?),
+                        invite: r.get(6)?,
+                        rsvp: r.get(7)?,
                     })
                 },
             )
             .optional()
+    }
+
+    /// Records the answer sent to the invite message `id` carries.
+    pub fn set_rsvp(&self, id: i64, answer: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET rsvp = ?2 WHERE id = ?1",
+            params![id, answer],
+        )?;
+        Ok(())
     }
 
     pub fn location(&self, id: i64) -> Result<Option<Location>> {
@@ -1680,9 +1708,9 @@ fn insert_message(
             account_id, remote_id, mailbox, uid, message_id, thread_id, in_reply_to, refs,
             from_name, from_address, to_list, cc_list, subject, snippet, date,
             text_body, html_body, attachments, category, state, unread, pinned, screening,
-            remote_place, remote_unread, remote_pinned, bcc_list)
+            remote_place, remote_unread, remote_pinned, bcc_list, invite)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25)",
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26)",
         params![
             m.account_id,
             m.remote_id,
@@ -1709,6 +1737,7 @@ fn insert_message(
             screening,
             place_str(place),
             json(&m.bcc),
+            m.invite,
         ],
     )?;
     let id = conn.last_insert_rowid();

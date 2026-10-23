@@ -51,6 +51,7 @@ fn main() {
             mailbox::rename_folder,
             mailbox::delete_folder,
             mailbox::get_message_content,
+            mailbox::answer_invite,
             mailbox::update_message,
             mailbox::add_gmail_account,
             mailbox::add_imap_account,

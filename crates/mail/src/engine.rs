@@ -16,6 +16,7 @@ use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
+use crate::invite::{self, Answer, Invite};
 use crate::oauth::{self, App};
 use crate::{Error, OLDER_STEP, Result, smtp};
 
@@ -635,6 +636,64 @@ impl Engine {
                 store.accept_sender(account_id, m.email.as_ref())?;
             }
         }
+        Ok(())
+    }
+
+    /// Answers the invitation message `message_id` carries, by email: a
+    /// REPLY to its organizer, sent at once rather than through the outbox.
+    /// The answer is kept with the message for its card.
+    pub async fn answer_invite(&self, message_id: i64, answer: Answer) -> Result<()> {
+        let (account_id, invite, original) = {
+            let store = self.store();
+            let gone = || Error::Config("That email is no longer here.".into());
+            let message = store.message(message_id)?.ok_or_else(gone)?;
+            let content = store.content(message_id)?.ok_or_else(gone)?;
+            let headers = store.headers(message_id)?.unwrap_or_default();
+            (message.account_id, content.invite, headers.message_id)
+        };
+        let account = self.account(account_id)?;
+        let not_an_invitation = || Error::Config("That invitation can't be answered.".into());
+        let invite = invite
+            .as_deref()
+            .and_then(Invite::from_json)
+            .ok_or_else(not_an_invitation)?;
+        let organizer = invite.organizer.as_ref().ok_or_else(not_an_invitation)?;
+        let reply = invite::reply(&invite.ics, &account.email, &account.name, answer, now_ms())
+            .ok_or_else(not_an_invitation)?;
+        let address = |a: &str| -> Result<lettre::Address> {
+            a.parse()
+                .map_err(|_| Error::Config(format!("\"{a}\" isn't an email address.")))
+        };
+        let from = Mailbox::new(
+            Some(account.name.clone()).filter(|n| !n.is_empty()),
+            address(&account.email)?,
+        );
+        let to = Mailbox::new(
+            Some(organizer.name.clone()).filter(|n| n != &organizer.address),
+            address(&organizer.address)?,
+        );
+        let message = invite::reply_message(
+            from,
+            to,
+            &invite.summary,
+            answer,
+            &reply,
+            original.as_deref(),
+        )?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                smtp: server,
+                ..
+            } => smtp::send(&server, &username, &self.password(account.id)?, message).await?,
+            AccountConfig::Microsoft { client_id, tenant } => {
+                let token = self
+                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                    .await?;
+                Graph::new(&token).send_mime(&message.formatted()).await?;
+            }
+        }
+        self.store().set_rsvp(message_id, answer.as_str())?;
         Ok(())
     }
 

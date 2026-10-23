@@ -24,6 +24,7 @@ use crate::attachment::{
     AttachmentData, INLINE_IMAGE_MAX, INLINE_TOTAL_MAX, InlineImage, cid_key, mime_for,
 };
 use crate::draft::{Draft, recipients};
+use crate::invite::Invite;
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::{Error, OLDER_STEP, Result};
 
@@ -148,6 +149,10 @@ pub struct GraphMessage {
     pub id: String,
     #[serde(rename = "@removed")]
     pub removed: Option<Value>,
+    /// `#microsoft.graph.eventMessageRequest` and the like for meeting
+    /// messages; absent for plain mail.
+    #[serde(rename = "@odata.type")]
+    pub odata_type: Option<String>,
     pub subject: Option<String>,
     pub from: Option<GraphRecipient>,
     #[serde(default)]
@@ -334,10 +339,8 @@ impl Graph {
                     continue;
                 }
                 let mut incoming = to_incoming(account_id, &m);
-                if m.has_attachments == Some(true)
-                    && !lock(store).has_remote_id(account_id, &m.id)?
-                {
-                    incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
+                if !lock(store).has_remote_id(account_id, &m.id)? {
+                    self.complete(&m, &mut incoming).await;
                 }
                 if let spark_store::Added::New(id) = lock(store).add_incoming(&incoming, !first)? {
                     report.new.push(id);
@@ -492,9 +495,7 @@ impl Graph {
                 }
             } else if let Some(m) = full.get(&listed.id) {
                 let mut incoming = to_incoming(account_id, m);
-                if m.has_attachments == Some(true) {
-                    incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
-                }
+                self.complete(m, &mut incoming).await;
                 incoming
             } else {
                 continue;
@@ -625,9 +626,7 @@ impl Graph {
                     continue;
                 };
                 let mut incoming = to_incoming(account_id, m);
-                if m.has_attachments == Some(true) {
-                    incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
-                }
+                self.complete(m, &mut incoming).await;
                 if let Added::New(_) = lock(store).add_incoming(&incoming, false)? {
                     stored += 1;
                 }
@@ -680,6 +679,42 @@ impl Graph {
     pub async fn delete_folder(&self, id: &str) -> Result<()> {
         self.send(self.request(Method::DELETE, &format!("/me/mailFolders/{}", path(id))))
             .await?;
+        Ok(())
+    }
+
+    /// What a listing leaves out of a new message: its attachments, and
+    /// the invite a meeting message carries.
+    async fn complete(&self, m: &GraphMessage, incoming: &mut Incoming) {
+        if m.has_attachments == Some(true) {
+            incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
+        }
+        if m.odata_type
+            .as_deref()
+            .is_some_and(|t| t.contains("eventMessage"))
+        {
+            incoming.invite = self.invite(&m.id).await.map(|i| i.to_json());
+        }
+    }
+
+    /// The invite in a meeting message. Exchange keeps meeting messages as
+    /// items of their own and writes the calendar part out only in their MIME.
+    async fn invite(&self, id: &str) -> Option<Invite> {
+        let response = self
+            .send(self.request(Method::GET, &format!("/me/messages/{}/$value", path(id))))
+            .await
+            .ok()?;
+        Invite::from_raw(&response.bytes().await.ok()?)
+    }
+
+    /// Sends a message given whole as MIME: one with parts Graph's JSON
+    /// can't express, like a calendar reply. It's saved in Sent Items.
+    pub async fn send_mime(&self, message: &[u8]) -> Result<()> {
+        self.send(
+            self.request(Method::POST, "/me/sendMail")
+                .header("Content-Type", "text/plain")
+                .body(STANDARD.encode(message)),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1289,7 +1324,7 @@ fn parse_iso_date(s: &str) -> Option<i64> {
 }
 
 /// Howard Hinnant's date algorithms.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -1298,7 +1333,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use spark_mail::draft::{Draft, OutgoingAttachment};
+use spark_mail::invite::{Answer, Card, Kind, Person};
 use spark_mail::{drafts, parse};
 use spark_store::{AccountKind, Category, FolderRole, MessageState, Patch, now_ms};
 
@@ -122,9 +123,34 @@ struct DemoEntry {
     /// The email's own HTML, for the few demo messages that have one.
     #[serde(default)]
     html: Option<String>,
+    #[serde(default)]
+    invite: Option<DemoInvite>,
 }
 
-pub struct DemoMailbox(Mutex<Vec<Message>>, Mutex<DemoDrafts>);
+/// A demo email's calendar invite, starting `start_minutes` from now.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DemoInvite {
+    kind: Kind,
+    summary: String,
+    start_minutes: i64,
+    minutes: i64,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    call_link: Option<String>,
+    organizer: Person,
+    attendees: Vec<Person>,
+}
+
+/// The messages, the drafts, and the answers given to demo invitations.
+pub struct DemoMailbox(
+    Mutex<Vec<Message>>,
+    Mutex<DemoDrafts>,
+    Mutex<HashMap<i64, Answer>>,
+);
 
 /// Drafts saved in the demo as the composer had them, and drafts being
 /// "sent", by outbox id, until their undo window is over.
@@ -139,7 +165,17 @@ impl DemoMailbox {
         Self(
             Mutex::new(demo_messages(now_ms())),
             Mutex::new(DemoDrafts::default()),
+            Mutex::default(),
         )
+    }
+
+    /// The answer given to message `id`'s invitation.
+    pub fn answer(&self, id: i64) -> Option<Answer> {
+        self.2.lock().unwrap().get(&id).copied()
+    }
+
+    pub fn set_answer(&self, id: i64, answer: Answer) {
+        self.2.lock().unwrap().insert(id, answer);
     }
 
     /// Every message; snoozed ones whose time has come are back in the inbox.
@@ -396,6 +432,49 @@ pub fn html(id: i64) -> Option<String> {
     .cloned()
 }
 
+/// The card for demo message `id`'s invite, if it has one, as the user
+/// `me` sees it, with `answer` theirs.
+pub fn invite(id: i64, me: &str, answer: Option<Answer>) -> Option<Card> {
+    static INVITES: OnceLock<HashMap<i64, DemoInvite>> = OnceLock::new();
+    let invite = INVITES
+        .get_or_init(|| {
+            let entries: Vec<DemoEntry> =
+                serde_json::from_str(include_str!("../../demo/mailbox.json"))
+                    .expect("demo/mailbox.json is valid");
+            entries
+                .into_iter()
+                .filter_map(|e| Some((e.id, e.invite?)))
+                .collect()
+        })
+        .get(&id)?
+        .clone();
+    // On the half hour, like real meetings.
+    const HALF_HOUR: i64 = 30 * 60_000;
+    let start = (now_ms() + invite.start_minutes * 60_000) / HALF_HOUR * HALF_HOUR;
+    let mut attendees = invite.attendees;
+    if let Some(mine) = attendees.iter_mut().find(|a| a.address == me) {
+        mine.answer = answer.or(mine.answer);
+    }
+    let invitation = invite.kind == Kind::Invitation;
+    Some(Card {
+        kind: invite.kind,
+        summary: invite.summary,
+        start,
+        end: Some(start + invite.minutes * 60_000),
+        all_day: false,
+        floating: false,
+        repeats: false,
+        location: invite.location,
+        description: invite.description,
+        call_link: invite.call_link,
+        can_answer: invitation && invite.organizer.address != me,
+        organizer: Some(invite.organizer),
+        attendees,
+        canceled: invite.kind == Kind::Cancellation,
+        answer: answer.filter(|_| invitation),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +582,24 @@ mod tests {
         let json = serde_json::to_value(&messages[0]).unwrap();
         assert_eq!(json["timestamp"], messages[0].timestamp);
         assert!(json.get("ageMinutes").is_none());
+    }
+
+    #[test]
+    fn demo_invitations_can_be_answered() {
+        let card = invite(26, "me@outlook.com", None).unwrap();
+        assert!(card.can_answer && card.answer.is_none());
+        assert!(card.start > now_ms(), "it's coming up");
+        let card = invite(26, "me@outlook.com", Some(Answer::Tentative)).unwrap();
+        assert_eq!(card.answer, Some(Answer::Tentative));
+        assert_eq!(
+            card.attendees[0].answer,
+            Some(Answer::Tentative),
+            "your own chip shows it"
+        );
+        let reply = invite(27, "me@gmail.com", None).unwrap();
+        assert_eq!(reply.kind, Kind::Reply);
+        assert!(!reply.can_answer);
+        assert!(invite(1, "me@gmail.com", None).is_none());
     }
 
     #[test]
