@@ -1153,6 +1153,14 @@ function NotificationsPage() {
             onToggle={() => void change({ meetingPopupGuestsOnly: !prefs.meetingPopupGuestsOnly })}
           />
         </Row>
+        <Row label="Sound" description="A soft chime as each meeting pops up." htmlFor="meeting-popup-sound">
+          <Switch
+            id="meeting-popup-sound"
+            on={prefs.meetingPopupSound}
+            disabled={!prefs.meetingPopup}
+            onToggle={() => void change({ meetingPopupSound: !prefs.meetingPopupSound })}
+          />
+        </Row>
         <Row label="Preview" description="Shows a sample meeting in the pop-up.">
           <button className="btn btn-sm h-8 rounded-lg" onClick={() => void preview()}>
             Show

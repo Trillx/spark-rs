@@ -1,9 +1,10 @@
 //! The meeting pop-up, Spark's Meeting Pop-Up: a card over every other
 //! window from a minute before a meeting until it ends, with the time left,
-//! who's in it, and Join, Copy link, Snooze and Dismiss. A timer here picks
-//! the meetings from the stored calendars, and keeps the next couple of hours
-//! fresh from the servers whether or not the calendar screen is open. The
-//! window (`src/popup.tsx`) only draws them.
+//! who's in it, and Join, Copy link, Snooze and Dismiss, and a chime
+//! (`chime.rs`) as each meeting appears. A timer here picks the meetings from
+//! the stored calendars, and keeps the next couple of hours fresh from the
+//! servers whether or not the calendar screen is open. The window
+//! (`src/popup.tsx`) only draws them.
 //!
 //! The window is made when a meeting is due and destroyed when none is. It's
 //! made visible and unfocused in one go: on Windows a hidden window that's
@@ -25,6 +26,7 @@ use tauri::{
 use tokio::sync::Notify;
 
 use crate::background;
+use crate::chime;
 use crate::mailbox::{Mailbox, open_external, text};
 use crate::prefs::PrefsState;
 
@@ -169,7 +171,7 @@ fn check(app: &AppHandle) {
     } else {
         Vec::new()
     };
-    let showing = {
+    let (showing, arrived) = {
         let mut state = meetings.lock();
         state.dismissed.retain(|_, end| *end > now);
         state.snoozed.retain(|_, until| *until > now);
@@ -182,9 +184,13 @@ fn check(app: &AppHandle) {
                     && !state.snoozed.contains_key(&m.id)
             }))
             .collect();
+        let arrived = arrived(&state.showing, &showing);
         state.showing = showing.clone();
-        showing
+        (showing, arrived)
     };
+    if arrived && prefs.meeting_popup_sound {
+        chime::play();
+    }
     match app.get_webview_window(LABEL) {
         Some(window) if showing.is_empty() => {
             let _ = window.destroy();
@@ -196,6 +202,13 @@ fn check(app: &AppHandle) {
         None if !showing.is_empty() => open(app, showing.len()),
         _ => {}
     }
+}
+
+/// Whether a meeting shows that didn't before: new, back from a snooze, or
+/// moved. One that's only been renamed hasn't arrived.
+fn arrived(before: &[Meeting], now: &[Meeting]) -> bool {
+    now.iter()
+        .any(|m| !before.iter().any(|b| (b.id, b.start) == (m.id, m.start)))
 }
 
 /// Makes the window, shown at once without taking the focus, at the top
@@ -555,6 +568,29 @@ mod tests {
         let m = meeting(7, e, "me@acme.example");
         let names: Vec<&str> = m.people.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Sam Okafor", "Priya Raman"]);
+    }
+
+    #[test]
+    fn chimes_for_a_new_moved_or_unsnoozed_meeting_not_a_renamed_one() {
+        let standup = meeting(7, standup(), "me@acme.example");
+        let moved = Meeting {
+            start: standup.start + MIN,
+            ..standup.clone()
+        };
+        let renamed = Meeting {
+            title: "Daily standup".into(),
+            ..standup.clone()
+        };
+        let preview = sample(0);
+        assert!(arrived(&[], std::slice::from_ref(&standup)));
+        assert!(arrived(std::slice::from_ref(&standup), &[moved]));
+        assert!(arrived(
+            std::slice::from_ref(&standup),
+            &[preview, standup.clone()]
+        ));
+        assert!(!arrived(std::slice::from_ref(&standup), &[renamed]));
+        // One dismissed out of two.
+        assert!(!arrived(&[sample(0), standup.clone()], &[standup]));
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod agents;
 mod ai;
 mod background;
 mod calendar;
+mod chime;
 mod demo;
 mod files;
 mod live;

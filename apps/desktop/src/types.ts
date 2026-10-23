@@ -102,6 +102,8 @@ export interface Prefs {
   meetingPopup: boolean;
   /** Leave events with no one else and no call out of the pop-up. */
   meetingPopupGuestsOnly: boolean;
+  /** A chime as a meeting appears in the pop-up. */
+  meetingPopupSound: boolean;
 }
 
 /** What agents may do in an account; each level includes the ones before. */

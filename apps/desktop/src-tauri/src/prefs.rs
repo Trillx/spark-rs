@@ -43,6 +43,8 @@ pub struct Prefs {
     pub meeting_popup: bool,
     /// Leaves events with no one else and no call out of the pop-up.
     pub meeting_popup_guests_only: bool,
+    /// A chime as a meeting appears in the pop-up.
+    pub meeting_popup_sound: bool,
     /// The "still running" notice has been shown, on the first close.
     pub told_keep_running: bool,
     /// What agents may do in each account, by account id; absent is none.
@@ -59,6 +61,7 @@ impl Default for Prefs {
             open_at_login: false,
             meeting_popup: true,
             meeting_popup_guests_only: true,
+            meeting_popup_sound: true,
             told_keep_running: false,
             agent_access: BTreeMap::new(),
         }
@@ -178,7 +181,9 @@ mod tests {
             }
         );
         assert!(prefs.sound && prefs.keep_running && !prefs.open_at_login);
-        assert!(prefs.meeting_popup && prefs.meeting_popup_guests_only);
+        assert!(
+            prefs.meeting_popup && prefs.meeting_popup_guests_only && prefs.meeting_popup_sound
+        );
     }
 
     #[test]

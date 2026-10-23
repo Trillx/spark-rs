@@ -646,6 +646,7 @@ let browserPrefs: Prefs = {
   openAtLogin: false,
   meetingPopup: true,
   meetingPopupGuestsOnly: true,
+  meetingPopupSound: true,
 };
 
 /** Snoozed mail whose time has come goes back to the Inbox, unread, as the Rust side does. */
