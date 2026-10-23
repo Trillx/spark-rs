@@ -183,6 +183,7 @@ import {
   type ActionId,
 } from "./lib/shortcuts";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
+import { useSearchHits } from "./lib/search";
 import type {
   AccountView,
   AgentSendingEvent,
@@ -328,9 +329,10 @@ export default function App() {
   const listWidthUsed = effectiveListWidth(listWidth, container);
   const twoColumns = useTwoColumns(container, listWidthUsed);
 
+  const hits = useSearchHits([view.search ?? "", ...layout.smartFolders.map((f) => f.query)], messages);
   const ctx: ListContext = useMemo(
-    () => ({ accounts, folders, smartFolders: layout.smartFolders, seen }),
-    [accounts, folders, layout.smartFolders, seen],
+    () => ({ accounts, folders, smartFolders: layout.smartFolders, seen, hits }),
+    [accounts, folders, layout.smartFolders, seen, hits],
   );
   const listed = useMemo(
     () => (discarding.size ? messages.filter((m) => !discarding.has(m.id)) : messages),

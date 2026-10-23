@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 mod calendar;
 mod conversations;
 mod drafts;
+mod search;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
@@ -589,6 +590,12 @@ impl Store {
             conn.execute_batch(calendar::SCHEMA_CALENDAR)?;
             conn.pragma_update(None, "user_version", 8)?;
         }
+        if version < 9 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(search::SCHEMA_SEARCH)?;
+            tx.pragma_update(None, "user_version", 9)?;
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -850,26 +857,6 @@ impl Store {
              ORDER BY date DESC"
         ))?;
         stmt.query_map([], message_row)?.collect()
-    }
-
-    /// Messages whose sender, subject or text contains `text`, ignoring
-    /// case, newest first, without bodies. Like `messages`, it skips drafts
-    /// waiting in the outbox.
-    pub fn search(&self, text: &str) -> Result<Vec<Message>> {
-        let pattern = format!(
-            "%{}%",
-            text.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages
-             WHERE (from_name LIKE ?1 ESCAPE '\\' OR from_address LIKE ?1 ESCAPE '\\'
-                    OR subject LIKE ?1 ESCAPE '\\' OR text_body LIKE ?1 ESCAPE '\\')
-               AND id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
-             ORDER BY date DESC"
-        ))?;
-        stmt.query_map([pattern], message_row)?.collect()
     }
 
     pub fn message(&self, id: i64) -> Result<Option<Message>> {

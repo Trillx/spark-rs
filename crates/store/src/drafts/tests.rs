@@ -277,6 +277,19 @@ fn graph_drafts_update_in_place() {
 }
 
 #[test]
+fn search_follows_draft_edits_and_discards() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let id = save(&mut store, account_id, None, "quarterly", 1_000);
+    let found = |store: &Store, text: &str| store.search(text).unwrap().len();
+    assert_eq!(found(&store, "quarterly"), 1);
+    let id = save(&mut store, account_id, Some(id), "yearly", 2_000);
+    assert_eq!(found(&store, "quarterly"), 0);
+    assert_eq!(found(&store, "yearly"), 1);
+    store.discard_draft(id).unwrap();
+    assert_eq!(found(&store, "yearly"), 0);
+}
+
+#[test]
 fn drafts_being_sent_are_hidden_and_not_uploaded() {
     let (mut store, account_id, _) = store_with_drafts();
     let id = save(&mut store, account_id, None, "v1", 1_000);

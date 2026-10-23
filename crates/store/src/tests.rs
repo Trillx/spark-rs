@@ -170,10 +170,130 @@ fn search_looks_in_senders_subjects_and_bodies() {
     assert_eq!(ids("STEEL"), [quote]);
     assert_eq!(ids("vendor.com"), [invoice]);
     assert_eq!(ids("message 2"), [invoice]);
-    // Newest first, and LIKE's wildcards are plain characters.
+    // Newest first. Words match from their start, punctuation is ignored,
+    // and text without letters or digits finds nothing.
     assert_eq!(ids("sender"), [invoice, quote]);
+    assert_eq!(ids("brack"), [quote]);
+    assert!(ids("racket").is_empty());
     assert_eq!(ids("100%"), [quote]);
     assert!(ids("_").is_empty());
+}
+
+fn found(store: &Store, text: &str) -> Vec<i64> {
+    store
+        .search(text)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
+}
+
+/// Fails unless the search index agrees with the messages table.
+fn check_search_index(store: &Store) {
+    store
+        .conn
+        .execute(
+            "INSERT INTO messages_fts (messages_fts, rank) VALUES ('integrity-check', 1)",
+            [],
+        )
+        .unwrap();
+}
+
+#[test]
+fn search_ignores_case_and_accents_and_finds_recipients() {
+    let (mut store, account) = store_with_account();
+    let mut booking = incoming(account, 1, "chef@bistro.fr");
+    booking.subject = "Réservation au Café".into();
+    booking.to = vec!["Zoë Ortiz <zoe@example.com>".into()];
+    booking.text = "Table pour deux, vendredi soir.".into();
+    let booking = new_id(store.add_incoming(&booking, false).unwrap());
+    for text in [
+        "cafe",
+        "RESERV",
+        "zoe",
+        "zoe@example.com",
+        "vendredi table",
+        "\"pour deux\"",
+    ] {
+        assert_eq!(found(&store, text), [booking], "{text}");
+    }
+    // Not the middle of a word, quoted words only in that order, and every word.
+    for text in ["afe", "\"deux pour\"", "table lundi"] {
+        assert!(found(&store, text).is_empty(), "{text}");
+    }
+}
+
+#[test]
+fn search_takes_operators_and_punctuation_literally() {
+    let (mut store, account) = store_with_account();
+    let mut m = incoming(account, 1, "ana@parts.com");
+    m.text = "Prices AND terms (draft) - see NEAR the end: 50*2".into();
+    let id = new_id(store.add_incoming(&m, false).unwrap());
+    for text in [
+        "AND",
+        "(draft)",
+        "NEAR(",
+        "-see",
+        "end:",
+        "50*2",
+        "\"terms (draft\"",
+    ] {
+        assert_eq!(found(&store, text), [id], "{text}");
+    }
+    for text in ["terms OR", "\"", "*", "(", ":", "\"unclosed"] {
+        assert!(found(&store, text).is_empty(), "{text}");
+    }
+}
+
+#[test]
+fn search_forgets_removed_mail() {
+    let (mut store, account) = store_with_account();
+    let mut m = incoming(account, 1, "ana@parts.com");
+    m.text = "Bracket quote".into();
+    store.add_incoming(&m, false).unwrap();
+    assert_eq!(found(&store, "bracket").len(), 1);
+    store.remove_account(account).unwrap();
+    assert!(found(&store, "bracket").is_empty());
+    check_search_index(&store);
+}
+
+#[test]
+fn version_8_databases_index_their_mail_for_search() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v8-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v8.sqlite");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        for schema in [
+            SCHEMA,
+            SCHEMA_2,
+            SCHEMA_3,
+            SCHEMA_4,
+            drafts::SCHEMA_DRAFTS,
+            conversations::SCHEMA_CONVERSATIONS,
+            SCHEMA_7,
+            calendar::SCHEMA_CALENDAR,
+        ] {
+            conn.execute_batch(schema).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, kind, email, name, label, color, config, position)
+             VALUES (1, 'imap', 'a@b.c', 'A', 'A', '#000', '{}', 0);
+             INSERT INTO messages (id, account_id, from_name, from_address, to_list, cc_list,
+                 subject, snippet, date, text_body, attachments, category, state, unread, pinned,
+                 remote_place, remote_unread, remote_pinned)
+             VALUES (1, 1, 'Ana', 'ana@x.com', '[]', '[]', 'Plan', '', 0, 'Budget attached',
+                     '[]', 'people', 'inbox', 0, 0, 'inbox', 0, 0);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(found(&store, "budget"), [1]);
+    check_search_index(&store);
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

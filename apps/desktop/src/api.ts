@@ -111,6 +111,15 @@ export function listMessages(): Promise<Message[]> {
   return Promise.resolve(structuredClone(browserMailbox));
 }
 
+/**
+ * Ids of the stored messages whose words start with those of `query`, newest first, from the
+ * search index. Null outside the app, where the caller matches the messages it has.
+ */
+export function searchMessages(query: string): Promise<number[] | null> {
+  if (isTauri()) return invoke("search_messages", { query });
+  return Promise.resolve(null);
+}
+
 export function getMessageContent(id: number): Promise<MessageContent> {
   if (isTauri()) return invoke("get_message_content", { id });
   const m = browserMailbox.find((x) => x.id === id);

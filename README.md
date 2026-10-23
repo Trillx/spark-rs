@@ -146,6 +146,16 @@ A folder shows its newest 200 messages, and 100 more each time you scroll
 to the end. Folders in the sidebar stay in sync, as does the one that's
 open; others are fetched when opened.
 
+## Search
+
+Ctrl+F opens the search field at the top of the list. spark-rs keeps a
+full-text index of the mail it has stored (senders, recipients, subjects and
+text), so a search finds words anywhere in a message, ignoring case and
+accents. Each word matches the start of a word ("invo" finds "Invoice"),
+"quoted words" have to appear together, and `from:`, `has:attachment`,
+`is:unread` and `date:today` narrow the results, newest first. Only mail
+already on this computer is searched; spark-rs doesn't ask the server yet.
+
 ## AI agents
 
 Agents on this computer, such as Claude Code, Codex and Hermes, can work

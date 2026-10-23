@@ -50,6 +50,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             mailbox::list_accounts,
             mailbox::list_messages,
+            mailbox::search_messages,
             mailbox::list_folders,
             mailbox::watch_folders,
             mailbox::sync_folders,

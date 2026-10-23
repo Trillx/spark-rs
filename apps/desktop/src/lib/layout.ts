@@ -91,7 +91,12 @@ export interface ListContext {
   smartFolders: SmartFolder[];
   /** Recently opened message ids, newest first. */
   seen: number[];
+  /** The search index's answers, for `matchesQuery`. */
+  hits?: SearchHits;
 }
+
+/** Message ids the search index found, per free text (`searchText`). */
+export type SearchHits = ReadonlyMap<string, ReadonlySet<number>>;
 
 const EMPTY_CONTEXT: ListContext = { accounts: [], folders: [], smartFolders: [], seen: [] };
 
@@ -233,7 +238,7 @@ export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, c
   const smartId = smartIdOf(key);
   if (smartId !== undefined) {
     const smart = ctx.smartFolders.find((f) => f.id === smartId);
-    return smart ? live.filter((m) => matchesQuery(m, smart.query)).sort(newestFirst) : [];
+    return smart ? live.filter((m) => matchesQuery(m, smart.query, ctx.hits)).sort(newestFirst) : [];
   }
   return live.filter(inFolders(listFolderIds(key, ctx.folders))).sort(newestFirst);
 }
@@ -248,7 +253,9 @@ export function buildList(
   const rows = listRows(messages, sticky, ctx);
   if (view.search !== null) {
     if (!view.search.trim()) return rows.model("Search", []);
-    const hits = rows.of(messages.filter((m) => isLive(m) && matchesQuery(m, view.search!)).sort(newestFirst));
+    const hits = rows.of(
+      messages.filter((m) => isLive(m) && matchesQuery(m, view.search!, ctx.hits)).sort(newestFirst),
+    );
     return { ...rows.model("Search", hits.map((m) => ({ kind: "row", message: m }))), found: hits.length };
   }
 
@@ -325,8 +332,8 @@ export function buildList(
   return rows.model(title, [...gatekeeper, ...withPeriods(mail)]);
 }
 
-/** Free text plus `from:`, `has:attachment`, `is:unread` and `date:today`. */
-export function matchesQuery(m: Message, query: string) {
+/** A search's `from:`, `has:attachment`, `is:unread` and `date:today`, and the free text left. */
+function parseQuery(query: string) {
   let rest = query;
   const take = (pattern: RegExp) => {
     const hit = rest.match(pattern);
@@ -337,14 +344,30 @@ export function matchesQuery(m: Message, query: string) {
   const hasAttachment = take(/(?:^|\s)has:attachments?(?=\s|$)/i) !== null;
   const unreadOnly = take(/(?:^|\s)is:unread(?=\s|$)/i) !== null;
   const todayOnly = take(/(?:^|\s)date:today(?=\s|$)/i) !== null;
-  const text = rest.trim().toLowerCase();
+  return { from, hasAttachment, unreadOnly, todayOnly, text: rest.trim().toLowerCase() };
+}
 
+/** A search's free text, what the search index is asked. */
+export function searchText(query: string) {
+  return parseQuery(query).text;
+}
+
+/**
+ * Free text plus `from:`, `has:attachment`, `is:unread` and `date:today`. The free text
+ * matches what the search index found for it, in `hits`, and until it answers, the
+ * message's sender, subject and snippet.
+ */
+export function matchesQuery(m: Message, query: string, hits?: SearchHits) {
+  const { from, hasAttachment, unreadOnly, todayOnly, text } = parseQuery(query);
   if (from && !`${m.from} ${m.address}`.toLowerCase().includes(from)) return false;
   if (hasAttachment && !m.attachment) return false;
   if (unreadOnly && !m.unread) return false;
   if (todayOnly && m.timestamp < new Date().setHours(0, 0, 0, 0)) return false;
+  if (!text) return true;
+  const found = hits?.get(text);
+  if (found) return found.has(m.id);
   const haystack = `${m.from} ${m.address} ${m.subject} ${m.snippet} ${m.body?.join(" ") ?? ""}`;
-  return !text || haystack.toLowerCase().includes(text);
+  return haystack.toLowerCase().includes(text);
 }
 
 export interface SidebarCounts {

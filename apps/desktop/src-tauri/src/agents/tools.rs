@@ -67,7 +67,7 @@ pub fn catalog() -> Value {
     });
     merge(&mut list_props, paging("messages"));
     let mut search_props = json!({
-        "query": { "type": "string", "description": "Words to find in the sender, subject or text. Also understands from:<name or address>, has:attachment and is:unread." },
+        "query": { "type": "string", "description": "Words to find in the sender, recipients, subject or text. Each word matches the start of a word, and \"quoted words\" must appear together. Also understands from:<name or address>, has:attachment and is:unread." },
         "account": account,
     });
     merge(&mut search_props, paging("messages"));

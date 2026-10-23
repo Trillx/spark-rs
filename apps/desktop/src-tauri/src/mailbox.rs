@@ -288,6 +288,20 @@ pub fn list_messages(mailbox: State<'_, Mailbox>) -> Result<Vec<Message>, String
     Ok(messages.into_iter().map(from_store).collect())
 }
 
+/// The stored messages whose words start with those of `query`, newest
+/// first. None in the demo, where the UI matches the messages it has.
+#[tauri::command]
+pub fn search_messages(
+    mailbox: State<'_, Mailbox>,
+    query: String,
+) -> Result<Option<Vec<i64>>, String> {
+    if !mailbox.live() {
+        return Ok(None);
+    }
+    let found = mailbox.live.engine.store().search(&query).map_err(text)?;
+    Ok(Some(found.into_iter().map(|m| m.id).collect()))
+}
+
 /// Every account's folders, accounts in order.
 #[tauri::command]
 pub fn list_folders(mailbox: State<'_, Mailbox>) -> Result<Vec<FolderView>, String> {
