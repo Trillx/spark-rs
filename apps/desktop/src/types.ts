@@ -29,8 +29,11 @@ export interface AccountView {
 }
 
 export type Category = "people" | "notifications" | "newsletters";
-/** `done` is Spark's Done (archive); `aside` is Set Aside. */
-export type MessageState = "inbox" | "done" | "snoozed" | "aside" | "deleted" | "blocked";
+/**
+ * `done` is Spark's Done (archive); `aside` is Set Aside; `filed` lives in
+ * another server folder (Sent, Spam, or one of the user's folders or labels).
+ */
+export type MessageState = "inbox" | "done" | "snoozed" | "aside" | "deleted" | "blocked" | "filed";
 
 export interface Message {
   id: number;
@@ -46,6 +49,8 @@ export interface Message {
   snoozedUntil?: number;
   from: string;
   address: string;
+  /** Who it's to, e.g. "Ana Ruiz <ana@x.com>"; Sent and Drafts show them instead of the sender. */
+  to?: string[];
   /** When the message arrived, in Unix milliseconds. */
   timestamp: number;
   subject: string;
@@ -53,6 +58,26 @@ export interface Message {
   /** Demo messages only; real ones load through `getMessageContent`. */
   body?: string[];
   attachment?: string;
+  /** Ids of the server folders that hold it (a Gmail message can be in several). */
+  folders?: number[];
+  /** The folder it was filed in, while `state` is `filed`. */
+  folder?: number;
+}
+
+/** What a server folder is for. User folders and labels have none. */
+export type FolderRole = "sent" | "drafts" | "archive" | "trash" | "spam" | "flagged";
+
+/** A server folder or label of one account. */
+export interface FolderView {
+  id: number;
+  account: AccountId;
+  name: string;
+  parent?: number;
+  role?: FolderRole;
+  /** False for folders that only hold other folders. */
+  selectable: boolean;
+  /** Its messages have been synced at least once. */
+  synced: boolean;
 }
 
 /** Which new mail shows a notification. `people` is Spark's smart notifications. */
@@ -90,8 +115,9 @@ export interface AgentSendingEvent {
   sendAt: number;
 }
 
+/** `folder` files the message in that folder of its own account, setting `state` to `filed`. */
 export type MessagePatch = Partial<
-  Pick<Message, "state" | "unread" | "pinned" | "priority" | "screening" | "snoozedUntil">
+  Pick<Message, "state" | "unread" | "pinned" | "priority" | "screening" | "snoozedUntil" | "folder">
 >;
 
 export interface MessageContent {
@@ -140,6 +166,11 @@ export interface OutgoingDraft {
   /** Unix ms: the end of the undo window for a normal send, or the Send Later time. */
   sendAt: number;
   attachments: OutgoingAttachment[];
+  /** The saved draft this was opened from or saved as; sending deletes it. */
+  draftId?: number;
+  /** Threading for a reply whose original isn't stored (a draft from the server). */
+  inReplyTo?: string;
+  references?: string;
 }
 
 /** Payload of the `sync-status` event. */

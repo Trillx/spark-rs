@@ -1,9 +1,11 @@
 //! Microsoft Graph for Microsoft 365 mailboxes: the inbox through delta
-//! queries, flag and move changes, and sending.
+//! queries, other folders' newest messages, flag and move changes, folder
+//! management, and sending.
 //!
 //! Every request asks for immutable ids, so a message keeps its id when it
 //! moves to Archive or Deleted Items and back.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -12,7 +14,10 @@ use base64::engine::general_purpose::STANDARD;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use spark_store::{Attachment, Category, Incoming, Pending, Place, Pushed, Store};
+use spark_store::{
+    Added, Attachment, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed,
+    RemoteFolder, Store,
+};
 
 use crate::attachment::{AttachmentData, mime_for};
 use crate::draft::{Draft, recipients};
@@ -28,9 +33,28 @@ const HOST: &str = "graph.microsoft.com";
 const INLINE_ATTACHMENT_MAX: usize = 3 * 1024 * 1024;
 /// Upload session chunks must be multiples of 320 KiB.
 const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
+/// A folder shows its newest this many messages.
+pub const FOLDER_LIMIT: usize = 200;
+/// More new messages than this in a folder are fetched in one listing
+/// rather than one by one.
+const FETCH_ONE_BY_ONE: usize = 10;
+/// Well-known folders: their role, or `None` for ones left out of the list.
+/// Folders inside the inbox are listed at the top.
+const WELL_KNOWN: [(&str, Option<FolderRole>); 8] = [
+    ("inbox", None),
+    ("archive", Some(FolderRole::Archive)),
+    ("sentitems", Some(FolderRole::Sent)),
+    ("drafts", Some(FolderRole::Drafts)),
+    ("deleteditems", Some(FolderRole::Trash)),
+    ("junkemail", Some(FolderRole::Spam)),
+    ("outbox", None),
+    ("conversationhistory", None),
+];
+const FOLDER_SELECT: &str = "id,displayName,childFolderCount";
 
-const SELECT: &str = "subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,\
-     bodyPreview,body,hasAttachments,internetMessageId,conversationId,inferenceClassification";
+const SELECT: &str = "subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,\
+     isRead,flag,bodyPreview,body,hasAttachments,internetMessageId,conversationId,\
+     inferenceClassification";
 
 /// One HTTP client for the process (connection reuse).
 pub(crate) fn http() -> reqwest::Client {
@@ -89,6 +113,8 @@ pub struct GraphMessage {
     pub to_recipients: Vec<GraphRecipient>,
     #[serde(default)]
     pub cc_recipients: Vec<GraphRecipient>,
+    #[serde(default)]
+    pub bcc_recipients: Vec<GraphRecipient>,
     pub received_date_time: Option<String>,
     pub is_read: Option<bool>,
     pub flag: Option<GraphFlag>,
@@ -123,6 +149,24 @@ pub struct GraphFlag {
 pub struct GraphBody {
     pub content_type: String,
     pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphFolder {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub child_folder_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct Page<T> {
+    #[serde(default = "Vec::new")]
+    value: Vec<T>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +313,229 @@ impl Graph {
         }
     }
 
+    /// The mailbox's folders, nested ones after their parents. Well-known
+    /// folders get their role; the inbox, Outbox and Conversation History
+    /// aren't listed (folders inside the inbox are, at the top).
+    pub async fn list_folders(&self) -> Result<Vec<RemoteFolder>> {
+        let mut well_known: HashMap<String, Option<FolderRole>> = HashMap::new();
+        let mut inbox = None;
+        for (name, role) in WELL_KNOWN {
+            match self
+                .json::<GraphFolder>(
+                    self.request(Method::GET, &format!("/me/mailFolders/{name}?$select=id")),
+                )
+                .await
+            {
+                Ok(f) => {
+                    if name == "inbox" {
+                        inbox = Some(f.id.clone());
+                    }
+                    well_known.insert(f.id, role);
+                }
+                // Not every mailbox has every folder (e.g. no archive).
+                Err(Error::Gone) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut folders = Vec::new();
+        let mut queue = VecDeque::from([(
+            format!("/me/mailFolders?$top=250&$select={FOLDER_SELECT}"),
+            None::<String>,
+        )]);
+        while let Some((first, parent)) = queue.pop_front() {
+            let mut next = Some(first);
+            while let Some(url) = next {
+                let page: Page<GraphFolder> = self.json(self.request(Method::GET, &url)).await?;
+                for f in page.value {
+                    let listed = match well_known.get(&f.id) {
+                        Some(None) => Some(&f.id) == inbox.as_ref(),
+                        _ => true,
+                    };
+                    // Children of the inbox go to the top; of hidden ones, nowhere.
+                    if f.child_folder_count > 0 && (listed || Some(&f.id) == inbox.as_ref()) {
+                        let child_parent = (Some(&f.id) != inbox.as_ref()).then(|| f.id.clone());
+                        queue.push_back((
+                            format!(
+                                "/me/mailFolders/{}/childFolders?$top=250&$select={FOLDER_SELECT}",
+                                path(&f.id)
+                            ),
+                            child_parent,
+                        ));
+                    }
+                    if Some(&f.id) == inbox.as_ref() || !listed {
+                        continue;
+                    }
+                    folders.push(RemoteFolder {
+                        role: well_known.get(&f.id).copied().flatten(),
+                        remote_id: f.id,
+                        parent: parent.clone(),
+                        name: f.display_name,
+                        selectable: true,
+                    });
+                }
+                next = page.next_link;
+            }
+            if folders.len() > 2_000 {
+                break;
+            }
+        }
+        Ok(folders)
+    }
+
+    /// Brings a folder's newest messages (up to `FOLDER_LIMIT`) into the
+    /// store and makes them its list. Returns how many came or went, or
+    /// `None` if the folder is gone.
+    pub async fn sync_folder(
+        &self,
+        store: &Mutex<Store>,
+        folder: &Folder,
+    ) -> Result<Option<usize>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Listed {
+            id: String,
+            is_read: Option<bool>,
+            flag: Option<GraphFlag>,
+        }
+        let account_id = folder.account_id;
+        let messages = format!("/me/mailFolders/{}/messages", path(&folder.remote_id));
+        let listing: Page<Listed> = match self
+            .json(self.request(
+                Method::GET,
+                &format!(
+                    "{messages}?$top={FOLDER_LIMIT}&$orderby=receivedDateTime+desc&$select=id,isRead,flag"
+                ),
+            ))
+            .await
+        {
+            Err(Error::Gone) => return Ok(None),
+            other => other?,
+        };
+        let (before, known): (HashSet<i64>, HashSet<String>) = {
+            let store = lock(store);
+            let mut known = HashSet::new();
+            for m in &listing.value {
+                if store.has_remote_id(account_id, &m.id)? {
+                    known.insert(m.id.clone());
+                }
+            }
+            (store.folder_member_ids(folder.id)?, known)
+        };
+
+        // The new ones in full: one by one, or the whole listing again.
+        let unknown: Vec<&str> = listing
+            .value
+            .iter()
+            .map(|m| m.id.as_str())
+            .filter(|id| !known.contains(*id))
+            .collect();
+        let mut full: HashMap<String, GraphMessage> = HashMap::new();
+        if unknown.len() > FETCH_ONE_BY_ONE {
+            let mut next = Some(format!(
+                "{messages}?$top=50&$orderby=receivedDateTime+desc&$select={SELECT}"
+            ));
+            while let Some(url) = next.take() {
+                let page: Page<GraphMessage> = self
+                    .json(
+                        self.request(Method::GET, &url)
+                            .header("Prefer", "outlook.body-content-type=\"html\""),
+                    )
+                    .await?;
+                full.extend(page.value.into_iter().map(|m| (m.id.clone(), m)));
+                if full.len() < FOLDER_LIMIT {
+                    next = page.next_link;
+                }
+            }
+        } else {
+            for id in &unknown {
+                match self
+                    .json::<GraphMessage>(
+                        self.request(
+                            Method::GET,
+                            &format!("/me/messages/{}?$select={SELECT}", path(id)),
+                        )
+                        .header("Prefer", "outlook.body-content-type=\"html\""),
+                    )
+                    .await
+                {
+                    Ok(m) => {
+                        full.insert(m.id.clone(), m);
+                    }
+                    // Moved or deleted since the listing.
+                    Err(Error::Gone) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        let mut changed = 0;
+        let mut members = Vec::new();
+        for listed in &listing.value {
+            let unread = !listed.is_read.unwrap_or(false);
+            let flagged = listed
+                .flag
+                .as_ref()
+                .is_some_and(|f| f.flag_status == "flagged");
+            let incoming = if known.contains(&listed.id) {
+                Incoming {
+                    account_id,
+                    remote_id: Some(listed.id.clone()),
+                    unread,
+                    flagged,
+                    ..Default::default()
+                }
+            } else if let Some(m) = full.get(&listed.id) {
+                let mut incoming = to_incoming(account_id, m);
+                if m.has_attachments == Some(true) {
+                    incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
+                }
+                incoming
+            } else {
+                continue;
+            };
+            let id = match lock(store).add_folder_message(folder.id, &incoming)? {
+                Added::New(id) | Added::Known(id) => id,
+            };
+            if !before.contains(&id) {
+                changed += 1;
+            }
+            members.push((id, None));
+        }
+        changed += lock(store).set_folder_members(folder.id, &members)?;
+        Ok(Some(changed))
+    }
+
+    /// Creates a folder, in `parent` (a folder id) or at the top; returns its id.
+    pub async fn create_folder(&self, parent: Option<&str>, name: &str) -> Result<String> {
+        let url = match parent {
+            Some(parent) => format!("/me/mailFolders/{}/childFolders", path(parent)),
+            None => "/me/mailFolders".to_owned(),
+        };
+        let created: GraphFolder = self
+            .json(
+                self.request(Method::POST, &url)
+                    .json(&json!({ "displayName": name })),
+            )
+            .await?;
+        Ok(created.id)
+    }
+
+    pub async fn rename_folder(&self, id: &str, name: &str) -> Result<()> {
+        self.send(
+            self.request(Method::PATCH, &format!("/me/mailFolders/{}", path(id)))
+                .json(&json!({ "displayName": name })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes a folder with its subfolders (Outlook keeps them in Deleted Items).
+    pub async fn delete_folder(&self, id: &str) -> Result<()> {
+        self.send(self.request(Method::DELETE, &format!("/me/mailFolders/{}", path(id))))
+            .await?;
+        Ok(())
+    }
+
     /// A message's attachments, not counting inline images.
     pub async fn attachments(&self, id: &str) -> Result<Vec<Attachment>> {
         #[derive(Deserialize)]
@@ -359,7 +626,8 @@ impl Graph {
     }
 
     /// Sends local changes: read and flagged state, then the move for Done
-    /// (Archive) or Delete (Deleted Items).
+    /// (Archive), Delete (Deleted Items), filing into a folder, or back to
+    /// the inbox.
     pub async fn push(&self, store: &Mutex<Store>, pending: Vec<Pending>) -> Result<usize> {
         let mut pushed = 0;
         for p in pending {
@@ -377,12 +645,7 @@ impl Graph {
                     )
                     .await?;
                 }
-                if p.place != p.remote_place {
-                    let destination = match p.place {
-                        Place::Inbox => "inbox",
-                        Place::Archive => "archive",
-                        Place::Trash => "deleteditems",
-                    };
+                if let Some(destination) = move_destination(&p) {
                     self.send(
                         self.request(Method::POST, &format!("/me/messages/{}/move", path(&id)))
                             .json(&json!({ "destinationId": destination })),
@@ -549,6 +812,108 @@ impl Graph {
     }
 }
 
+/// Where a pending change moves a message: a well-known folder name, or the
+/// id of the folder it's filed into. `None` if it stays where it is.
+fn move_destination(p: &Pending) -> Option<&str> {
+    let destination = match p.place {
+        Place::Inbox => "inbox",
+        Place::Archive => "archive",
+        Place::Trash => "deleteditems",
+        // Filed mail goes to its home folder; without one it stays put.
+        Place::Folder => {
+            let (id, remote_id) = p.folder.as_ref()?;
+            let there = p.remote_place == Place::Folder && p.remote_folder == Some(*id);
+            return (!there).then_some(remote_id.as_str());
+        }
+    };
+    (p.place != p.remote_place).then_some(destination)
+}
+
+/// Server drafts: they live in Drafts like Outlook's own.
+impl Graph {
+    /// Saves a draft: `update` (a draft's id) changed in place, or a new
+    /// one in Drafts with `files` attached. Returns its id and Message-ID.
+    /// A draft that's gone is made anew.
+    pub async fn save_draft(
+        &self,
+        update: Option<&str>,
+        draft: &Draft,
+        files: &[AttachmentData],
+    ) -> Result<(String, Option<String>)> {
+        let message = draft_message(draft);
+        if let Some(id) = update {
+            match self
+                .json::<GraphMessage>(
+                    self.request(Method::PATCH, &format!("/me/messages/{}", path(id)))
+                        .json(&message),
+                )
+                .await
+            {
+                Ok(m) => return Ok((m.id, m.internet_message_id.as_deref().map(bare_id))),
+                Err(Error::Gone) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let created: GraphMessage = self
+            .json(self.request(Method::POST, "/me/messages").json(&message))
+            .await?;
+        let draft_path = format!("/me/messages/{}", path(&created.id));
+        for f in files {
+            if let Err(e) = self.attach(&draft_path, f).await {
+                let _ = self.send(self.request(Method::DELETE, &draft_path)).await;
+                return Err(e);
+            }
+        }
+        Ok((
+            created.id,
+            created.internet_message_id.as_deref().map(bare_id),
+        ))
+    }
+
+    /// Deletes a draft for good, as Outlook does once it's sent; where
+    /// that isn't offered, into Deleted Items.
+    pub async fn delete_draft(&self, id: &str) -> Result<()> {
+        let draft_path = format!("/me/messages/{}", path(id));
+        let deleted = self
+            .send(
+                self.request(Method::POST, &format!("{draft_path}/permanentDelete"))
+                    .json(&json!({})),
+            )
+            .await;
+        let deleted = match deleted {
+            Err(Error::Server(_)) => self.send(self.request(Method::DELETE, &draft_path)).await,
+            other => other,
+        };
+        match deleted {
+            Ok(_) | Err(Error::Gone) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// A draft as Graph takes it. Addresses that don't parse yet are left out.
+pub fn draft_message(draft: &Draft) -> Value {
+    let list = |field: &str| -> Vec<Value> {
+        crate::drafts::recipients(field)
+            .into_iter()
+            .map(|m| {
+                let mut address = json!({ "address": m.email.to_string() });
+                if let Some(name) = m.name {
+                    address["name"] = Value::String(name);
+                }
+                json!({ "emailAddress": address })
+            })
+            .collect()
+    };
+    json!({
+        "subject": draft.subject.trim(),
+        "body": { "contentType": "Text", "content": draft.body },
+        "toRecipients": list(&draft.to),
+        "ccRecipients": list(&draft.cc),
+        "bccRecipients": list(&draft.bcc),
+    })
+}
+
 /// The first delta request: the inbox's last `FIRST_SYNC_DAYS` days.
 pub fn first_delta_url(now_ms: i64) -> String {
     let since = iso_date(now_ms - FIRST_SYNC_DAYS * 86_400_000);
@@ -595,6 +960,7 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         from_address,
         to: m.to_recipients.iter().filter_map(display).collect(),
         cc: m.cc_recipients.iter().filter_map(display).collect(),
+        bcc: m.bcc_recipients.iter().filter_map(display).collect(),
         subject: m.subject.clone().unwrap_or_default().trim().to_owned(),
         snippet: snippet(m.body_preview.as_deref().unwrap_or(&text)),
         date: m
@@ -782,6 +1148,101 @@ mod tests {
         .unwrap();
         assert!(page.value[0].removed.is_some());
         assert!(page.delta_link.is_some() && page.next_link.is_none());
+    }
+
+    fn pending(place: Place, remote_place: Place, remote_folder: Option<i64>) -> Pending {
+        Pending {
+            id: 1,
+            remote_id: Some("AAMk1".into()),
+            mailbox: None,
+            uid: None,
+            message_id: None,
+            place,
+            folder: None,
+            unread: false,
+            pinned: false,
+            remote_place,
+            remote_folder,
+            remote_unread: false,
+            remote_pinned: false,
+        }
+    }
+
+    #[test]
+    fn filed_mail_moves_to_its_home_folder_by_id() {
+        let clients = Some((5, "AAMk-clients".to_owned()));
+        // Into a folder from the inbox, or from another folder.
+        let from_inbox = Pending {
+            folder: clients.clone(),
+            ..pending(Place::Folder, Place::Inbox, None)
+        };
+        assert_eq!(move_destination(&from_inbox), Some("AAMk-clients"));
+        let from_projects = Pending {
+            folder: clients.clone(),
+            ..pending(Place::Folder, Place::Folder, Some(4))
+        };
+        assert_eq!(move_destination(&from_projects), Some("AAMk-clients"));
+        // Already there (e.g. only read): no move.
+        let read = Pending {
+            folder: clients.clone(),
+            ..pending(Place::Folder, Place::Folder, Some(5))
+        };
+        assert_eq!(move_destination(&read), None);
+        // Done undone after it reached Archive: back into the folder.
+        let undone = Pending {
+            folder: clients,
+            ..pending(Place::Folder, Place::Archive, None)
+        };
+        assert_eq!(move_destination(&undone), Some("AAMk-clients"));
+        // Done, back to the inbox, and filed without a known folder.
+        assert_eq!(
+            move_destination(&pending(Place::Archive, Place::Folder, Some(5))),
+            Some("archive")
+        );
+        assert_eq!(
+            move_destination(&pending(Place::Inbox, Place::Folder, Some(5))),
+            Some("inbox")
+        );
+        assert_eq!(
+            move_destination(&pending(Place::Folder, Place::Folder, Some(5))),
+            None
+        );
+    }
+
+    #[test]
+    fn drafts_are_sent_as_text_with_every_recipient_field() {
+        let draft = Draft {
+            account: 1,
+            to: "Ana Ruiz <ana@contoso.com>; bob@".into(),
+            cc: String::new(),
+            bcc: "boss@contoso.com".into(),
+            subject: " Plan ".into(),
+            body: "Draft text".into(),
+            reply_to: None,
+            send_at: 0,
+            attachments: Vec::new(),
+            draft_id: Some(4),
+            in_reply_to: None,
+            references: None,
+        };
+        assert_eq!(
+            draft_message(&draft),
+            json!({
+                "subject": "Plan",
+                "body": { "contentType": "Text", "content": "Draft text" },
+                "toRecipients": [
+                    { "emailAddress": { "address": "ana@contoso.com", "name": "Ana Ruiz" } }
+                ],
+                "ccRecipients": [],
+                "bccRecipients": [ { "emailAddress": { "address": "boss@contoso.com" } } ],
+            })
+        );
+        let m: GraphMessage = serde_json::from_value(json!({
+            "id": "d1",
+            "bccRecipients": [ { "emailAddress": { "name": "Boss", "address": "boss@contoso.com" } } ]
+        }))
+        .unwrap();
+        assert_eq!(to_incoming(3, &m).bcc, ["Boss <boss@contoso.com>"]);
     }
 
     #[test]

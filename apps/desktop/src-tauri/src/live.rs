@@ -1,18 +1,20 @@
 //! Real accounts: the mail engine and one background worker per account.
 //!
 //! A worker loops: send what's due, push local changes once they're past the
-//! undo window, and fetch new mail every couple of minutes or when asked.
-//! It tells the UI through events (`mailbox-changed`, `sync-status`,
-//! `send-status`), and the user through notifications for new mail.
+//! undo window, and fetch new mail every couple of minutes or when asked,
+//! syncing the folders the UI watches along with it. The folder list is
+//! refreshed now and then. It tells the UI through events
+//! (`mailbox-changed`, `folders-changed`, `sync-status`, `send-status`), and
+//! the user through notifications for new mail.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use spark_mail::{Engine, Error};
+use spark_mail::{Engine, Error, Round};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
@@ -26,6 +28,7 @@ const TICK: Duration = Duration::from_secs(2);
 const FETCH_EVERY: Duration = Duration::from_secs(120);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const SNOOZE_CHECK: Duration = Duration::from_secs(15);
+const LIST_FOLDERS_EVERY: Duration = Duration::from_secs(15 * 60);
 
 pub struct Live {
     pub engine: Arc<Engine>,
@@ -33,12 +36,23 @@ pub struct Live {
     status: Arc<Mutex<HashMap<i64, SyncView>>>,
     /// Cancels the Microsoft sign-in in progress.
     sign_in: Mutex<Option<oneshot::Sender<()>>>,
+    /// Folders (of any account) the UI wants in sync: on the sidebar or open.
+    watched: Arc<Mutex<HashSet<i64>>>,
 }
 
 struct Worker {
     wake: Arc<Notify>,
-    fetch_now: Arc<AtomicBool>,
+    asks: Arc<Asks>,
     task: JoinHandle<()>,
+}
+
+/// What the user asked a worker for, between rounds.
+#[derive(Default)]
+struct Asks {
+    fetch: AtomicBool,
+    list_folders: AtomicBool,
+    /// Folders to sync on the next round, whatever the timer says.
+    folders: Mutex<HashSet<i64>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -77,6 +91,7 @@ impl Live {
             workers: Mutex::new(HashMap::new()),
             status: Arc::new(Mutex::new(HashMap::new())),
             sign_in: Mutex::new(None),
+            watched: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -102,26 +117,29 @@ impl Live {
         });
     }
 
-    /// Starts the account's worker; its first round fetches at once.
+    /// Starts the account's worker; its first round fetches and lists the
+    /// folders at once.
     pub fn start(&self, app: &AppHandle, account_id: i64) {
         let wake = Arc::new(Notify::new());
-        let fetch_now = Arc::new(AtomicBool::new(true));
+        let asks = Arc::new(Asks {
+            fetch: AtomicBool::new(true),
+            list_folders: AtomicBool::new(true),
+            ..Default::default()
+        });
         let task = tauri::async_runtime::spawn(work(
             app.clone(),
             self.engine.clone(),
             self.status.clone(),
+            self.watched.clone(),
             account_id,
             wake.clone(),
-            fetch_now.clone(),
+            asks.clone(),
         ));
-        let old = self.workers.lock().unwrap().insert(
-            account_id,
-            Worker {
-                wake,
-                fetch_now,
-                task,
-            },
-        );
+        let old = self
+            .workers
+            .lock()
+            .unwrap()
+            .insert(account_id, Worker { wake, asks, task });
         if let Some(old) = old {
             old.task.abort();
         }
@@ -134,10 +152,44 @@ impl Live {
         self.status.lock().unwrap().remove(&account_id);
     }
 
-    /// Fetches new mail for every account now.
+    /// Fetches new mail, lists folders and syncs the watched ones for every
+    /// account now.
     pub fn sync_now(&self) {
         for worker in self.workers.lock().unwrap().values() {
-            worker.fetch_now.store(true, Ordering::Relaxed);
+            worker.asks.fetch.store(true, Ordering::Relaxed);
+            worker.asks.list_folders.store(true, Ordering::Relaxed);
+            worker.wake.notify_one();
+        }
+    }
+
+    /// Lists every account's folders again now.
+    pub fn refresh_folders(&self) {
+        for worker in self.workers.lock().unwrap().values() {
+            worker.asks.list_folders.store(true, Ordering::Relaxed);
+            worker.wake.notify_one();
+        }
+    }
+
+    /// Replaces the watched folders; ones not watched before sync now.
+    pub fn watch_folders(&self, ids: Vec<i64>) {
+        let ids: HashSet<i64> = ids.into_iter().collect();
+        let added: Vec<i64> = {
+            let mut watched = self.watched.lock().unwrap();
+            let added = ids.difference(&watched).copied().collect();
+            *watched = ids;
+            added
+        };
+        self.sync_folders(added);
+    }
+
+    /// Syncs these folders on their accounts' next rounds, starting now.
+    pub fn sync_folders(&self, ids: Vec<i64>) {
+        if ids.is_empty() {
+            return;
+        }
+        // Each engine round skips other accounts' folders.
+        for worker in self.workers.lock().unwrap().values() {
+            worker.asks.folders.lock().unwrap().extend(&ids);
             worker.wake.notify_one();
         }
     }
@@ -179,9 +231,10 @@ async fn work(
     app: AppHandle,
     engine: Arc<Engine>,
     status: Arc<Mutex<HashMap<i64, SyncView>>>,
+    watched: Arc<Mutex<HashSet<i64>>>,
     account_id: i64,
     wake: Arc<Notify>,
-    fetch_now: Arc<AtomicBool>,
+    asks: Arc<Asks>,
 ) {
     let set_status = |view: SyncView| {
         status.lock().unwrap().insert(account_id, view.clone());
@@ -194,6 +247,7 @@ async fn work(
         );
     };
     let mut last_fetch: Option<Instant> = None;
+    let mut last_list: Option<Instant> = None;
     let mut last_sync: Option<i64> = None;
     let mut retry_at: Option<Instant> = None;
     loop {
@@ -223,20 +277,34 @@ async fn work(
             Err(e) => eprintln!("spark-rs: sending for account {account_id}: {e}"),
         }
 
-        let requested = fetch_now.swap(false, Ordering::Relaxed);
+        let requested = asks.fetch.swap(false, Ordering::Relaxed);
+        let list_asked = asks.list_folders.swap(false, Ordering::Relaxed);
+        let mut folders: HashSet<i64> = std::mem::take(&mut *asks.folders.lock().unwrap());
+        let asked = requested || list_asked || !folders.is_empty();
         let waiting = retry_at.is_some_and(|at| Instant::now() < at);
-        if requested || !waiting {
+        if asked || !waiting {
             let fetch = requested || last_fetch.is_none_or(|at| at.elapsed() >= FETCH_EVERY);
+            let list_folders = list_asked
+                || (fetch && last_list.is_none_or(|at| at.elapsed() >= LIST_FOLDERS_EVERY));
             if fetch {
+                folders.extend(watched.lock().unwrap().iter());
                 set_status(SyncView {
                     status: SyncStatus::Syncing,
                     message: None,
                     last_sync,
                 });
             }
-            match engine.run(account_id, fetch).await {
+            let round = Round {
+                fetch,
+                list_folders,
+                folders: folders.into_iter().collect(),
+            };
+            match engine.run_round(account_id, &round).await {
                 Ok(report) => {
                     retry_at = None;
+                    if list_folders {
+                        last_list = Some(Instant::now());
+                    }
                     if fetch {
                         last_fetch = Some(Instant::now());
                         last_sync = Some(now_ms());
@@ -245,6 +313,12 @@ async fn work(
                             message: None,
                             last_sync,
                         });
+                    }
+                    for e in &report.folder_errors {
+                        eprintln!("spark-rs: syncing a folder of account {account_id}: {e}");
+                    }
+                    if report.folders_changed {
+                        let _ = app.emit("folders-changed", ());
                     }
                     if report.changed() {
                         let _ = app.emit("mailbox-changed", ());

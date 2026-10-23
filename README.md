@@ -51,6 +51,12 @@ Delete, read and pinned go back to the server after the 6-second undo
 window; Done archives (All Mail on Gmail). Snooze, Set Aside, Priority and
 new-sender screening stay on this computer.
 
+Closing the composer saves the message to the account's Drafts folder
+(it's also saved as you type), on this computer at once and on the server
+with the next sync, so it works offline. Opening a draft from Drafts edits
+it; sending it or Delete Draft removes it from the server too, and undoing
+the send keeps it. Sent and Drafts list who the mail is to.
+
 Attachments download when you open or save them, also from archived mail.
 Program files (`.exe`, `.js`, `.lnk` and the like) can only be saved, not
 opened, and downloaded files are marked as coming from the internet, so
@@ -71,6 +77,36 @@ Notifications changes this, turns the sound off, stops closing to the tray, or
 opens spark-rs in the background when you sign in to Windows.
 
 Starting spark-rs again while it runs brings the running window forward.
+
+## Sidebar and folders
+
+The sidebar starts as a narrow strip of icons. `/` or the ≡ button opens it
+over the list, and Lock Sidebar keeps it open. Right under the Inbox is a top
+section (Pins, Drafts, Sent, Trash at first), then Folders. Only the top
+section shows in the narrow strip.
+
+More opens every list you can add: shared lists like Snoozed, Spam, Blocked
+and Recently Seen, smart folders (saved searches), and each account's own
+folders and Gmail labels. Clicking one opens it and keeps it under Recents;
+Ctrl-click or the star adds it to the sidebar. Right-click a sidebar entry to
+move it to the top, hide its counter, color it, or rename or delete a folder.
+The + buttons create folders on the server, and the search field's Save
+button turns a search into a smart folder.
+
+Drag entries in the open sidebar to reorder them or move them between the top
+section and Folders; Recents can be dragged into either. Drag an email from
+the list onto a folder (of its own account) to move it there, or onto Inbox,
+Archive, Trash or Pins; this works on the narrow strip's icons too, and Undo
+puts it back. With more than one account, the Inbox and the shared lists
+(Sent, Drafts, Archive, Trash, Spam, Snoozed, Pins…) expand into a row per
+account that shows just that account's mail.
+
+Moving an email to a folder moves it on the server once the undo window
+passes. On Gmail, folders are labels: moving between them swaps the labels,
+and the email keeps its other labels.
+
+A folder shows its newest 200 messages. Folders in the sidebar stay in sync,
+as does the one that's open; others are fetched when opened.
 
 ## AI agents
 
@@ -97,7 +133,7 @@ trust the agents you use.
 ## Layout
 
 ```
-crates/store              SQLite storage: accounts, messages, outbox (bundled SQLite with FTS5)
+crates/store              SQLite storage: accounts, messages, folders, outbox, drafts (bundled SQLite with FTS5)
 crates/mail               IMAP/SMTP and Microsoft Graph: sync, sending, Microsoft sign-in
 crates/ai                 bring-your-own-key AI client (Anthropic, OpenAI-compatible)
 crates/agent              how spark-cli reaches the running app (loopback port + token)

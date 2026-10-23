@@ -435,6 +435,9 @@ fn send_email(cx: &mut Context, args: &Value) -> ToolResult {
         reply_to: original.map(|m| m.id),
         send_at,
         attachments: Vec::new(),
+        draft_id: None,
+        in_reply_to: None,
+        references: None,
     };
     let json = serde_json::to_string(&queued).expect("drafts serialize");
     let id = cx
@@ -516,6 +519,7 @@ fn folder(m: &spark_store::Message) -> &'static str {
         MessageState::Done => "done",
         MessageState::Deleted => "trash",
         MessageState::Blocked => "blocked",
+        MessageState::Filed => "filed",
     }
 }
 

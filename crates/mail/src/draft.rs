@@ -33,6 +33,16 @@ pub struct Draft {
     /// Files to attach, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<OutgoingAttachment>,
+    /// The saved draft (its message id) this was opened from or saved as:
+    /// its server copy is deleted once this is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_id: Option<i64>,
+    /// Threading for a reply whose original isn't stored here (a draft from
+    /// the server): the original's Message-ID and References.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<String>,
 }
 
 /// A file on an outgoing message.
@@ -101,7 +111,7 @@ pub fn recipients(field: &str) -> Result<Vec<Mailbox>> {
 }
 
 /// Splits on commas outside quotes and angle brackets.
-fn split_addresses(field: &str) -> Vec<&str> {
+pub(crate) fn split_addresses(field: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let (mut start, mut quoted, mut angle) = (0, false, false);
     for (i, c) in field.char_indices() {
@@ -220,6 +230,9 @@ mod tests {
             reply_to: None,
             send_at: 0,
             attachments: Vec::new(),
+            draft_id: None,
+            in_reply_to: None,
+            references: None,
         }
     }
 

@@ -349,6 +349,9 @@ mod tests {
             snippet: format!("About {subject}"),
             date: 0,
             attachment: None,
+            folders: Vec::new(),
+            folder: None,
+            to: Vec::new(),
         }
     }
 

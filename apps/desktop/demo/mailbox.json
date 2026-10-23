@@ -121,5 +121,42 @@
     "subject": "How small teams ship desktop apps",
     "snippet": "Three teams on choosing a UI toolkit, and what they would do differently.",
     "body": ["Three small teams on how they chose a desktop UI toolkit, and what they would do differently next time."]
+  },
+  {
+    "id": 18, "account": "personal", "category": "people", "state": "filed",
+    "from": "Me", "address": "me@gmail.com", "to": ["Marcus Lee <marcus.lee@gmail.com>"], "ageMinutes": 190,
+    "subject": "Re: Saturday hike?",
+    "snippet": "I'm in! 8 works. I'll bring the good snacks, promise.",
+    "body": ["I'm in! 8 works.", "I'll bring the good snacks, promise."]
+  },
+  {
+    "id": 19, "account": "work", "category": "people", "state": "filed",
+    "from": "Me", "address": "me@outlook.com",
+    "to": ["Priya Raman <priya@acme.example>", "Sam Okafor <sam.okafor@acme.example>", "Hannah Cole <hannah@acme.example>", "kai@acme.example"],
+    "ageMinutes": 1440,
+    "subject": "Re: Q4 roadmap review",
+    "snippet": "Thursday at 2 works for me. I'll bring the updated timeline.",
+    "body": ["Thursday at 2 works for me.", "I'll bring the updated timeline and the open questions from last week."]
+  },
+  {
+    "id": 20, "account": "personal", "category": "people", "state": "filed",
+    "from": "Me", "address": "me@gmail.com", "to": ["Mom <mom@example.com>"], "ageMinutes": 1530,
+    "subject": "Re: Photos from the weekend",
+    "snippet": "These are great! The dog one is going on the fridge.",
+    "body": ["These are great! The dog one is going on the fridge.", "I'll call you Wednesday."]
+  },
+  {
+    "id": 21, "account": "work", "category": "people", "state": "filed",
+    "from": "Me", "address": "me@outlook.com", "to": ["Alex Moreno <alex@moreno-design.example>"], "ageMinutes": 300,
+    "subject": "Re: Invoice #1042",
+    "snippet": "Hi Alex, thanks for sending this over. Before I pass it to finance,",
+    "body": ["Hi Alex,", "Thanks for sending this over. Before I pass it to finance, could you split the design and"]
+  },
+  {
+    "id": 22, "account": "personal", "category": "people", "state": "filed",
+    "from": "Me", "address": "me@gmail.com", "to": [], "ageMinutes": 15,
+    "subject": "Packing list",
+    "snippet": "Boots, rain jacket, headlamp, the good snacks",
+    "body": ["Boots, rain jacket, headlamp, the good snacks"]
   }
 ]

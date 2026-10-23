@@ -10,6 +10,9 @@ import {
   Clock,
   Copy,
   Download,
+  FileText,
+  Folder,
+  FolderSearch,
   Forward,
   Inbox,
   LayoutGrid,
@@ -45,35 +48,55 @@ import {
 } from "./ai";
 import {
   cancelSend,
+  createFolder,
+  deleteFolder,
+  discardDraft,
   listAccounts,
+  listFolders,
   listMessages,
   onAccountsChanged,
   onAgentActivity,
   onAgentSending,
+  onFoldersChanged,
   onMailboxChanged,
   onOpenMessage,
   onSendStatus,
   onSyncStatus,
   openAttachment,
+  openDraft,
   patched,
+  refreshFolders,
+  renameFolder,
   saveAllAttachments,
   saveAttachment,
+  saveDraft,
   sendMessage,
+  syncFolders,
   syncNow,
   updateMessage,
+  watchFolders,
 } from "./api";
 import CommandCenter, { type Command } from "./components/CommandCenter";
-import Composer, { draftHasContent, emptyDraft, type Draft } from "./components/Composer";
+import Composer, {
+  draftHasContent,
+  draftKey,
+  emptyDraft,
+  outgoingDraft,
+  savedDraft,
+  type Draft,
+} from "./components/Composer";
+import { PromptDialog } from "./components/Dialog";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
 import type { RowActions } from "./components/MessageRow";
 import Settings, { type SettingsPage } from "./components/Settings";
-import Sidebar, { type SidebarMode } from "./components/Sidebar";
+import Sidebar, { type SidebarActions, type SidebarMode } from "./components/Sidebar";
 import { reduceSummary, startSummary, type SummaryState } from "./components/SummaryCard";
 import ThreadView, { type ThreadActions } from "./components/ThreadView";
 import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./components/UndoToast";
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode } from "./lib/accounts";
 import { clearContent, loadContent } from "./lib/content";
+import { isDraft } from "./lib/drafts";
 import {
   LATER_PRESETS,
   formatFullDate,
@@ -85,13 +108,12 @@ import {
 } from "./lib/format";
 import { loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
-  FOLDERS,
   INBOX_MODES,
   buildList,
   sidebarCounts,
   type AccountFilter,
-  type Folder,
   type InboxMode,
+  type ListContext,
   type ListModel,
   type ListView,
 } from "./lib/layout";
@@ -99,13 +121,39 @@ import {
   LIST_MAX,
   LIST_MIN,
   READER_MIN,
-  SIDEBAR_DEFAULT,
   SIDEBAR_RAIL,
   clamp,
   effectiveListWidth,
   useTwoColumns,
   useWindowWidth,
 } from "./lib/panes";
+import {
+  SEEN_MAX,
+  SYSTEM_LISTS,
+  SYSTEM_ORDER,
+  addSmartFolder,
+  addToSidebar,
+  dropPatch,
+  folderIdOf,
+  folderKey,
+  hasAccountRows,
+  inSidebar,
+  isSystemList,
+  listFolderIds,
+  listInfo,
+  loadLayout,
+  loadSeen,
+  pruneLayout,
+  removeSmartFolder,
+  renameSmartFolder,
+  saveLayout,
+  saveSeen,
+  smartIdOf,
+  visit,
+  watchedFolderIds,
+  type ListKey,
+  type SidebarLayout,
+} from "./lib/sidebar";
 import {
   isInsideOverlay,
   isModShortcut,
@@ -117,6 +165,7 @@ import {
 import type {
   AccountView,
   AgentSendingEvent,
+  FolderView,
   Message,
   MessagePatch,
   SendStatusEvent,
@@ -148,7 +197,9 @@ const ICONS = {
   accept: { Icon: ThumbsUp, className: "text-primary" },
   block: { Icon: ThumbsDown, className: "text-text-2" },
   send: { Icon: Send, className: "text-primary" },
+  draft: { Icon: FileText, className: "text-primary" },
   copy: { Icon: Copy, className: "text-primary" },
+  folder: { Icon: Folder, className: "text-primary" },
   download: { Icon: Download, className: "text-primary" },
   error: { Icon: CircleAlert, className: "text-error" },
   agent: { Icon: Bot, className: "text-primary" },
@@ -156,6 +207,8 @@ const ICONS = {
 
 /** Failures stay up longer than undo toasts. */
 const ERROR_TOAST_MS = 10_000;
+/** The composer saves its draft after this long without typing. */
+const AUTOSAVE_MS = 4_000;
 
 const SUMMARY_ACTIONS: Record<"summarize" | "summarizeDetailed" | "summarizeActions", SummaryStyle> = {
   summarize: "short",
@@ -181,12 +234,29 @@ export default function App() {
   /** The list cursor. In split view it follows the open thread. */
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [openId, setOpenId] = useState<number | null>(null);
-  const [sidebarMode, setSidebarMode] = useState<SidebarMode>("rail");
-  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
+  const [folders, setFolders] = useState<FolderView[]>([]);
+  const [layout, setLayout] = useState<SidebarLayout>(loadLayout);
+  const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => (layout.locked ? "locked" : "rail"));
+  const [pickerOpen, setPickerOpen] = useState(false);
+  /** Recently opened messages, newest first. */
+  const [seen, setSeen] = useState<number[]>(loadSeen);
+  /** A search being saved as a smart folder, while its name is asked for. */
+  const [savingSearch, setSavingSearch] = useState<string | null>(null);
   const [listWidth, setListWidth] = useState(LIST_MIN);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [composerKey, setComposerKey] = useState(0);
   const [composerFull, setComposerFull] = useState(false);
+  /** `draftKey` of the composer's draft as it is in Drafts (opened or saved), if it is. */
+  const [draftSaved, setDraftSaved] = useState<string | null>(null);
+  /** The saved draft each composer session (by `composerKey`) saved to. */
+  const draftIds = useRef(new Map<number, number>());
+  /** Saves run one after another, so saving again updates the same draft. */
+  const draftSaves = useRef<Promise<unknown>>(Promise.resolve());
+  /** The composer as it stands, for callbacks that outlive a render (undo, autosave). */
+  const composer = useRef({ draft, saved: draftSaved, key: composerKey });
+  composer.current = { draft, saved: draftSaved, key: composerKey };
+  /** Drafts deleted while their Undo toast is up: hidden now, deleted when it's gone. */
+  const [discarding, setDiscarding] = useState<ReadonlySet<number>>(new Set());
   const [palette, setPalette] = useState<Palette | null>(null);
   /** +AI summaries by message id, kept while the app runs. */
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
@@ -201,13 +271,29 @@ export default function App() {
   const searchRef = useRef<HTMLInputElement>(null);
 
   const windowWidth = useWindowWidth();
+  const sidebarWidth = layout.width;
   const sidebarSpace = sidebarMode === "locked" ? sidebarWidth : SIDEBAR_RAIL;
   const container = windowWidth - sidebarSpace;
   const listWidthUsed = effectiveListWidth(listWidth, container);
   const twoColumns = useTwoColumns(container, listWidthUsed);
 
-  const model = useMemo(() => buildList(messages, view, sticky, accounts), [messages, view, sticky, accounts]);
-  const counts = useMemo(() => sidebarCounts(messages), [messages]);
+  const ctx: ListContext = useMemo(
+    () => ({ accounts, folders, smartFolders: layout.smartFolders, seen }),
+    [accounts, folders, layout.smartFolders, seen],
+  );
+  const listed = useMemo(
+    () => (discarding.size ? messages.filter((m) => !discarding.has(m.id)) : messages),
+    [messages, discarding],
+  );
+  const model = useMemo(() => buildList(listed, view, sticky, ctx), [listed, view, sticky, ctx]);
+  const counts = useMemo(
+    () => sidebarCounts(listed, [...layout.favorites, ...layout.folders, ...layout.recents], ctx),
+    [listed, layout, ctx],
+  );
+  /** The open list's folders haven't synced yet, so an empty list may only be loading. */
+  const loading = listFolderIds(view.folder, folders, accountOf(view.account)).some(
+    (id) => !folders.find((f) => f.id === id)?.synced,
+  );
   const openMessage = messages.find((m) => m.id === openId) ?? null;
   const selected = messages.find((m) => m.id === selectedId && model.order.includes(m.id)) ?? null;
   /** What message shortcuts and commands act on. */
@@ -216,6 +302,7 @@ export default function App() {
   const syncing = accounts.some((a) => a.sync.status === "syncing");
 
   useEffect(() => {
+    void reloadFolders();
     void Promise.all([listAccounts(), listMessages()]).then(
       ([loadedAccountList, loaded]) => {
         loadedAccounts.current = accountSet(loadedAccountList);
@@ -229,11 +316,28 @@ export default function App() {
   }, []);
 
   // Backend events. They call through a ref so the listeners, registered once, see current state.
-  const events = useRef({ reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification, agentSending });
-  events.current = { reloadMessages, reloadAccounts, syncStatus, sendStatus, openFromNotification, agentSending };
+  const events = useRef({
+    reloadMessages,
+    reloadAccounts,
+    reloadFolders,
+    syncStatus,
+    sendStatus,
+    openFromNotification,
+    agentSending,
+  });
+  events.current = {
+    reloadMessages,
+    reloadAccounts,
+    reloadFolders,
+    syncStatus,
+    sendStatus,
+    openFromNotification,
+    agentSending,
+  };
   useEffect(() => {
     const stops = [
       onMailboxChanged(() => void events.current.reloadMessages()),
+      onFoldersChanged(() => void events.current.reloadFolders()),
       onAccountsChanged(() => void events.current.reloadAccounts()),
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
@@ -247,6 +351,15 @@ export default function App() {
   useEffect(() => {
     if (searching) searchRef.current?.focus();
   }, [searching]);
+
+  useEffect(() => saveLayout(layout), [layout]);
+  useEffect(() => saveSeen(seen), [seen]);
+
+  // The backend keeps the sidebar's folders and the open one in sync.
+  const watched = watchedFolderIds(layout, folders, view.folder).join(",");
+  useEffect(() => {
+    void watchFolders(watched ? watched.split(",").map(Number) : []).catch(() => {});
+  }, [watched]);
 
   useEffect(() => {
     if (settingsPage !== null) return;
@@ -304,10 +417,28 @@ export default function App() {
         if (demoChanged) {
           setOpenId(null);
           setSelectedId(null);
+          setSeen([]);
         }
         void reloadMessages();
+        void reloadFolders();
       },
       (error) => showToast(`Couldn't load accounts: ${String(error)}`, undefined, ICONS.error),
+    );
+  }
+
+  /** Reloads the folder list; folders that are gone leave the sidebar, and the list closes if it was open. */
+  function reloadFolders() {
+    return listFolders().then(
+      (loaded) => {
+        setFolders(loaded);
+        setLayout((l) => pruneLayout(l, loaded));
+        const ids = new Set(loaded.map((f) => f.id));
+        setView((v) => {
+          const id = folderIdOf(v.folder);
+          return id !== undefined && !ids.has(id) ? { ...v, folder: "inbox", sub: null } : v;
+        });
+      },
+      (error) => showToast(`Couldn't load your folders: ${String(error)}`, undefined, ICONS.error),
     );
   }
 
@@ -334,6 +465,8 @@ export default function App() {
   function sendStatus(e: SendStatusEvent) {
     const sent = outbox.current.get(e.id);
     outbox.current.delete(e.id);
+    // A saved draft it came from is gone now, or back in Drafts if it failed.
+    if (sent?.draftId !== undefined) void reloadMessages();
     if (e.status !== "failed") return;
     showToast(
       `Couldn't send: ${e.message ?? "the server refused the message."}`,
@@ -398,7 +531,7 @@ export default function App() {
       return change ? patched(m, change.patch) : m;
     });
     const before = listedIds(model);
-    const remaining = listedIds(buildList(after, view, sticky));
+    const remaining = listedIds(buildList(after, view, sticky, ctx));
     const leaving = changes.map((c) => c.id).filter((id) => before.has(id) && !remaining.has(id));
     const cursor = { selectedId, openId };
 
@@ -439,7 +572,7 @@ export default function App() {
             .reverse()
             .find((id) => !gone.has(id)) ??
           null);
-    if (twoColumns && openId !== null && next !== null) openThread(next);
+    if (twoColumns && openId !== null && next !== null) follow(next);
     else {
       setOpenId(null);
       setSelectedId(next);
@@ -451,10 +584,29 @@ export default function App() {
   function openThread(id: number, list = messages) {
     setSelectedId(id);
     setOpenId(id);
+    setSeen((s) => (s[0] === id ? s : [id, ...s.filter((x) => x !== id)].slice(0, SEEN_MAX)));
     const m = list.find((x) => x.id === id);
     if (m?.unread) {
       setSticky((s) => new Set(s).add(id));
       void update(id, { unread: false });
+    }
+  }
+
+  /** Opens a message: a draft in the composer, other mail in the reader. */
+  function openListed(id: number) {
+    const m = messages.find((x) => x.id === id);
+    if (m && isDraft(m, folders)) void editDraft(m);
+    else openThread(id);
+  }
+
+  /** The cursor moved: split view shows the message there, but a draft only opens when asked. */
+  function follow(id: number) {
+    const m = messages.find((x) => x.id === id);
+    if (m && isDraft(m, folders)) {
+      setOpenId(null);
+      setSelectedId(id);
+    } else {
+      openThread(id);
     }
   }
 
@@ -483,7 +635,7 @@ export default function App() {
     const anchor = openId ?? selectedId;
     const i = anchor === null ? -1 : order.indexOf(anchor);
     const next = i < 0 ? order[0] : order[clamp(i + step, 0, order.length - 1)];
-    if (twoColumns || openId !== null) openThread(next);
+    if (twoColumns || openId !== null) follow(next);
     else setSelectedId(next);
   }
 
@@ -499,9 +651,90 @@ export default function App() {
     }
   }
 
-  function selectFolder(folder: Folder, account: AccountFilter = "all") {
-    changeView({ folder, account, sub: null, search: null });
-    if (sidebarMode === "overlay") setSidebarMode("rail");
+  /** Opens a list, narrowed to an account if it has account rows. Server-backed lists sync now. */
+  function selectList(folder: ListKey, account: AccountFilter = "all") {
+    const narrowed = hasAccountRows(folder) ? account : "all";
+    changeView({ folder, account: narrowed, sub: null, search: null });
+    closeSidebar();
+    const ids = listFolderIds(folder, folders, accountOf(narrowed));
+    if (ids.length) void syncFolders(ids).catch(() => {});
+  }
+
+  /** Closes the folder picker, and the sidebar if it's showing over the list. */
+  function closeSidebar() {
+    setPickerOpen(false);
+    setSidebarMode((m) => (m === "overlay" ? "rail" : m));
+  }
+
+  function toggleSidebar() {
+    if (sidebarMode === "locked") return;
+    setPickerOpen(false);
+    setSidebarMode((m) => (m === "rail" ? "overlay" : "rail"));
+  }
+
+  function toggleLock() {
+    const locked = sidebarMode !== "locked";
+    setSidebarMode(locked ? "locked" : "rail");
+    setLayout((l) => ({ ...l, locked }));
+    if (!locked) setPickerOpen(false);
+  }
+
+  function togglePicker() {
+    if (!pickerOpen) void refreshFolders().catch(() => {});
+    setPickerOpen(!pickerOpen);
+  }
+
+  /** From the folder picker: open the list (it shows under Recents), or with `add`, put it in the sidebar. */
+  function pick(key: ListKey, add: boolean) {
+    if (add) {
+      if (inSidebar(layout, key)) showToast("This folder is already in the sidebar");
+      else setLayout((l) => addToSidebar(l, key));
+      return;
+    }
+    setLayout((l) => visit(l, key));
+    selectList(key);
+  }
+
+  /** The folder picker's +: search, then save the search from the search field. */
+  function newSmartFolder() {
+    closeSidebar();
+    openSearch();
+  }
+
+  function saveSmartFolder(name: string, query: string) {
+    const [next, key] = addSmartFolder(layout, name, query);
+    setLayout(next);
+    selectList(key);
+  }
+
+  async function newFolder(account: number, parent: number | undefined, name: string) {
+    const created = await createFolder(account, parent, name);
+    await reloadFolders();
+    setLayout((l) => addToSidebar(l, folderKey(created.id)));
+  }
+
+  async function renameList(key: ListKey, name: string) {
+    const smart = smartIdOf(key);
+    if (smart !== undefined) {
+      setLayout((l) => renameSmartFolder(l, smart, name));
+      return;
+    }
+    const id = folderIdOf(key);
+    if (id === undefined) return;
+    await renameFolder(id, name);
+    await reloadFolders();
+  }
+
+  async function deleteList(key: ListKey) {
+    const smart = smartIdOf(key);
+    if (smart !== undefined) setLayout((l) => removeSmartFolder(l, smart));
+    else {
+      const id = folderIdOf(key);
+      if (id === undefined) return;
+      await deleteFolder(id);
+      await reloadFolders();
+    }
+    if (view.folder === key) selectList("inbox");
   }
 
   const setMode = (mode: InboxMode) => changeView({ folder: "inbox", mode, sub: null, search: null }, true);
@@ -513,9 +746,9 @@ export default function App() {
 
   const closeSearch = () => changeView({ search: null }, true);
 
-  /** Esc: the sidebar overlay, then the thread, then a sub-list, then search. */
+  /** Esc: the folder picker and sidebar overlay, then the thread, then a sub-list, then search. */
   function closeTopmost() {
-    if (sidebarMode === "overlay") setSidebarMode("rail");
+    if (pickerOpen || sidebarMode === "overlay") closeSidebar();
     else if (openId !== null) setOpenId(null);
     else if (view.sub) changeView({ sub: null });
     else if (searching) closeSearch();
@@ -529,7 +762,7 @@ export default function App() {
       e.preventDefault();
       moveCursor(e.key === "ArrowDown" ? 1 : -1);
     } else if (e.key === "Enter" && selectedId !== null) {
-      openThread(selectedId);
+      openListed(selectedId);
     }
   }
 
@@ -541,7 +774,8 @@ export default function App() {
         ? act([m], { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
         : act([m], { state: "done" }, "Marked as Done", ICONS.done),
     trash: (m: Message) => {
-      if (m.state !== "deleted") act([m], { state: "deleted" }, "Moved to Trash", ICONS.trash);
+      if (isDraft(m, folders)) discardListed(m);
+      else if (m.state !== "deleted") act([m], { state: "deleted" }, "Moved to Trash", ICONS.trash);
     },
     pin: (m: Message) => act([m], { pinned: !m.pinned }, m.pinned ? "Unpinned" : "Pinned", ICONS.pin),
     priority: (m: Message) =>
@@ -588,11 +822,136 @@ export default function App() {
 
   const snoozeMenu = (m: Message) => setPalette({ kind: "snooze", targetId: m.id });
 
+  /** A message dragged onto a sidebar list: filed in a folder, or done, trashed, pinned or back in the Inbox. */
+  function dropMessage(dragged: Message, key: ListKey, account?: number) {
+    const m = messages.find((x) => x.id === dragged.id);
+    const patch = m && dropPatch(m, key, folders, account);
+    if (!m || !patch) return;
+    if (isDraft(m, folders)) discardListed(m);
+    else if (patch.folder !== undefined) {
+      const name = folders.find((f) => f.id === patch.folder)?.name ?? "the folder";
+      act([m], patch, `Moved to ${name}`, ICONS.folder);
+    } else if (key === "archive") act([m], patch, "Marked as Done", ICONS.done);
+    else if (key === "trash") act([m], patch, "Moved to Trash", ICONS.trash);
+    else if (key === "pins") act([m], patch, "Pinned", ICONS.pin);
+    else act([m], patch, "Moved to Inbox", ICONS.inbox);
+  }
+
   // ---- composer ----
 
-  function openComposer(next: Draft) {
+  /** `saved` is the new draft's `draftKey` if it's in Drafts as it is. An open composer's changes are saved. */
+  function openComposer(next: Draft, saved: string | null = null) {
+    const open = composer.current;
+    if (open.draft && draftHasContent(open.draft) && draftKey(open.draft) !== open.saved) {
+      void storeDraft(open.draft, open.key).then(reloadMessages, (error) => draftError(error, open.draft!));
+    }
+    const key = open.key + 1;
+    composer.current = { draft: next, saved, key };
     setDraft(next);
-    setComposerKey((k) => k + 1);
+    setDraftSaved(saved);
+    setComposerKey(key);
+  }
+
+  /** Saves a composer session's draft to its account's Drafts, after any save still running. Resolves to its id. */
+  function storeDraft(d: Draft, session: number): Promise<number> {
+    const run = draftSaves.current.then(async () => {
+      const id = await saveDraft(outgoingDraft(d, 0, draftIds.current.get(session) ?? d.draftId));
+      draftIds.current.set(session, id);
+      return id;
+    });
+    draftSaves.current = run.catch(() => {});
+    return run;
+  }
+
+  /** The saved draft a composer session edits, once its saves are done. */
+  async function savedDraftId(d: Draft, session: number) {
+    await draftSaves.current;
+    return draftIds.current.get(session) ?? d.draftId;
+  }
+
+  function draftError(error: unknown, d: Draft) {
+    showToast(`Couldn't save the draft: ${String(error)}`, () => openComposer(d), ICONS.error, {
+      actionLabel: "Edit",
+      duration: ERROR_TOAST_MS,
+    });
+  }
+
+  // Changes are saved to Drafts after a pause in typing.
+  useEffect(() => {
+    if (!draft || !draftHasContent(draft)) return;
+    const key = draftKey(draft);
+    if (key === draftSaved) return;
+    const session = composerKey;
+    const timer = window.setTimeout(() => {
+      storeDraft(draft, session).then(
+        () => {
+          if (composer.current.key === session) setDraftSaved(key);
+          void reloadMessages();
+        },
+        () => {}, // Closing the composer saves again, and says if it fails.
+      );
+    }, AUTOSAVE_MS);
+    return () => window.clearTimeout(timer);
+  }, [draft, draftSaved, composerKey]);
+
+  /** A draft from Drafts, in the composer. Already open there, it stays as it is. */
+  async function editDraft(m: Message) {
+    setSelectedId(m.id);
+    const open = composer.current;
+    if (open.draft && (draftIds.current.get(open.key) ?? open.draft.draftId) === m.id) return;
+    try {
+      const next = savedDraft(await openDraft(m.id));
+      openComposer(next, draftKey(next));
+    } catch (error) {
+      showToast(`Couldn't open the draft: ${String(error)}`, undefined, ICONS.error);
+    }
+  }
+
+  /**
+   * Deletes a saved draft once the Undo toast is gone (sooner if another toast
+   * replaces it); until then it's out of the lists. `undo` also runs on Undo.
+   */
+  function discardLater(id: number | undefined, undo?: () => void) {
+    if (id === undefined) {
+      if (undo) showToast("Draft discarded", undo, ICONS.trash);
+      return;
+    }
+    setDiscarding((s) => new Set(s).add(id));
+    const keep = () => setDiscarding((s) => new Set([...s].filter((x) => x !== id)));
+    const timer = window.setTimeout(() => {
+      discardDraft(id).then(
+        () => reloadMessages().then(keep),
+        (error) => {
+          keep();
+          showToast(`Couldn't delete the draft: ${String(error)}`, undefined, ICONS.error);
+        },
+      );
+    }, TOAST_MS);
+    showToast(
+      "Draft discarded",
+      () => {
+        window.clearTimeout(timer);
+        keep();
+        undo?.();
+      },
+      ICONS.trash,
+    );
+  }
+
+  /** Move to Trash on a draft in the list. */
+  function discardListed(m: Message) {
+    moveOffMessages([m.id]);
+    discardLater(m.id);
+  }
+
+  /** The composer's Delete Draft: it closes, and its saved draft goes too. Undo brings both back. */
+  async function discardComposer() {
+    if (!draft) return;
+    const closed = draft;
+    const session = composerKey;
+    setDraft(null);
+    const id = await savedDraftId(closed, session);
+    discardLater(id, draftHasContent(closed) ? () => openComposer({ ...closed, draftId: id }) : undefined);
   }
 
   /** From the account the Inbox is narrowed to, else the first. */
@@ -657,11 +1016,29 @@ export default function App() {
     });
   }
 
-  function closeComposer() {
+  /** Closing keeps the draft in Drafts; one emptied out is deleted there. */
+  async function closeComposer() {
     if (!draft) return;
     const closed = draft;
+    const session = composerKey;
+    const unchanged = draftKey(closed) === draftSaved;
     setDraft(null);
-    if (draftHasContent(closed)) showToast("Draft discarded", () => openComposer(closed));
+    if (!draftHasContent(closed)) {
+      discardLater(await savedDraftId(closed, session));
+      return;
+    }
+    if (unchanged) {
+      if (draftIds.current.has(session)) showToast("Draft saved", undefined, ICONS.draft);
+      return;
+    }
+    try {
+      await storeDraft(closed, session);
+    } catch (error) {
+      draftError(error, closed);
+      return;
+    }
+    showToast("Draft saved", undefined, ICONS.draft);
+    void reloadMessages();
   }
 
   /**
@@ -674,24 +1051,15 @@ export default function App() {
       showToast("Add at least one recipient");
       return;
     }
-    const sent = draft;
-    const repliedTo = sent.doneAfter ? messages.find((m) => m.id === sent.replyTo && m.state !== "done") : undefined;
+    const session = composerKey;
+    const repliedTo = draft.doneAfter ? messages.find((m) => m.id === draft.replyTo && m.state !== "done") : undefined;
     setDraft(null);
     const undoDone = repliedTo ? apply([repliedTo], () => ({ state: "done" })) : undefined;
+    // A saved draft goes with it: deleted once it's sent, back in Drafts on Undo.
+    const sent = { ...draft, draftId: await savedDraftId(draft, session) };
     let id: number;
     try {
-      id = await sendMessage({
-        account: sent.from,
-        to: sent.to,
-        cc: sent.cc,
-        bcc: sent.bcc,
-        subject: sent.subject,
-        body: sent.body,
-        // A forward isn't a reply; it only carries replyTo for "Mark as Done after sending".
-        replyTo: sent.forward ? undefined : sent.replyTo,
-        sendAt: sent.sendLater?.at ?? Date.now() + TOAST_MS,
-        attachments: sent.attachments,
-      });
+      id = await sendMessage(outgoingDraft(sent, sent.sendLater?.at ?? Date.now() + TOAST_MS));
     } catch (error) {
       undoDone?.();
       openComposer(sent);
@@ -699,6 +1067,7 @@ export default function App() {
       return;
     }
     outbox.current.set(id, sent);
+    if (sent.draftId !== undefined) void reloadMessages();
     showToast(sent.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, sent, undoDone), ICONS.send);
   }
 
@@ -711,6 +1080,7 @@ export default function App() {
     outbox.current.delete(id);
     undoDone?.();
     openComposer(sent);
+    if (sent.draftId !== undefined) void reloadMessages();
   }
 
   // ---- +AI Summary ----
@@ -768,7 +1138,7 @@ export default function App() {
       case "prev":
         return moveCursor(-1);
       case "open":
-        if (selectedId !== null) openThread(selectedId);
+        if (selectedId !== null) openListed(selectedId);
         return;
       case "close":
         return closeTopmost();
@@ -777,7 +1147,7 @@ export default function App() {
       case "search":
         return openSearch();
       case "sidebar":
-        return setSidebarMode((m) => (m === "rail" ? "overlay" : "rail"));
+        return toggleSidebar();
       case "command":
         return setPalette({ kind: "actions" });
       case "settings":
@@ -965,14 +1335,29 @@ export default function App() {
       },
       { id: "search", label: "Search", keywords: "find", Icon: Search, shortcut: shortcutLabel("search"), run: openSearch },
       { id: "sync", label: "Check for new mail", keywords: "sync refresh fetch receive", Icon: RefreshCw, run: checkMail },
-      { id: "go-inbox", label: "Go to Inbox", keywords: "folder", Icon: Inbox, run: () => selectFolder("inbox") },
-      ...FOLDERS.map(({ key, label, Icon }) => ({
+      { id: "go-inbox", label: "Go to Inbox", keywords: "folder", Icon: Inbox, run: () => selectList("inbox") },
+      ...SYSTEM_ORDER.map((key) => ({
         id: `go-${key}`,
-        label: `Go to ${label}`,
+        label: `Go to ${SYSTEM_LISTS[key].label}`,
         keywords: "folder",
-        Icon,
-        run: () => selectFolder(key),
+        Icon: SYSTEM_LISTS[key].Icon,
+        run: () => selectList(key),
       })),
+      ...[...layout.favorites, ...layout.folders, ...layout.recents]
+        .filter((key) => !isSystemList(key))
+        .flatMap((key) => {
+          const info = listInfo(key, folders, layout.smartFolders, (id) => accounts.find((a) => a.id === id)?.label ?? "");
+          return info
+            ? [{ id: `go-${key}`, label: `Go to ${info.label}`, keywords: "folder label smart", Icon: info.Icon, detail: info.detail, run: () => selectList(key) }]
+            : [];
+        }),
+      {
+        id: "new-smart-folder",
+        label: "New Smart Folder",
+        keywords: "saved search folder",
+        Icon: FolderSearch,
+        run: newSmartFolder,
+      },
       ...INBOX_MODES.map(({ key, label, action }) => ({
         id: `mode-${key}`,
         label: `Switch to ${label}`,
@@ -1030,7 +1415,7 @@ export default function App() {
         label: "Toggle sidebar",
         Icon: PanelLeft,
         shortcut: shortcutLabel("sidebar"),
-        run: () => setSidebarMode((s) => (s === "rail" ? "overlay" : "rail")),
+        run: toggleSidebar,
       },
     ];
   }
@@ -1049,7 +1434,7 @@ export default function App() {
   // ---- layout ----
 
   const rows: RowActions = {
-    open: (id) => openThread(id),
+    open: openListed,
     done: actions.done,
     pin: actions.pin,
     snooze: snoozeMenu,
@@ -1093,6 +1478,25 @@ export default function App() {
     showToast(String(error), undefined, ICONS.error, { duration: ERROR_TOAST_MS });
   }
 
+  const sidebarActions: SidebarActions = {
+    select: selectList,
+    pick,
+    layout: setLayout,
+    open: () => setSidebarMode("overlay"),
+    close: closeSidebar,
+    toggleLock,
+    resize: (width) => setLayout((l) => ({ ...l, width })),
+    sync: checkMail,
+    settings: () => openSettings(),
+    togglePicker,
+    closePicker: () => setPickerOpen(false),
+    newSmartFolder,
+    createFolder: newFolder,
+    renameList,
+    deleteList,
+    drop: dropMessage,
+  };
+
   const showList = twoColumns || !openMessage;
   const showReader = twoColumns || openMessage !== null;
   const readerLeft = sidebarSpace + (twoColumns ? listWidthUsed : 0);
@@ -1103,17 +1507,15 @@ export default function App() {
         <Sidebar
           mode={sidebarMode}
           width={sidebarWidth}
-          folder={view.folder}
+          layout={layout}
+          folders={folders}
+          current={view.folder}
           account={view.account}
           counts={counts}
           syncing={syncing}
-          onSelect={selectFolder}
-          onOpen={() => setSidebarMode("overlay")}
-          onClose={() => setSidebarMode("rail")}
-          onToggleLock={() => setSidebarMode((m) => (m === "locked" ? "rail" : "locked"))}
-          onResize={setSidebarWidth}
-          onSync={checkMail}
-          onSettings={() => openSettings()}
+          pickerOpen={pickerOpen}
+          demo={isDemoMode(accounts)}
+          actions={sidebarActions}
         />
 
         <main className="relative flex min-w-0 flex-1">
@@ -1147,6 +1549,8 @@ export default function App() {
                 searchRef={searchRef}
                 demo={isDemoMode(accounts)}
                 onAddAccounts={() => openSettings("accounts")}
+                loading={loading}
+                onSaveSearch={(query) => setSavingSearch(query)}
               />
               {twoColumns && (
                 <Splitter
@@ -1178,11 +1582,13 @@ export default function App() {
           <Composer
             key={composerKey}
             draft={draft}
+            saved={draftSaved === draftKey(draft)}
             full={composerFull}
             fullStyle={{ left: readerLeft, right: 0 }}
             onChange={(patch) => setDraft((d) => d && { ...d, ...patch })}
             onToggleFull={() => setComposerFull((f) => !f)}
-            onClose={closeComposer}
+            onClose={() => void closeComposer()}
+            onDiscard={() => void discardComposer()}
             onSend={send}
             onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
           />
@@ -1229,6 +1635,17 @@ export default function App() {
           />
         )}
 
+        {savingSearch !== null && (
+          <PromptDialog
+            title="New Smart Folder"
+            label={`Emails matching “${savingSearch}”, from all your accounts.`}
+            placeholder="Smart Folder Name"
+            confirmLabel="Save"
+            onSubmit={(name) => saveSmartFolder(name, savingSearch)}
+            onClose={() => setSavingSearch(null)}
+          />
+        )}
+
         {toast && <UndoToast toast={toast} left={sidebarSpace + 16} onUndo={undoToast} />}
       </div>
     </AccountsContext>
@@ -1251,9 +1668,19 @@ function EmptyReader() {
 function previousValues(m: Message, patch: MessagePatch): MessagePatch {
   const previous: MessagePatch = {};
   for (const key of Object.keys(patch) as (keyof MessagePatch)[]) Object.assign(previous, { [key]: m[key] });
-  if (patch.state !== undefined && m.state === "snoozed") previous.snoozedUntil = m.snoozedUntil;
+  const moves = patch.state !== undefined || patch.folder !== undefined;
+  // Filing changes the state; undo puts back the state, and the folder it was filed in.
+  if (moves) {
+    previous.state = m.state;
+    if (m.state === "filed" && m.folder !== undefined) previous.folder = m.folder;
+    else delete previous.folder;
+  }
+  if (moves && m.state === "snoozed") previous.snoozedUntil = m.snoozedUntil;
   return previous;
 }
+
+/** An account filter as an account id, or undefined for all of them. */
+const accountOf = (account: AccountFilter) => (account === "all" ? undefined : account);
 
 /** Every message a list shows, including card rows past the limit and Gatekeeper senders. */
 function listedIds(list: ListModel) {

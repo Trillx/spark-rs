@@ -1,24 +1,10 @@
-import {
-  Archive,
-  ArrowDownLeft,
-  Bell,
-  Clock,
-  FileText,
-  MailOpen,
-  Newspaper,
-  Pin,
-  Send,
-  Trash2,
-  UserPlus,
-  Users,
-  Zap,
-  type LucideIcon,
-} from "lucide-react";
-import type { AccountId, AccountView, Message } from "../types";
+import { Bell, MailOpen, Newspaper, Pin, UserPlus, Users, Zap, type LucideIcon } from "lucide-react";
+import type { AccountId, AccountView, FolderView, Message } from "../types";
 import { datePeriod } from "./format";
+import { showsRecipients } from "./recipients";
 import type { ActionId } from "./shortcuts";
+import { folderIdOf, hasAccountRows, listFolderIds, listInfo, smartIdOf, type ListKey, type SmartFolder } from "./sidebar";
 
-export type Folder = "inbox" | "pins" | "snoozed" | "aside" | "archive" | "sent" | "drafts" | "trash";
 export type InboxMode = "focused" | "cards" | "simple";
 export type AccountFilter = AccountId | "all";
 export type CardKey = "priority" | "pinned" | "people" | "notifications" | "newsletters" | "seen";
@@ -26,8 +12,12 @@ export type GroupKey = "notifications" | "newsletters";
 export type SubList = { kind: "card"; key: CardKey } | { kind: "group"; key: GroupKey } | { kind: "gatekeeper" };
 
 export interface ListView {
-  folder: Folder;
-  /** Only narrows the Inbox; folders are unified like Spark's. */
+  folder: ListKey;
+  /**
+   * Narrows the Inbox or a shared list (Sent, Archive…) to one account, from
+   * its account rows. Folders belong to one account already; smart folders
+   * stay unified.
+   */
   account: AccountFilter;
   mode: InboxMode;
   /** A card's "Show all" or a Focused group row opened as its own list. */
@@ -55,17 +45,9 @@ export interface ListModel {
   bulk: Message[];
   /** Set while a search query is active. */
   found?: number;
+  /** Rows name who mail is to rather than the sender (Sent, Drafts). */
+  recipients?: boolean;
 }
-
-export const FOLDERS: { key: Exclude<Folder, "inbox">; label: string; Icon: LucideIcon }[] = [
-  { key: "pins", label: "Pins", Icon: Pin },
-  { key: "snoozed", label: "Snoozed", Icon: Clock },
-  { key: "aside", label: "Set Aside", Icon: ArrowDownLeft },
-  { key: "archive", label: "Archive", Icon: Archive },
-  { key: "sent", label: "Sent", Icon: Send },
-  { key: "drafts", label: "Drafts", Icon: FileText },
-  { key: "trash", label: "Trash", Icon: Trash2 },
-];
 
 export const INBOX_MODES: { key: InboxMode; label: string; action: ActionId }[] = [
   { key: "focused", label: "Focused list", action: "modeFocused" },
@@ -90,9 +72,16 @@ export const CARD_LIMIT = 3;
 
 const CARD_ORDER: CardKey[] = ["priority", "pinned", "people", "notifications", "newsletters", "seen"];
 
-export function folderLabel(folder: Folder) {
-  return folder === "inbox" ? "Inbox" : FOLDERS.find((f) => f.key === folder)!.label;
+/** What lists other than the Inbox are made of. */
+export interface ListContext {
+  accounts: AccountView[];
+  folders: FolderView[];
+  smartFolders: SmartFolder[];
+  /** Recently opened message ids, newest first. */
+  seen: number[];
 }
+
+const EMPTY_CONTEXT: ListContext = { accounts: [], folders: [], smartFolders: [], seen: [] };
 
 const newestFirst = (a: Message, b: Message) => b.timestamp - a.timestamp;
 const isLive = (m: Message) => m.state !== "deleted" && m.state !== "blocked";
@@ -164,13 +153,41 @@ function model(title: string, blocks: ListBlock[], bulk: Message[] = []): ListMo
   return { title, blocks, order: rowIds(blocks), bulk };
 }
 
-/** `accounts` names the list when the Inbox is narrowed to one account. */
+/** Messages in any of these server folders. */
+const inFolders = (ids: number[]) => (m: Message) => m.folders?.some((id) => ids.includes(id)) ?? false;
+
+/** A list other than the Inbox, newest first (Recently Seen: most recently opened first). */
+export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, ctx: ListContext): Message[] {
+  const live = messages.filter(isLive);
+  switch (key) {
+    case "pins":
+      return live.filter((m) => m.pinned && !m.screening).sort(newestFirst);
+    case "snoozed":
+    case "aside":
+      return live.filter((m) => m.state === key).sort(newestFirst);
+    case "archive":
+      return live.filter((m) => m.state === "done").sort(newestFirst);
+    case "trash":
+    case "blocked":
+      return messages.filter((m) => m.state === (key === "trash" ? "deleted" : "blocked")).sort(newestFirst);
+    case "seen":
+      return ctx.seen.flatMap((id) => live.filter((m) => m.id === id));
+  }
+  const smartId = smartIdOf(key);
+  if (smartId !== undefined) {
+    const smart = ctx.smartFolders.find((f) => f.id === smartId);
+    return smart ? live.filter((m) => matchesQuery(m, smart.query)).sort(newestFirst) : [];
+  }
+  return live.filter(inFolders(listFolderIds(key, ctx.folders))).sort(newestFirst);
+}
+
 export function buildList(
   messages: Message[],
   view: ListView,
   sticky: ReadonlySet<number>,
-  accounts: AccountView[] = [],
+  ctx: ListContext = EMPTY_CONTEXT,
 ): ListModel {
+  const accounts = ctx.accounts;
   if (view.search !== null) {
     if (!view.search.trim()) return model("Search", []);
     const hits = messages.filter((m) => isLive(m) && matchesQuery(m, view.search!)).sort(newestFirst);
@@ -178,21 +195,15 @@ export function buildList(
   }
 
   if (view.folder !== "inbox") {
-    const live = messages.filter(isLive);
-    const filters: Record<Exclude<Folder, "inbox">, (m: Message) => boolean> = {
-      pins: (m) => m.pinned && !m.screening,
-      snoozed: (m) => m.state === "snoozed",
-      aside: (m) => m.state === "aside",
-      archive: (m) => m.state === "done",
-      sent: () => false,
-      drafts: () => false,
-      trash: () => false,
-    };
-    const items =
-      view.folder === "trash"
-        ? messages.filter((m) => m.state === "deleted").sort(newestFirst)
-        : live.filter(filters[view.folder]).sort(newestFirst);
-    return model(folderLabel(view.folder), withPeriods(items));
+    const all = listItems(messages, view.folder, ctx);
+    const items = view.account === "all" ? all : all.filter((m) => m.account === view.account);
+    const label = listInfo(view.folder, ctx.folders, ctx.smartFolders)?.label ?? "Folder";
+    const account = view.account !== "all" && accounts.find((a) => a.id === view.account)?.label;
+    const title = account ? `${label} · ${account}` : label;
+    // Recently Seen keeps the order they were opened in.
+    const blocks: ListBlock[] =
+      view.folder === "seen" ? items.map((m) => ({ kind: "row", message: m })) : withPeriods(items);
+    return { ...model(title, blocks), recipients: showsRecipients(view.folder, ctx.folders) };
   }
 
   const { mail, screening } = inboxMessages(messages, view.account, view.showDone);
@@ -246,7 +257,7 @@ export function buildList(
   return model(title, [...gatekeeper, ...withPeriods(mail)]);
 }
 
-/** Free text plus `from:`, `has:attachment` and `is:unread`. */
+/** Free text plus `from:`, `has:attachment`, `is:unread` and `date:today`. */
 export function matchesQuery(m: Message, query: string) {
   let rest = query;
   const take = (pattern: RegExp) => {
@@ -257,26 +268,48 @@ export function matchesQuery(m: Message, query: string) {
   const from = take(/(?:^|\s)from:(\S+)/i)?.[1]?.toLowerCase();
   const hasAttachment = take(/(?:^|\s)has:attachments?(?=\s|$)/i) !== null;
   const unreadOnly = take(/(?:^|\s)is:unread(?=\s|$)/i) !== null;
+  const todayOnly = take(/(?:^|\s)date:today(?=\s|$)/i) !== null;
   const text = rest.trim().toLowerCase();
 
   if (from && !`${m.from} ${m.address}`.toLowerCase().includes(from)) return false;
   if (hasAttachment && !m.attachment) return false;
   if (unreadOnly && !m.unread) return false;
+  if (todayOnly && m.timestamp < new Date().setHours(0, 0, 0, 0)) return false;
   const haystack = `${m.from} ${m.address} ${m.subject} ${m.snippet} ${m.body?.join(" ") ?? ""}`;
   return !text || haystack.toLowerCase().includes(text);
 }
 
-export type SidebarCounts = ReturnType<typeof sidebarCounts>;
+export interface SidebarCounts {
+  /** Unread accepted inbox mail, in all accounts and per account. */
+  inbox: number;
+  accounts: Partial<Record<AccountId, number>>;
+  /** Per sidebar list: totals for Snoozed, Set Aside and Drafts, unread mail elsewhere. */
+  lists: Partial<Record<ListKey, number>>;
+  /** The same per account, for a shared list's account rows. */
+  listAccounts: Partial<Record<ListKey, Partial<Record<AccountId, number>>>>;
+}
 
-/** Sidebar counters: unread accepted inbox mail (in all and per account), plus totals for parked folders. */
-export function sidebarCounts(messages: Message[]) {
+/** Sidebar counters, for the Inbox and the lists in `keys`. */
+export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListContext = EMPTY_CONTEXT): SidebarCounts {
   const unread = messages.filter((m) => m.state === "inbox" && !m.screening && m.unread);
-  const accounts: Partial<Record<AccountId, number>> = {};
-  for (const m of unread) accounts[m.account] = (accounts[m.account] ?? 0) + 1;
-  return {
-    inbox: unread.length,
-    accounts,
-    snoozed: messages.filter((m) => m.state === "snoozed").length,
-    aside: messages.filter((m) => m.state === "aside").length,
-  };
+  const lists: Partial<Record<ListKey, number>> = {};
+  const listAccounts: SidebarCounts["listAccounts"] = {};
+  for (const key of keys) {
+    if (key === "inbox") continue;
+    let counted: Message[];
+    if (key === "snoozed" || key === "aside" || key === "drafts") {
+      counted = listItems(messages, key, ctx);
+    } else if (key === "spam" || folderIdOf(key) !== undefined) {
+      counted = listItems(messages, key, ctx).filter((m) => m.unread && !m.screening);
+    } else continue;
+    lists[key] = counted.length;
+    if (hasAccountRows(key)) listAccounts[key] = perAccount(counted);
+  }
+  return { inbox: unread.length, accounts: perAccount(unread), lists, listAccounts };
+}
+
+function perAccount(messages: Message[]) {
+  const counts: Partial<Record<AccountId, number>> = {};
+  for (const m of messages) counts[m.account] = (counts[m.account] ?? 0) + 1;
+  return counts;
 }

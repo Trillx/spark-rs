@@ -53,6 +53,7 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         from_address,
         to: display_list(m.to()),
         cc: display_list(m.cc()),
+        bcc: display_list(m.bcc()),
         subject: m.subject().unwrap_or_default().trim().to_owned(),
         date: m.date().map_or(0, |d| d.to_timestamp() * 1000),
         snippet: snippet(&text),
@@ -157,6 +158,14 @@ pub fn snippet(text: &str) -> String {
         Some((cut, _)) => format!("{}…", out[..cut].trim_end()),
         None => out,
     }
+}
+
+/// The Message-ID in a block of headers, without angle brackets.
+pub fn message_id(headers: &[u8]) -> Option<String> {
+    MessageParser::default()
+        .parse_headers(headers)?
+        .message_id()
+        .map(bare_id)
 }
 
 /// Message-IDs are stored without angle brackets.

@@ -1,17 +1,18 @@
 //! The engine the apps drive: adding accounts, and per account one round of
-//! work at a time (send what's due, push local changes, fetch new mail).
-//! Callers run rounds for an account one after another; different accounts
-//! can run in parallel.
+//! work at a time (send what's due, push local changes, fetch new mail,
+//! list and sync folders). Callers run rounds for an account one after
+//! another; different accounts can run in parallel.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
-use spark_store::{Account, AccountKind, NewAccount, Store, now_ms};
+use spark_store::{Account, AccountKind, Folder, NewAccount, Store, now_ms};
 
 use crate::attachment::{self, AttachmentData};
 use crate::draft::{self, Draft, Original, OutgoingAttachment};
+use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::oauth::{self, App};
@@ -52,6 +53,17 @@ pub enum AccountConfig {
     Microsoft { client_id: String, tenant: String },
 }
 
+/// What a round does besides pushing local changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Round {
+    /// Fetch new inbox mail.
+    pub fetch: bool,
+    /// Refresh the account's folder list.
+    pub list_folders: bool,
+    /// Stored folders (of any account; others are skipped) to sync.
+    pub folders: Vec<i64>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub new: usize,
@@ -61,12 +73,27 @@ pub struct Report {
     /// except on an account's first sync, which brings in mail they've
     /// already seen elsewhere.
     pub arrived: Vec<i64>,
+    /// Messages that came into or left synced folders.
+    pub folder_changes: usize,
+    /// The folder list changed, or a folder was synced for the first time.
+    pub folders_changed: bool,
+    /// Folders that couldn't be synced this round, and why.
+    pub folder_errors: Vec<String>,
+    /// Drafts uploaded to the server, and server copies deleted.
+    pub drafts: usize,
 }
 
 impl Report {
     /// Whether the message list needs reloading.
     pub fn changed(&self) -> bool {
-        self.new + self.gone > 0
+        self.new + self.gone + self.folder_changes + self.drafts > 0
+    }
+
+    fn drafts_pushed(&mut self, pushed: DraftsReport) {
+        self.drafts = pushed.uploaded + pushed.removed;
+        self.folders_changed |= pushed.folders_changed;
+        self.folder_errors
+            .extend(pushed.errors.into_iter().map(|e| format!("Drafts: {e}")));
     }
 
     fn synced(&mut self, new: Vec<i64>, gone: usize, first: bool) {
@@ -207,9 +234,37 @@ impl Engine {
     /// and with `fetch`, bring in new mail. Opens no connection when there
     /// is nothing to do.
     pub async fn run(&self, account_id: i64, fetch: bool) -> Result<Report> {
+        self.run_round(
+            account_id,
+            &Round {
+                fetch,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// `run`, plus listing the account's folders and syncing some of them.
+    /// A folder that can't be synced doesn't fail the round unless the
+    /// account itself is unreachable.
+    pub async fn run_round(&self, account_id: i64, round: &Round) -> Result<Report> {
         let account = self.account(account_id)?;
         let pending = self.store().pending(account_id, now_ms(), SETTLE_MS)?;
-        if pending.is_empty() && !fetch {
+        // Saves settle like other changes, so a burst of them goes up once.
+        let settled = now_ms() - SETTLE_MS;
+        let draft_work = self.store().has_draft_work(account_id, settled)?;
+        let folders: Vec<Folder> = self
+            .store()
+            .folders()?
+            .into_iter()
+            .filter(|f| f.account_id == account_id && f.selectable && round.folders.contains(&f.id))
+            .collect();
+        if pending.is_empty()
+            && !draft_work
+            && !round.fetch
+            && !round.list_folders
+            && folders.is_empty()
+        {
             return Ok(Report::default());
         }
         let mut report = Report::default();
@@ -224,7 +279,13 @@ impl Engine {
                 let mut session = imap::login(&server, &username, &password).await?;
                 imap::find_folders(&mut session, &mut state).await?;
                 report.pushed = imap::push(&mut session, &self.store, &state, pending).await?;
-                if fetch {
+                if draft_work {
+                    let pushed =
+                        drafts::push_imap(&mut session, &self.store, &account, &state, settled)
+                            .await?;
+                    report.drafts_pushed(pushed);
+                }
+                if round.fetch {
                     let sync =
                         imap::sync_inbox(&mut session, &self.store, account_id, &mut state).await;
                     // Keep the position even if part of the sync failed.
@@ -233,6 +294,32 @@ impl Engine {
                     report.synced(sync.new, sync.gone, sync.first);
                 }
                 self.store().set_sync_state(account_id, &to_json(&state))?;
+                let mut listed = false;
+                if round.list_folders {
+                    let found = imap::list_folders(&mut session, &state).await?;
+                    report.folders_changed |= self.store().replace_folders(account_id, &found)?;
+                    listed = true;
+                }
+                for folder in &folders {
+                    let mut folder_state: imap::FolderState = from_json(&folder.sync_state);
+                    match imap::sync_folder(&mut session, &self.store, folder, &mut folder_state)
+                        .await
+                    {
+                        Ok(r) if r.missing => {
+                            if !listed {
+                                let found = imap::list_folders(&mut session, &state).await?;
+                                self.store().replace_folders(account_id, &found)?;
+                                listed = true;
+                            }
+                            report.folders_changed = true;
+                        }
+                        Ok(r) => {
+                            self.folder_synced(folder, &to_json(&folder_state), &mut report)?;
+                            report.folder_changes += r.changed;
+                        }
+                        Err(e) => folder_failed(folder, e, &mut report)?,
+                    }
+                }
                 let _ = session.logout().await;
             }
             AccountConfig::Microsoft { client_id, tenant } => {
@@ -242,7 +329,11 @@ impl Engine {
                         .await?,
                 );
                 report.pushed = graph.push(&self.store, pending).await?;
-                if fetch {
+                if draft_work {
+                    let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await?;
+                    report.drafts_pushed(pushed);
+                }
+                if round.fetch {
                     let mut state: graph::SyncState = from_json(&account.sync_state);
                     let sync = graph
                         .sync_inbox(&self.store, account_id, &mut state)
@@ -250,9 +341,176 @@ impl Engine {
                     self.store().set_sync_state(account_id, &to_json(&state))?;
                     report.synced(sync.new, sync.gone, sync.first);
                 }
+                let mut listed = false;
+                if round.list_folders {
+                    let found = graph.list_folders().await?;
+                    report.folders_changed |= self.store().replace_folders(account_id, &found)?;
+                    listed = true;
+                }
+                for folder in &folders {
+                    match graph.sync_folder(&self.store, folder).await {
+                        Ok(Some(changed)) => {
+                            self.folder_synced(folder, "{}", &mut report)?;
+                            report.folder_changes += changed;
+                        }
+                        Ok(None) => {
+                            if !listed {
+                                let found = graph.list_folders().await?;
+                                self.store().replace_folders(account_id, &found)?;
+                                listed = true;
+                            }
+                            report.folders_changed = true;
+                        }
+                        Err(e) => folder_failed(folder, e, &mut report)?,
+                    }
+                }
             }
         }
         Ok(report)
+    }
+
+    fn folder_synced(&self, folder: &Folder, state: &str, report: &mut Report) -> Result<()> {
+        self.store().set_folder_synced(folder.id, state, now_ms())?;
+        if folder.synced_at.is_none() {
+            report.folders_changed = true;
+        }
+        Ok(())
+    }
+
+    /// Creates a folder in the account, in `parent` (a stored folder) or at
+    /// the top, and returns the new folder's id once it's listed.
+    pub async fn create_folder(
+        &self,
+        account_id: i64,
+        parent: Option<i64>,
+        name: &str,
+    ) -> Result<i64> {
+        let name = folder_name(name)?;
+        let account = self.account(account_id)?;
+        let parent = parent.map(|id| self.folder(id)).transpose()?;
+        let remote_id = match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let mut session =
+                    imap::login(&server, &username, &self.password(account_id)?).await?;
+                let state: imap::SyncState = from_json(&account.sync_state);
+                let created = imap::create_folder(
+                    &mut session,
+                    parent.as_ref().map(|p| p.remote_id.as_str()),
+                    name,
+                )
+                .await;
+                let listed = match &created {
+                    Ok(_) => Some(imap::list_folders(&mut session, &state).await),
+                    Err(_) => None,
+                };
+                let _ = session.logout().await;
+                let remote_id = created?;
+                if let Some(listed) = listed {
+                    self.store().replace_folders(account_id, &listed?)?;
+                }
+                remote_id
+            }
+            AccountConfig::Microsoft { client_id, tenant } => {
+                let graph = self.graph(account_id, &client_id, &tenant).await?;
+                let remote_id = graph
+                    .create_folder(parent.as_ref().map(|p| p.remote_id.as_str()), name)
+                    .await?;
+                let listed = graph.list_folders().await?;
+                self.store().replace_folders(account_id, &listed)?;
+                remote_id
+            }
+        };
+        self.store()
+            .folders()?
+            .into_iter()
+            .find(|f| f.account_id == account_id && f.remote_id == remote_id)
+            .map(|f| f.id)
+            .ok_or_else(|| Error::Server("The new folder didn't show up on the server.".into()))
+    }
+
+    /// Renames a folder on its server, keeping where it is.
+    pub async fn rename_folder(&self, folder_id: i64, name: &str) -> Result<()> {
+        let name = folder_name(name)?;
+        let folder = self.folder(folder_id)?;
+        let account = self.account(folder.account_id)?;
+        let remote_id = match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let mut session =
+                    imap::login(&server, &username, &self.password(account.id)?).await?;
+                let renamed = imap::rename_folder(&mut session, &folder.remote_id, name).await;
+                let _ = session.logout().await;
+                renamed?
+            }
+            AccountConfig::Microsoft { client_id, tenant } => {
+                self.graph(account.id, &client_id, &tenant)
+                    .await?
+                    .rename_folder(&folder.remote_id, name)
+                    .await?;
+                folder.remote_id.clone()
+            }
+        };
+        self.store().rename_folder(folder_id, &remote_id, name)?;
+        Ok(())
+    }
+
+    /// Deletes a folder and the folders in it on the server.
+    pub async fn delete_folder(&self, folder_id: i64) -> Result<()> {
+        let folder = self.folder(folder_id)?;
+        let account = self.account(folder.account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                // Innermost first: not every server deletes a folder with children.
+                let all = self.store().folders()?;
+                let mut subtree = vec![folder.clone()];
+                let mut i = 0;
+                while i < subtree.len() {
+                    let parent = subtree[i].id;
+                    subtree.extend(all.iter().filter(|f| f.parent_id == Some(parent)).cloned());
+                    i += 1;
+                }
+                let mailboxes: Vec<String> =
+                    subtree.into_iter().rev().map(|f| f.remote_id).collect();
+                let mut session =
+                    imap::login(&server, &username, &self.password(account.id)?).await?;
+                let deleted = imap::delete_folders(&mut session, &mailboxes).await;
+                let _ = session.logout().await;
+                deleted?;
+            }
+            AccountConfig::Microsoft { client_id, tenant } => {
+                self.graph(account.id, &client_id, &tenant)
+                    .await?
+                    .delete_folder(&folder.remote_id)
+                    .await?;
+            }
+        }
+        self.store().remove_folder(folder_id)?;
+        Ok(())
+    }
+
+    fn folder(&self, folder_id: i64) -> Result<Folder> {
+        self.store()
+            .folder(folder_id)?
+            .ok_or_else(|| Error::Config("That folder is gone.".into()))
+    }
+
+    async fn graph(&self, account_id: i64, client_id: &str, tenant: &str) -> Result<Graph> {
+        Ok(Graph::new(
+            &self
+                .access_token(account_id, &App::new(client_id, tenant)?)
+                .await?,
+        ))
     }
 
     /// Sends the account's drafts whose time has come.
@@ -260,7 +518,9 @@ impl Engine {
         let due = self.store().claim_due_sends(account_id, now_ms())?;
         let mut outcomes = Vec::new();
         for (id, json) in due {
-            let result = match serde_json::from_str::<Draft>(&json) {
+            let parsed = serde_json::from_str::<Draft>(&json);
+            let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
+            let result = match parsed {
                 Ok(draft) => self.send_draft(account_id, id, &draft).await,
                 Err(e) => Err(Error::Config(format!(
                     "The queued message is unreadable: {e}"
@@ -268,6 +528,10 @@ impl Engine {
             };
             let result = match result {
                 Ok(()) => {
+                    // The saved draft it came from is done with, here and on the server.
+                    if let Some(saved) = saved_draft {
+                        self.store().discard_draft(saved)?;
+                    }
                     self.store().finish_send(id)?;
                     Ok(true)
                 }
@@ -292,7 +556,8 @@ impl Engine {
             .reply_to
             .map(|id| self.original(id))
             .transpose()?
-            .flatten();
+            .flatten()
+            .or_else(|| drafts::original_from_headers(draft));
         let files = self.outgoing_files(outbox_id, draft).await?;
         match config(&account)? {
             AccountConfig::Imap {
@@ -361,9 +626,10 @@ impl Engine {
             let gone = || Error::Config("That email is no longer here.".into());
             let at = store.location(message_id)?.ok_or_else(gone)?;
             let content = store.content(message_id)?.ok_or_else(gone)?;
-            let wanted = content.attachments.get(index).cloned().ok_or_else(|| {
-                Error::Config("That attachment isn't part of the email.".into())
-            })?;
+            let wanted =
+                content.attachments.get(index).cloned().ok_or_else(|| {
+                    Error::Config("That attachment isn't part of the email.".into())
+                })?;
             (at, wanted)
         };
         let account = self.account(at.account_id)?;
@@ -486,6 +752,28 @@ pub fn gmail_servers() -> (Server, Server) {
         Server::new("imap.gmail.com", 993),
         Server::new("smtp.gmail.com", 465),
     )
+}
+
+/// Folder sync failures that mean the account can't be reached fail the
+/// round; others are reported and the round goes on.
+fn folder_failed(folder: &Folder, e: Error, report: &mut Report) -> Result<()> {
+    match e {
+        Error::Network { .. } | Error::Auth(_) => Err(e),
+        other => {
+            report
+                .folder_errors
+                .push(format!("{}: {other}", folder.name));
+            Ok(())
+        }
+    }
+}
+
+fn folder_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Config("Enter a name for the folder.".into()));
+    }
+    Ok(name)
 }
 
 fn default_label(label: &str, kind: AccountKind, email: &str) -> String {

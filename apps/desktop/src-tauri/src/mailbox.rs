@@ -8,7 +8,9 @@ use spark_mail::attachment::{AttachmentData, mime_for};
 use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::gmail_servers;
 use spark_mail::imap::Server;
-use spark_store::{Account, AccountKind, Category, MessageState, OutboxFile, Patch, now_ms};
+use spark_store::{
+    Account, AccountKind, Category, Folder, FolderRole, MessageState, OutboxFile, Patch, now_ms,
+};
 use tauri::{AppHandle, Emitter, State, Window};
 
 use crate::demo::{self, DemoMailbox};
@@ -37,6 +39,10 @@ pub struct Message {
     pub screening: bool,
     pub from: String,
     pub address: String,
+    /// Who it's to: "Name <address>" or the bare address. Sent and Drafts
+    /// list them instead of the sender.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<String>,
     /// When the message arrived, in Unix milliseconds.
     pub timestamp: i64,
     pub subject: String,
@@ -47,6 +53,30 @@ pub struct Message {
     pub body: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<String>,
+    /// Ids of the folders that hold it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<i64>,
+    /// While Filed: the folder it's kept in (its home).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<i64>,
+}
+
+/// A server folder or label, for the sidebar and folder picker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderView {
+    pub id: i64,
+    pub account: i64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<i64>,
+    /// What it's for; absent for the user's own folders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<FolderRole>,
+    /// False for folders that only hold other folders.
+    pub selectable: bool,
+    /// Its messages have been synced at least once.
+    pub synced: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -104,6 +134,7 @@ pub struct AttachmentView {
 }
 
 const DEMO_FILES: &str = "This is demo mail: its attachments are only names.";
+const DEMO_FOLDERS: &str = "These are demo folders: add an account to manage your own.";
 
 impl Mailbox {
     fn live(&self) -> bool {
@@ -160,11 +191,26 @@ fn from_store(m: spark_store::Message) -> Message {
         screening: m.screening,
         from: m.from_name,
         address: m.from_address,
+        to: m.to,
         timestamp: m.date,
         subject: m.subject,
         snippet: m.snippet,
         body: None,
         attachment: m.attachment,
+        folders: m.folders,
+        folder: m.folder,
+    }
+}
+
+fn folder_view(f: Folder) -> FolderView {
+    FolderView {
+        id: f.id,
+        account: f.account_id,
+        name: f.name,
+        parent: f.parent_id,
+        role: f.role,
+        selectable: f.selectable,
+        synced: f.synced_at.is_some(),
     }
 }
 
@@ -213,6 +259,95 @@ pub fn list_messages(mailbox: State<'_, Mailbox>) -> Result<Vec<Message>, String
     Ok(messages.into_iter().map(from_store).collect())
 }
 
+/// Every account's folders, accounts in order.
+#[tauri::command]
+pub fn list_folders(mailbox: State<'_, Mailbox>) -> Result<Vec<FolderView>, String> {
+    if !mailbox.live() {
+        return Ok(demo::folders());
+    }
+    let folders = mailbox.live.engine.store().folders().map_err(text)?;
+    Ok(folders.into_iter().map(folder_view).collect())
+}
+
+/// The folders to keep in sync: those on the sidebar or open. New ones
+/// sync at once.
+#[tauri::command]
+pub fn watch_folders(mailbox: State<'_, Mailbox>, ids: Vec<i64>) {
+    mailbox.live.watch_folders(ids);
+}
+
+/// Syncs these folders now, e.g. the one just opened.
+#[tauri::command]
+pub fn sync_folders(mailbox: State<'_, Mailbox>, ids: Vec<i64>) {
+    mailbox.live.sync_folders(ids);
+}
+
+/// Lists every account's folders again, e.g. when the folder picker opens.
+#[tauri::command]
+pub fn refresh_folders(mailbox: State<'_, Mailbox>) {
+    mailbox.live.refresh_folders();
+}
+
+#[tauri::command]
+pub async fn create_folder(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    account: i64,
+    parent: Option<i64>,
+    name: String,
+) -> Result<FolderView, String> {
+    if !mailbox.live() {
+        return Err(DEMO_FOLDERS.into());
+    }
+    let id = mailbox
+        .live
+        .engine
+        .create_folder(account, parent, &name)
+        .await
+        .map_err(text)?;
+    let _ = app.emit("folders-changed", ());
+    let folder = mailbox.live.engine.store().folder(id).map_err(text)?;
+    folder
+        .map(folder_view)
+        .ok_or_else(|| "The new folder is gone.".to_owned())
+}
+
+#[tauri::command]
+pub async fn rename_folder(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    name: String,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        return Err(DEMO_FOLDERS.into());
+    }
+    mailbox
+        .live
+        .engine
+        .rename_folder(id, &name)
+        .await
+        .map_err(text)?;
+    let _ = app.emit("folders-changed", ());
+    Ok(())
+}
+
+/// Deletes a folder, its subfolders and the mail in them on the server.
+#[tauri::command]
+pub async fn delete_folder(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        return Err(DEMO_FOLDERS.into());
+    }
+    mailbox.live.engine.delete_folder(id).await.map_err(text)?;
+    let _ = app.emit("folders-changed", ());
+    let _ = app.emit("mailbox-changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<MessageContent, String> {
     if !mailbox.live() {
@@ -223,7 +358,11 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
         return Ok(MessageContent {
             text: m.body.unwrap_or_default(),
             html: None,
-            to: vec!["You".into()],
+            to: if m.to.is_empty() {
+                vec!["You".into()]
+            } else {
+                m.to
+            },
             cc: Vec::new(),
             attachments: m
                 .attachment
@@ -370,7 +509,10 @@ pub async fn pick_files(window: Window) -> Vec<LocalFile> {
         .pick_files()
         .await
         .unwrap_or_default();
-    picked.iter().filter_map(|f| files::describe(f.path())).collect()
+    picked
+        .iter()
+        .filter_map(|f| files::describe(f.path()))
+        .collect()
 }
 
 /// Names and sizes of dropped files; folders are skipped.
@@ -527,8 +669,8 @@ pub fn sync_now(mailbox: State<'_, Mailbox>) {
 #[tauri::command]
 pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
     if !mailbox.live() {
-        // The demo pretends; ids only need to be unique.
-        return Ok(now_ms());
+        // The demo pretends.
+        return Ok(mailbox.demo.send(&draft));
     }
     // Catch typos and oversized attachments now rather than after the undo window.
     for field in [&draft.to, &draft.cc, &draft.bcc] {
@@ -537,37 +679,86 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
     draft::check_attachment_size(&draft.attachments).map_err(text)?;
     // Copies of local files go into the outbox, so a later send doesn't
     // depend on the originals.
-    let mut queued = Vec::new();
-    for a in &draft.attachments {
-        if let OutgoingAttachment::File { path, name, .. } = a {
-            let data = std::fs::read(path).map_err(|e| format!("Couldn't read {name}: {e}"))?;
-            queued.push(OutboxFile {
-                name: name.clone(),
-                mime: mime_for(name).into(),
-                data,
-            });
-        }
-    }
+    let queued = local_files(&draft)?;
     let json = serde_json::to_string(&draft).map_err(text)?;
-    let id = mailbox
-        .live
-        .engine
-        .store()
+    let mut store = mailbox.live.engine.store();
+    let id = store
         .queue_send(draft.account, &json, draft.send_at, &queued)
         .map_err(text)?;
+    // The saved draft it came from waits with it, out of the lists.
+    if let Some(saved) = draft.draft_id {
+        store.hold_draft_for_send(id, saved).map_err(text)?;
+    }
+    drop(store);
     if draft.send_at <= now_ms() {
         mailbox.live.nudge(draft.account);
     }
     Ok(id)
 }
 
-/// True if the send was stopped in time.
+/// True if the send was stopped in time. A saved draft it came from is
+/// listed again.
 #[tauri::command]
 pub fn cancel_send(mailbox: State<'_, Mailbox>, id: i64) -> Result<bool, String> {
     if !mailbox.live() {
-        return Ok(true);
+        return Ok(mailbox.demo.cancel_send(id));
     }
     mailbox.live.engine.store().cancel_send(id).map_err(text)
+}
+
+/// Copies of a draft's files from this computer, in order.
+fn local_files(draft: &Draft) -> Result<Vec<OutboxFile>, String> {
+    let mut files = Vec::new();
+    for a in &draft.attachments {
+        if let OutgoingAttachment::File { path, name, .. } = a {
+            let data = std::fs::read(path).map_err(|e| format!("Couldn't read {name}: {e}"))?;
+            files.push(OutboxFile {
+                name: name.clone(),
+                mime: mime_for(name).into(),
+                data,
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// Saves the composer's draft in its account's Drafts folder: here at once,
+/// on the server with the account's next round, replacing the copy it was
+/// opened from. Returns the draft's message id, for saving it again.
+#[tauri::command]
+pub fn save_draft(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
+    if !mailbox.live() {
+        return mailbox.demo.save_draft(draft);
+    }
+    let files = local_files(&draft)?;
+    mailbox.live.engine.save_draft(&draft, &files).map_err(text)
+}
+
+/// A draft from Drafts, for the composer.
+#[tauri::command]
+pub fn open_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<Draft, String> {
+    let opened = if mailbox.live() {
+        mailbox.live.engine.open_draft(id).map_err(text)?
+    } else {
+        mailbox.demo.open_draft(id)
+    };
+    opened.ok_or_else(|| "That draft is gone.".to_owned())
+}
+
+/// Deletes a draft, here and on the server.
+#[tauri::command]
+pub fn discard_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<(), String> {
+    if !mailbox.live() {
+        mailbox.demo.discard_draft(id);
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .discard_draft(id)
+        .map_err(text)?;
+    Ok(())
 }
 
 /// Opens a link from an email in the system browser or mail handler.
@@ -611,6 +802,9 @@ mod tests {
             snippet: "…".into(),
             date: 9,
             attachment: None,
+            folders: vec![4],
+            folder: None,
+            to: vec!["Me <me@x.com>".into()],
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["account"], 7);
@@ -621,5 +815,8 @@ mod tests {
         assert_eq!(json["category"], "newsletters");
         assert_eq!(json["state"], "snoozed");
         assert!(json.get("body").is_none() && json.get("attachment").is_none());
+        assert_eq!(json["folders"], serde_json::json!([4]));
+        assert!(json.get("folder").is_none());
+        assert_eq!(json["to"], serde_json::json!(["Me <me@x.com>"]));
     }
 }

@@ -609,3 +609,984 @@ fn version_1_databases_gain_the_outbox_files_table() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn remote(
+    remote_id: &str,
+    parent: Option<&str>,
+    name: &str,
+    role: Option<FolderRole>,
+) -> RemoteFolder {
+    RemoteFolder {
+        remote_id: remote_id.into(),
+        parent: parent.map(Into::into),
+        name: name.into(),
+        role,
+        selectable: true,
+    }
+}
+
+/// `incoming`, but found in folder `mailbox`.
+fn in_folder(account_id: i64, mailbox: &str, uid: u32, message: u32) -> Incoming {
+    Incoming {
+        mailbox: Some(mailbox.into()),
+        uid: Some(uid),
+        message_id: Some(format!("<{message}@example.com>")),
+        subject: format!("Message {message}"),
+        ..incoming(account_id, uid, "a@x.com")
+    }
+}
+
+fn folder_id(store: &Store, remote_id: &str) -> i64 {
+    store
+        .folders()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.remote_id == remote_id)
+        .unwrap_or_else(|| panic!("no folder {remote_id}"))
+        .id
+}
+
+#[test]
+fn folders_keep_their_ids_across_listings_and_nest() {
+    let (mut store, account) = store_with_account();
+    let listed = vec![
+        remote("Projects", None, "Projects", None),
+        remote("Projects/Q4", Some("Projects"), "Q4", None),
+        remote(
+            "[Gmail]/Sent Mail",
+            None,
+            "Sent Mail",
+            Some(FolderRole::Sent),
+        ),
+    ];
+    assert!(store.replace_folders(account, &listed).unwrap());
+    let folders = store.folders().unwrap();
+    assert_eq!(folders.len(), 3);
+    let (projects, q4) = (folders[0].id, folders[1].id);
+    assert_eq!(folders[1].parent_id, Some(projects));
+    assert_eq!(folders[1].name, "Q4");
+    assert_eq!(folders[2].role, Some(FolderRole::Sent));
+    assert_eq!(folders[0].synced_at, None);
+
+    // The same listing changes nothing.
+    assert!(!store.replace_folders(account, &listed).unwrap());
+
+    // Reordered, one gone: ids stay, the gone one goes with its mail.
+    let only_q4 = new_id(
+        store
+            .add_folder_message(projects, &in_folder(account, "Projects", 1, 1))
+            .unwrap(),
+    );
+    let reordered = vec![listed[2].clone(), listed[1].clone()];
+    assert!(store.replace_folders(account, &reordered).unwrap());
+    let folders = store.folders().unwrap();
+    assert_eq!(
+        folders.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [folder_id(&store, "[Gmail]/Sent Mail"), q4]
+    );
+    assert_eq!(folders[1].parent_id, None, "its parent is gone");
+    // On Gmail a label's mail stays in All Mail.
+    assert!(store.message(only_q4).unwrap().unwrap().folders.is_empty());
+}
+
+#[test]
+fn folder_mail_is_filed_unless_the_inbox_has_it() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[
+                remote("Travel", None, "Travel", None),
+                remote("Receipts", None, "Receipts", None),
+                remote(
+                    "[Gmail]/All Mail",
+                    None,
+                    "All Mail",
+                    Some(FolderRole::Archive),
+                ),
+                remote("[Gmail]/Trash", None, "Trash", Some(FolderRole::Trash)),
+            ],
+        )
+        .unwrap();
+    let travel = folder_id(&store, "Travel");
+    let receipts = folder_id(&store, "Receipts");
+
+    // Only in a folder: Filed there, and listed with it.
+    let flight = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 5, 100))
+            .unwrap(),
+    );
+    let m = store.message(flight).unwrap().unwrap();
+    assert_eq!(m.state, MessageState::Filed);
+    assert!(!m.screening, "folder mail never waits in the Gatekeeper");
+    assert_eq!(m.folders, [travel]);
+    let at = store.location(flight).unwrap().unwrap();
+    assert_eq!((at.mailbox.as_deref(), at.uid), (Some("Travel"), Some(5)));
+    assert_eq!(at.remote_place, Place::Folder);
+
+    // Inbox mail with a label stays in the inbox, and in the folder too.
+    let lunch = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    let added = store
+        .add_folder_message(travel, &in_folder(account, "Travel", 6, 1))
+        .unwrap();
+    assert_eq!(added, Added::Known(lunch));
+    let m = store.message(lunch).unwrap().unwrap();
+    assert_eq!(m.state, MessageState::Inbox);
+    assert_eq!(m.folders, [travel]);
+    assert_eq!(
+        store.location(lunch).unwrap().unwrap().mailbox.as_deref(),
+        Some("INBOX")
+    );
+
+    // Archived elsewhere, then found in a folder: it moved there.
+    store.observe_gone_uids(account, "INBOX", &[1]).unwrap();
+    store
+        .add_folder_message(receipts, &in_folder(account, "Receipts", 2, 1))
+        .unwrap();
+    let m = store.message(lunch).unwrap().unwrap();
+    assert_eq!(m.state, MessageState::Filed);
+    assert_eq!(
+        store.location(lunch).unwrap().unwrap().mailbox.as_deref(),
+        Some("Receipts")
+    );
+
+    // Another label's folder doesn't take it over.
+    store
+        .add_folder_message(travel, &in_folder(account, "Travel", 6, 1))
+        .unwrap();
+    assert_eq!(
+        store.location(lunch).unwrap().unwrap().mailbox.as_deref(),
+        Some("Receipts")
+    );
+    let mut both = store.message(lunch).unwrap().unwrap().folders;
+    both.sort();
+    assert_eq!(both, [travel, receipts]);
+    assert_eq!(
+        store.member_locations(lunch).unwrap(),
+        [("Travel".to_owned(), 6), ("Receipts".to_owned(), 2)]
+    );
+
+    // Archive mail is Done; Trash mail is Deleted.
+    let all_mail = folder_id(&store, "[Gmail]/All Mail");
+    let old = new_id(
+        store
+            .add_folder_message(all_mail, &in_folder(account, "[Gmail]/All Mail", 9, 200))
+            .unwrap(),
+    );
+    assert_eq!(
+        store.message(old).unwrap().unwrap().state,
+        MessageState::Done
+    );
+    let trash = folder_id(&store, "[Gmail]/Trash");
+    let binned = new_id(
+        store
+            .add_folder_message(trash, &in_folder(account, "[Gmail]/Trash", 3, 300))
+            .unwrap(),
+    );
+    assert_eq!(
+        store.message(binned).unwrap().unwrap().state,
+        MessageState::Deleted
+    );
+
+    // Moved into the inbox on another device: back in the Inbox.
+    store
+        .add_incoming(
+            &Incoming {
+                message_id: Some("<100@example.com>".into()),
+                ..incoming(account, 40, "a@x.com")
+            },
+            true,
+        )
+        .unwrap();
+    let m = store.message(flight).unwrap().unwrap();
+    assert_eq!(m.state, MessageState::Inbox);
+    assert_eq!(m.folders, [travel], "the label stays");
+}
+
+#[test]
+fn folder_membership_is_replaced_by_each_sync() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(account, &[remote("Travel", None, "Travel", None)])
+        .unwrap();
+    let travel = folder_id(&store, "Travel");
+    let a = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 1, 1))
+            .unwrap(),
+    );
+    let b = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 2, 2))
+            .unwrap(),
+    );
+    assert_eq!(
+        store.folder_uids(travel).unwrap(),
+        HashMap::from([(1, a), (2, b)])
+    );
+    assert_eq!(
+        store.set_folder_members(travel, &[(b, Some(2))]).unwrap(),
+        1
+    );
+    assert_eq!(store.folder_member_ids(travel).unwrap(), HashSet::from([b]));
+    assert!(store.message(a).unwrap().unwrap().folders.is_empty());
+
+    // A renumbered folder forgets its UIDs.
+    store.forget_folder_uids(travel).unwrap();
+    assert!(store.folder_uids(travel).unwrap().is_empty());
+    assert_eq!(store.location(b).unwrap().unwrap().uid, None);
+    store.set_folder_synced(travel, "{\"x\":1}", 77).unwrap();
+    let f = store.folder(travel).unwrap().unwrap();
+    assert_eq!(
+        (f.sync_state.as_str(), f.synced_at),
+        ("{\"x\":1}", Some(77))
+    );
+}
+
+#[test]
+fn filed_mail_is_pushed_when_it_leaves_its_folder() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(account, &[remote("Travel", None, "Travel", None)])
+        .unwrap();
+    let travel = folder_id(&store, "Travel");
+    let id = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 1, 1))
+            .unwrap(),
+    );
+    // Read in place: a flag change, no move.
+    let read = Patch {
+        unread: Some(false),
+        ..Default::default()
+    };
+    store.update(id, &read, 1_000).unwrap();
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    assert_eq!((p.place, p.remote_place), (Place::Folder, Place::Folder));
+    assert_eq!(p.mailbox.as_deref(), Some("Travel"));
+    store
+        .mark_pushed(
+            p,
+            Pushed {
+                mailbox: Some("Travel"),
+                uid: Some(1),
+            },
+        )
+        .unwrap();
+    assert!(store.pending(account, 9_000, 0).unwrap().is_empty());
+
+    // Done moves it to the archive.
+    let done = Patch {
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    store.update(id, &done, 2_000).unwrap();
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    assert_eq!((p.place, p.remote_place), (Place::Archive, Place::Folder));
+    // Undone within the window: nothing to push.
+    let undo = Patch {
+        state: Some(MessageState::Filed),
+        ..Default::default()
+    };
+    store.update(id, &undo, 3_000).unwrap();
+    assert!(store.pending(account, 9_000, 0).unwrap().is_empty());
+}
+
+#[test]
+fn graph_folder_mail_follows_the_server_and_flags() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(account, &[remote("AAMk-folder", None, "Clients", None)])
+        .unwrap();
+    let clients = folder_id(&store, "AAMk-folder");
+    let graph = |remote_id: &str| Incoming {
+        account_id: account,
+        remote_id: Some(remote_id.into()),
+        from_address: "a@x.com".into(),
+        subject: remote_id.into(),
+        unread: true,
+        ..Default::default()
+    };
+    let inbox = new_id(store.add_incoming(&graph("g1"), false).unwrap());
+    // Still in the inbox per the server: left alone.
+    store.add_folder_message(clients, &graph("g1")).unwrap();
+    assert_eq!(
+        store.message(inbox).unwrap().unwrap().state,
+        MessageState::Inbox
+    );
+    // Gone from the inbox, then listed in the folder: it moved there.
+    store.observe_gone_remote(account, "g1").unwrap();
+    store
+        .add_folder_message(
+            clients,
+            &Incoming {
+                unread: false,
+                ..graph("g1")
+            },
+        )
+        .unwrap();
+    let m = store.message(inbox).unwrap().unwrap();
+    assert_eq!(m.state, MessageState::Filed);
+    assert!(!m.unread);
+    store
+        .observe_remote_flags(account, "g1", true, true)
+        .unwrap();
+    let m = store.message(inbox).unwrap().unwrap();
+    assert!(m.unread && m.pinned);
+}
+
+fn store_with_imap_account() -> (Store, i64) {
+    let store = Store::open_in_memory().unwrap();
+    let account = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "me@fastmail.com",
+            name: "Me",
+            label: "Fastmail",
+            config: "{}",
+        })
+        .unwrap();
+    (store, account.id)
+}
+
+#[test]
+fn renaming_and_removing_folders_carry_their_subfolders() {
+    let (mut store, account) = store_with_imap_account();
+    store
+        .replace_folders(
+            account,
+            &[
+                remote("Projects", None, "Projects", None),
+                remote("Projects/Q4", Some("Projects"), "Q4", None),
+                remote("Projects2", None, "Projects2", None),
+            ],
+        )
+        .unwrap();
+    let projects = folder_id(&store, "Projects");
+    let q4 = folder_id(&store, "Projects/Q4");
+    let plan = new_id(
+        store
+            .add_folder_message(q4, &in_folder(account, "Projects/Q4", 1, 5))
+            .unwrap(),
+    );
+    store.rename_folder(projects, "Work", "Work").unwrap();
+    let f = store.folder(q4).unwrap().unwrap();
+    assert_eq!(
+        (f.remote_id.as_str(), f.parent_id),
+        ("Work/Q4", Some(projects))
+    );
+    assert_eq!(store.folder(projects).unwrap().unwrap().name, "Work");
+    assert_eq!(
+        store
+            .folder(folder_id(&store, "Projects2"))
+            .unwrap()
+            .unwrap()
+            .remote_id,
+        "Projects2"
+    );
+    assert_eq!(
+        store.location(plan).unwrap().unwrap().mailbox.as_deref(),
+        Some("Work/Q4")
+    );
+
+    // Inbox mail listed in the subfolder outlives it, as does Done mail;
+    // filed mail goes with it.
+    let lunch = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    store
+        .add_folder_message(q4, &in_folder(account, "Work/Q4", 2, 1))
+        .unwrap();
+    let done = new_id(
+        store
+            .add_incoming(&incoming(account, 3, "a@x.com"), false)
+            .unwrap(),
+    );
+    store.observe_gone_uids(account, "INBOX", &[3]).unwrap();
+    store
+        .add_folder_message(q4, &in_folder(account, "Work/Q4", 4, 3))
+        .unwrap();
+    let marked_done = Patch {
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    store.update(done, &marked_done, 1_000).unwrap();
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    store
+        .mark_pushed(
+            p,
+            Pushed {
+                mailbox: None,
+                uid: None,
+            },
+        )
+        .unwrap();
+    store.remove_folder(projects).unwrap();
+    assert_eq!(store.folders().unwrap().len(), 1);
+    assert_eq!(store.message(plan).unwrap(), None);
+    assert!(store.message(lunch).unwrap().unwrap().folders.is_empty());
+    assert_eq!(
+        store.message(done).unwrap().unwrap().state,
+        MessageState::Done
+    );
+}
+
+#[test]
+fn inbox_mail_first_seen_in_a_folder_still_arrives_as_new() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[remote(
+                "[Gmail]/All Mail",
+                None,
+                "All Mail",
+                Some(FolderRole::Archive),
+            )],
+        )
+        .unwrap();
+    let all_mail = folder_id(&store, "[Gmail]/All Mail");
+    let spam = new_id(
+        store
+            .add_incoming(&incoming(account, 2, "spam@x.com"), false)
+            .unwrap(),
+    );
+    let blocking = Patch {
+        state: Some(MessageState::Blocked),
+        ..Default::default()
+    };
+    store.update(spam, &blocking, 1_000).unwrap();
+
+    // All Mail syncs before the inbox: a stranger's mail and a blocked sender's.
+    let in_all_mail = |uid: u32, message: u32, from: &str| Incoming {
+        from_address: from.into(),
+        ..in_folder(account, "[Gmail]/All Mail", uid, message)
+    };
+    let stranger = new_id(
+        store
+            .add_folder_message(all_mail, &in_all_mail(50, 10, "new@y.com"))
+            .unwrap(),
+    );
+    let blocked = new_id(
+        store
+            .add_folder_message(all_mail, &in_all_mail(51, 11, "spam@x.com"))
+            .unwrap(),
+    );
+    assert_eq!(
+        store.message(stranger).unwrap().unwrap().state,
+        MessageState::Done
+    );
+
+    // Then the inbox has them: new mail, screened or blocked as usual.
+    let inbox = |uid: u32, message: u32, from: &str| Incoming {
+        message_id: Some(format!("<{message}@example.com>")),
+        ..incoming(account, uid, from)
+    };
+    assert_eq!(
+        store
+            .add_incoming(&inbox(20, 10, "new@y.com"), true)
+            .unwrap(),
+        Added::New(stranger)
+    );
+    let m = store.message(stranger).unwrap().unwrap();
+    assert!(m.state == MessageState::Inbox && m.screening);
+    assert_eq!(m.folders, [all_mail]);
+    assert_eq!(
+        store
+            .add_incoming(&inbox(21, 11, "spam@x.com"), true)
+            .unwrap(),
+        Added::New(blocked)
+    );
+    assert_eq!(
+        store.message(blocked).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+    // Seen in the inbox once, it's known from then on.
+    assert_eq!(
+        store
+            .add_incoming(&inbox(20, 10, "new@y.com"), true)
+            .unwrap(),
+        Added::Known(stranger)
+    );
+}
+
+#[test]
+fn graph_copies_with_one_message_id_stay_apart() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[remote(
+                "sent-id",
+                None,
+                "Sent Items",
+                Some(FolderRole::Sent),
+            )],
+        )
+        .unwrap();
+    let sent = folder_id(&store, "sent-id");
+    let copy = |remote_id: &str| Incoming {
+        account_id: account,
+        remote_id: Some(remote_id.into()),
+        message_id: Some("same@x.com".into()),
+        from_address: "me@contoso.com".into(),
+        ..Default::default()
+    };
+    let received = new_id(store.add_incoming(&copy("inbox-copy"), false).unwrap());
+    let filed = new_id(store.add_folder_message(sent, &copy("sent-copy")).unwrap());
+    assert_ne!(received, filed);
+    assert_eq!(
+        store.message(received).unwrap().unwrap().state,
+        MessageState::Inbox
+    );
+    assert_eq!(
+        store.message(filed).unwrap().unwrap().state,
+        MessageState::Filed
+    );
+}
+
+#[test]
+fn version_2_databases_gain_folders() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v2.sqlite");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(SCHEMA_2).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    let account = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "a@b.c",
+            name: "A",
+            label: "A",
+            config: "{}",
+        })
+        .unwrap();
+    assert!(
+        store
+            .replace_folders(account.id, &[remote("Travel", None, "Travel", None)])
+            .unwrap()
+    );
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Records the account's one pending change as pushed: moved to `mailbox`,
+/// its new UID not known yet.
+fn push_to(store: &Store, account: i64, mailbox: &str) -> Pending {
+    let mut pending = store.pending(account, i64::MAX, 0).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let p = pending.remove(0);
+    store
+        .mark_pushed(
+            &p,
+            Pushed {
+                mailbox: Some(mailbox),
+                uid: None,
+            },
+        )
+        .unwrap();
+    p
+}
+
+fn file_into(folder: i64) -> Patch {
+    Patch {
+        folder: Some(folder),
+        ..Default::default()
+    }
+}
+
+fn store_with_folders(kind: AccountKind) -> (Store, i64, i64, i64) {
+    let (mut store, account) = match kind {
+        AccountKind::Gmail => store_with_account(),
+        _ => store_with_imap_account(),
+    };
+    store
+        .replace_folders(
+            account,
+            &[
+                remote("Travel", None, "Travel", None),
+                remote("Receipts", None, "Receipts", None),
+                remote("Archive", None, "Archive", Some(FolderRole::Archive)),
+                remote("Trash", None, "Trash", Some(FolderRole::Trash)),
+                remote("Junk", None, "Junk", Some(FolderRole::Spam)),
+            ],
+        )
+        .unwrap();
+    let travel = folder_id(&store, "Travel");
+    let receipts = folder_id(&store, "Receipts");
+    (store, account, travel, receipts)
+}
+
+#[test]
+fn inbox_mail_moves_into_a_folder_and_back() {
+    let (mut store, account, travel, _) = store_with_folders(AccountKind::Imap);
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    let m = store
+        .update(id, &file_into(travel), 1_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.state, MessageState::Filed);
+    assert_eq!((m.folder, m.folders), (Some(travel), vec![travel]));
+
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    assert_eq!((p.place, p.remote_place), (Place::Folder, Place::Inbox));
+    assert_eq!(p.folder, Some((travel, "Travel".to_owned())));
+    assert_eq!((p.mailbox.as_deref(), p.uid), (Some("INBOX"), Some(1)));
+    push_to(&store, account, "Travel");
+    assert!(store.pending(account, 9_000, 0).unwrap().is_empty());
+    let at = store.location(id).unwrap().unwrap();
+    assert_eq!((at.mailbox.as_deref(), at.uid), (Some("Travel"), None));
+    assert_eq!(at.remote_place, Place::Folder);
+
+    // Travel's next sync finds it under its new UID.
+    store
+        .add_folder_message(travel, &in_folder(account, "Travel", 8, 1))
+        .unwrap();
+    let m = store.message(id).unwrap().unwrap();
+    assert_eq!((m.state, m.folder), (MessageState::Filed, Some(travel)));
+    assert_eq!(store.folder_uids(travel).unwrap(), HashMap::from([(8, id)]));
+
+    // Undo after the push: back to the inbox, out of the folder.
+    let back = Patch {
+        state: Some(MessageState::Inbox),
+        ..Default::default()
+    };
+    let m = store.update(id, &back, 2_000).unwrap().unwrap();
+    assert_eq!((m.folder, m.folders), (None, vec![]));
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    assert_eq!((p.place, p.remote_place), (Place::Inbox, Place::Folder));
+    assert_eq!((p.mailbox.as_deref(), p.uid), (Some("Travel"), Some(8)));
+}
+
+#[test]
+fn filed_mail_moves_between_folders_and_undo_puts_it_back() {
+    let (mut store, account, travel, receipts) = store_with_folders(AccountKind::Imap);
+    let id = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 5, 1))
+            .unwrap(),
+    );
+    // Found by a folder sync: Filed there, with its home folder.
+    assert_eq!(store.message(id).unwrap().unwrap().folder, Some(travel));
+
+    let m = store
+        .update(id, &file_into(receipts), 1_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!((m.folder, m.folders), (Some(receipts), vec![receipts]));
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    assert_eq!((p.place, p.remote_place), (Place::Folder, Place::Folder));
+    assert_eq!(p.folder, Some((receipts, "Receipts".to_owned())));
+    assert_eq!(p.remote_folder, Some(travel));
+
+    // Undone within the window: nothing to push, back in Travel with its UID.
+    let undo = Patch {
+        state: Some(MessageState::Filed),
+        folder: Some(travel),
+        ..Default::default()
+    };
+    let m = store.update(id, &undo, 2_000).unwrap().unwrap();
+    assert_eq!((m.folder, m.folders), (Some(travel), vec![travel]));
+    assert!(store.pending(account, 9_000, 0).unwrap().is_empty());
+    assert_eq!(store.folder_uids(travel).unwrap(), HashMap::from([(5, id)]));
+
+    // Moved and pushed, then undone: that's a move back.
+    store.update(id, &file_into(receipts), 3_000).unwrap();
+    push_to(&store, account, "Receipts");
+    let m = store.update(id, &undo, 4_000).unwrap().unwrap();
+    assert_eq!((m.folder, m.folders), (Some(travel), vec![travel]));
+    let p = push_to(&store, account, "Travel");
+    assert_eq!(p.folder, Some((travel, "Travel".to_owned())));
+    assert_eq!(
+        (p.remote_place, p.remote_folder),
+        (Place::Folder, Some(receipts))
+    );
+    assert_eq!((p.mailbox.as_deref(), p.uid), (Some("Receipts"), None));
+    assert!(store.pending(account, 9_000, 0).unwrap().is_empty());
+}
+
+#[test]
+fn folder_syncs_leave_a_pending_move_alone() {
+    let (mut store, account, travel, receipts) = store_with_folders(AccountKind::Imap);
+    let id = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 5, 1))
+            .unwrap(),
+    );
+    store.update(id, &file_into(receipts), 1_000).unwrap();
+
+    // Before the push: Travel still has it, Receipts doesn't yet.
+    assert_eq!(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 5, 1))
+            .unwrap(),
+        Added::Known(id)
+    );
+    store.set_folder_members(travel, &[(id, Some(5))]).unwrap();
+    assert_eq!(store.set_folder_members(receipts, &[]).unwrap(), 0);
+    let m = store.message(id).unwrap().unwrap();
+    assert_eq!((m.state, m.folder), (MessageState::Filed, Some(receipts)));
+    assert_eq!(m.folders, [receipts]);
+    let p = &store.pending(account, 9_000, 0).unwrap()[0];
+    assert_eq!((p.mailbox.as_deref(), p.uid), (Some("Travel"), Some(5)));
+
+    // After it: the server says so.
+    push_to(&store, account, "Receipts");
+    store.set_folder_members(travel, &[]).unwrap();
+    store
+        .add_folder_message(receipts, &in_folder(account, "Receipts", 9, 1))
+        .unwrap();
+    store
+        .set_folder_members(receipts, &[(id, Some(9))])
+        .unwrap();
+    let m = store.message(id).unwrap().unwrap();
+    assert_eq!((m.folder, m.folders), (Some(receipts), vec![receipts]));
+    let at = store.location(id).unwrap().unwrap();
+    assert_eq!((at.mailbox.as_deref(), at.uid), (Some("Receipts"), Some(9)));
+}
+
+#[test]
+fn gmail_label_moves_swap_labels_and_stay_put() {
+    let (mut store, account, travel, receipts) = store_with_folders(AccountKind::Gmail);
+    let all_mail = folder_id(&store, "Archive");
+    // Inbox mail labelled Travel goes to Receipts: the label stays.
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    store
+        .add_folder_message(travel, &in_folder(account, "Travel", 6, 1))
+        .unwrap();
+    let m = store
+        .update(id, &file_into(receipts), 1_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.folder, Some(receipts));
+    let mut both = m.folders.clone();
+    both.sort();
+    assert_eq!(both, [travel, receipts]);
+
+    // Syncs before the push keep both.
+    store
+        .add_folder_message(travel, &in_folder(account, "Travel", 6, 1))
+        .unwrap();
+    store.set_folder_members(travel, &[(id, Some(6))]).unwrap();
+    store.set_folder_members(receipts, &[]).unwrap();
+    let mut both = store.message(id).unwrap().unwrap().folders;
+    both.sort();
+    assert_eq!(both, [travel, receipts]);
+
+    // The move took it out of the inbox, into Receipts. Travel and All
+    // Mail still list it; neither takes it over.
+    push_to(&store, account, "Receipts");
+    store
+        .add_folder_message(travel, &in_folder(account, "Travel", 6, 1))
+        .unwrap();
+    store
+        .add_folder_message(all_mail, &in_folder(account, "Archive", 40, 1))
+        .unwrap();
+    store
+        .add_folder_message(receipts, &in_folder(account, "Receipts", 3, 1))
+        .unwrap();
+    let m = store.message(id).unwrap().unwrap();
+    assert_eq!((m.state, m.folder), (MessageState::Filed, Some(receipts)));
+    let at = store.location(id).unwrap().unwrap();
+    assert_eq!((at.mailbox.as_deref(), at.uid), (Some("Receipts"), Some(3)));
+
+    // From Receipts to Travel: Receipts' label goes, Travel's stays.
+    let m = store
+        .update(id, &file_into(travel), 2_000)
+        .unwrap()
+        .unwrap();
+    let mut left = m.folders.clone();
+    left.sort();
+    assert_eq!(left, [travel, all_mail]);
+    // Receipts still has it until the push; its sync doesn't list it again.
+    store
+        .add_folder_message(receipts, &in_folder(account, "Receipts", 3, 1))
+        .unwrap();
+    store
+        .set_folder_members(receipts, &[(id, Some(3))])
+        .unwrap();
+    assert!(
+        !store
+            .message(id)
+            .unwrap()
+            .unwrap()
+            .folders
+            .contains(&receipts)
+    );
+}
+
+#[test]
+fn undoing_done_puts_filed_mail_back_in_its_folder() {
+    let (mut store, account, travel, _) = store_with_folders(AccountKind::Imap);
+    let id = new_id(
+        store
+            .add_folder_message(travel, &in_folder(account, "Travel", 5, 1))
+            .unwrap(),
+    );
+    let done = Patch {
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    let m = store.update(id, &done, 1_000).unwrap().unwrap();
+    assert_eq!((m.folder, m.folders), (None, vec![]));
+    let p = push_to(&store, account, "Archive");
+    assert_eq!((p.place, p.remote_place), (Place::Archive, Place::Folder));
+
+    // Undone after the push, as the UI does it or as an older one did.
+    for undo in [
+        Patch {
+            state: Some(MessageState::Filed),
+            folder: Some(travel),
+            ..Default::default()
+        },
+        Patch {
+            state: Some(MessageState::Filed),
+            ..Default::default()
+        },
+    ] {
+        let m = store.update(id, &undo, 2_000).unwrap().unwrap();
+        assert_eq!((m.folder, m.folders), (Some(travel), vec![travel]));
+        let p = &store.pending(account, 9_000, 0).unwrap()[0];
+        assert_eq!((p.place, p.remote_place), (Place::Folder, Place::Archive));
+        assert_eq!(p.folder, Some((travel, "Travel".to_owned())));
+        assert_eq!((p.mailbox.as_deref(), p.uid), (Some("Archive"), None));
+        store.update(id, &done, 3_000).unwrap();
+    }
+}
+
+#[test]
+fn filing_follows_the_folder_role_and_stays_in_the_account() {
+    let (mut store, account, travel, _) = store_with_folders(AccountKind::Imap);
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    let into = |store: &mut Store, name: &str| {
+        let folder = folder_id(store, name);
+        store
+            .update(id, &file_into(folder), 1_000)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(into(&mut store, "Archive").state, MessageState::Done);
+    assert_eq!(into(&mut store, "Trash").state, MessageState::Deleted);
+    let junk = into(&mut store, "Junk");
+    assert_eq!(junk.state, MessageState::Filed);
+    assert_eq!(junk.folder, Some(folder_id(&store, "Junk")));
+
+    // Another state clears the home folder.
+    let snooze = Patch {
+        state: Some(MessageState::Snoozed),
+        snoozed_until: Some(9_000),
+        ..Default::default()
+    };
+    let m = store.update(id, &snooze, 2_000).unwrap().unwrap();
+    assert_eq!((m.folder, m.folders), (None, vec![]));
+
+    // Not another account's folder, nor one that only holds folders.
+    let other = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "me@other.com",
+            name: "Me",
+            label: "Other",
+            config: "{}",
+        })
+        .unwrap();
+    store
+        .replace_folders(
+            other.id,
+            &[RemoteFolder {
+                selectable: false,
+                ..remote("Clients", None, "Clients", None)
+            }],
+        )
+        .unwrap();
+    let clients = store
+        .folders()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.account_id == other.id)
+        .unwrap()
+        .id;
+    let err = store.update(id, &file_into(clients), 3_000).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "An email can only be moved to a folder of its own account."
+    );
+    store
+        .conn
+        .execute("UPDATE folders SET selectable = 0 WHERE id = ?1", [travel])
+        .unwrap();
+    let err = store.update(id, &file_into(travel), 3_000).unwrap_err();
+    assert_eq!(err.to_string(), "That folder only holds other folders.");
+    assert_eq!(
+        store.message(id).unwrap().unwrap().state,
+        MessageState::Snoozed
+    );
+}
+
+#[test]
+fn version_3_databases_gain_home_folders() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v3.sqlite");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(SCHEMA_2).unwrap();
+        conn.execute_batch(SCHEMA_3).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, kind, email, name, label, color, config, position)
+             VALUES (1, 'imap', 'a@b.c', 'A', 'A', '#000', '{}', 0);
+             INSERT INTO folders (id, account_id, remote_id, name, position)
+             VALUES (10, 1, 'Travel', 'Travel', 0), (11, 1, 'Graph-id', 'Clients', 1);
+             INSERT INTO messages (id, account_id, mailbox, uid, from_name, from_address,
+                 to_list, cc_list, subject, snippet, date, text_body, attachments, category,
+                 state, unread, pinned, remote_place, remote_unread, remote_pinned)
+             VALUES
+                 (1, 1, 'Travel', 5, '', '', '[]', '[]', 'IMAP', '', 0, '', '[]', 'people',
+                  'filed', 0, 0, 'folder', 0, 0),
+                 (2, 1, NULL, NULL, '', '', '[]', '[]', 'Graph', '', 0, '', '[]', 'people',
+                  'filed', 0, 0, 'folder', 0, 0),
+                 (3, 1, 'INBOX', 1, '', '', '[]', '[]', 'Inbox', '', 0, '', '[]', 'people',
+                  'inbox', 0, 0, 'inbox', 0, 0);
+             INSERT INTO folder_members (folder_id, message_id, uid)
+             VALUES (10, 1, 5), (11, 2, NULL), (10, 3, 7);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let folder = |id: i64| store.message(id).unwrap().unwrap().folder;
+    assert_eq!(
+        (folder(1), folder(2), folder(3)),
+        (Some(10), Some(11), None)
+    );
+    assert!(store.pending(1, i64::MAX, 0).unwrap().is_empty());
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

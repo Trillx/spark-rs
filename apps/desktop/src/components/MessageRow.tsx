@@ -13,7 +13,9 @@ import {
 } from "lucide-react";
 import { useEffect, useRef } from "react";
 import type { Message } from "../types";
+import { dragMessage } from "../lib/drag";
 import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
+import { recipientNames } from "../lib/recipients";
 import { hint } from "../lib/shortcuts";
 import Avatar from "./Avatar";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
@@ -41,12 +43,15 @@ export default function MessageRow({
   selected,
   actions,
   inPriorityCard = false,
+  recipients = false,
 }: {
   message: Message;
   selected: boolean;
   actions: RowActions;
   /** Rows on the peach Priority card hover in its own tint. */
   inPriorityCard?: boolean;
+  /** Sent and Drafts rows name who it's to, and show the first recipient's avatar. */
+  recipients?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -56,12 +61,16 @@ export default function MessageRow({
   const done = m.state === "done";
   const snoozed = m.state === "snoozed" && m.snoozedUntil !== undefined;
   const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
+  const to = recipients ? recipientNames(m.to) : null;
+  const weight = m.unread ? "font-semibold" : "font-medium";
   return (
     <div
       ref={ref}
       role="option"
       aria-selected={selected}
       onClick={() => actions.open(m.id)}
+      // Onto a sidebar list: a folder, Inbox, Archive, Trash or Pins.
+      onPointerDown={(e) => dragMessage(e, m)}
       className={`group grid h-[70px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 ${
         selected ? "bg-row-selected" : hover
       }`}
@@ -79,11 +88,20 @@ export default function MessageRow({
         )}
       </span>
       <span className={done ? "opacity-50" : ""}>
-        <Avatar name={m.from} account={m.account} />
+        <Avatar name={to?.first ?? m.from} account={m.account} />
       </span>
       <div className={`min-w-0 pl-2.5 ${done ? "text-text-2" : ""}`}>
         <div className="flex h-5 items-center gap-1">
-          <span className={`truncate text-sm leading-5 ${m.unread ? "font-semibold" : "font-medium"}`}>{m.from}</span>
+          {to ? (
+            <span className="flex min-w-0 items-center gap-1 text-sm leading-5" data-tip={m.to?.join(", ")}>
+              <span className={`truncate ${weight}`}>
+                {to.shown.length ? `To: ${to.shown.join(", ")}` : <i className="font-normal">No recipients</i>}
+              </span>
+              {to.more > 0 && <span className="shrink-0 text-[13px] text-text-2">+{to.more}</span>}
+            </span>
+          ) : (
+            <span className={`truncate text-sm leading-5 ${weight}`}>{m.from}</span>
+          )}
           <span
             data-tip={snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : undefined}
             className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${

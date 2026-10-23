@@ -4,16 +4,18 @@
 
 pub mod attachment;
 pub mod draft;
+pub mod drafts;
 pub mod engine;
 pub mod graph;
 pub mod imap;
 pub mod oauth;
 pub mod parse;
 pub mod smtp;
+pub mod utf7;
 
 use std::fmt::Display;
 
-pub use engine::{AccountConfig, Engine, Secrets};
+pub use engine::{AccountConfig, Engine, Round, Secrets};
 
 /// Errors are phrased for the user; they never contain passwords or tokens.
 #[derive(Debug, thiserror::Error)]

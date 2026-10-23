@@ -1,0 +1,14 @@
+[
+  { "id": 101, "account": "personal", "name": "Travel", "members": [14] },
+  { "id": 102, "account": "personal", "name": "Finance", "members": [7] },
+  { "id": 103, "account": "personal", "name": "Taxes", "parent": 102, "members": [] },
+  { "id": 104, "account": "personal", "name": "Family", "members": [4] },
+  { "id": 105, "account": "personal", "name": "Sent Mail", "role": "sent", "members": [18, 20] },
+  { "id": 107, "account": "personal", "name": "Drafts", "role": "drafts", "members": [22] },
+  { "id": 106, "account": "personal", "name": "Spam", "role": "spam", "members": [] },
+  { "id": 201, "account": "work", "name": "Projects", "members": [15] },
+  { "id": 202, "account": "work", "name": "Q4 roadmap", "parent": 201, "members": [3] },
+  { "id": 203, "account": "work", "name": "Clients", "members": [5] },
+  { "id": 204, "account": "work", "name": "Sent Items", "role": "sent", "members": [19] },
+  { "id": 205, "account": "work", "name": "Drafts", "role": "drafts", "members": [21] }
+]

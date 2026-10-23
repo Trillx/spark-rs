@@ -188,6 +188,7 @@ mod tests {
             snoozed_until: None,
             from: "Dana Whitfield".into(),
             address: "dana@example.com".into(),
+            to: Vec::new(),
             timestamp: 1_790_000_000_000,
             subject: "Q4 budget review".into(),
             snippet: "Can you send".into(),
@@ -198,6 +199,8 @@ mod tests {
                 "Thanks, Dana".into(),
             ]),
             attachment: None,
+            folders: Vec::new(),
+            folder: None,
         }
     }
 

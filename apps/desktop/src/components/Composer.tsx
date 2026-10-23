@@ -6,11 +6,12 @@ import {
   Maximize2,
   Minimize2,
   Paperclip,
+  Trash2,
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { describeFiles, onFileDrag, pickFiles } from "../api";
-import type { AccountId, LocalFile, OutgoingAttachment } from "../types";
+import type { AccountId, LocalFile, OutgoingAttachment, OutgoingDraft } from "../types";
 import { useAccounts } from "../lib/accounts";
 import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
@@ -41,6 +42,11 @@ export interface Draft {
   forward?: boolean;
   /** Files from disk, and a forwarded message's own attachments. */
   attachments: OutgoingAttachment[];
+  /** The saved draft this edits (opened from Drafts, or saved before). */
+  draftId?: number;
+  /** A reply's threading when its original isn't stored here. */
+  inReplyTo?: string;
+  references?: string;
 }
 
 export function emptyDraft(from: AccountId): Draft {
@@ -65,27 +71,77 @@ export function draftHasContent(d: Draft) {
   return [d.to, d.cc, d.bcc, d.subject, d.body].some((s) => s.trim()) || d.attachments.length > 0;
 }
 
+/** What a saved draft keeps, to tell whether there's anything new to save. */
+export function draftKey(d: Draft) {
+  return JSON.stringify([d.from, d.to, d.cc, d.bcc, d.subject, d.body, d.attachments]);
+}
+
+/** The draft as the backend takes it, to save or to send at `sendAt`. */
+export function outgoingDraft(d: Draft, sendAt: number, draftId = d.draftId): OutgoingDraft {
+  return {
+    account: d.from,
+    to: d.to,
+    cc: d.cc,
+    bcc: d.bcc,
+    subject: d.subject,
+    body: d.body,
+    // A forward isn't a reply; it only carries replyTo for "Mark as Done after sending".
+    replyTo: d.forward ? undefined : d.replyTo,
+    sendAt,
+    attachments: d.attachments,
+    draftId,
+    inReplyTo: d.inReplyTo,
+    references: d.references,
+  };
+}
+
+/** A draft from Drafts, back in the composer. */
+export function savedDraft(saved: OutgoingDraft): Draft {
+  return {
+    ...emptyDraft(saved.account),
+    title: "Draft",
+    to: saved.to,
+    cc: saved.cc,
+    bcc: saved.bcc,
+    showCc: saved.cc.trim() !== "",
+    showBcc: saved.bcc.trim() !== "",
+    subject: saved.subject,
+    body: saved.body,
+    replyTo: saved.replyTo,
+    attachments: saved.attachments,
+    draftId: saved.draftId,
+    inReplyTo: saved.inReplyTo,
+    references: saved.references,
+  };
+}
+
 /**
  * Compact floating composer, with a toggle that fills the reading pane.
  * Plain text only for now; the rich editor comes later.
  */
 export default function Composer({
   draft,
+  saved = false,
   full,
   fullStyle,
   onChange,
   onToggleFull,
   onClose,
+  onDiscard,
   onSend,
   onError,
 }: {
   draft: Draft;
+  /** It's in Drafts as it stands. */
+  saved?: boolean;
   full: boolean;
   /** Where the full-pane composer sits (the reading pane's box). */
   fullStyle: CSSProperties;
   onChange: (patch: Partial<Draft>) => void;
   onToggleFull: () => void;
+  /** Closing keeps it in Drafts. */
   onClose: () => void;
+  onDiscard: () => void;
   onSend: () => void;
   onError: (text: string) => void;
 }) {
@@ -164,7 +220,10 @@ export default function Composer({
       }`}
     >
       <div className="flex h-10 shrink-0 items-center gap-1 border-b border-hairline pl-4 pr-1.5">
-        <span className="flex-1 truncate text-[13px] font-semibold">{draft.title}</span>
+        <span className="flex-1 truncate text-[13px] font-semibold">
+          {draft.title}
+          {saved && <span className="ml-2 text-xs font-normal text-text-3">Saved</span>}
+        </span>
         <IconButton title={full ? "Compact view" : "Full screen"} onClick={onToggleFull}>
           {full ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
         </IconButton>
@@ -337,6 +396,9 @@ export default function Composer({
         </IconButton>
 
         <div className="ml-auto flex items-center gap-1.5">
+          <IconButton title="Delete draft" onClick={onDiscard}>
+            <Trash2 size={17} />
+          </IconButton>
           <Dropdown
             direction="up"
             align="end"

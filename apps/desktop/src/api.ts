@@ -2,12 +2,15 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import demo from "../demo/mailbox.json";
+import demoFolders from "../demo/folders.json";
 import type {
   AccountId,
   AgentAccess,
   AgentSendingEvent,
   AgentsView,
   AccountView,
+  FolderRole,
+  FolderView,
   LocalFile,
   Message,
   MessageContent,
@@ -97,10 +100,53 @@ export function getMessageContent(id: number): Promise<MessageContent> {
   return Promise.resolve({
     text: m.body ?? [],
     html: null,
-    to: ["You"],
+    to: m.to?.length ? m.to : ["You"],
     cc: [],
     attachments: m.attachment ? [{ name: m.attachment, mime: "", size: 0 }] : [],
   });
+}
+
+// ---- folders ----
+
+/** Every account's server folders and labels, accounts in order. */
+export function listFolders(): Promise<FolderView[]> {
+  if (isTauri()) return invoke("list_folders");
+  return Promise.resolve(structuredClone(BROWSER_FOLDERS));
+}
+
+/** The folders to keep in sync: those on the sidebar or open. New ones sync at once. */
+export function watchFolders(ids: number[]): Promise<void> {
+  if (isTauri()) return invoke("watch_folders", { ids });
+  return Promise.resolve();
+}
+
+/** Syncs these folders now, e.g. the one just opened. Results arrive as `mailbox-changed`. */
+export function syncFolders(ids: number[]): Promise<void> {
+  if (isTauri()) return invoke("sync_folders", { ids });
+  return Promise.resolve();
+}
+
+/** Lists the folders on the servers again; changes arrive as `folders-changed`. */
+export function refreshFolders(): Promise<void> {
+  if (isTauri()) return invoke("refresh_folders");
+  return Promise.resolve();
+}
+
+/** Creates a folder in `account`, inside `parent` or at the top. */
+export function createFolder(account: AccountId, parent: number | undefined, name: string): Promise<FolderView> {
+  if (isTauri()) return invoke("create_folder", { account, parent: parent ?? null, name });
+  return Promise.reject(DEMO_FOLDERS);
+}
+
+export function renameFolder(id: number, name: string): Promise<void> {
+  if (isTauri()) return invoke("rename_folder", { id, name });
+  return Promise.reject(DEMO_FOLDERS);
+}
+
+/** Deletes the folder, its subfolders and their mail on the server. */
+export function deleteFolder(id: number): Promise<void> {
+  if (isTauri()) return invoke("delete_folder", { id });
+  return Promise.reject(DEMO_FOLDERS);
 }
 
 // ---- attachments ----
@@ -156,6 +202,10 @@ export function updateMessage(id: number, patch: MessagePatch): Promise<Message>
   if (isTauri()) return invoke("update_message", { id, patch });
   const index = browserMailbox.findIndex((m) => m.id === id);
   if (index < 0) return Promise.reject(new Error(`no message ${id}`));
+  const folder = BROWSER_FOLDERS.find((f) => f.id === patch.folder);
+  if (patch.folder !== undefined && folder?.account !== browserMailbox[index].account) {
+    return Promise.reject(`No folder ${patch.folder} in this account.`);
+  }
   browserMailbox[index] = patched(browserMailbox[index], patch);
   return Promise.resolve(structuredClone(browserMailbox[index]));
 }
@@ -166,6 +216,18 @@ export function patched(message: Message, patch: MessagePatch): Message {
   if (patch.state !== undefined) {
     next.state = patch.state;
     if (patch.state !== "snoozed") delete next.snoozedUntil;
+    // Out of its folder, e.g. to the Archive or back to the Inbox.
+    if (patch.state !== "filed" && message.folder !== undefined) {
+      next.folders = message.folders?.filter((id) => id !== message.folder);
+      delete next.folder;
+    }
+  }
+  if (patch.folder !== undefined) {
+    next.state = "filed";
+    delete next.snoozedUntil;
+    const others = next.folders?.filter((id) => id !== next.folder && id !== patch.folder) ?? [];
+    next.folders = [...others, patch.folder];
+    next.folder = patch.folder;
   }
   if (patch.snoozedUntil !== undefined) next.snoozedUntil = patch.snoozedUntil;
   if (patch.unread !== undefined) next.unread = patch.unread;
@@ -177,16 +239,59 @@ export function patched(message: Message, patch: MessagePatch): Message {
 
 // ---- sending ----
 
-/** Queues a message to go out at `draft.sendAt`. Returns its outbox id. */
+/** Queues a message to go out at `draft.sendAt`. Returns its outbox id. A saved draft it came from leaves Drafts. */
 export function sendMessage(draft: OutgoingDraft): Promise<number> {
   if (isTauri()) return invoke("send_message", { draft });
-  return Promise.resolve(++browserOutbox);
+  const id = ++browserOutbox;
+  const i = browserMailbox.findIndex((m) => m.id === draft.draftId && isBrowserDraft(m));
+  if (i >= 0) browserSending.set(id, browserMailbox.splice(i, 1)[0]);
+  return Promise.resolve(id);
 }
 
-/** True if it was cancelled before going out. */
+/** True if it was cancelled before going out; a saved draft it came from is back in Drafts. */
 export function cancelSend(id: number): Promise<boolean> {
   if (isTauri()) return invoke("cancel_send", { id });
+  const draft = browserSending.get(id);
+  browserSending.delete(id);
+  if (draft) browserMailbox.push(draft);
   return Promise.resolve(true);
+}
+
+// ---- drafts ----
+
+/** Saves the composer's draft in its account's Drafts: here at once, on the server with the next sync. Resolves to its id. */
+export function saveDraft(draft: OutgoingDraft): Promise<number> {
+  if (isTauri()) return invoke("save_draft", { draft });
+  return Promise.resolve(saveBrowserDraft(draft));
+}
+
+/** A draft from Drafts, for the composer. */
+export function openDraft(id: number): Promise<OutgoingDraft> {
+  if (isTauri()) return invoke("open_draft", { id });
+  const saved = browserDrafts.get(id);
+  if (saved) return Promise.resolve(structuredClone(saved));
+  const m = browserMailbox.find((x) => x.id === id && isBrowserDraft(x));
+  if (!m) return Promise.reject("That draft is gone.");
+  return Promise.resolve({
+    account: m.account,
+    to: (m.to ?? []).join(", "),
+    cc: "",
+    bcc: "",
+    subject: m.subject,
+    body: (m.body ?? []).join("\n\n"),
+    sendAt: 0,
+    attachments: [],
+    draftId: id,
+  });
+}
+
+/** Deletes a draft, here and on the server. */
+export function discardDraft(id: number): Promise<void> {
+  if (isTauri()) return invoke("discard_draft", { id });
+  const i = browserMailbox.findIndex((m) => m.id === id && isBrowserDraft(m));
+  if (i >= 0) browserMailbox.splice(i, 1);
+  browserDrafts.delete(id);
+  return Promise.resolve();
 }
 
 /** Opens an http(s) or mailto link in the system's handler. */
@@ -240,6 +345,9 @@ function on<T>(event: string, handler: (payload: T) => void): () => void {
 /** Messages were added, changed or removed: reload `listMessages`. */
 export const onMailboxChanged = (handler: () => void) => on<null>("mailbox-changed", handler);
 
+/** The folder list changed, or a folder synced for the first time: reload `listFolders`. */
+export const onFoldersChanged = (handler: () => void) => on<null>("folders-changed", handler);
+
 /** An account was added, removed or renamed (demo mode may have ended): reload `listAccounts`. */
 export const onAccountsChanged = (handler: () => void) => on<null>("accounts-changed", handler);
 
@@ -260,6 +368,7 @@ export const onOpenMessage = (handler: (id: number) => void) => on("open-message
 
 const DESKTOP_ONLY = "Run the desktop app to add accounts.";
 const DEMO_FILES = "This is demo mail: its attachments are only names.";
+const DEMO_FOLDERS = "These are demo folders: add an account to manage your own.";
 
 /** Same as the Rust side's demo accounts. */
 const BROWSER_ACCOUNTS: AccountView[] = [
@@ -289,6 +398,17 @@ const BROWSER_ACCOUNTS: AccountView[] = [
 
 const DEMO_ACCOUNT_IDS: Record<string, AccountId> = { personal: 1, work: 2 };
 
+/** Like demo::folders on the Rust side. */
+const BROWSER_FOLDERS: FolderView[] = demoFolders.map((f) => ({
+  id: f.id,
+  account: DEMO_ACCOUNT_IDS[f.account],
+  name: f.name,
+  parent: "parent" in f ? f.parent : undefined,
+  role: "role" in f ? (f.role as FolderRole) : undefined,
+  selectable: true,
+  synced: true,
+}));
+
 // Like DemoMailbox::load: each entry's age becomes a timestamp relative to now.
 const loadedAt = Date.now();
 const browserMailbox: Message[] = demo.map(({ ageMinutes, account, ...m }) => ({
@@ -300,9 +420,51 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, ...m }) => ({
   ...m,
   account: DEMO_ACCOUNT_IDS[account],
   timestamp: loadedAt - ageMinutes * 60_000,
+  folders: demoFolders.filter((f) => (f.members as number[]).includes(m.id)).map((f) => f.id),
 })) as Message[];
 
 let browserOutbox = 0;
+
+/** Drafts saved in the preview, as the composer had them. */
+const browserDrafts = new Map<number, OutgoingDraft>();
+/** Drafts out of Drafts while their send can be undone, by outbox id. */
+const browserSending = new Map<number, Message>();
+
+const isBrowserDraft = (m: Message) =>
+  m.folders?.some((id) => BROWSER_FOLDERS.some((f) => f.id === id && f.role === "drafts")) ?? false;
+
+/** Like DemoMailbox::save_draft. */
+function saveBrowserDraft(draft: OutgoingDraft): number {
+  const folder = BROWSER_FOLDERS.find((f) => f.account === draft.account && f.role === "drafts");
+  const i = browserMailbox.findIndex((m) => m.id === draft.draftId && isBrowserDraft(m));
+  const id = i >= 0 ? draft.draftId! : Math.max(0, ...browserMailbox.map((m) => m.id)) + 1;
+  const saved: Message = {
+    id,
+    account: draft.account,
+    category: "people",
+    state: "filed",
+    unread: false,
+    pinned: false,
+    priority: false,
+    screening: false,
+    from: "Me",
+    address: BROWSER_ACCOUNTS.find((a) => a.id === draft.account)?.email ?? "",
+    to: draft.to
+      .split(/[,;]/)
+      .map((r) => r.trim())
+      .filter(Boolean),
+    timestamp: Date.now(),
+    subject: draft.subject.trim(),
+    snippet: draft.body.replace(/\s+/g, " ").trim().slice(0, 200),
+    body: draft.body.split("\n\n"),
+    attachment: draft.attachments[0]?.name,
+    folders: folder ? [folder.id] : [],
+  };
+  if (i >= 0) browserMailbox.splice(i, 1);
+  browserMailbox.push(saved);
+  browserDrafts.set(id, { ...structuredClone(draft), draftId: id });
+  return id;
+}
 
 /** The Rust side's defaults. */
 let browserPrefs: Prefs = { notify: "people", sound: true, keepRunning: true, openAtLogin: false };

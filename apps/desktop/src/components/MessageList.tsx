@@ -4,6 +4,7 @@ import {
   CheckCheck,
   ChevronDown,
   CircleCheck,
+  FolderSearch,
   Pen,
   Search,
   SearchX,
@@ -59,6 +60,10 @@ interface Props {
   /** Only the demo accounts exist: a notice offers to add real ones. */
   demo: boolean;
   onAddAccounts: () => void;
+  /** The list's server folders haven't synced yet. */
+  loading: boolean;
+  /** Saves the search as a smart folder. */
+  onSaveSearch: (query: string) => void;
 }
 
 const SEARCH_TIPS = [
@@ -71,7 +76,14 @@ export default function MessageList(props: Props) {
   const { model, view, selectedId, rows } = props;
   const searching = view.search !== null;
   const row = (m: Message, inPriorityCard = false) => (
-    <MessageRow key={m.id} message={m} selected={m.id === selectedId} actions={rows} inPriorityCard={inPriorityCard} />
+    <MessageRow
+      key={m.id}
+      message={m}
+      selected={m.id === selectedId}
+      actions={rows}
+      inPriorityCard={inPriorityCard}
+      recipients={model.recipients}
+    />
   );
 
   return (
@@ -137,7 +149,9 @@ export default function MessageList(props: Props) {
                   );
               }
             })}
-            {!searching && model.blocks.length === 0 && <EmptyList inbox={view.folder === "inbox"} />}
+            {!searching && model.blocks.length === 0 && (
+              <EmptyList inbox={view.folder === "inbox"} loading={props.loading} />
+            )}
           </>
         )}
       </div>
@@ -158,6 +172,7 @@ function Toolbar({
   onSearchClose,
   onSearchKeyDown,
   onCompose,
+  onSaveSearch,
   searchRef,
 }: Props) {
   const iconButton = "btn btn-ghost btn-sm btn-square text-text-2 hover:text-base-content";
@@ -193,6 +208,16 @@ function Toolbar({
             </button>
           )}
         </label>
+        {view.search.trim() && (
+          <button
+            className={iconButton}
+            data-tip="Save as Smart Folder"
+            aria-label="Save as Smart Folder"
+            onClick={() => onSaveSearch(view.search!.trim())}
+          >
+            <FolderSearch size={18} />
+          </button>
+        )}
       </div>
     );
   }
@@ -362,7 +387,15 @@ function NoResults() {
   );
 }
 
-function EmptyList({ inbox }: { inbox: boolean }) {
+function EmptyList({ inbox, loading }: { inbox: boolean; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="flex flex-col items-center px-6 pt-20 text-center text-sm text-text-2">
+        <span className="loading loading-spinner loading-md text-text-3" />
+        <p className="mt-3">Loading this folder…</p>
+      </div>
+    );
+  }
   return (
     <div className="flex flex-col items-center px-6 pt-20 text-center">
       <span className="grid size-24 place-items-center rounded-full bg-primary/10 text-primary">
