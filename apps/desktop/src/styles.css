@@ -1,86 +1,122 @@
 @import "tailwindcss";
 
-/* Only the custom themes below; they carry default / prefersdark. */
+/* Only the custom themes below, and no modal (the app has its own dialogs).
+   Both would add :root:has() rules (daisyUI's modal scroll lock, and
+   daisyui/theme's theme-controller selectors), which make Blink restyle the
+   whole page on every DOM change: with a long message list, each keystroke. */
 @plugin "daisyui" {
   themes: false;
+  exclude: modal;
 }
 
-@plugin "daisyui/theme" {
-  name: "spark-light";
-  default: true;
-  prefersdark: false;
-  color-scheme: light;
+/* The daisyUI themes, as daisyui/theme makes them minus the theme-controller
+   selectors. `data-theme` (lib/theme.ts) picks one, otherwise the system does. */
+@layer base {
+  :where(:root),
+  [data-theme="spark-light"] {
+    color-scheme: light;
+    --color-base-100: #ffffff;
+    --color-base-200: #f5f6f8;
+    --color-base-300: #edeff2;
+    --color-base-content: #141414;
 
-  --color-base-100: #ffffff;
-  --color-base-200: #f5f6f8;
-  --color-base-300: #edeff2;
-  --color-base-content: #141414;
+    --color-primary: #007cff;
+    --color-primary-content: #ffffff;
+    --color-secondary: #6866f7;
+    --color-secondary-content: #ffffff;
+    --color-accent: #4139f5;
+    --color-accent-content: #ffffff;
+    --color-neutral: #282a2e;
+    --color-neutral-content: #aeb8c5;
 
-  --color-primary: #007cff;
-  --color-primary-content: #ffffff;
-  --color-secondary: #6866f7;
-  --color-secondary-content: #ffffff;
-  --color-accent: #4139f5;
-  --color-accent-content: #ffffff;
-  --color-neutral: #282a2e;
-  --color-neutral-content: #aeb8c5;
+    --color-info: #157efb;
+    --color-info-content: #ffffff;
+    --color-success: #01b363;
+    --color-success-content: #ffffff;
+    --color-warning: #ff8a00;
+    --color-warning-content: #ffffff;
+    --color-error: #e43535;
+    --color-error-content: #ffffff;
 
-  --color-info: #157efb;
-  --color-info-content: #ffffff;
-  --color-success: #01b363;
-  --color-success-content: #ffffff;
-  --color-warning: #ff8a00;
-  --color-warning-content: #ffffff;
-  --color-error: #e43535;
-  --color-error-content: #ffffff;
+    --radius-selector: 0.375rem;
+    --radius-field: 0.375rem;
+    --radius-box: 0.5rem;
+    --size-selector: 0.25rem;
+    --size-field: 0.25rem;
+    --border: 1px;
+    --depth: 0;
+    --noise: 0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+      color-scheme: dark;
+      --color-base-100: #1f2124;
+      --color-base-200: #282a2e;
+      --color-base-300: #2f3237;
+      --color-base-content: #dee3eb;
 
-  --radius-selector: 0.375rem;
-  --radius-field: 0.375rem;
-  --radius-box: 0.5rem;
-  --size-selector: 0.25rem;
-  --size-field: 0.25rem;
-  --border: 1px;
-  --depth: 0;
-  --noise: 0;
-}
+      --color-primary: #439fff;
+      --color-primary-content: #ffffff;
+      --color-secondary: #8c8aff;
+      --color-secondary-content: #141414;
+      --color-accent: #6b5cf6;
+      --color-accent-content: #ffffff;
+      --color-neutral: #282a2e;
+      --color-neutral-content: #aeb8c5;
 
-@plugin "daisyui/theme" {
-  name: "spark-dark";
-  default: false;
-  prefersdark: true;
-  color-scheme: dark;
+      --color-info: #46a2ff;
+      --color-info-content: #141414;
+      --color-success: #42be20;
+      --color-success-content: #141414;
+      --color-warning: #ff8a00;
+      --color-warning-content: #141414;
+      --color-error: #e04242;
+      --color-error-content: #ffffff;
 
-  --color-base-100: #1f2124;
-  --color-base-200: #282a2e;
-  --color-base-300: #2f3237;
-  --color-base-content: #dee3eb;
+      --radius-selector: 0.375rem;
+      --radius-field: 0.375rem;
+      --radius-box: 0.5rem;
+      --size-selector: 0.25rem;
+      --size-field: 0.25rem;
+      --border: 1px;
+      --depth: 0;
+      --noise: 0;
+    }
+  }
+  [data-theme="spark-dark"] {
+    color-scheme: dark;
+    --color-base-100: #1f2124;
+    --color-base-200: #282a2e;
+    --color-base-300: #2f3237;
+    --color-base-content: #dee3eb;
 
-  --color-primary: #439fff;
-  --color-primary-content: #ffffff;
-  --color-secondary: #8c8aff;
-  --color-secondary-content: #141414;
-  --color-accent: #6b5cf6;
-  --color-accent-content: #ffffff;
-  --color-neutral: #282a2e;
-  --color-neutral-content: #aeb8c5;
+    --color-primary: #439fff;
+    --color-primary-content: #ffffff;
+    --color-secondary: #8c8aff;
+    --color-secondary-content: #141414;
+    --color-accent: #6b5cf6;
+    --color-accent-content: #ffffff;
+    --color-neutral: #282a2e;
+    --color-neutral-content: #aeb8c5;
 
-  --color-info: #46a2ff;
-  --color-info-content: #141414;
-  --color-success: #42be20;
-  --color-success-content: #141414;
-  --color-warning: #ff8a00;
-  --color-warning-content: #141414;
-  --color-error: #e04242;
-  --color-error-content: #ffffff;
+    --color-info: #46a2ff;
+    --color-info-content: #141414;
+    --color-success: #42be20;
+    --color-success-content: #141414;
+    --color-warning: #ff8a00;
+    --color-warning-content: #141414;
+    --color-error: #e04242;
+    --color-error-content: #ffffff;
 
-  --radius-selector: 0.375rem;
-  --radius-field: 0.375rem;
-  --radius-box: 0.5rem;
-  --size-selector: 0.25rem;
-  --size-field: 0.25rem;
-  --border: 1px;
-  --depth: 0;
-  --noise: 0;
+    --radius-selector: 0.375rem;
+    --radius-field: 0.375rem;
+    --radius-box: 0.5rem;
+    --size-selector: 0.25rem;
+    --size-field: 0.25rem;
+    --border: 1px;
+    --depth: 0;
+    --noise: 0;
+  }
 }
 
 /* Spark-specific tokens that daisyUI has no slot for. */

@@ -1433,7 +1433,8 @@ export default function App() {
 
   // ---- layout ----
 
-  const rows: RowActions = {
+  // Stable, so typing in the composer doesn't re-render every (memoized) row.
+  const rows = useLatest<RowActions>({
     open: openListed,
     done: actions.done,
     pin: actions.pin,
@@ -1443,7 +1444,7 @@ export default function App() {
     priority: actions.priority,
     read: actions.read,
     more: (m) => setPalette({ kind: "actions", targetId: m.id }),
-  };
+  });
 
   const threadActions: ThreadActions = {
     ...actions,
@@ -1690,4 +1691,22 @@ function listedIds(list: ListModel) {
     else if (block.kind !== "period") for (const m of block.items) ids.add(m.id);
   }
   return ids;
+}
+
+/**
+ * `fns` with an identity that lasts across renders, each function calling
+ * the latest render's version, so memoized children skip renders that would
+ * only hand them new closures.
+ */
+function useLatest<T extends object>(fns: T): T {
+  const latest = useRef(fns);
+  latest.current = fns;
+  const [stable] = useState(() => {
+    const call =
+      (key: string) =>
+      (...args: unknown[]) =>
+        (latest.current as Record<string, (...args: unknown[]) => unknown>)[key](...args);
+    return Object.fromEntries(Object.keys(fns).map((key) => [key, call(key)])) as T;
+  });
+  return stable;
 }

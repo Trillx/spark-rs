@@ -11,7 +11,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import type { Message } from "../types";
 import { dragMessage } from "../lib/drag";
 import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
@@ -36,9 +36,12 @@ export interface RowActions {
 /**
  * Split-view row, about 70px: unread dot, 26px avatar with the
  * account ring, sender / subject / snippet. Hover shows a Done circle in
- * the leading column and swaps the date for the row actions.
+ * the leading column and swaps the date for the row actions. Memoized: a
+ * list has thousands, and most renders change none of them.
  */
-export default function MessageRow({
+export default memo(MessageRow);
+
+function MessageRow({
   message: m,
   selected,
   actions,
