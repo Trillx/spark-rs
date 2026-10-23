@@ -2,6 +2,8 @@
 
 This repo is worked on from more than one machine (a Windows ARM laptop and a Linux server). The only thing they share is git.cafe (`origin`, `michael/spark-rs`), so work that isn't pushed doesn't exist on the other machine.
 
+GitHub (`Trillx/spark-rs`) is a read-only mirror of `main`, there for release downloads. Never push to it: the mirror workflow overwrites it from git.cafe. Releases are cut by bumping the app version on `main` (see "Releases" in the README).
+
 ## Starting a session
 
 - Run `git fetch origin` and `git status -sb`. Claude Code does this for you: the SessionStart hook in `.claude/settings.json` (`.claude/hooks/git-sync.sh`) fetches, fast-forwards a clean checkout that's behind, and reports anything else.

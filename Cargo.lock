@@ -4103,6 +4103,7 @@ dependencies = [
  "spark-agent",
  "spark-ai",
  "spark-store",
+ "static_vcruntime",
  "tokio",
  "tokio-rustls",
  "webpki-roots",

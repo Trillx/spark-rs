@@ -15,3 +15,6 @@ spark-store = { version = "0.1.0", path = "../../crates/store" }
 tokio = { version = "1.54.1", features = ["rt", "net", "io-std", "io-util", "time", "macros"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 webpki-roots = "1.0.10"
+
+[build-dependencies]
+static_vcruntime = "3.0.0"

@@ -1,0 +1,38 @@
+# Copies main from GitCafe, where development happens, to the GitHub mirror,
+# which exists for its release downloads. GitHub only ever receives what
+# GitCafe has: anything pushed to the mirror directly is overwritten.
+#
+# Pushes with a deploy key (secret MIRROR_DEPLOY_KEY) rather than GITHUB_TOKEN,
+# which can't update workflow files and whose pushes don't trigger the release
+# workflow.
+name: Mirror
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mirror
+
+permissions: {}
+
+jobs:
+  mirror:
+    if: github.repository == 'Trillx/spark-rs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Push GitCafe main to GitHub
+        env:
+          DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror
+          chmod 600 ~/.ssh/mirror
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > ~/.ssh/known_hosts
+          git init -q --bare mirror.git
+          git -C mirror.git fetch -q https://git.cafe/michael/spark-rs.git +refs/heads/main:refs/heads/main
+          GIT_SSH_COMMAND='ssh -i ~/.ssh/mirror -o IdentitiesOnly=yes' \
+            git -C mirror.git push --force "git@github.com:$GITHUB_REPOSITORY.git" main

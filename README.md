@@ -2,10 +2,18 @@
 
 # spark-rs
 
-A personal, Spark-style email client with a Rust core. First target: Windows
-on ARM (`aarch64-pc-windows-msvc`).
+A personal, Spark-style email client with a Rust core, for Windows on ARM
+(`aarch64-pc-windows-msvc`), the first target, and Windows x64.
 
 Created in [T3 Code](https://t3.codes).
+
+## Download
+
+Releases are on the GitHub mirror:
+<https://github.com/Trillx/spark-rs/releases>. Take the `windows-arm64` zip
+for Windows on ARM or `windows-x64` for Intel and AMD, unzip it, and run
+`spark-desktop.exe`. The exes aren't code-signed, so SmartScreen may warn the
+first time (More info → Run anyway).
 
 ## Accounts
 
@@ -217,6 +225,10 @@ SPARK_CROSS_DOCKER_ARGS='--network spark-test -e SPARK_TEST_GREENMAIL=spark-gree
 # Windows on ARM
 tools/cross/run.sh cargo xwin build --release --target aarch64-pc-windows-msvc -p spark-desktop -p spark-cli
 # → target/aarch64-pc-windows-msvc/release/{spark-desktop,spark-cli}.exe
+
+# Windows x64
+tools/cross/run.sh cargo xwin build --release --target x86_64-pc-windows-msvc -p spark-desktop -p spark-cli
+# → target/x86_64-pc-windows-msvc/release/{spark-desktop,spark-cli}.exe
 ```
 
 `spark-desktop.exe` is a single file with the UI embedded; it needs the
@@ -256,3 +268,19 @@ Central) and set `SPARK_TEST_GREENMAIL=127.0.0.1` before `cargo.cmd test`.
 TLS uses rustls with the aws-lc-rs backend. Don't switch it to `ring`: ring's
 build forces plain `clang` on ARM64 Windows, which fails with cargo-xwin's
 MSVC-style flags.
+
+## Releases
+
+Development happens on GitCafe (<https://git.cafe/michael/spark-rs>). GitHub
+(<https://github.com/Trillx/spark-rs>) is a read-only mirror that exists for
+its release downloads: every 15 minutes `.github/workflows/mirror.yml` copies
+`main` across, and anything pushed to GitHub directly is overwritten.
+
+To release, bump the version in `apps/desktop/src-tauri/tauri.conf.json`,
+`apps/desktop/src-tauri/Cargo.toml` and `apps/desktop/package.json` (they must
+match) and push to `main`. When that commit reaches GitHub,
+`.github/workflows/release.yml` builds both Windows targets, runs
+`spark-cli doctor` on a Windows ARM64 and a Windows x64 machine, and publishes
+the zips as release `v<version>`, with the commit subjects since the previous
+release as its notes. To run the mirror or the release without waiting, use
+`gh workflow run mirror -R Trillx/spark-rs` (or `release`).
