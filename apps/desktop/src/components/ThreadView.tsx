@@ -24,7 +24,7 @@ import {
 import { Fragment, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { QUICK_REPLIES, SUMMARY_STYLES, type QuickReply, type SummaryStyle } from "../ai";
 import type { AccountView, Message, MessageContent } from "../types";
-import { useAccount } from "../lib/accounts";
+import { isFromYou, useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
 import { allowRemoteImages, remoteImagesAllowed, useInlineImages, useMessageContent } from "../lib/content";
 import {
@@ -517,7 +517,7 @@ function MessageCard({
 }: {
   message: Message;
   showReplyBar: boolean;
-  /** The quick replies, under the latest email unless you sent it. */
+  /** The quick replies, under the latest email. */
   quickReplies: boolean;
   /** Clicking the header collapses the card, in a conversation of several. */
   onCollapse?: () => void;
@@ -526,7 +526,8 @@ function MessageCard({
   const account = useAccount(m.account);
   const [state, retry] = useMessageContent(m.id);
   const content = state.status === "ready" ? state.content : null;
-  const fromYou = account !== undefined && m.address.toLowerCase() === account.email.toLowerCase();
+  // As in Spark, quick replies are for personal email that someone else sent.
+  const offerQuickReplies = quickReplies && m.category === "people" && !isFromYou(m, account);
   return (
     <article data-message={m.id} className="scroll-mt-2 rounded-2xl border border-hairline bg-card">
       <header
@@ -586,7 +587,7 @@ function MessageCard({
       )}
       {showReplyBar && (
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
-          {quickReplies && !fromYou && (
+          {offerQuickReplies && (
             <>
               {QUICK_REPLIES.map(({ key, label }) => (
                 <button
