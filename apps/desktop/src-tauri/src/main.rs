@@ -67,6 +67,7 @@ fn main() {
             mailbox::open_attachment,
             mailbox::save_attachment,
             mailbox::save_all_attachments,
+            mailbox::inline_images,
             mailbox::pick_files,
             mailbox::describe_files,
             ai::get_ai_settings,

@@ -19,7 +19,9 @@ use spark_store::{
     RemoteFolder, Store,
 };
 
-use crate::attachment::{AttachmentData, mime_for};
+use crate::attachment::{
+    AttachmentData, INLINE_IMAGE_MAX, INLINE_TOTAL_MAX, InlineImage, cid_key, mime_for,
+};
 use crate::draft::{Draft, recipients};
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::{Error, Result};
@@ -573,6 +575,98 @@ impl Graph {
                 })
             })
             .collect())
+    }
+
+    /// The images of message `id` whose Content-IDs (as `cid_key` gives
+    /// them) are in `wanted`. Inline attachments are tried first; other
+    /// images only if some are still missing, as a few mailers send them so.
+    pub async fn inline_images(&self, id: &str, wanted: &[String]) -> Result<Vec<InlineImage>> {
+        #[derive(Deserialize)]
+        struct Page {
+            value: Vec<Listed>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Listed {
+            id: String,
+            content_type: Option<String>,
+            size: Option<usize>,
+            is_inline: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Full {
+            name: Option<String>,
+            content_type: Option<String>,
+            content_id: Option<String>,
+            content_bytes: Option<String>,
+        }
+        let page: Page = self
+            .json(self.request(
+                Method::GET,
+                &format!(
+                    "/me/messages/{}/attachments?$select=id,contentType,size,isInline",
+                    path(id)
+                ),
+            ))
+            .await?;
+        let mut candidates: Vec<Listed> = page
+            .value
+            .into_iter()
+            .filter(|a| {
+                a.is_inline == Some(true)
+                    || a.content_type
+                        .as_deref()
+                        .is_some_and(|t| t.to_ascii_lowercase().starts_with("image/"))
+            })
+            // Graph's size counts the item's metadata too; this only skips giants.
+            .filter(|a| a.size.unwrap_or(0) <= INLINE_IMAGE_MAX * 2)
+            .collect();
+        candidates.sort_by_key(|a| a.is_inline != Some(true));
+
+        let mut images: Vec<InlineImage> = Vec::new();
+        let mut total = 0;
+        for listed in candidates {
+            if images.len() == wanted.len() {
+                break;
+            }
+            let full: Full = match self
+                .json(self.request(
+                    Method::GET,
+                    &format!("/me/messages/{}/attachments/{}", path(id), path(&listed.id)),
+                ))
+                .await
+            {
+                Ok(full) => full,
+                // Removed since the listing.
+                Err(Error::Gone) => continue,
+                Err(e) => return Err(e),
+            };
+            let Some(cid) = full.content_id.as_deref().map(cid_key) else {
+                continue;
+            };
+            if !wanted.contains(&cid) || images.iter().any(|i| i.cid == cid) {
+                continue;
+            }
+            let Some(mime) = InlineImage::image_type(
+                full.content_type.as_deref().unwrap_or_default(),
+                full.name.as_deref(),
+            ) else {
+                continue;
+            };
+            let Some(bytes) = full.content_bytes.and_then(|b| STANDARD.decode(b).ok()) else {
+                continue;
+            };
+            if bytes.is_empty()
+                || bytes.len() > INLINE_IMAGE_MAX
+                || total + bytes.len() > INLINE_TOTAL_MAX
+            {
+                continue;
+            }
+            total += bytes.len();
+            images.push(InlineImage { cid, mime, bytes });
+        }
+        Ok(images)
     }
 
     /// Downloads `wanted`, attachment `index` of message `id` as the store
@@ -1243,6 +1337,105 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(to_incoming(3, &m).bcc, ["Boss <boss@contoso.com>"]);
+    }
+
+    /// A stand-in for Graph on a local port: answers each GET with
+    /// `reply(path)` as JSON, or 404 for `None`, and records the paths.
+    async fn stand_in(
+        reply: fn(&str) -> Option<Value>,
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        _ => break,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (status, body) = match reply(&path) {
+                    Some(json) => ("200 OK", json.to_string()),
+                    None => (
+                        "404 Not Found",
+                        json!({ "error": { "message": "nope" } }).to_string(),
+                    ),
+                };
+                log.lock().unwrap().push(path);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (base, seen)
+    }
+
+    fn attachments_of_m1(path: &str) -> Option<Value> {
+        let png = "iVBORw0KGgo=";
+        Some(match path.strip_prefix("/me/messages/m1/attachments")? {
+            p if p.starts_with('?') => json!({ "value": [
+                { "id": "file", "contentType": "application/pdf", "size": 9000, "isInline": false },
+                { "id": "photo", "contentType": "image/jpeg", "size": 100, "isInline": false },
+                { "id": "unused", "contentType": "image/gif", "size": 100, "isInline": true },
+                { "id": "logo", "contentType": "image/png", "size": 100, "isInline": true },
+            ] }),
+            "/logo" => json!({ "name": "image001.png", "contentType": "image/png",
+                               "contentId": "image001.png@01DD", "contentBytes": png }),
+            "/unused" => {
+                json!({ "contentType": "image/gif", "contentId": "<other@x>", "contentBytes": png })
+            }
+            "/photo" => json!({ "name": "photo.jpg", "contentType": "application/octet-stream",
+                                "contentId": "Photo", "contentBytes": png }),
+            _ => return None,
+        })
+    }
+
+    #[tokio::test]
+    async fn inline_images_come_from_the_inline_attachments_first() {
+        let (base, seen) = stand_in(attachments_of_m1).await;
+        let graph = Graph::with_base(&base, "token");
+
+        let logo = graph
+            .inline_images("m1", &["image001.png@01dd".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(logo.len(), 1);
+        assert_eq!(
+            (logo[0].cid.as_str(), logo[0].mime.as_str()),
+            ("image001.png@01dd", "image/png")
+        );
+        assert_eq!(logo[0].bytes, b"\x89PNG\r\n\x1a\n");
+        let fetched: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        assert!(
+            fetched[0].starts_with("/me/messages/m1/attachments?"),
+            "{fetched:?}"
+        );
+        assert!(
+            !fetched
+                .iter()
+                .any(|p| p.ends_with("/file") || p.ends_with("/photo")),
+            "the PDF is never fetched, the non-inline image not while inline ones remain: {fetched:?}"
+        );
+
+        // A cid only a non-inline image has: found after the inline ones.
+        let both = graph
+            .inline_images("m1", &["image001.png@01dd".to_owned(), "photo".to_owned()])
+            .await
+            .unwrap();
+        let cids: Vec<&str> = both.iter().map(|i| i.cid.as_str()).collect();
+        assert_eq!(cids, ["image001.png@01dd", "photo"]);
+        assert_eq!(both[1].mime, "image/jpeg", "typed by its name");
+        assert!(!seen.lock().unwrap().iter().any(|p| p.ends_with("/file")));
     }
 
     #[test]

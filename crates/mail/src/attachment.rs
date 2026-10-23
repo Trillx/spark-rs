@@ -1,9 +1,16 @@
 //! Attachments: describing a message's files for the store, taking one back
-//! out of the raw message when the user opens or forwards it, and types for
-//! files picked from disk.
+//! out of the raw message when the user opens or forwards it, the images
+//! its HTML embeds (`cid:` URLs), and types for files picked from disk.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use mail_parser::{Message, MessageParser, MessagePart, MimeHeaders};
 use spark_store::Attachment;
+
+/// Embedded images bigger than this are left out; together they stop at
+/// `INLINE_TOTAL_MAX`. They travel to the UI as data URLs.
+pub const INLINE_IMAGE_MAX: usize = 5 * 1024 * 1024;
+pub const INLINE_TOTAL_MAX: usize = 20 * 1024 * 1024;
 
 /// An attachment with its content.
 #[derive(Clone, PartialEq, Eq)]
@@ -21,6 +28,134 @@ impl std::fmt::Debug for AttachmentData {
             .field("bytes", &self.bytes.len())
             .finish()
     }
+}
+
+/// An image the email's HTML shows with `<img src="cid:…">`: a part of the
+/// message (an "inline attachment") named by its Content-ID.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    /// The Content-ID as `cid_key` gives it.
+    pub cid: String,
+    /// Always `image/…`.
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for InlineImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineImage")
+            .field("cid", &self.cid)
+            .field("mime", &self.mime)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl InlineImage {
+    /// Its MIME type if it's an image: `mime`, else the one `name` implies.
+    pub fn image_type(mime: &str, name: Option<&str>) -> Option<String> {
+        let mime = mime.trim().to_ascii_lowercase();
+        if mime.starts_with("image/") {
+            return Some(mime);
+        }
+        name.map(mime_for)
+            .filter(|m| m.starts_with("image/"))
+            .map(str::to_owned)
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, STANDARD.encode(&self.bytes))
+    }
+}
+
+/// A Content-ID in the form matching uses: without angle brackets, lowercase.
+pub fn cid_key(content_id: &str) -> String {
+    content_id
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_lowercase()
+}
+
+/// The Content-IDs (as `cid_key` gives them) that the HTML refers to with
+/// `cid:` URLs, each once. The UI's `cidKey` reads them the same way.
+pub fn cid_refs(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut refs: Vec<String> = Vec::new();
+    for (at, _) in lower.match_indices("cid:") {
+        // Only attribute values and CSS url()s, not "cid:" in the text.
+        if !matches!(
+            lower[..at].chars().next_back(),
+            Some('"' | '\'' | '=' | '(')
+        ) {
+            continue;
+        }
+        let rest = &html[at + 4..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>'))
+            .unwrap_or(rest.len());
+        let key = cid_key(&percent_decode(&rest[..end].replace("&amp;", "&")));
+        if !key.is_empty() && !refs.contains(&key) {
+            refs.push(key);
+        }
+    }
+    refs
+}
+
+/// `%xx` escapes decoded, as in a `cid:` URL; anything else is kept.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(&h), Some(&l)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(h), Some(l)) = (hex(h), hex(l))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The images in a raw message whose Content-IDs are in `wanted`, within
+/// the size limits.
+pub fn inline_images(raw: &[u8], wanted: &[String]) -> Vec<InlineImage> {
+    let Some(m) = MessageParser::default().parse(raw) else {
+        return Vec::new();
+    };
+    let mut images: Vec<InlineImage> = Vec::new();
+    let mut total = 0;
+    for part in &m.parts {
+        let Some(cid) = part.content_id().map(cid_key) else {
+            continue;
+        };
+        if !wanted.contains(&cid) || images.iter().any(|i| i.cid == cid) {
+            continue;
+        }
+        let Some(mime) = InlineImage::image_type(&mime_of(part), part.attachment_name()) else {
+            continue;
+        };
+        let bytes = part.contents();
+        if bytes.is_empty()
+            || bytes.len() > INLINE_IMAGE_MAX
+            || total + bytes.len() > INLINE_TOTAL_MAX
+        {
+            continue;
+        }
+        total += bytes.len();
+        images.push(InlineImage {
+            cid,
+            mime,
+            bytes: bytes.to_vec(),
+        });
+    }
+    images
 }
 
 /// The attachments of a parsed message as the store keeps them.
@@ -235,10 +370,59 @@ Hello.\r\n\
         assert_eq!(pdf.mime, "application/pdf");
         assert_eq!(extract(raw, 1, "Attachment 2").unwrap().bytes, [0, 1, 2]);
         let eml = extract(raw, 2, "Old thread.eml").unwrap();
-        assert!(String::from_utf8(eml.bytes).unwrap().contains("Subject: Old thread"));
+        assert!(
+            String::from_utf8(eml.bytes)
+                .unwrap()
+                .contains("Subject: Old thread")
+        );
         // An older row listed plan.pdf at another position.
         assert_eq!(extract(raw, 5, "plan.pdf").unwrap().name, "plan.pdf");
         assert_eq!(extract(raw, 0, "missing.doc"), None);
+    }
+
+    #[test]
+    fn finds_the_cid_urls_the_html_uses() {
+        let html = "<p>cid: in the text doesn't count.</p>\
+            <img src=\"cid:image001.png@01DD62D9.84F42140\">\
+            <img src='CID:Logo%20Big' alt=x>\
+            <img src=cid:a&amp;b>\
+            <td style=\"background:url(cid:bg)\">\
+            <img src=\"cid:image001.png@01DD62D9.84F42140\">";
+        assert_eq!(
+            cid_refs(html),
+            ["image001.png@01dd62d9.84f42140", "logo big", "a&b", "bg"]
+        );
+        assert_eq!(cid_key("<Logo@X>"), "logo@x");
+        assert!(cid_refs("<p>No images.</p>").is_empty());
+    }
+
+    #[test]
+    fn takes_the_wanted_inline_images_out_of_the_raw_message() {
+        let raw = MIXED.as_bytes();
+        let images = inline_images(raw, &["logo".to_owned()]);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].cid, "logo");
+        assert_eq!(images[0].mime, "image/png");
+        assert_eq!(images[0].bytes, b"\x89PNG\r\n\x1a\n");
+        assert_eq!(images[0].data_url(), "data:image/png;base64,iVBORw0KGgo=");
+        assert!(inline_images(raw, &["other".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn inline_images_are_images() {
+        assert_eq!(
+            InlineImage::image_type("IMAGE/PNG", None).as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            InlineImage::image_type("application/octet-stream", Some("image001.jpg")).as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            InlineImage::image_type("text/html", Some("page.html")),
+            None
+        );
+        assert_eq!(InlineImage::image_type("", None), None);
     }
 
     #[test]

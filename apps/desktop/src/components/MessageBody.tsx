@@ -1,6 +1,7 @@
 import { ImageOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { openExternal } from "../api";
+import type { InlineImages } from "../types";
 
 // Email HTML is untrusted. It renders in an iframe sandboxed without
 // `allow-scripts` (so nothing in it runs, submits or opens windows) under its
@@ -27,6 +28,22 @@ export function openLink(href: string | null | undefined) {
 /** Whether the HTML loads anything from the network: img src/srcset, background="", CSS url(). */
 export function hasRemoteImages(html: string) {
   return /(?:\bsrc(?:set)?|\bbackground)\s*=\s*["']?\s*(?:https?:)?\/\/|url\(\s*["']?\s*(?:https?:)?\/\//i.test(html);
+}
+
+/** Whether the HTML embeds images with `cid:` URLs (the same test as `cid_refs` on the Rust side). */
+export function hasInlineImages(html: string) {
+  return /["'=(]cid:/i.test(html);
+}
+
+/** A `cid:` URL's Content-ID as `InlineImages` keys it: decoded, without angle brackets, lowercase. */
+function cidKey(url: string) {
+  let id = url.trim().slice(4);
+  try {
+    id = decodeURIComponent(id);
+  } catch {
+    // A stray `%`: keep it as written.
+  }
+  return id.trim().replace(/^<+/, "").replace(/>+$/, "").toLowerCase();
 }
 
 /** The bar above a body whose remote images are blocked. */
@@ -77,12 +94,23 @@ function linkify(text: string): ReactNode[] {
   return parts;
 }
 
-/** The email's HTML in a sandboxed frame sized to its content. */
-export function HtmlBody({ html, remoteImages }: { html: string; remoteImages: boolean }) {
+/**
+ * The email's HTML in a sandboxed frame sized to its content. Its embedded
+ * images show once `inlineImages` has them; until then they're blank.
+ */
+export function HtmlBody({
+  html,
+  remoteImages,
+  inlineImages,
+}: {
+  html: string;
+  remoteImages: boolean;
+  inlineImages: InlineImages | null;
+}) {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  /** Kept across the reload that "Load images" causes, so the card doesn't jump. */
+  /** Kept across the reloads that "Load images" and arriving embedded images cause, so the card doesn't jump. */
   const [height, setHeight] = useState(0);
-  const srcDoc = useMemo(() => frameDocument(html, remoteImages), [html, remoteImages]);
+  const srcDoc = useMemo(() => frameDocument(html, remoteImages, inlineImages), [html, remoteImages, inlineImages]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -141,11 +169,20 @@ export function HtmlBody({ html, remoteImages }: { html: string; remoteImages: b
  * The frame's document: our CSP, base and styles first in <head>, then the
  * email. Its own CSP, base, refresh and <link> tags are dropped (a policy can
  * only be tightened, but a refresh or prefetch would still reach the network).
+ * Embedded images become data URLs; ones not (yet) fetched stay hidden by
+ * FRAME_CSS rather than showing as broken.
  */
-function frameDocument(html: string, remoteImages: boolean) {
+function frameDocument(html: string, remoteImages: boolean, inlineImages: InlineImages | null) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   for (const el of doc.querySelectorAll("script, meta[http-equiv], base, link, iframe, frame, frameset, object, embed")) {
     el.remove();
+  }
+  if (inlineImages) {
+    for (const img of doc.querySelectorAll("img[src]")) {
+      const src = img.getAttribute("src")!;
+      const data = /^\s*cid:/i.test(src) ? inlineImages[cidKey(src)] : undefined;
+      if (data) img.setAttribute("src", data);
+    }
   }
   const imgSrc = remoteImages ? "data: cid: https: http:" : "data: cid:";
   doc.head.insertAdjacentHTML(
@@ -166,6 +203,7 @@ const FRAME_CSS = `
 :root:root > body { height: auto !important; min-height: 0 !important; }
 body { margin: 0; background: #fff; color: #141414; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Roboto, sans-serif; overflow-wrap: break-word; word-wrap: break-word; }
 img { max-width: 100%; height: auto; }
+img[src^="cid:" i] { visibility: hidden; }
 table { max-width: 100%; }
 pre { white-space: pre-wrap; }
 a { color: #007cff; }

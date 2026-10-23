@@ -11,6 +11,7 @@ import type {
   AccountView,
   FolderRole,
   FolderView,
+  InlineImages,
   LocalFile,
   Message,
   MessageContent,
@@ -167,6 +168,12 @@ export function saveAttachment(id: number, index: number): Promise<boolean> {
 export function saveAllAttachments(id: number): Promise<number> {
   if (isTauri()) return invoke("save_all_attachments", { id });
   return Promise.reject(DEMO_FILES);
+}
+
+/** Fetches the images the email's HTML embeds from its server. None for demo mail. */
+export function getInlineImages(id: number): Promise<InlineImages> {
+  if (isTauri()) return invoke("inline_images", { id });
+  return Promise.resolve({});
 }
 
 /** The system file picker, for attaching. Empty if cancelled. */

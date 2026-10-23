@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
-import { getMessageContent } from "../api";
-import type { MessageContent } from "../types";
+import { getInlineImages, getMessageContent } from "../api";
+import type { InlineImages, MessageContent } from "../types";
 
 // Message bodies load on demand and stay cached while the app runs, so
 // reopening a thread (or forwarding it) is instant. Failed loads aren't cached.
+// Embedded images come from the server the same way; being data URLs, only
+// the most recently shown INLINE_CACHE_MAX messages' are kept.
 
 const cache = new Map<number, MessageContent>();
 const pending = new Map<number, Promise<MessageContent>>();
+const inlineCache = new Map<number, InlineImages>();
+const inlinePending = new Map<number, Promise<InlineImages>>();
+const INLINE_CACHE_MAX = 100;
+const NO_IMAGES: InlineImages = Object.freeze({});
 /** Messages whose remote images the user chose to load. */
 const imagesAllowed = new Set<number>();
 /** Bumped by `clearContent`, so a load that started before it isn't cached. */
@@ -42,7 +48,75 @@ export function clearContent() {
   generation++;
   cache.clear();
   pending.clear();
+  inlineCache.clear();
+  inlinePending.clear();
   imagesAllowed.clear();
+}
+
+/** Cached embedded images, marked as just used. */
+function cachedInline(id: number): InlineImages | null {
+  const images = inlineCache.get(id);
+  if (!images) return null;
+  inlineCache.delete(id);
+  inlineCache.set(id, images);
+  return images;
+}
+
+function loadInlineImages(id: number): Promise<InlineImages> {
+  let request = inlinePending.get(id);
+  if (!request) {
+    const started = generation;
+    const settle = () => {
+      if (started === generation) inlinePending.delete(id);
+    };
+    request = getInlineImages(id).then(
+      (images) => {
+        settle();
+        if (started === generation) {
+          inlineCache.set(id, images);
+          for (const oldest of inlineCache.keys()) {
+            if (inlineCache.size <= INLINE_CACHE_MAX) break;
+            inlineCache.delete(oldest);
+          }
+        }
+        return images;
+      },
+      (error: unknown) => {
+        settle();
+        throw error;
+      },
+    );
+    inlinePending.set(id, request);
+  }
+  return request;
+}
+
+/**
+ * The images a message's HTML embeds, fetched when `wanted`: null while
+ * they load. A failed fetch shows none and is tried again next time.
+ */
+export function useInlineImages(id: number, wanted: boolean): InlineImages | null {
+  const [images, setImages] = useState<InlineImages | null>(() => (wanted ? cachedInline(id) : NO_IMAGES));
+
+  useEffect(() => {
+    if (!wanted) {
+      setImages(NO_IMAGES);
+      return;
+    }
+    const cached = cachedInline(id);
+    setImages(cached);
+    if (cached) return;
+    let live = true;
+    loadInlineImages(id).then(
+      (loaded) => live && setImages(loaded),
+      () => live && setImages(NO_IMAGES),
+    );
+    return () => {
+      live = false;
+    };
+  }, [id, wanted]);
+
+  return images;
 }
 
 export function remoteImagesAllowed(id: number) {

@@ -1,6 +1,7 @@
 //! What the UI talks to: real accounts once one is added, the demo mailbox
 //! until then. Types here are the UI's shapes (`src/types.ts` mirrors them).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -498,6 +499,23 @@ pub async fn save_all_attachments(
         files::write_downloaded(&path, &file.bytes)?;
     }
     Ok(count)
+}
+
+/// The images an email embeds with `cid:` URLs, as data URLs by Content-ID
+/// (lowercase, without angle brackets). Empty for demo mail.
+#[tauri::command]
+pub async fn inline_images(
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+) -> Result<HashMap<String, String>, String> {
+    if !mailbox.live() {
+        return Ok(HashMap::new());
+    }
+    let images = mailbox.live.engine.inline_images(id).await.map_err(text)?;
+    Ok(images
+        .iter()
+        .map(|i| (i.cid.clone(), i.data_url()))
+        .collect())
 }
 
 /// The file picker for attaching files.

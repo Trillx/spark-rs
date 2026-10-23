@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
-use spark_store::{Account, AccountKind, Folder, NewAccount, Store, now_ms};
+use spark_store::{Account, AccountKind, Folder, Location, NewAccount, Store, now_ms};
 
-use crate::attachment::{self, AttachmentData};
+use crate::attachment::{self, AttachmentData, InlineImage};
 use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
@@ -639,12 +639,7 @@ impl Engine {
                 imap: server,
                 ..
             } => {
-                let password = self.password(account.id)?;
-                let state: imap::SyncState = from_json(&account.sync_state);
-                let mut session = imap::login(&server, &username, &password).await?;
-                let raw = imap::fetch_raw(&mut session, &state, &at).await;
-                let _ = session.logout().await;
-                let raw = raw?.ok_or(Error::Gone)?;
+                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
                 attachment::extract(&raw, index, &wanted.name).ok_or_else(|| {
                     Error::Server(format!(
                         "{} wasn't in the email on the server.",
@@ -660,6 +655,60 @@ impl Engine {
                 Graph::new(&token).attachment(&remote, index, &wanted).await
             }
         }
+    }
+
+    /// The images a stored message's HTML embeds with `cid:` URLs, from its
+    /// server. Empty, without asking the server, when it embeds none.
+    pub async fn inline_images(&self, message_id: i64) -> Result<Vec<InlineImage>> {
+        let (at, wanted) = {
+            let store = self.store();
+            let gone = || Error::Config("That email is no longer here.".into());
+            let at = store.location(message_id)?.ok_or_else(gone)?;
+            let content = store.content(message_id)?.ok_or_else(gone)?;
+            let wanted = content
+                .html
+                .as_deref()
+                .map(attachment::cid_refs)
+                .unwrap_or_default();
+            (at, wanted)
+        };
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account = self.account(at.account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
+                Ok(attachment::inline_images(&raw, &wanted))
+            }
+            AccountConfig::Microsoft { client_id, tenant } => {
+                let remote = at.remote_id.ok_or(Error::Gone)?;
+                let token = self
+                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                    .await?;
+                Graph::new(&token).inline_images(&remote, &wanted).await
+            }
+        }
+    }
+
+    /// A stored message as the IMAP server has it, wherever it is now.
+    async fn fetch_raw(
+        &self,
+        account: &Account,
+        server: &Server,
+        username: &str,
+        at: &Location,
+    ) -> Result<Vec<u8>> {
+        let password = self.password(account.id)?;
+        let state: imap::SyncState = from_json(&account.sync_state);
+        let mut session = imap::login(server, username, &password).await?;
+        let raw = imap::fetch_raw(&mut session, &state, at).await;
+        let _ = session.logout().await;
+        raw?.ok_or(Error::Gone)
     }
 
     /// The message being replied to, and its Graph id if it has one.

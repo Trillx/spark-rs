@@ -23,7 +23,7 @@ import { useMemo, useRef, useState, type ReactNode } from "react";
 import { SUMMARY_STYLES, type SummaryStyle } from "../ai";
 import type { AccountView, Message, MessageContent } from "../types";
 import { useAccount } from "../lib/accounts";
-import { allowRemoteImages, remoteImagesAllowed, useMessageContent } from "../lib/content";
+import { allowRemoteImages, remoteImagesAllowed, useInlineImages, useMessageContent } from "../lib/content";
 import { LATER_PRESETS, formatFullDate, formatLater, parseAddress, presetDetail, type LaterPreset } from "../lib/format";
 import { hint, shortcutLabel, type ActionId } from "../lib/shortcuts";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
@@ -31,7 +31,7 @@ import AiMark from "./AiMark";
 import { AttachmentList } from "./Attachments";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
-import { BlockedImagesBar, HtmlBody, TextBody, hasRemoteImages } from "./MessageBody";
+import { BlockedImagesBar, HtmlBody, TextBody, hasInlineImages, hasRemoteImages } from "./MessageBody";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
 
 export interface ThreadActions {
@@ -481,11 +481,13 @@ function MessageCard({
   );
 }
 
-/** The email's HTML in the sandboxed frame (remote images on request), else its text. */
+/** The email's HTML in the sandboxed frame (embedded images fetched, remote ones on request), else its text. */
 function Body({ id, content }: { id: number; content: MessageContent }) {
   const [images, setImages] = useState(() => remoteImagesAllowed(id));
   const html = content.html;
   const blocked = useMemo(() => html !== null && hasRemoteImages(html), [html]);
+  const embeds = useMemo(() => html !== null && hasInlineImages(html), [html]);
+  const inlineImages = useInlineImages(id, embeds);
   if (html === null) return <TextBody paragraphs={content.text} />;
   return (
     <>
@@ -497,7 +499,7 @@ function Body({ id, content }: { id: number; content: MessageContent }) {
           }}
         />
       )}
-      <HtmlBody html={html} remoteImages={images} />
+      <HtmlBody html={html} remoteImages={images} inlineImages={inlineImages} />
     </>
   );
 }

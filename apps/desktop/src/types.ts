@@ -131,6 +131,9 @@ export interface MessageContent {
   attachments: Attachment[];
 }
 
+/** The images an email's HTML embeds (`cid:` URLs): data URLs by Content-ID, lowercase without angle brackets. */
+export type InlineImages = Record<string, string>;
+
 export interface Attachment {
   name: string;
   /** e.g. "application/pdf"; empty when unknown. */
