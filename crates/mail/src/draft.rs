@@ -30,8 +30,9 @@ pub struct Draft {
     pub reply_to: Option<i64>,
     /// Unix ms: the end of the undo window, or the Send Later time.
     pub send_at: i64,
-    /// Files to attach, in order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Files to attach, in order. Always written, even empty: the composer
+    /// reads it as an array.
+    #[serde(default)]
     pub attachments: Vec<OutgoingAttachment>,
     /// The saved draft (its message id) this was opened from or saved as:
     /// its server copy is deleted once this is sent.
@@ -338,6 +339,13 @@ mod tests {
         // Drafts queued before attachments existed still read.
         let old = r#"{"account":1,"to":"a@x.com","subject":"s","body":"b","sendAt":0}"#;
         assert!(serde_json::from_str::<Draft>(old).unwrap().attachments.is_empty());
+    }
+
+    #[test]
+    fn drafts_without_attachments_still_list_them() {
+        // The composer reads `attachments` as an array: opening a draft without it blanked the app.
+        let json = serde_json::to_value(draft("ana@x.com")).unwrap();
+        assert_eq!(json["attachments"], serde_json::json!([]), "{json}");
     }
 
     #[test]
