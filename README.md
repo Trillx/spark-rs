@@ -1,11 +1,116 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<div align="center">
+
+<img src="assets/icon.svg" width="88" height="88" alt="">
 
 # spark-rs
 
-A personal, Spark-style email client with a Rust core, for Windows on ARM
-(`aarch64-pc-windows-msvc`), the first target, and Windows x64.
+**Spark-style email for Windows, with a Rust core and AI on your own key.**
+
+[![Download](https://img.shields.io/github/v/release/Trillx/spark-rs?label=download&color=f59e0b)](https://github.com/Trillx/spark-rs/releases/latest)
+[![Windows on ARM and x64](https://img.shields.io/badge/Windows-ARM64%20%C2%B7%20x64-0078d4)](#download)
+[![Built with Rust and Tauri](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-b7410e)](#layout)
+[![AI: bring your own key](https://img.shields.io/badge/AI-bring%20your%20own%20key-7c3aed)](#ai)
+
+</div>
+
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/inbox-dark.png">
+  <img src="assets/screenshots/inbox-light.png" alt="The spark-rs Smart Inbox: Priority, New senders, Pinned and People cards next to an open conversation">
+</picture>
+
+<p align="center"><sub>Screenshots show the demo mailbox that spark-rs opens with until you add an account.</sub></p>
+
+spark-rs is a desktop email client modeled on Spark: the Smart Inbox, the
+Gatekeeper for new senders, pins, snooze, Set Aside, the single-key shortcuts
+and the +AI tools, rebuilt as a Windows app with a Rust core. Windows on ARM
+(`aarch64-pc-windows-msvc`) was the first target, and Windows x64 works too.
+The one deliberate difference is AI, which runs on your own Anthropic, OpenAI
+or OpenAI-compatible account. Nothing goes through spark-rs's servers, because
+there aren't any.
 
 Created in [T3 Code](https://t3.codes).
+
+## Features
+
+- **Smart Inbox.** Priority, Pins, People, Notifications and Newsletters as
+  cards, or as one focused list. Mail from new senders waits in the
+  Gatekeeper until you accept or block the sender.
+- **Work and personal mail together.** Microsoft 365 through Microsoft Graph,
+  Gmail with an app password, and any IMAP server, in one inbox.
+- **Fast triage.** Done, snooze, pin, Set Aside and Priority on single keys,
+  Ctrl+K for every command, and Undo before anything reaches the server.
+- **+AI on your own key.** Summaries, quick replies, and writing and rewriting
+  in the composer, through Anthropic, OpenAI, or an OpenAI-compatible server
+  such as Ollama on your own computer.
+- **Calendar.** Microsoft 365 calendars by day, week or month, invitations you
+  answer from the email, and a pop-up a minute before each meeting with a
+  Join button.
+- **Search.** A full-text index on your computer answers as you type, and the
+  servers are searched too, for mail that isn't downloaded yet.
+- **Agents.** Claude Code, Codex and other MCP clients can read, triage or
+  send your mail through `spark-cli`, as far as you allow for each account.
+- **Native on Windows.** Builds for ARM and x64, about 12 MB to download, with
+  the tray, notifications, and drafts that save offline. Passwords and keys
+  stay in Windows Credential Manager.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <b>+AI Summary</b><br>
+      <sub>Short, detailed or action points, from your own AI provider.</sub><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-summary-dark.png">
+        <img src="assets/screenshots/ai-summary-light.png" width="100%" alt="A short +AI summary under an email about a lease renewal">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Write with +AI</b><br>
+      <sub>Describe the email, pick a quick reply, or have your draft rewritten.</sub><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/ai-compose-dark.png">
+        <img src="assets/screenshots/ai-compose-light.png" width="100%" alt="The +AI menu in a reply: an instruction, quick replies and templates">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Calendar</b><br>
+      <sub>Day, week or month, with the next meeting and its Join button.</sub><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/calendar-dark.png">
+        <img src="assets/screenshots/calendar-light.png" width="100%" alt="The calendar's week view with the next meeting in the side panel">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Meeting pop-up</b><br>
+      <sub>A minute before each meeting, over your other windows.</sub><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/meeting-popup-dark.png">
+        <img src="assets/screenshots/meeting-popup-light.png" width="100%" alt="The meeting pop-up with Join, over the calendar">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <b>Invitations</b><br>
+      <sub>Accept, Maybe or Decline from the email, with who's coming.</sub><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/invite-dark.png">
+        <img src="assets/screenshots/invite-light.png" width="100%" alt="A meeting invitation shown as a card with Accept, Maybe and Decline">
+      </picture>
+    </td>
+    <td width="50%" valign="top">
+      <b>Command center</b><br>
+      <sub>Ctrl+K for every action, with its single-key shortcut.</sub><br><br>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/command-dark.png">
+        <img src="assets/screenshots/command-light.png" width="100%" alt="The command center listing actions and their shortcuts">
+      </picture>
+    </td>
+  </tr>
+</table>
 
 ## Download
 
@@ -182,6 +287,28 @@ found locally from then on. Gmail and IMAP search the inbox and the archive
 folder; Microsoft 365 searches every folder except Deleted Items, Junk Email
 and Drafts. Searches with only filters, or for today's mail, stay local.
 
+## AI
+
+The +AI features use your own AI provider. In Settings → AI, choose
+**Anthropic** (Claude), **OpenAI**, or **Custom** for any OpenAI-compatible
+server, such as Ollama on your own computer (`http://localhost:11434/v1`).
+Enter the API key and the model, and Test connection checks them. The key is
+kept in Windows Credential Manager, not in a settings file.
+
+- **+AI Summary** in the toolbar puts a summary under the email: Short
+  (`Ctrl+Shift+S`), Detailed (`Ctrl+Shift+D`) or Action Points
+  (`Ctrl+Shift+A`).
+- **Quick replies** under each email (Interested, Not interested, Thanks)
+  start a reply that AI writes.
+- **+AI in the composer** writes an email from a few words, or rephrases,
+  shortens, expands or proofreads what you've written, changes its tone, or
+  changes it the way you describe.
+
+Nothing is sent in the background. An email's sender, date, subject and text
+go to your provider only when you use one of these on it, under that
+provider's terms. Check your employer's policy before using AI on
+work mail.
+
 ## AI agents
 
 Agents on this computer, such as Claude Code, Codex and Hermes, can work
@@ -302,3 +429,8 @@ match) and push to `main`. When that commit reaches GitHub,
 the zips as release `v<version>`, with the commit subjects since the previous
 release as its notes. To run the mirror or the release without waiting, use
 `gh workflow run mirror -R Trillx/spark-rs` (or `release`).
+
+---
+
+<sub>spark-rs is an independent project. It isn't affiliated with or endorsed
+by Readdle, which makes Spark.</sub>
