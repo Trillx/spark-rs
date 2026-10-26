@@ -127,12 +127,12 @@ pub fn forget_all() -> Result<(), String> {
     for &credential in found_slice {
         let credential = unsafe { &*credential };
         let target = unsafe { credential.TargetName.to_string() }.unwrap_or_default();
-        if credential.Type == CRED_TYPE_GENERIC && target.ends_with(&format!(".{SERVICE}")) {
-            if let Err(e) =
+        if credential.Type == CRED_TYPE_GENERIC
+            && target.ends_with(&format!(".{SERVICE}"))
+            && let Err(e) =
                 unsafe { CredDeleteW(PCWSTR(credential.TargetName.0), CRED_TYPE_GENERIC, None) }
-            {
-                result = Err(e.to_string());
-            }
+        {
+            result = Err(e.to_string());
         }
     }
     unsafe { CredFree(found as *const _) };
