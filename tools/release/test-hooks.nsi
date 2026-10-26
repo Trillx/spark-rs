@@ -3,8 +3,8 @@ Unicode true
 RequestExecutionLevel user
 SilentInstall silent
 !include LogicLib.nsh
-!include "${__FILEDIR__}\..\..\apps\desktop\src-tauri\installer\hooks.nsh"
-OutFile "${__FILEDIR__}\stop-installed-cli.exe"
+!include "${HOOKS_FILE}"
+OutFile "${OUTPUT_FILE}"
 Section
   Call SparkStopCli
   IfErrors failed passed
