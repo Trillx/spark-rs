@@ -35,7 +35,14 @@ export type ActionId =
   | "bottom"
   | "selectAll"
   | "selectNext"
-  | "selectPrev";
+  | "selectPrev"
+  | "acceptSender"
+  | "acceptAndOpen"
+  | "acceptAll"
+  | "acceptDomain"
+  | "blockSender"
+  | "blockAll"
+  | "blockDomain";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -86,16 +93,24 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   selectAll: [{ key: "a", mod: true }],
   selectNext: [{ key: "ArrowDown", shift: true }],
   selectPrev: [{ key: "ArrowUp", shift: true }],
+  /** The Gatekeeper's, as in Spark. E is Accept and Done for an email from a new sender. */
+  acceptSender: [{ key: "t", mod: true }],
+  acceptAndOpen: [{ key: "t" }],
+  acceptAll: [{ key: "t", mod: true, shift: true }],
+  acceptDomain: [{ code: "KeyT", mod: true, alt: true, shift: true }],
+  blockSender: [{ key: "b", mod: true }],
+  blockAll: [{ key: "b", mod: true, shift: true }],
+  blockDomain: [{ code: "KeyB", mod: true, alt: true, shift: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {
   const mod = IS_MAC ? e.metaKey : e.ctrlKey;
   const otherMod = IS_MAC ? e.ctrlKey : e.metaKey;
   if (Boolean(b.mod) !== mod || otherMod || Boolean(b.alt) !== e.altKey) return false;
-  if (b.code) return e.code === b.code;
-  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   // "/" needs Shift on many non-US layouts, so Shift is ignored for it.
   if (b.key !== "/" && Boolean(b.shift) !== e.shiftKey) return false;
+  if (b.code) return e.code === b.code;
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   return key === b.key;
 }
 
@@ -123,7 +138,7 @@ const KEY_NAMES: Record<string, string> = {
 };
 
 function bindingLabel(b: Binding) {
-  const key = b.code ? b.code.replace("Digit", "") : (KEY_NAMES[b.key!] ?? b.key!.toUpperCase());
+  const key = b.code ? b.code.replace(/^(Digit|Key)/, "") : (KEY_NAMES[b.key!] ?? b.key!.toUpperCase());
   if (IS_MAC) return `${b.shift ? "⇧" : ""}${b.alt ? "⌥" : ""}${b.mod ? "⌘" : ""}${key}`;
   return [b.mod && "Ctrl", b.alt && "Alt", b.shift && "Shift", key].filter(Boolean).join("+");
 }

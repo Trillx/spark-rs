@@ -19,15 +19,19 @@ import {
   ShieldAlert,
   ShieldCheck,
   Text,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { Fragment, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { QUICK_REPLIES, SUMMARY_STYLES, type QuickReply, type SummaryStyle } from "../ai";
-import type { AccountView, Message, MessageContent } from "../types";
+import { senderStatus } from "../api";
+import type { AccountView, Message, MessageContent, SenderStatus } from "../types";
 import { isFromYou, useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
+import { decidableDomain, domainOf } from "../lib/gatekeeper";
 import { allowRemoteImages, remoteImagesAllowed, useInlineImages, useMessageContent } from "../lib/content";
 import {
   LATER_PRESETS,
@@ -75,8 +79,15 @@ export interface ThreadActions {
   quickReply: (m: Message, chip: QuickReply) => void;
   replyAll: (m: Message) => void;
   forward: (m: Message) => void;
+  /** The Gatekeeper's decisions about `m`'s sender, or everyone at its domain, for every account. */
   accept: (m: Message) => void;
+  /** Accepts the sender and shows the email in the Inbox. */
+  acceptAndOpen: (m: Message) => void;
+  /** Accepts the sender and marks the mail they had waiting Done. */
+  acceptAndDone: (m: Message) => void;
+  acceptDomain: (m: Message) => void;
   block: (m: Message) => void;
+  blockDomain: (m: Message) => void;
   /** Settle when done (errors are reported by the caller), so tiles can show progress. */
   openAttachment: (m: Message, index: number) => Promise<void>;
   saveAttachment: (m: Message, index: number) => Promise<void>;
@@ -124,6 +135,9 @@ export default function ThreadView({
   scrollRef: RefObject<HTMLDivElement | null>;
 }) {
   const screening = m.screening && m.state === "inbox";
+  const blocked = m.state === "blocked";
+  /** A blocked sender's email stays hidden until asked for, as in Spark. */
+  const [shown, setShown] = useState(false);
   const summaryRef = useRef<HTMLElement>(null);
   /** Stops holding the place reading starts at, once the user moves around. */
   const stopHolding = useRef(() => {});
@@ -236,6 +250,7 @@ export default function ThreadView({
           </Pill>
         )}
       </div>
+      {blocked && <BlockedSenderCard message={m} actions={actions} />}
       <OverlayScroll
         className="min-h-0 flex-1"
         viewportClassName="px-3 pb-8"
@@ -247,24 +262,33 @@ export default function ThreadView({
           setScrolled((was) => el.scrollTop > 0 && (was || el.scrollHeight - el.clientHeight > HEADER_SLACK));
         }}
       >
-        <div className="space-y-2">
-          {conversation.map((x, i) => (
-            <Fragment key={x.id}>
-              {i === firstNew && i > 0 && <NewMessagesLine />}
-              {collapsed.has(x.id) ? (
-                <CollapsedCard message={x} onExpand={() => toggle(x.id)} />
-              ) : (
-                <MessageCard
-                  message={x}
-                  showReplyBar={!screening}
-                  quickReplies={x === latest}
-                  onCollapse={several ? () => toggle(x.id) : undefined}
-                  actions={actions}
-                />
-              )}
-            </Fragment>
-          ))}
-        </div>
+        {blocked && !shown ? (
+          <div className="grid place-items-center gap-2 rounded-2xl border border-dashed border-hairline px-4 py-8 text-[13px] text-text-2">
+            Message is hidden
+            <button className="btn btn-ghost btn-sm h-8 rounded-lg text-primary" onClick={() => setShown(true)}>
+              Show message
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {conversation.map((x, i) => (
+              <Fragment key={x.id}>
+                {i === firstNew && i > 0 && <NewMessagesLine />}
+                {collapsed.has(x.id) ? (
+                  <CollapsedCard message={x} onExpand={() => toggle(x.id)} />
+                ) : (
+                  <MessageCard
+                    message={x}
+                    showReplyBar={!screening}
+                    quickReplies={x === latest}
+                    onCollapse={several ? () => toggle(x.id) : undefined}
+                    actions={actions}
+                  />
+                )}
+              </Fragment>
+            ))}
+          </div>
+        )}
         {summary && (
           <SummaryCard
             ref={summaryRef}
@@ -565,7 +589,36 @@ function MessageMenuItems({
       {!single && spam && (
         <MenuItem label="Delete Forever" icon={<Trash2 size={15} />} danger onSelect={() => actions.deleteForever(m)} />
       )}
-      <MenuItem label="Block Sender" icon={<Ban size={15} />} danger onSelect={() => actions.block(m)} />
+      <SenderMenuItems message={m} actions={actions} />
+    </>
+  );
+}
+
+/** Block (or, for blocked mail, Accept) the sender, and everyone at their domain unless anyone can sign up there. */
+function SenderMenuItems({ message: m, actions }: { message: Message; actions: ThreadActions }) {
+  const domain = decidableDomain(m.address);
+  if (m.state === "blocked") {
+    return (
+      <>
+        <MenuItem label="Accept Sender" detail={shortcutLabel("acceptSender")} icon={<ThumbsUp size={15} />} onSelect={() => actions.accept(m)} />
+        {domain && (
+          <MenuItem label={`Accept all from ${domain}`} icon={<ThumbsUp size={15} />} onSelect={() => actions.acceptDomain(m)} />
+        )}
+      </>
+    );
+  }
+  return (
+    <>
+      <MenuItem
+        label="Block Sender"
+        detail={shortcutLabel("blockSender")}
+        icon={<Ban size={15} />}
+        danger
+        onSelect={() => actions.block(m)}
+      />
+      {domain && (
+        <MenuItem label={`Block all from ${domain}`} icon={<Ban size={15} />} danger onSelect={() => actions.blockDomain(m)} />
+      )}
     </>
   );
 }
@@ -580,6 +633,7 @@ function GatekeeperToolbar({
   closeTip: Tip;
   actions: ThreadActions;
 }) {
+  const domain = decidableDomain(m.address);
   return (
     <div className="shrink-0 px-3 pb-2">
       <div className="flex h-12 items-center">
@@ -595,21 +649,146 @@ function GatekeeperToolbar({
           </span>
         </div>
         <div className="flex gap-2">
-          <button
-            className="btn btn-sm border-0 bg-primary/10 px-5 text-primary shadow-none hover:bg-primary/20"
-            {...tipAttrs({ label: "Accept", card: "accept" })}
+          <SplitButton
+            label="Accept"
+            tip={{ label: "Accept", keys: shortcutLabel("acceptSender"), card: "accept" }}
+            fill="bg-primary/10 text-primary"
+            hover="hover:bg-primary/20"
             onClick={() => actions.accept(m)}
+            menu="Accept options"
           >
-            Accept
-          </button>
-          <button
-            className="btn btn-sm border-0 bg-error/10 px-5 text-error shadow-none hover:bg-error/20"
-            {...tipAttrs({ label: "Block", card: "block" })}
+            <MenuItem label="Accept and Open" detail={shortcutLabel("acceptAndOpen")} onSelect={() => actions.acceptAndOpen(m)} />
+            <MenuItem label="Accept and Done" detail={shortcutLabel("done")} onSelect={() => actions.acceptAndDone(m)} />
+            {domain && (
+              <MenuItem
+                label={`Accept all from ${domain}`}
+                detail={shortcutLabel("acceptDomain")}
+                onSelect={() => actions.acceptDomain(m)}
+              />
+            )}
+          </SplitButton>
+          <SplitButton
+            label="Block"
+            tip={{ label: "Block", keys: shortcutLabel("blockSender"), card: "block" }}
+            fill="bg-error/10 text-error"
+            hover="hover:bg-error/20"
             onClick={() => actions.block(m)}
+            menu={domain ? "Block options" : undefined}
           >
-            Block
-          </button>
+            {domain && (
+              <MenuItem
+                label={`Block all from ${domain}`}
+                detail={shortcutLabel("blockDomain")}
+                danger
+                onSelect={() => actions.blockDomain(m)}
+              />
+            )}
+          </SplitButton>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** A button with a chevron for its other choices, like Spark's Accept and Block. */
+function SplitButton({
+  label,
+  tip,
+  fill,
+  hover,
+  onClick,
+  menu,
+  children,
+}: {
+  label: string;
+  tip: Tip;
+  fill: string;
+  hover: string;
+  onClick: () => void;
+  /** The chevron's name; without one there's only the button. */
+  menu?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className={`flex h-8 items-stretch rounded-lg text-[13px] font-medium ${fill}`}>
+      <button className={`px-4 ${menu ? "rounded-l-lg" : "rounded-lg"} ${hover}`} {...tipAttrs(tip)} onClick={onClick}>
+        {label}
+      </button>
+      {menu && (
+        <Dropdown
+          align="end"
+          width="w-60"
+          trigger={({ toggle, open }) => (
+            <button
+              className={`grid h-full w-7 place-items-center rounded-r-lg border-l border-current/15 ${hover} ${open ? "brightness-95" : ""}`}
+              aria-label={menu}
+              aria-haspopup="menu"
+              aria-expanded={open}
+              onClick={toggle}
+            >
+              <ChevronDown size={14} />
+            </button>
+          )}
+        >
+          {children}
+        </Dropdown>
+      )}
+    </div>
+  );
+}
+
+/** Over a blocked sender's email: who's blocked (them, or their domain), and accepting them. */
+function BlockedSenderCard({ message: m, actions }: { message: Message; actions: ThreadActions }) {
+  const [status, setStatus] = useState<SenderStatus | null>(null);
+  useEffect(() => {
+    let current = true;
+    void senderStatus(m.address).then(
+      (s) => current && setStatus(s),
+      () => {},
+    );
+    return () => {
+      current = false;
+    };
+  }, [m.address, m.state]);
+  const byDomain = status !== null && status.sender === null && status.domain === "blocked";
+  const domain = domainOf(m.address);
+  return (
+    <div className="mx-3 mb-2 flex flex-wrap items-center gap-4 rounded-2xl border border-hairline px-4 py-3.5">
+      <Avatar name={m.from} size="lg" />
+      <div className="min-w-0 flex-1">
+        <span className="inline-block rounded-full bg-error/10 px-2 text-[11px] font-medium leading-[18px] text-error">
+          {byDomain ? "Blocked domain" : "Blocked sender"}
+        </span>
+        <div className="mt-1 text-[13px] leading-5 text-text-2">
+          {byDomain ? (
+            <>
+              You blocked everyone at <span className="font-medium text-base-content">{domain}</span>. Accept{" "}
+              {m.address} to see their mail in the Inbox.
+            </>
+          ) : (
+            <>
+              You blocked <span className="font-medium text-base-content">{m.address}</span>. Their mail goes to
+              Blocked.
+            </>
+          )}
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <button
+          className="btn btn-sm h-8 rounded-lg border-0 bg-primary/10 px-4 text-primary shadow-none hover:bg-primary/20"
+          {...tipAttrs({ label: "Accept Sender", keys: shortcutLabel("acceptSender") })}
+          onClick={() => actions.accept(m)}
+        >
+          Accept Sender
+        </button>
+        {byDomain && (
+          <button
+            className="btn btn-sm h-8 rounded-lg border-0 bg-primary/10 px-4 text-primary shadow-none hover:bg-primary/20"
+            onClick={() => actions.acceptDomain(m)}
+          >
+            Accept {domain}
+          </button>
+        )}
       </div>
     </div>
   );

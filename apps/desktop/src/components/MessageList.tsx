@@ -33,8 +33,10 @@ import { GatekeeperCard, GroupRow, SmartInboxCard } from "./SmartInboxCard";
 import { tipAttrs } from "../lib/tooltip";
 
 export interface GatekeeperActions {
-  accept: (m: Message) => void;
-  block: (m: Message) => void;
+  /** One sender's waiting mail, from their card. */
+  acceptSender: (items: Message[]) => void;
+  blockSender: (items: Message[]) => void;
+  /** Everyone waiting; these ask first. */
   acceptAll: (items: Message[]) => void;
   blockAll: (items: Message[]) => void;
 }
@@ -176,8 +178,8 @@ export default function MessageList(props: Props) {
                       openId={props.openId}
                       onOpen={rows.open}
                       onShowAll={props.onOpenGatekeeper}
-                      onAccept={props.gatekeeper.acceptAll}
-                      onBlock={props.gatekeeper.blockAll}
+                      onAccept={props.gatekeeper.acceptSender}
+                      onBlock={props.gatekeeper.blockSender}
                       onAcceptAll={() => props.gatekeeper.acceptAll(block.items)}
                       onBlockAll={() => props.gatekeeper.blockAll(block.items)}
                     />

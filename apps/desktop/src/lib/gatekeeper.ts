@@ -11,6 +11,23 @@ export function domainOf(address: string): string | undefined {
   return domain || undefined;
 }
 
+/** Free mail providers, as in `PUBLIC_DOMAINS` in gatekeeper.rs: the store refuses to decide about them as a whole. */
+const PUBLIC_DOMAINS = new Set([
+  "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "yahoo.com", "ymail.com",
+  "rocketmail.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me", "protonmail.com", "pm.me", "gmx.com",
+  "gmx.net", "gmx.de", "web.de", "mail.com", "zoho.com", "fastmail.com", "hey.com", "tutanota.com", "tuta.io",
+  "yandex.com", "yandex.ru", "mail.ru", "qq.com", "163.com", "126.com", "comcast.net", "verizon.net", "att.net",
+  "sbcglobal.net", "btinternet.com", "orange.fr", "free.fr", "t-online.de", "libero.it", "seznam.cz", "naver.com",
+]);
+const PUBLIC_PREFIXES = ["hotmail.", "outlook.", "live.", "yahoo.", "gmx.", "yandex."];
+
+/** The domain of `address` if it can be accepted or blocked as a whole: not a free mail provider's. */
+export function decidableDomain(address: string): string | undefined {
+  const domain = domainOf(address);
+  if (!domain || PUBLIC_DOMAINS.has(domain) || PUBLIC_PREFIXES.some((p) => domain.startsWith(p))) return undefined;
+  return domain;
+}
+
 export const sender = (address: string): Screen => ({ sender: address });
 export const domain = (name: string): Screen => ({ domain: name });
 

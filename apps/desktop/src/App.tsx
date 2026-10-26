@@ -1,6 +1,7 @@
 import {
   AlignLeft,
   ArrowDownLeft,
+  Ban,
   Bell,
   Bot,
   Check,
@@ -134,7 +135,7 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
-import { forSenders, predict } from "./lib/gatekeeper";
+import { decidableDomain, domain, forSenders, predict } from "./lib/gatekeeper";
 import {
   LATER_PRESETS,
   formatFullDate,
@@ -213,6 +214,7 @@ import type {
   Prefs,
   SendStatusEvent,
   SenderChange,
+  SenderDecision,
   SyncStatusEvent,
   Untrusted,
 } from "./types";
@@ -253,6 +255,9 @@ const INITIAL_VIEW: ListView = {
 };
 
 /** Toast icons per action, in the action's color. */
+/** Spark's Done, as a patch. */
+const DONE: MessagePatch = { state: "done" };
+
 const ICONS = {
   done: { Icon: CircleCheck, className: "text-success" },
   inbox: { Icon: Inbox, className: "text-primary" },
@@ -757,10 +762,12 @@ export default function App() {
   /**
    * Accepts or blocks senders or domains for every account, with an undo:
    * their mail follows, stored mail too, so the list reloads once it's done.
+   * `done` is mail to mark Done with it (Accept and Done).
    */
-  function decide(changes: SenderChange[], text: string, icon?: ToastIcon) {
+  function decide(changes: SenderChange[], text: string, icon?: ToastIcon, done: Message[] = []) {
     if (!changes.length) return;
-    const after = predict(messages, changes);
+    const finishing = done.map((m) => ({ id: m.id, patch: DONE, previous: previousValues(m, DONE) }));
+    const after = predict(messages, changes).map((m) => (done.some((x) => x.id === m.id) ? patched(m, DONE) : m));
     const putBack = leave(after);
     setMessages(after);
     const failed = (error: unknown) => {
@@ -768,11 +775,36 @@ export default function App() {
       putBack();
       void reloadMessages();
     };
-    void decideSenders(changes).then((undo) => {
-      void reloadMessages();
-      showToast(text, () => void decideSenders(undo).then(reloadMessages, failed).finally(putBack), icon);
-    }, failed);
+    const undoAll = (undo: SenderChange[]) => async () => {
+      if (finishing.length) await updateAll(finishing.map((f) => ({ id: f.id, patch: f.previous })));
+      await decideSenders(undo);
+    };
+    void decideSenders(changes)
+      .then(async (undo) => {
+        if (finishing.length) await updateAll(finishing);
+        return undo;
+      })
+      .then((undo) => {
+        void reloadMessages();
+        showToast(text, () => void undoAll(undo)().then(reloadMessages, failed).finally(putBack), icon);
+      }, failed);
   }
+
+  /** Everyone at `m`'s domain, unless anyone can have an address there. */
+  function decideDomain(m: Message, decision: SenderDecision) {
+    const at = decidableDomain(m.address);
+    if (!at) return;
+    const accepted = decision === "accepted";
+    decide(
+      [{ screen: domain(at), decision }],
+      accepted ? "Domain accepted" : "Domain blocked",
+      accepted ? ICONS.accept : ICONS.block,
+    );
+  }
+
+  /** `m`'s sender's mail waiting in the Gatekeeper. */
+  const waitingFrom = (m: Message) =>
+    messages.filter((x) => x.screening && x.state === "inbox" && x.address.toLowerCase() === m.address.toLowerCase());
 
   function act(
     targets: Message[],
@@ -1067,7 +1099,26 @@ export default function App() {
         ICONS.snooze,
       ),
     accept: (m: Message) => decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept),
+    acceptAndOpen: (m: Message) => {
+      decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept);
+      if (view.folder !== "inbox" || view.sub || view.search !== null) {
+        changeView({ folder: "inbox", sub: null, search: null }, true);
+      }
+      openThread(m.id);
+    },
+    acceptAndDone: (m: Message) => {
+      const waiting = waitingFrom(m);
+      const done = waiting.length ? waiting : [own(m)];
+      decide(
+        forSenders([m], "accepted"),
+        `Sender accepted. ${plural(done.length, "email")} marked as Done`,
+        ICONS.accept,
+        done,
+      );
+    },
+    acceptDomain: (m: Message) => decideDomain(m, "accepted"),
     block: (m: Message) => decide(forSenders([m], "blocked"), "Sender blocked", ICONS.block),
+    blockDomain: (m: Message) => decideDomain(m, "blocked"),
   };
 
   /** Move to Spam, or for mail in Spam, Not Spam: back to the Inbox. Rows stand for their conversations. */
@@ -1305,11 +1356,28 @@ export default function App() {
     return count === 1 ? `Sender ${verb}` : `${plural(count, "sender")} ${verb}`;
   };
 
+  /** Everyone waiting in New senders, after asking as Spark does. */
+  function decideAll(items: Message[], decision: SenderDecision) {
+    if (!items.length) return;
+    const accepting = decision === "accepted";
+    const run = () =>
+      decide(forSenders(items, decision), senders(items, accepting ? "accepted" : "blocked"), ICONS[accepting ? "accept" : "block"]);
+    setConfirm({
+      title: accepting ? "Accept all" : "Block all",
+      message: accepting
+        ? "Do you want to accept all new senders?"
+        : "Do you want to block all new senders? Their mail goes to the Blocked folder.",
+      confirmLabel: accepting ? "Accept all" : "Block all",
+      danger: !accepting,
+      run,
+    });
+  }
+
   const gatekeeper: GatekeeperActions = {
-    accept: actions.accept,
-    block: actions.block,
-    acceptAll: (items) => decide(forSenders(items, "accepted"), senders(items, "accepted"), ICONS.accept),
-    blockAll: (items) => decide(forSenders(items, "blocked"), senders(items, "blocked"), ICONS.block),
+    acceptSender: (items) => decide(forSenders(items, "accepted"), senders(items, "accepted"), ICONS.accept),
+    blockSender: (items) => decide(forSenders(items, "blocked"), senders(items, "blocked"), ICONS.block),
+    acceptAll: (items) => decideAll(items, "accepted"),
+    blockAll: (items) => decideAll(items, "blocked"),
   };
 
   const snoozeMenu = (m: Message) => setPalette({ kind: "snooze", targetIds: [m.id] });
@@ -1795,6 +1863,10 @@ export default function App() {
         return pickNext(1);
       case "selectPrev":
         return pickNext(-1);
+      case "acceptAll":
+        return gatekeeper.acceptAll(waitingInList());
+      case "blockAll":
+        return gatekeeper.blockAll(waitingInList());
     }
     if (pickedRows.length) {
       switch (action) {
@@ -1812,9 +1884,21 @@ export default function App() {
     }
     const m = current;
     if (!m) return;
+    const waiting = m.screening && m.state === "inbox";
     switch (action) {
+      // For an email from a new sender, E is the Gatekeeper's Accept and Done.
       case "done":
-        return actions.done(m);
+        return waiting ? actions.acceptAndDone(m) : actions.done(m);
+      case "acceptSender":
+        return waiting || m.state === "blocked" ? actions.accept(m) : undefined;
+      case "acceptAndOpen":
+        return waiting ? actions.acceptAndOpen(m) : undefined;
+      case "acceptDomain":
+        return waiting || m.state === "blocked" ? actions.acceptDomain(m) : undefined;
+      case "blockSender":
+        return m.state !== "blocked" ? actions.block(m) : undefined;
+      case "blockDomain":
+        return m.state !== "blocked" ? actions.blockDomain(m) : undefined;
       case "snooze":
         return snoozeMenu(m);
       case "pin":
@@ -1883,6 +1967,81 @@ export default function App() {
   }
 
   // ---- Command Center ----
+
+  /** Mail waiting in the Gatekeeper, in the accounts the Inbox shows. */
+  function waitingInList() {
+    return messages.filter(
+      (x) => x.screening && x.state === "inbox" && (view.account === "all" || x.account === view.account),
+    );
+  }
+
+  /** Accepting a new or blocked sender, or blocking one, and the same for everyone at their domain. */
+  function gatekeeperCommands(m: Message): Command[] {
+    const at = decidableDomain(m.address);
+    const waiting = m.screening && m.state === "inbox";
+    const commands: Command[] = [];
+    if (waiting || m.state === "blocked") {
+      commands.push({
+        id: "accept-sender",
+        label: "Accept Sender",
+        keywords: "gatekeeper new unblock",
+        Icon: ThumbsUp,
+        shortcut: shortcutLabel("acceptSender"),
+        run: () => actions.accept(m),
+      });
+    }
+    if (waiting) {
+      commands.push(
+        {
+          id: "accept-open",
+          label: "Accept and Open",
+          keywords: "gatekeeper new",
+          Icon: ThumbsUp,
+          shortcut: shortcutLabel("acceptAndOpen"),
+          run: () => actions.acceptAndOpen(m),
+        },
+        {
+          id: "accept-done",
+          label: "Accept and Done",
+          keywords: "gatekeeper new archive",
+          Icon: ThumbsUp,
+          shortcut: shortcutLabel("done"),
+          run: () => actions.acceptAndDone(m),
+        },
+      );
+    }
+    if (at && (waiting || m.state === "blocked")) {
+      commands.push({
+        id: "accept-domain",
+        label: `Accept all from ${at}`,
+        keywords: "gatekeeper domain unblock",
+        Icon: ThumbsUp,
+        shortcut: shortcutLabel("acceptDomain"),
+        run: () => actions.acceptDomain(m),
+      });
+    }
+    if (m.state !== "blocked") {
+      commands.push({
+        id: "block-sender",
+        label: "Block Sender",
+        keywords: "gatekeeper spam",
+        Icon: Ban,
+        shortcut: shortcutLabel("blockSender"),
+        run: () => actions.block(m),
+      });
+      if (at) {
+        commands.push({
+          id: "block-domain",
+          label: `Block all from ${at}`,
+          keywords: "gatekeeper spam domain",
+          Icon: Ban,
+          shortcut: shortcutLabel("blockDomain"),
+          run: () => actions.blockDomain(m),
+        });
+      }
+    }
+    return commands;
+  }
 
   function actionCommands(targetId?: number): Command[] {
     const target = targetId === undefined ? current : messages.find((x) => x.id === targetId);
@@ -2004,8 +2163,30 @@ export default function App() {
           })),
         ]
       : [];
+    const waiting = waitingInList();
     return [
       ...messageCommands,
+      ...(m ? gatekeeperCommands(m) : []),
+      ...(waiting.length
+        ? [
+            {
+              id: "accept-all",
+              label: "Accept all new senders",
+              keywords: "gatekeeper",
+              Icon: ThumbsUp,
+              shortcut: shortcutLabel("acceptAll"),
+              run: () => gatekeeper.acceptAll(waiting),
+            },
+            {
+              id: "block-all",
+              label: "Block all new senders",
+              keywords: "gatekeeper",
+              Icon: ThumbsDown,
+              shortcut: shortcutLabel("blockAll"),
+              run: () => gatekeeper.blockAll(waiting),
+            },
+          ]
+        : []),
       {
         id: "compose",
         label: "Compose new email",

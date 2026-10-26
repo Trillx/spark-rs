@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Message } from "../types.ts";
-import { covers, domain, domainOf, forSenders, predict, sender, settled } from "./gatekeeper.ts";
+import { covers, decidableDomain, domain, domainOf, forSenders, predict, sender, settled } from "./gatekeeper.ts";
 
 const mail = (id: number, address: string, state: Message["state"] = "inbox", screening = true): Message => ({
   id,
@@ -27,6 +27,9 @@ test("decisions cover one address, or everyone at a domain", () => {
   assert.ok(!covers(sender("ana@parts.com"), "bob@parts.com"));
   assert.ok(covers(domain("@Parts.com"), "bob@parts.com"));
   assert.ok(!covers(domain("parts.com"), "bob@sub.parts.com"));
+  assert.equal(decidableDomain("ana@Parts.com"), "parts.com");
+  assert.equal(decidableDomain("ana@gmail.com"), undefined);
+  assert.equal(decidableDomain("ana@hotmail.co.uk"), undefined);
 });
 
 test("mail follows its sender's decision", () => {
