@@ -998,7 +998,7 @@ export default function App() {
     spam: (m: Message) => spam([m]),
     deleteForever: (m: Message) => deleteForeverAsk(together(m)),
     pin: (m: Message) => flag(m, "pinned", "Pinned", "Unpinned", ICONS.pin),
-    priority: (m: Message) => flag(m, "priority", "Marked as Priority", "Removed from Priority", ICONS.priority),
+    priority: (m: Message) => flag(m, "priority", "Thread is Priority", "Thread is Not Priority", ICONS.priority),
     /** Reading marks the whole conversation read; unread marks `m`. */
     read: (m: Message) => {
       const unread = threadOf(m).filter((x) => x.unread);

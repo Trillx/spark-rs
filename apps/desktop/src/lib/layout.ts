@@ -124,7 +124,9 @@ export function inboxMessages(messages: Message[], account: AccountFilter, showD
 /**
  * Sorts accepted inbox mail into Smart Inbox cards. `sticky` holds messages read
  * during this visit: they keep their card until the list changes, so opening a
- * message doesn't make it jump to Seen under the cursor.
+ * message doesn't make it jump to Seen under the cursor. Priority mail stays
+ * in its card once read, until it's Done (Spark's `priorityCardShowsRead`
+ * defaults to on).
  */
 export function smartCards(mail: Message[], sticky: ReadonlySet<number>): Record<CardKey, Message[]> {
   const unread = (m: Message) => m.unread || sticky.has(m.id);
@@ -138,7 +140,7 @@ export function smartCards(mail: Message[], sticky: ReadonlySet<number>): Record
   };
   for (const m of mail) {
     if (m.state === "done") cards.seen.push(m);
-    else if (m.priority && unread(m)) cards.priority.push(m);
+    else if (m.priority) cards.priority.push(m);
     else if (m.pinned) cards.pinned.push(m);
     else if (!unread(m)) cards.seen.push(m);
     else cards[m.category].push(m);
@@ -308,7 +310,7 @@ export function buildList(
   }
 
   if (view.mode === "focused") {
-    // Unread Priority mail sits in a card on top; the rest is grouped by date,
+    // Priority mail sits in a card on top; the rest is grouped by date,
     // with notifications and newsletters folded into one row each.
     const priority = smartCards(mail, rows.sticky).priority;
     const rest = mail.filter((m) => !priority.includes(m));
