@@ -1,7 +1,7 @@
 [
   {
     "id": 1, "account": "personal", "category": "people", "pinned": true, "unread": true,
-    "from": "Dana Whitfield", "address": "dana@whitfieldproperties.com", "ageMinutes": 120,
+    "from": "Dana Whitfield", "address": "dana@whitfieldproperties.example", "ageMinutes": 120,
     "subject": "Lease renewal — signature needed by Friday",
     "snippet": "Hi! Attached is the renewal for next year. Nothing changed except the parking spot…",
     "body": ["Hi!", "Attached is the lease renewal for next year. Nothing changed except the parking spot number (now 14B). Could you sign and send it back by Friday?", "Thanks so much,", "Dana"],
@@ -9,7 +9,7 @@
   },
   {
     "id": 2, "account": "personal", "category": "people", "unread": true,
-    "from": "Marcus Lee", "address": "marcus.lee@gmail.com", "ageMinutes": 210,
+    "from": "Marcus Lee", "address": "marcus.lee@example.com", "ageMinutes": 210,
     "subject": "Saturday hike?",
     "snippet": "Thinking Mt. Si if the weather holds. Leave around 8?",
     "body": ["Thinking Mt. Si if the weather holds. Leave around 8 and grab breakfast after?", "I can drive — just bring water and the good snacks this time.", "— M"]
@@ -126,7 +126,7 @@
   },
   {
     "id": 18, "account": "personal", "category": "people", "state": "filed",
-    "from": "Me", "address": "me@gmail.com", "to": ["Marcus Lee <marcus.lee@gmail.com>"], "ageMinutes": 190,
+    "from": "Me", "address": "me@gmail.com", "to": ["Marcus Lee <marcus.lee@example.com>"], "ageMinutes": 190,
     "subject": "Re: Saturday hike?", "conversation": 2,
     "snippet": "I'm in! 8 works. I'll bring the good snacks, promise.",
     "body": ["I'm in! 8 works.", "I'll bring the good snacks, promise."]
@@ -179,7 +179,7 @@
   },
   {
     "id": 25, "account": "personal", "category": "people", "unread": true, "conversation": 2,
-    "from": "Marcus Lee", "address": "marcus.lee@gmail.com", "ageMinutes": 170,
+    "from": "Marcus Lee", "address": "marcus.lee@example.com", "ageMinutes": 170,
     "to": ["Me <me@gmail.com>"],
     "subject": "Re: Saturday hike?",
     "snippet": "Perfect. I'll pick you up at 7:45 — the trailhead lot fills up fast.",
@@ -207,7 +207,7 @@
   },
   {
     "id": 27, "account": "personal", "category": "people",
-    "from": "Marcus Lee", "address": "marcus.lee@gmail.com", "ageMinutes": 150,
+    "from": "Marcus Lee", "address": "marcus.lee@example.com", "ageMinutes": 150,
     "to": ["Me <me@gmail.com>"],
     "subject": "Accepted: Saturday hike",
     "snippet": "Marcus Lee has accepted this invitation.",
@@ -216,7 +216,7 @@
       "kind": "reply", "summary": "Saturday hike", "startMinutes": 2700, "minutes": 240,
       "location": "Pantoll trailhead, Mount Tamalpais",
       "organizer": { "name": "Me", "address": "me@gmail.com", "answer": "accepted" },
-      "attendees": [{ "name": "Marcus Lee", "address": "marcus.lee@gmail.com", "answer": "accepted" }]
+      "attendees": [{ "name": "Marcus Lee", "address": "marcus.lee@example.com", "answer": "accepted" }]
     }
   }
 ]

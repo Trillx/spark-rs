@@ -7,9 +7,9 @@
 **Spark-style email for Windows, with a Rust core and AI on your own key.**
 
 [![Download](https://img.shields.io/github/v/release/Trillx/spark-rs?label=download&color=f59e0b)](https://github.com/Trillx/spark-rs/releases/latest)
-[![Windows on ARM and x64](https://img.shields.io/badge/Windows-ARM64%20%C2%B7%20x64-0078d4)](#download)
-[![Built with Rust and Tauri](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-b7410e)](#layout)
-[![AI: bring your own key](https://img.shields.io/badge/AI-bring%20your%20own%20key-7c3aed)](#ai)
+[![Windows on ARM and x64](https://img.shields.io/badge/Windows-ARM64%20%C2%B7%20x64-0078d4)](https://github.com/Trillx/spark-rs/releases/latest)
+[![Built with Rust and Tauri](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-b7410e)](https://v2.tauri.app)
+![AI: bring your own key](https://img.shields.io/badge/AI-bring%20your%20own%20key-7c3aed)
 
 </div>
 
@@ -20,15 +20,19 @@
   <img src="assets/screenshots/inbox-light.png" alt="The spark-rs Smart Inbox: Priority, New senders, Pinned and People cards next to an open conversation">
 </picture>
 
-<p align="center"><sub>Screenshots show the demo mailbox that spark-rs opens with until you add an account.</sub></p>
+<p align="center"><sub>Screenshots show the demo mailbox that spark-rs opens with until you add an account. The demo doesn't call an AI provider, so the +AI summary in them was written by hand.</sub></p>
 
 spark-rs is a desktop email client modeled on Spark: the Smart Inbox, the
 Gatekeeper for new senders, pins, snooze, Set Aside, the single-key shortcuts
 and the +AI tools, rebuilt as a Windows app with a Rust core. Windows on ARM
 (`aarch64-pc-windows-msvc`) was the first target, and Windows x64 works too.
-The one deliberate difference is AI, which runs on your own Anthropic, OpenAI
-or OpenAI-compatible account. Nothing goes through spark-rs's servers, because
-there aren't any.
+
+It differs from Spark on purpose in a few places. AI runs on your own
+Anthropic, OpenAI or OpenAI-compatible account. There's no sync server: the
+app talks to your mail servers itself, so snooze, Set Aside, Priority and
+new-sender screening stay on the computer you set them on. Gmail signs in with
+an app password. Nothing goes through spark-rs's servers, because there aren't
+any.
 
 Created in [T3 Code](https://t3.codes).
 
@@ -40,13 +44,14 @@ Created in [T3 Code](https://t3.codes).
 - **Work and personal mail together.** Microsoft 365 through Microsoft Graph,
   Gmail with an app password, and any IMAP server, in one inbox.
 - **Fast triage.** Done, snooze, pin, Set Aside and Priority on single keys,
-  Ctrl+K for every command, and Undo before anything reaches the server.
+  Ctrl+K for every command, and six seconds to undo Done, Delete or a move
+  before the server sees it.
 - **+AI on your own key.** Summaries, quick replies, and writing and rewriting
   in the composer, through Anthropic, OpenAI, or an OpenAI-compatible server
   such as Ollama on your own computer.
 - **Calendar.** Microsoft 365 calendars by day, week or month, invitations you
-  answer from the email, and a pop-up a minute before each meeting with a
-  Join button.
+  answer from the email, and a pop-up a minute before meetings on your main
+  calendar, with Join for Teams, Zoom and Meet calls.
 - **Search.** A full-text index on your computer answers as you type, and the
   servers are searched too, for mail that isn't downloaded yet.
 - **Agents.** Claude Code, Codex and other MCP clients can read, triage or
@@ -152,8 +157,8 @@ registrations → New registration). If you can't register apps, ask IT:
 Then choose **Microsoft 365** and enter the Application (client) ID and the
 Directory (tenant) ID, or your domain such as `contoso.onmicrosoft.com`.
 Your browser opens Microsoft's sign-in; when it's done the account appears.
-Check your company's rules first: using your own client on work mail, and
-sending work mail to an AI provider for summaries and drafts, may not be allowed.
+Check your company's rules first: using your own mail client on work mail may
+not be allowed, and neither may AI (see AI below).
 
 **Other IMAP servers.** Choose **Other (IMAP)** and enter the servers. Ports
 993 and 465 use TLS from the start; 143 and 587 use STARTTLS.
@@ -187,8 +192,9 @@ Attachments download when you open or save them, also from archived mail.
 Program files (`.exe`, `.js`, `.lnk` and the like) can only be saved, not
 opened, and downloaded files are marked as coming from the internet, so
 Office opens them in Protected View. Attach files with the paperclip,
-Ctrl+Shift+A, or by dropping them on the window; forwards keep the original's
-attachments. Messages over 10 MB are stored without their body or file list.
+Ctrl+Shift+A in the composer, or by dropping them on the window; forwards keep
+the original's attachments. Messages over 10 MB are stored without their body
+or file list.
 
 Calendar invitations show as a card in place of the email: the date and time
 in your time zone, who's invited and how they answered, the call to join,
@@ -289,25 +295,37 @@ and Drafts. Searches with only filters, or for today's mail, stay local.
 
 ## AI
 
-The +AI features use your own AI provider. In Settings → AI, choose
-**Anthropic** (Claude), **OpenAI**, or **Custom** for any OpenAI-compatible
-server, such as Ollama on your own computer (`http://localhost:11434/v1`).
-Enter the API key and the model, and Test connection checks them. The key is
+The +AI features use your own AI provider, set up in Settings → AI:
+
+- **Anthropic** (Claude) or **OpenAI**: enter your API key and the model.
+  Anthropic starts with Claude Opus 5.5.
+- **Custom**, for any server with the OpenAI Chat Completions API: enter its
+  base URL, such as `http://localhost:11434/v1` for Ollama on your own
+  computer, and the model. The key is optional, since local servers usually
+  don't need one.
+
+Test connection checks the key and the base URL by loading the provider's
+models, which the Model field then suggests. It doesn't try the model itself,
+so a misspelled model name shows up only when you first use +AI. The key is
 kept in Windows Credential Manager, not in a settings file.
 
 - **+AI Summary** in the toolbar puts a summary under the email: Short
   (`Ctrl+Shift+S`), Detailed (`Ctrl+Shift+D`) or Action Points
-  (`Ctrl+Shift+A`).
-- **Quick replies** under each email (Interested, Not interested, Thanks)
-  start a reply that AI writes.
+  (`Ctrl+Shift+A`; in the composer it attaches files instead).
+- **Quick replies** (Interested, Not interested, Thanks) start a reply that AI
+  writes. They're under the latest email in a conversation when it's from a
+  person rather than a newsletter or notification, isn't one you sent, and
+  isn't waiting in the Gatekeeper.
 - **+AI in the composer** writes an email from a few words, or rephrases,
   shortens, expands or proofreads what you've written, changes its tone, or
   changes it the way you describe.
 
-Nothing is sent in the background. An email's sender, date, subject and text
-go to your provider only when you use one of these on it, under that
-provider's terms. Check your employer's policy before using AI on
-work mail.
+Nothing is sent in the background: your provider gets only what you use AI
+on, under its terms. A summary sends the email's sender, date, subject and
+text. The composer sends what you ask for, the draft or the part you
+selected, the email you're replying to or forwarding, and, when no signature
+follows, your name for the sign-off. Check your employer's policy before
+using AI on work mail.
 
 ## AI agents
 

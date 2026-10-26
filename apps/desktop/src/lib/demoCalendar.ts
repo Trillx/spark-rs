@@ -20,7 +20,7 @@ const SAM: InvitePerson = { name: "Sam Okafor", address: "sam.okafor@acme.exampl
 const HANNAH: InvitePerson = { name: "Hannah Cole", address: "hannah@acme.example", answer: "tentative" };
 const ALEX: InvitePerson = { name: "Alex Moreno", address: "alex@moreno-design.example" };
 const KAI: InvitePerson = { name: "Kai Tanaka", address: "kai@acme.example", answer: "declined" };
-const MARCUS: InvitePerson = { name: "Marcus Lee", address: "marcus.lee@gmail.com", answer: "accepted" };
+const MARCUS: InvitePerson = { name: "Marcus Lee", address: "marcus.lee@example.com", answer: "accepted" };
 
 const TEAMS = "https://teams.microsoft.com/l/meetup-join/demo";
 const MEET = "https://meet.google.com/abc-defg-hij";
