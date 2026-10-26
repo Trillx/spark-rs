@@ -30,7 +30,8 @@ export interface ListView {
 }
 
 export type ListBlock =
-  | { kind: "card"; key: CardKey; items: Message[]; total: number }
+  /** `shown` rows, then "Show all". */
+  | { kind: "card"; key: CardKey; items: Message[]; total: number; shown: number }
   /** New senders: a strip of cards above the list, or the full grid of its own view. */
   | { kind: "gatekeeper"; items: Message[]; layout: "strip" | "grid" }
   | { kind: "period"; title: string }
@@ -117,6 +118,8 @@ export interface ListContext {
   hits?: SearchHits;
   /** Where new senders wait; their mail is inbox mail unless that's before the Inbox. */
   gatekeeper?: GatekeeperMode;
+  /** Rows the Priority card shows before "Show all" (Settings → Priority); 0 shows them all. */
+  priorityLines?: number;
 }
 
 /** Mail waiting in New Senders, out of the lists until its sender is accepted. */
@@ -217,7 +220,7 @@ function withReturnPeriods(items: Message[]): ListBlock[] {
 
 function rowIds(blocks: ListBlock[]) {
   return blocks.flatMap((b) =>
-    b.kind === "row" ? [b.message.id] : b.kind === "card" ? b.items.slice(0, CARD_LIMIT).map((m) => m.id) : [],
+    b.kind === "row" ? [b.message.id] : b.kind === "card" ? b.items.slice(0, b.shown).map((m) => m.id) : [],
   );
 }
 
@@ -358,11 +361,21 @@ export function buildList(
     );
   }
 
+  const priorityLines = ctx.priorityLines ?? CARD_LIMIT;
+  /** A card's block: the Priority card shows as many rows as Settings → Priority says. */
+  const card = (key: CardKey, items: Message[]): ListBlock => ({
+    kind: "card",
+    key,
+    items,
+    total: items.length,
+    shown: key !== "priority" ? CARD_LIMIT : priorityLines || items.length,
+  });
+
   if (view.mode === "cards") {
     const cards = smartCards(mail, rows.sticky);
     const blocks: ListBlock[] = [];
     for (const key of CARD_ORDER) {
-      if (cards[key].length) blocks.push({ kind: "card", key, items: cards[key], total: cards[key].length });
+      if (cards[key].length) blocks.push(card(key, cards[key]));
       // New senders sit right under Priority.
       if (key === "priority") blocks.push(...gatekeeper);
     }
@@ -385,9 +398,7 @@ export function buildList(
         items.push(m);
       }
     }
-    const top: ListBlock[] = priority.length
-      ? [{ kind: "card", key: "priority", items: priority, total: priority.length }]
-      : [];
+    const top: ListBlock[] = priority.length ? [card("priority", priority)] : [];
     return rows.model(title, [...top, ...gatekeeper, ...withPeriods(items, inboxTime)]);
   }
 

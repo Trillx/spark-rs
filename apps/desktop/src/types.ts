@@ -135,6 +135,13 @@ export interface SenderStatus {
   publicDomain: boolean;
 }
 
+/** What `prioritizeSenders` changed: these senders and emails go back to `priority`. */
+export interface PriorityUndo {
+  senders: string[];
+  messages: number[];
+  priority: boolean;
+}
+
 /** Where new senders wait: New Senders above the Inbox, in the Inbox asking when opened, or nowhere. */
 export type GatekeeperMode = "beforeInbox" | "insideInbox" | "off";
 
@@ -160,7 +167,7 @@ export interface FolderView {
 }
 
 /** Which new mail shows a notification. `people` is Spark's smart notifications. */
-export type NotifyFor = "people" | "all" | "off";
+export type NotifyFor = "people" | "all" | "priority" | "off";
 
 /** What the app icon's badge counts: unread conversations in the Inbox, all of them, or nothing. */
 export type BadgeCount = "new" | "inbox" | "off";

@@ -73,6 +73,7 @@ import {
   discardDraft,
   emptyFolders,
   getPrefs,
+  getPrioritySenders,
   listAccounts,
   listFolders,
   listMessages,
@@ -90,6 +91,7 @@ import {
   openAttachment,
   openDraft,
   patched,
+  prioritizeSenders,
   refreshFolders,
   renameFolder,
   saveAllAttachments,
@@ -103,6 +105,7 @@ import {
   syncFolders,
   syncNow,
   trustCertificate,
+  undoPrioritize,
   unsubscribe,
   updateMessage,
   watchFolders,
@@ -144,6 +147,7 @@ import {
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
 import { decidableDomain, domain, forSenders, predict } from "./lib/gatekeeper";
+import { loadPriorityLines, savePriorityLines } from "./lib/priority";
 import {
   formatFullDate,
   formatLater,
@@ -381,6 +385,10 @@ export default function App() {
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
   /** Settings → Appearance → Minimize old emails. */
   const [minimize, setMinimize] = useState(loadMinimize);
+  /** Settings → Priority: rows the Priority card shows; 0 shows them all. */
+  const [priorityLines, setPriorityLines] = useState(loadPriorityLines);
+  /** The Priority senders, as stored, whose mail is all Priority. */
+  const [prioritySenders, setPrioritySenders] = useState<string[]>([]);
   /** The configured provider's name, for "Anthropic declined…". */
   const [aiProvider, setAiProvider] = useState("The AI provider");
   const [toast, setToast] = useState<ToastData | null>(null);
@@ -410,8 +418,16 @@ export default function App() {
     view.account === "all" ? undefined : view.account,
   );
   const ctx: ListContext = useMemo(
-    () => ({ accounts, folders, smartFolders: layout.smartFolders, seen, hits, gatekeeper: gatekeeperMode }),
-    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode],
+    () => ({
+      accounts,
+      folders,
+      smartFolders: layout.smartFolders,
+      seen,
+      hits,
+      gatekeeper: gatekeeperMode,
+      priorityLines,
+    }),
+    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode, priorityLines],
   );
   const listed = useMemo(
     () => (discarding.size ? messages.filter((m) => !discarding.has(m.id)) : messages),
@@ -453,6 +469,7 @@ export default function App() {
   useEffect(() => {
     void reloadFolders();
     void getGatekeeperMode().then(setGatekeeperMode, () => {});
+    void reloadPrioritySenders();
     void Promise.all([listAccounts(), listMessages()]).then(
       ([loadedAccountList, loaded]) => {
         loadedAccounts.current = accountSet(loadedAccountList);
@@ -625,6 +642,7 @@ export default function App() {
         void reloadFolders();
         // The demo keeps its own mode.
         if (demoChanged) void getGatekeeperMode().then(setGatekeeperMode, () => {});
+        void reloadPrioritySenders();
       },
       (error) => showToast(`Couldn't load accounts: ${String(error)}`, undefined, ICONS.error),
     );
@@ -640,6 +658,19 @@ export default function App() {
         setGatekeeperMode(before);
         showToast(`Couldn't change the Gatekeeper: ${String(error)}`, undefined, ICONS.error);
       },
+    );
+  }
+
+  /** Bumped by each load and each change shown before the store answers; a load answered after either is stale. */
+  const prioritySendersVersion = useRef(0);
+
+  function reloadPrioritySenders() {
+    const version = ++prioritySendersVersion.current;
+    return getPrioritySenders().then(
+      (list) => {
+        if (version === prioritySendersVersion.current) setPrioritySenders(list);
+      },
+      (error) => showToast(`Couldn't load Priority senders: ${String(error)}`, undefined, ICONS.error),
     );
   }
 
@@ -828,6 +859,60 @@ export default function App() {
   /** `m`'s sender's mail waiting in the Gatekeeper. */
   const waitingFrom = (m: Message) =>
     messages.filter((x) => x.screening && x.state === "inbox" && x.address.toLowerCase() === m.address.toLowerCase());
+
+  const prioritySet = useMemo(() => new Set(prioritySenders.map((a) => a.toLowerCase())), [prioritySenders]);
+  const isOwnAddress = (address: string) => accounts.some((a) => a.email.toLowerCase() === address.toLowerCase());
+  /** Whether `m`'s sender is a Priority sender; null for the user's own mail, which can't be. */
+  const senderPriority = (m: Message) =>
+    !m.address.includes("@") || isOwnAddress(m.address) ? null : prioritySet.has(m.address.toLowerCase());
+
+  /**
+   * Adds senders to the Priority senders, or takes them off, with an undo:
+   * all their mail turns Priority or not, so the list reloads once it's done.
+   */
+  function prioritize(addresses: string[], priority: boolean) {
+    const byKey = new Map(addresses.map((a) => [a.trim().toLowerCase(), a.trim()]));
+    if (!byKey.size) return;
+    const after = messages.map((m) =>
+      byKey.has(m.address.toLowerCase()) && m.priority !== priority ? { ...m, priority } : m,
+    );
+    const putBack = leave(after);
+    setMessages(after);
+    // The list changes at once too, so the menus offer the opposite right away.
+    showPrioritySenders([...byKey.values()], priority);
+    const text = `${byKey.size === 1 ? "Sender is" : "Senders are"} ${priority ? "Priority" : "Not Priority"}`;
+    const reload = () => void Promise.all([reloadMessages(), reloadPrioritySenders()]);
+    const failed = (error: unknown) => {
+      showToast(`Couldn't change Priority senders: ${String(error)}`, undefined, ICONS.error);
+      putBack();
+      reload();
+    };
+    void prioritizeSenders([...byKey.values()], priority).then((undo) => {
+      reload();
+      // Nothing changed (it was so already): keep the toast whose undo does something.
+      if (!undo.senders.length && !undo.messages.length) return;
+      showToast(
+        text,
+        () => {
+          const changed = new Set(undo.messages);
+          setMessages((ms) => ms.map((m) => (changed.has(m.id) ? { ...m, priority: undo.priority } : m)));
+          showPrioritySenders(undo.senders, undo.priority);
+          void undoPrioritize(undo).then(reload, failed).finally(putBack);
+        },
+        ICONS.priority,
+      );
+    }, failed);
+  }
+
+  /** Puts senders on the Priority senders shown, or takes them off, before the store answers. */
+  function showPrioritySenders(addresses: string[], priority: boolean) {
+    prioritySendersVersion.current++;
+    const keys = new Set(addresses.map((a) => a.toLowerCase()));
+    setPrioritySenders((list) => {
+      const rest = list.filter((a) => !keys.has(a.toLowerCase()));
+      return priority ? [...rest, ...addresses].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase())) : rest;
+    });
+  }
 
   function act(
     targets: Message[],
@@ -1902,6 +1987,11 @@ export default function App() {
     setMinimize(on);
   }
 
+  function changePriorityLines(lines: number) {
+    savePriorityLines(lines);
+    setPriorityLines(lines);
+  }
+
   // ---- keyboard ----
 
   function run(action: ActionId) {
@@ -2200,6 +2290,19 @@ export default function App() {
             shortcut: shortcutLabel("priority"),
             run: () => actions.priority(m),
           },
+          ...(senderPriority(m) === null
+            ? []
+            : [
+                {
+                  id: "priority-sender",
+                  label: senderPriority(m)
+                    ? `Remove "${m.from.trim() || m.address}" from Priority senders`
+                    : `Mark "${m.from.trim() || m.address}" as priority sender`,
+                  keywords: "important vip contact person",
+                  Icon: Zap,
+                  run: () => prioritize([m.address], !senderPriority(m)),
+                },
+              ]),
           {
             id: "trash",
             label: m.state === "deleted" ? "Delete Forever" : "Move to Trash",
@@ -2278,10 +2381,25 @@ export default function App() {
           })),
         ]
       : [];
+    const pickedSenders = pickedMessages.filter((x) => senderPriority(x) !== null).map((x) => x.address);
+    const allPrioritySenders = pickedSenders.every((a) => prioritySet.has(a.toLowerCase()));
+    const selectionCommands: Command[] =
+      pickedMessages.length > 1 && pickedSenders.length
+        ? [
+            {
+              id: "priority-senders",
+              label: allPrioritySenders ? "Remove senders from Priority senders" : "Mark senders as priority senders",
+              keywords: "important vip contacts people",
+              Icon: Zap,
+              run: () => prioritize(pickedSenders, !allPrioritySenders),
+            },
+          ]
+        : [];
     const waiting = waitingInList();
     return [
       ...messageCommands,
       ...(m ? gatekeeperCommands(m) : []),
+      ...selectionCommands,
       ...(waiting.length
         ? [
             {
@@ -2482,6 +2600,8 @@ export default function App() {
   const threadActions: ThreadActions = {
     ...actions,
     inSpam,
+    senderPriority,
+    prioritySender: (m) => prioritize([m.address], !senderPriority(m)),
     close: () => setOpenId(null),
     summarize,
     stopSummary,
@@ -2724,6 +2844,10 @@ export default function App() {
             onTheme={changeTheme}
             minimize={minimize}
             onMinimize={changeMinimize}
+            priorityLines={priorityLines}
+            onPriorityLines={changePriorityLines}
+            prioritySenders={prioritySenders}
+            onPrioritize={prioritize}
             onAccountsChanged={() => void reloadAccounts()}
             gatekeeper={gatekeeperMode}
             onGatekeeper={changeGatekeeper}

@@ -5,7 +5,7 @@
 //! date, so the demo always looks recent; loading turns that into a timestamp.
 //! Changes live in memory only.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
@@ -14,8 +14,8 @@ use spark_mail::invite::{Answer, Card, Kind, Person};
 use spark_mail::{drafts, parse};
 use spark_store::{
     AccountKind, Category, Change, Contact, Decision, FolderRole, GatekeeperMode, Incoming,
-    MessageState, NewAccount, Patch, Screen, SenderStatus, Store, domain_of, is_public_domain,
-    now_ms,
+    MessageState, NewAccount, Patch, PriorityUndo, Screen, SenderStatus, Store, domain_of,
+    is_public_domain, now_ms,
 };
 
 use crate::mailbox::{AccountView, FolderView, Message, SyncView};
@@ -183,13 +183,15 @@ struct DemoInvite {
 }
 
 /// The messages, the drafts, the answers given to demo invitations, the
-/// people in the demo mail, and the Gatekeeper's decisions.
+/// people in the demo mail, the Gatekeeper's decisions, and the Priority
+/// senders (lowercased).
 pub struct DemoMailbox(
     Mutex<Vec<Message>>,
     Mutex<DemoDrafts>,
     Mutex<HashMap<i64, Answer>>,
     Mutex<Store>,
     Mutex<DemoGatekeeper>,
+    Mutex<BTreeSet<String>>,
 );
 
 /// Gatekeeper decisions, by lowercased address and domain, and the mode.
@@ -236,7 +238,78 @@ impl DemoMailbox {
             Mutex::default(),
             Mutex::new(people),
             Mutex::new(gatekeeper),
+            Mutex::default(),
         )
+    }
+
+    pub fn priority_senders(&self) -> Vec<String> {
+        self.5.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// As `Store::prioritize_senders`.
+    pub fn prioritize_senders(
+        &self,
+        addresses: &[String],
+        priority: bool,
+    ) -> Result<PriorityUndo, String> {
+        let mut senders = self.5.lock().unwrap();
+        let mut messages = self.0.lock().unwrap();
+        let addresses: Vec<String> = addresses.iter().map(|a| a.trim().to_lowercase()).collect();
+        // All or nothing, as the store's transaction is.
+        for address in &addresses {
+            if !address.contains('@') {
+                return Err("That isn't an email address.".into());
+            }
+            if priority
+                && accounts()
+                    .iter()
+                    .any(|a| a.email.eq_ignore_ascii_case(address))
+            {
+                return Err("That's one of your own addresses.".into());
+            }
+        }
+        let mut undo = PriorityUndo {
+            priority: !priority,
+            ..Default::default()
+        };
+        for address in addresses {
+            let changed = if priority {
+                senders.insert(address.clone())
+            } else {
+                senders.remove(&address)
+            };
+            if changed {
+                undo.senders.push(address.clone());
+            }
+            for m in messages
+                .iter_mut()
+                .filter(|m| m.priority != priority && m.address.eq_ignore_ascii_case(&address))
+            {
+                m.priority = priority;
+                undo.messages.push(m.id);
+            }
+        }
+        Ok(undo)
+    }
+
+    pub fn undo_prioritize(&self, undo: &PriorityUndo) {
+        let mut senders = self.5.lock().unwrap();
+        for address in &undo.senders {
+            if undo.priority {
+                senders.insert(address.to_lowercase());
+            } else {
+                senders.remove(&address.to_lowercase());
+            }
+        }
+        for m in self
+            .0
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|m| undo.messages.contains(&m.id))
+        {
+            m.priority = undo.priority;
+        }
     }
 
     pub fn gatekeeper_mode(&self) -> GatekeeperMode {
@@ -718,6 +791,46 @@ mod tests {
         assert!(messages.iter().any(|m| m.screening));
         assert!(messages.iter().any(|m| m.priority));
         assert!(messages.iter().any(|m| m.account == 2));
+    }
+
+    #[test]
+    fn priority_senders_change_all_or_nothing_and_undo() {
+        let demo = DemoMailbox::load();
+        let mail = demo.list();
+        let own = accounts()[0].email.clone();
+        // Someone none of whose mail is Priority yet.
+        let sender = mail
+            .iter()
+            .map(|m| m.address.clone())
+            .find(|a| *a != own && mail.iter().all(|m| m.address != *a || !m.priority))
+            .unwrap();
+        assert!(
+            demo.prioritize_senders(&[sender.clone(), own], true)
+                .is_err()
+        );
+        assert!(demo.priority_senders().is_empty());
+        assert!(
+            demo.list()
+                .iter()
+                .all(|m| m.address != sender || !m.priority)
+        );
+
+        let undo = demo
+            .prioritize_senders(std::slice::from_ref(&sender), true)
+            .unwrap();
+        assert_eq!(demo.priority_senders(), [sender.to_lowercase()]);
+        assert!(
+            demo.list()
+                .iter()
+                .all(|m| m.address != sender || m.priority)
+        );
+        demo.undo_prioritize(&undo);
+        assert!(demo.priority_senders().is_empty());
+        assert!(
+            demo.list()
+                .iter()
+                .all(|m| m.address != sender || !m.priority)
+        );
     }
 
     #[test]

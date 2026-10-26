@@ -20,6 +20,7 @@ mod contacts;
 mod conversations;
 mod drafts;
 mod gatekeeper;
+mod priority;
 mod search;
 mod signatures;
 
@@ -29,6 +30,7 @@ pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
 pub use gatekeeper::{
     Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
 };
+pub use priority::PriorityUndo;
 pub use rusqlite::Error;
 pub use search::{Query, Term};
 pub use signatures::{DefaultSignature, Signature};
@@ -696,6 +698,10 @@ impl Store {
             )?;
             tx.pragma_update(None, "user_version", 15)?;
             tx.commit()?;
+        }
+        if version < 16 {
+            conn.execute_batch(priority::SCHEMA_PRIORITY)?;
+            conn.pragma_update(None, "user_version", 16)?;
         }
         Ok(Self { conn })
     }
@@ -1852,6 +1858,7 @@ fn insert_message(
             )?;
         }
     }
+    priority::arrived(conn, id)?;
     Ok(id)
 }
 

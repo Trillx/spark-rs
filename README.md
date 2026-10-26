@@ -50,6 +50,10 @@ Created in [T3 Code](https://t3.codes).
   inside it (the email asks when you open it), or not at all. An email's
   Accept and Block menus, the Command Center and Spark's shortcuts (Ctrl+T
   accepts, Ctrl+B blocks, E accepts and marks Done) also take a whole domain.
+- **Priority.** Priority conversations stay on top of the Inbox until
+  they're Done. Make a sender Priority and all their mail is, the emails
+  you have and the ones still to come; notifications can be just for
+  Priority mail.
 - **Work and personal mail together.** Microsoft 365 through Microsoft Graph,
   Gmail with an app password, and any IMAP server, in one inbox.
 - **Fast triage.** Done, snooze, pin, Set Aside and Priority on single keys,
@@ -295,8 +299,9 @@ sound, and clicking one opens the message. By default only mail from people
 notifies (Spark's smart notifications); newsletters, notifications, mail from
 new senders waiting in the Gatekeeper, and an account's first sync stay
 quiet, as does anything arriving while the window is in front. Settings →
-Notifications changes this, turns the sound off, stops closing to the tray, or
-opens spark-rs in the background when you sign in to Windows.
+Notifications changes this (to all mail, or only Priority mail), turns the
+sound off, stops closing to the tray, or opens spark-rs in the background
+when you sign in to Windows.
 
 Starting spark-rs again while it runs brings the running window forward.
 

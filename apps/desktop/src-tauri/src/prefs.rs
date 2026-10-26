@@ -25,6 +25,8 @@ pub enum NotifyFor {
     #[default]
     People,
     All,
+    /// Only Priority mail: from Priority senders, or in Priority conversations.
+    Priority,
     Off,
 }
 

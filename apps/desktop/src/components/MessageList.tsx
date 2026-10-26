@@ -179,6 +179,7 @@ export default function MessageList(props: Props) {
                       key={block.key}
                       cardKey={block.key}
                       items={block.items}
+                      shown={block.shown}
                       renderRow={row}
                       onCompleteAll={() => props.onDoneAll(block.items)}
                       onShowAll={() => props.onShowAll(block.key)}

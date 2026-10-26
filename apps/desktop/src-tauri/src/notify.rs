@@ -204,6 +204,7 @@ pub fn alerts(arrived: &[Message], notify: NotifyFor, account: Option<&str>) -> 
                 && match notify {
                     NotifyFor::People => m.category == Category::People,
                     NotifyFor::All => true,
+                    NotifyFor::Priority => m.priority,
                     NotifyFor::Off => false,
                 }
         })
@@ -452,6 +453,21 @@ mod tests {
         );
         assert_eq!(alerts(&arrived, NotifyFor::All, Some("Work")).len(), 2);
         assert!(alerts(&arrived, NotifyFor::Off, None).is_empty());
+    }
+
+    #[test]
+    fn priority_notifies_only_about_priority_mail() {
+        let arrived = [
+            message(1, "Ana", "Lunch?"),
+            Message {
+                priority: true,
+                category: Category::Notifications,
+                ..message(2, "Boss", "Budget")
+            },
+        ];
+        let shown = alerts(&arrived, NotifyFor::Priority, None);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].message, Some(2));
     }
 
     #[test]

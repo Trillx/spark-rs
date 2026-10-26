@@ -14,7 +14,7 @@ use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_store::{
     Account, AccountKind, Category, Change, Contact, Folder, FolderRole, GatekeeperMode,
-    MessageState, OutboxFile, Patch, SenderStatus, now_ms,
+    MessageState, OutboxFile, Patch, PriorityUndo, SenderStatus, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -955,6 +955,48 @@ pub fn set_gatekeeper_mode(
         .engine
         .store()
         .set_gatekeeper_mode(mode)
+        .map_err(text)
+}
+
+/// The Priority senders, whose mail is all Priority.
+#[tauri::command]
+pub fn priority_senders(mailbox: State<'_, Mailbox>) -> Result<Vec<String>, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.priority_senders());
+    }
+    mailbox.live.engine.store().priority_senders().map_err(text)
+}
+
+/// Adds senders to the Priority senders, or takes them off, and marks their
+/// mail Priority or not. Returns what `undo_prioritize` puts back.
+#[tauri::command]
+pub fn prioritize_senders(
+    mailbox: State<'_, Mailbox>,
+    addresses: Vec<String>,
+    priority: bool,
+) -> Result<PriorityUndo, String> {
+    if !mailbox.live() {
+        return mailbox.demo.prioritize_senders(&addresses, priority);
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .prioritize_senders(&addresses, priority)
+        .map_err(text)
+}
+
+#[tauri::command]
+pub fn undo_prioritize(mailbox: State<'_, Mailbox>, undo: PriorityUndo) -> Result<(), String> {
+    if !mailbox.live() {
+        mailbox.demo.undo_prioritize(&undo);
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .undo_prioritize(&undo)
         .map_err(text)
 }
 

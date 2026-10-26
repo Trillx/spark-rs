@@ -29,6 +29,7 @@ import type {
   OutgoingDraft,
   PopupMeeting,
   Prefs,
+  PriorityUndo,
   SendStatusEvent,
   SenderChange,
   SenderDecision,
@@ -558,6 +559,49 @@ export function saveGatekeeperMode(mode: GatekeeperMode): Promise<void> {
   return Promise.resolve();
 }
 
+// ---- Priority senders ----
+
+/** The Priority senders, whose mail is all Priority. */
+export function getPrioritySenders(): Promise<string[]> {
+  if (isTauri()) return invoke("priority_senders");
+  return Promise.resolve([...browserPriority].sort());
+}
+
+/** Adds senders to the Priority senders, or takes them off, and marks their mail Priority or not. */
+export function prioritizeSenders(addresses: string[], priority: boolean): Promise<PriorityUndo> {
+  if (isTauri()) return invoke("prioritize_senders", { addresses, priority });
+  const keys = addresses.map((a) => a.trim().toLowerCase());
+  // All or nothing, as the store's transaction is.
+  if (keys.some((a) => !a.includes("@"))) return Promise.reject("That isn't an email address.");
+  if (priority && keys.some((a) => BROWSER_ACCOUNTS.some((x) => x.email.toLowerCase() === a))) {
+    return Promise.reject("That's one of your own addresses.");
+  }
+  const undo: PriorityUndo = { senders: [], messages: [], priority: !priority };
+  for (const address of keys) {
+    if (browserPriority.has(address) !== priority) undo.senders.push(address);
+    if (priority) browserPriority.add(address);
+    else browserPriority.delete(address);
+    browserMailbox.forEach((m, i) => {
+      if (m.priority === priority || m.address.toLowerCase() !== address) return;
+      undo.messages.push(m.id);
+      browserMailbox[i] = { ...m, priority };
+    });
+  }
+  return Promise.resolve(undo);
+}
+
+export function undoPrioritize(undo: PriorityUndo): Promise<void> {
+  if (isTauri()) return invoke("undo_prioritize", { undo });
+  for (const address of undo.senders) {
+    if (undo.priority) browserPriority.add(address);
+    else browserPriority.delete(address);
+  }
+  browserMailbox.forEach((m, i) => {
+    if (undo.messages.includes(m.id)) browserMailbox[i] = { ...m, priority: undo.priority };
+  });
+  return Promise.resolve();
+}
+
 function browserStatus(address: string): SenderStatus {
   const domain = domainOf(address) ?? "";
   return {
@@ -863,6 +907,8 @@ const browserDecisions = new Map<string, SenderDecision>(
   browserMailbox.filter((m) => !m.screening).map((m) => [`s:${m.address.toLowerCase()}`, "accepted"]),
 );
 let browserMode: GatekeeperMode = "beforeInbox";
+/** Priority senders in the preview, lowercased. */
+const browserPriority = new Set<string>();
 /** A few free mail providers, standing in for the store's list. */
 const BROWSER_PUBLIC = new Set(["gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"]);
 

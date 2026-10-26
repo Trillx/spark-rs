@@ -1,26 +1,36 @@
 import { Check, ChevronRight, Ellipsis, Mail, Minus, Plus, ThumbsDown, ThumbsUp, Zap } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import type { Message } from "../types";
-import { CARDS, CARD_LIMIT, GATEKEEPER, type CardKey, type GroupKey } from "../lib/layout";
+import { CARDS, GATEKEEPER, type CardKey, type GroupKey } from "../lib/layout";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem } from "./Dropdown";
 
-/** Smart Inbox card: icon header, complete-all, up to three rows, "Show all (N)". */
+/** Smart Inbox card: icon header, complete-all, the first `shown` rows, "Show all (N)". */
 export function SmartInboxCard({
   cardKey,
   items,
+  shown,
   renderRow,
   onCompleteAll,
   onShowAll,
 }: {
   cardKey: CardKey;
   items: Message[];
+  shown: number;
   renderRow: (m: Message, inPriorityCard: boolean) => ReactNode;
   onCompleteAll: () => void;
   onShowAll: () => void;
 }) {
   if (cardKey === "priority") {
-    return <PriorityCard items={items} renderRow={renderRow} onCompleteAll={onCompleteAll} onShowAll={onShowAll} />;
+    return (
+      <PriorityCard
+        items={items}
+        shown={shown}
+        renderRow={renderRow}
+        onCompleteAll={onCompleteAll}
+        onShowAll={onShowAll}
+      />
+    );
   }
   const { label, Icon, iconClass } = CARDS[cardKey];
   return (
@@ -32,7 +42,7 @@ export function SmartInboxCard({
         <h3 className="min-w-0 flex-1 truncate text-[13px] font-medium leading-[18px]">{label}</h3>
         <CompleteAll label={label} count={items.length} onClick={onCompleteAll} />
       </header>
-      <div className="px-[5px]">{items.slice(0, CARD_LIMIT).map((m) => renderRow(m, false))}</div>
+      <div className="px-[5px]">{items.slice(0, shown).map((m) => renderRow(m, false))}</div>
       <button
         onClick={onShowAll}
         className="flex h-10 w-full items-center gap-1 rounded-b-2xl px-3.5 text-[13px] text-text-2 hover:bg-row-hover hover:text-base-content"
@@ -44,14 +54,16 @@ export function SmartInboxCard({
   );
 }
 
-/** The peach Priority card that tops the Inbox. */
+/** The peach Priority card that tops the Inbox. "Show all" only when some rows are left out. */
 function PriorityCard({
   items,
+  shown,
   renderRow,
   onCompleteAll,
   onShowAll,
 }: {
   items: Message[];
+  shown: number;
   renderRow: (m: Message, inPriorityCard: boolean) => ReactNode;
   onCompleteAll: () => void;
   onShowAll: () => void;
@@ -64,20 +76,24 @@ function PriorityCard({
         <h3 className="min-w-0 flex-1 truncate text-[13px] font-medium leading-[18px]">Priority</h3>
         <CompleteAll label="Priority" count={items.length} onClick={onCompleteAll} />
       </header>
-      <div className="px-[5px] pt-[5px]">{items.slice(0, CARD_LIMIT).map((m) => renderRow(m, true))}</div>
-      <button
-        onClick={onShowAll}
-        className="flex h-10 w-full items-center gap-2 rounded-b-2xl px-3.5 text-[13px] font-medium text-priority hover:bg-priority-line/60"
-      >
-        Show all ({items.length})
-        <span className="flex -space-x-1">
-          {faces.map((m) => (
-            <span key={m.address} className="rounded-full ring-2 ring-priority-fill">
-              <Avatar name={m.from} size="xs" />
-            </span>
-          ))}
-        </span>
-      </button>
+      <div className={`px-[5px] pt-[5px] ${shown < items.length ? "" : "pb-[5px]"}`}>
+        {items.slice(0, shown).map((m) => renderRow(m, true))}
+      </div>
+      {shown < items.length && (
+        <button
+          onClick={onShowAll}
+          className="flex h-10 w-full items-center gap-2 rounded-b-2xl px-3.5 text-[13px] font-medium text-priority hover:bg-priority-line/60"
+        >
+          Show all ({items.length})
+          <span className="flex -space-x-1">
+            {faces.map((m) => (
+              <span key={m.address} className="rounded-full ring-2 ring-priority-fill">
+                <Avatar name={m.from} size="xs" />
+              </span>
+            ))}
+          </span>
+        </button>
+      )}
     </section>
   );
 }

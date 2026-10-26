@@ -40,6 +40,7 @@ import {
   UserCheck,
   UsersRound,
   X,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from "react";
@@ -82,7 +83,8 @@ import {
   type TrustedCerts,
 } from "../api";
 import { isDemoMode, useAccounts } from "../lib/accounts";
-import { formatAgo } from "../lib/format";
+import { formatAgo, plural } from "../lib/format";
+import { PRIORITY_LINE_CHOICES } from "../lib/priority";
 import type { ThemePref } from "../lib/theme";
 import { signatureLabel } from "../lib/signatures";
 import type {
@@ -114,6 +116,7 @@ export type SettingsPage =
   | "ai"
   | "agents"
   | "gatekeeper"
+  | "priority"
   | "notifications"
   | "appearance"
   | "about";
@@ -129,6 +132,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
   ],
   [
     { key: "gatekeeper", label: "Gatekeeper", Icon: UserCheck },
+    { key: "priority", label: "Priority", Icon: Zap },
     { key: "notifications", label: "Notifications", Icon: Bell },
     { key: "appearance", label: "Appearance", Icon: Palette },
   ],
@@ -149,6 +153,10 @@ export default function Settings({
   onTheme,
   minimize,
   onMinimize,
+  priorityLines,
+  onPriorityLines,
+  prioritySenders,
+  onPrioritize,
   onAccountsChanged,
   gatekeeper,
   onGatekeeper,
@@ -162,6 +170,12 @@ export default function Settings({
   /** Minimize old emails in a conversation. */
   minimize: boolean;
   onMinimize: (on: boolean) => void;
+  /** Rows the Priority card shows; 0 shows them all. */
+  priorityLines: number;
+  onPriorityLines: (lines: number) => void;
+  prioritySenders: string[];
+  /** Adds senders to the Priority senders, or takes them off. */
+  onPrioritize: (addresses: string[], priority: boolean) => void;
   /** After an add, rename or remove, so the list updates without waiting for the event. */
   onAccountsChanged: () => void;
   gatekeeper: GatekeeperMode;
@@ -251,6 +265,14 @@ export default function Settings({
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "about" && <About updates={updates} />}
               {page === "gatekeeper" && <GatekeeperPage mode={gatekeeper} onMode={onGatekeeper} />}
+              {page === "priority" && (
+                <PriorityPage
+                  lines={priorityLines}
+                  onLines={onPriorityLines}
+                  senders={prioritySenders}
+                  onPrioritize={onPrioritize}
+                />
+              )}
               {page === "notifications" && <NotificationsPage />}
               {page === "appearance" && (
                 <AppearancePage theme={theme} onTheme={onTheme} minimize={minimize} onMinimize={onMinimize} />
@@ -1215,6 +1237,97 @@ function GatekeeperPage({ mode, onMode }: { mode: GatekeeperMode; onMode: (mode:
   );
 }
 
+// ---- Priority ----
+
+/** Priority emails in the Inbox, and the Priority senders, whose mail is all Priority. */
+function PriorityPage({
+  lines,
+  onLines,
+  senders,
+  onPrioritize,
+}: {
+  lines: number;
+  onLines: (lines: number) => void;
+  senders: string[];
+  onPrioritize: (addresses: string[], priority: boolean) => void;
+}) {
+  const [address, setAddress] = useState("");
+  const accounts = useAccounts();
+  const key = address.trim().toLowerCase();
+  const own = accounts.some((a) => a.email.toLowerCase() === key);
+  const listed = senders.some((s) => s.toLowerCase() === key);
+  const valid = /^[^\s@]+@[^\s@]+$/.test(key) && !own && !listed;
+
+  function add(e: FormEvent) {
+    e.preventDefault();
+    if (!valid) return;
+    onPrioritize([address.trim()], true);
+    setAddress("");
+  }
+
+  return (
+    <>
+      <Group title="Priority emails in Inbox">
+        <Row
+          label="Show"
+          description="Priority emails stay on top of your Inbox until they're Done. Show all opens the rest."
+          htmlFor="priority-lines"
+        >
+          <select
+            id="priority-lines"
+            value={lines}
+            onChange={(e) => onLines(Number(e.target.value))}
+            className="select select-sm h-8 w-40 rounded-lg border-hairline text-[13px]"
+          >
+            {PRIORITY_LINE_CHOICES.map((n) => (
+              <option key={n} value={n}>
+                {n === 0 ? "All emails" : plural(n, "Line")}
+              </option>
+            ))}
+          </select>
+        </Row>
+      </Group>
+
+      <Group
+        title="Priority senders"
+        note="Every email from a Priority sender is Priority, the ones you have and the ones still to come. You can also add a sender from an email's ⋯ menu or the Command Center."
+      >
+        {senders.map((sender) => (
+          <Row key={sender} label={sender}>
+            <button
+              className="btn btn-ghost btn-sm h-8 rounded-lg"
+              aria-label={`Remove ${sender} from Priority senders`}
+              onClick={() => onPrioritize([sender], false)}
+            >
+              Remove
+            </button>
+          </Row>
+        ))}
+        <div className="px-4 py-2.5">
+          <form onSubmit={add} className="flex items-center gap-2">
+            <input
+              type="email"
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              placeholder="name@example.com"
+              aria-label="Address to add to Priority senders"
+              className="input input-sm h-8 min-w-0 flex-1 rounded-lg border-hairline text-[13px]"
+            />
+            <button type="submit" className="btn btn-sm h-8 rounded-lg" disabled={!valid}>
+              <Plus size={15} /> Add
+            </button>
+          </form>
+          {(own || listed) && (
+            <p className="mt-1.5 text-xs text-text-2">
+              {own ? "That's one of your own addresses." : "That's a Priority sender already."}
+            </p>
+          )}
+        </div>
+      </Group>
+    </>
+  );
+}
+
 // ---- Notifications ----
 
 const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
@@ -1226,6 +1339,7 @@ const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
 const NOTIFY_CHOICES: { key: NotifyFor; label: string; detail: string }[] = [
   { key: "people", label: "Smart", detail: "Only mail from people" },
   { key: "all", label: "All", detail: "Every new email" },
+  { key: "priority", label: "Priority", detail: "Only Priority mail" },
   { key: "off", label: "Off", detail: "No notifications" },
 ];
 
@@ -1284,7 +1398,7 @@ function NotificationsPage() {
     <>
       <section className="mb-7">
         <h3 className="mb-2 px-1 text-[13px] font-semibold text-text-2">Notify me about new mail</h3>
-        <div role="radiogroup" aria-label="Notify me about new mail" className="grid grid-cols-3 gap-3">
+        <div role="radiogroup" aria-label="Notify me about new mail" className="grid grid-cols-4 gap-3">
           {NOTIFY_CHOICES.map((c) => (
             <button
               key={c.key}
@@ -1303,8 +1417,9 @@ function NotificationsPage() {
           ))}
         </div>
         <p className="mt-2 px-1 text-xs leading-[18px] text-text-2">
-          Smart leaves out notifications and newsletters. Mail waiting in New senders doesn't notify, and while the
-          spark-rs window is in front, new mail just appears in the list.
+          Smart leaves out notifications and newsletters. Priority is mail from Priority senders and in Priority
+          conversations. Mail waiting in New senders doesn't notify, and while the spark-rs window is in front, new
+          mail just appears in the list.
         </p>
       </section>
 

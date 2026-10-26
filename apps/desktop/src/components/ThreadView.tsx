@@ -68,6 +68,10 @@ export interface ThreadActions {
   spam: (m: Message) => void;
   inSpam: (m: Message) => boolean;
   deleteForever: (m: Message) => void;
+  /** Adds the sender to the Priority senders, or takes them off. */
+  prioritySender: (m: Message) => void;
+  /** Whether the sender is a Priority sender; null for the user's own mail. */
+  senderPriority: (m: Message) => boolean | null;
   priority: (m: Message) => void;
   read: (m: Message) => void;
   pin: (m: Message) => void;
@@ -584,6 +588,7 @@ function MessageMenuItems({
 }) {
   const spam = actions.inSpam(m);
   const deleted = m.state === "deleted";
+  const senderPriority = actions.senderPriority(m);
   return (
     <>
       <MenuItem label="Reply" detail={shortcutLabel("reply")} icon={<Reply size={15} />} onSelect={() => actions.reply(m)} />
@@ -626,6 +631,13 @@ function MessageMenuItems({
       )}
       {!single && spam && (
         <MenuItem label="Delete Forever" icon={<Trash2 size={15} />} danger onSelect={() => actions.deleteForever(m)} />
+      )}
+      {senderPriority !== null && (
+        <MenuItem
+          label={senderPriority ? "Remove Sender from Priority" : "Mark Sender as Priority"}
+          icon={<Zap size={15} />}
+          onSelect={() => actions.prioritySender(m)}
+        />
       )}
       <SenderMenuItems message={m} actions={actions} />
     </>
