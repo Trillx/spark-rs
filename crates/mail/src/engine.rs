@@ -9,7 +9,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
-use spark_store::{Account, AccountKind, Folder, Location, NewAccount, Query, Store, now_ms};
+use spark_store::{
+    Account, AccountKind, Folder, FolderRole, Location, NewAccount, Pending, Place, Query, Store,
+    now_ms,
+};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::attachment::{self, AttachmentData, InlineImage};
 use crate::calendar::{Event, Response};
@@ -19,7 +23,7 @@ use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::invite::{self, Answer, Invite};
 use crate::oauth::{self, App};
-use crate::{Error, OLDER_STEP, Result, search, smtp};
+use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
 
 /// How long a local change waits before it's pushed: longer than the UI's
 /// undo window, so an undone change never reaches the server.
@@ -160,6 +164,11 @@ pub struct Engine {
     tokens: Mutex<HashMap<i64, (String, i64)>>,
     /// How each account's last calendar refresh went.
     calendars: Mutex<HashMap<i64, CalendarStatus>>,
+    /// Per account, taken by rounds, deleting for good and emptying
+    /// folders, so they change the server one at a time: a round pushing a
+    /// move can't land between an empty's look at what's pending and its
+    /// expunge.
+    turns: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
 }
 
 impl Engine {
@@ -169,6 +178,7 @@ impl Engine {
             secrets,
             tokens: Mutex::new(HashMap::new()),
             calendars: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -207,6 +217,8 @@ impl Engine {
             other => other,
         })?;
         let _ = session.logout().await;
+        // A certificate to trust is asked about now, not at the first send.
+        smtp::check_certificate(&smtp).await?;
 
         let config = AccountConfig::Imap {
             username: email.to_owned(),
@@ -312,6 +324,40 @@ impl Engine {
         self.account(account_id)
     }
 
+    /// Trusts the certificate one of an IMAP account's servers shows, by its
+    /// fingerprint (`Untrusted::fingerprint`), where the system doesn't.
+    pub fn trust_certificate(
+        &self,
+        account_id: i64,
+        service: Service,
+        fingerprint: &str,
+    ) -> Result<()> {
+        let account = self.account(account_id)?;
+        let AccountConfig::Imap {
+            username,
+            mut imap,
+            mut smtp,
+        } = config(&account)?
+        else {
+            return Err(Error::Config(
+                "Only IMAP accounts have certificates to trust.".into(),
+            ));
+        };
+        let server = match service {
+            Service::Imap => &mut imap,
+            Service::Smtp => &mut smtp,
+        };
+        server.trusted_cert = Some(fingerprint.to_owned());
+        let config = AccountConfig::Imap {
+            username,
+            imap,
+            smtp,
+        };
+        self.store()
+            .set_account_config(account_id, &to_json(&config))?;
+        Ok(())
+    }
+
     /// Removes the account, its mail and its saved password or sign-in.
     pub fn remove_account(&self, account_id: i64) -> Result<()> {
         self.store().remove_account(account_id)?;
@@ -343,6 +389,8 @@ impl Engine {
     /// round reads at its start and writes at its end: so it happens here,
     /// in the account's round, and not on a connection of its own.
     pub async fn run_round(&self, account_id: i64, round: &Round) -> Result<Report> {
+        let turn = self.turn(account_id);
+        let _turn = turn.lock().await;
         let account = self.account(account_id)?;
         let pending = self.store().pending(account_id, now_ms(), SETTLE_MS)?;
         // Saves settle like other changes, so a burst of them goes up once.
@@ -670,6 +718,130 @@ impl Engine {
         }
         self.store().remove_folder(folder_id)?;
         Ok(())
+    }
+
+    /// Deletes stored messages for good, on their servers and here, wherever
+    /// the servers have them now. Returns how many went.
+    pub async fn delete_forever(&self, ids: &[i64]) -> Result<usize> {
+        let mut by_account: HashMap<i64, Vec<i64>> = HashMap::new();
+        for &id in ids {
+            if let Some(at) = self.store().location(id)? {
+                by_account.entry(at.account_id).or_default().push(id);
+            }
+        }
+        let mut removed = 0;
+        for (account_id, ids) in by_account {
+            let turn = self.turn(account_id);
+            let _turn = turn.lock().await;
+            let account = self.account(account_id)?;
+            removed += match config(&account)? {
+                AccountConfig::Imap {
+                    username,
+                    imap: server,
+                    ..
+                } => {
+                    let spam = self.role_folder(account_id, FolderRole::Spam)?;
+                    let mut state: imap::SyncState = from_json(&account.sync_state);
+                    let mut session =
+                        imap::login(&server, &username, &self.password(account_id)?).await?;
+                    let deleted = async {
+                        imap::find_folders(&mut session, &mut state).await?;
+                        let spam = spam.as_ref().map(|f| f.remote_id.as_str());
+                        imap::delete_forever(&mut session, &self.store, &state, spam, &ids).await
+                    }
+                    .await;
+                    let _ = session.logout().await;
+                    deleted?
+                }
+                AccountConfig::Microsoft {
+                    client_id, tenant, ..
+                } => {
+                    let graph = self.graph(account_id, &client_id, &tenant).await?;
+                    let mut removed = 0;
+                    for id in ids {
+                        let remote = self.store().location(id)?.and_then(|at| at.remote_id);
+                        if let Some(remote) = remote {
+                            graph.delete_forever(&remote).await?;
+                        }
+                        removed += self.store().remove_messages(&[id])?;
+                    }
+                    removed
+                }
+            };
+        }
+        Ok(removed)
+    }
+
+    /// Deletes everything in a folder for good, on the server and here.
+    /// Changes still on their way into or out of it are pushed first, so
+    /// what goes is what the folder shows. On Gmail only Trash and Spam
+    /// can be emptied: expunging a label only takes the label off. Returns
+    /// how many emails the server deleted.
+    pub async fn empty_folder(&self, folder_id: i64) -> Result<usize> {
+        let folder = self.folder(folder_id)?;
+        let account = self.account(folder.account_id)?;
+        let deletes = matches!(folder.role, Some(FolderRole::Trash | FolderRole::Spam));
+        if account.kind == AccountKind::Gmail && !deletes {
+            return Err(Error::Config(
+                "On Gmail, only Trash and Spam can be emptied.".into(),
+            ));
+        }
+        // Pending changes are read with the turn taken: none is half pushed.
+        let turn = self.turn(account.id);
+        let _turn = turn.lock().await;
+        let pending: Vec<Pending> = self
+            .store()
+            .pending(account.id, now_ms(), 0)?
+            .into_iter()
+            .filter(|p| moves_through(p, &folder))
+            .collect();
+        let emptied = match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let mut state: imap::SyncState = from_json(&account.sync_state);
+                let mut session =
+                    imap::login(&server, &username, &self.password(account.id)?).await?;
+                let emptied = async {
+                    imap::find_folders(&mut session, &mut state).await?;
+                    imap::push(&mut session, &self.store, &mut state, pending).await?;
+                    imap::empty_folder(&mut session, &folder.remote_id).await
+                }
+                .await;
+                let _ = session.logout().await;
+                emptied? as usize
+            }
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let graph = self.graph(account.id, &client_id, &tenant).await?;
+                graph.push(&self.store, pending).await?;
+                graph.empty_folder(&folder.remote_id).await?
+            }
+        };
+        self.store().forget_emptied(folder_id)?;
+        Ok(emptied)
+    }
+
+    /// The account's turn at changing its server (`turns`).
+    fn turn(&self, account_id: i64) -> Arc<AsyncMutex<()>> {
+        self.turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(account_id)
+            .or_default()
+            .clone()
+    }
+
+    /// The account's folder with this role, if it has one.
+    fn role_folder(&self, account_id: i64, role: FolderRole) -> Result<Option<Folder>> {
+        Ok(self
+            .store()
+            .folders()?
+            .into_iter()
+            .find(|f| f.account_id == account_id && f.role == Some(role)))
     }
 
     fn folder(&self, folder_id: i64) -> Result<Folder> {
@@ -1194,6 +1366,17 @@ pub fn gmail_servers() -> (Server, Server) {
 
 /// Folder sync failures that mean the account can't be reached fail the
 /// round; others are reported and the round goes on.
+/// Whether a pending change moves a message into or out of `folder`.
+fn moves_through(p: &Pending, folder: &Folder) -> bool {
+    let at = |place: Place, filed_in: Option<i64>| match folder.role {
+        Some(FolderRole::Trash) => place == Place::Trash,
+        Some(FolderRole::Archive) => place == Place::Archive,
+        Some(FolderRole::Blocked) => place == Place::Blocked,
+        _ => place == Place::Folder && filed_in == Some(folder.id),
+    };
+    at(p.place, p.folder.as_ref().map(|(id, _)| *id)) || at(p.remote_place, p.remote_folder)
+}
+
 fn folder_failed(folder: &Folder, e: Error, report: &mut Report) -> Result<()> {
     match e {
         Error::Network { .. } | Error::Auth(_) => Err(e),
@@ -1299,6 +1482,7 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port,
                 security: imap::Security::Plain,
+                trusted_cert: None,
             },
             task,
         )
@@ -1547,6 +1731,62 @@ mod tests {
             r#"{"limit":300,"complete":true}"#,
             Some(5)
         )));
+    }
+
+    #[test]
+    fn emptying_a_folder_pushes_what_moves_into_or_out_of_it() {
+        let folder = |id, role| Folder {
+            id,
+            account_id: 1,
+            remote_id: "x".into(),
+            parent_id: None,
+            name: "x".into(),
+            role,
+            selectable: true,
+            sync_state: "{}".into(),
+            synced_at: None,
+        };
+        let change = |place, home: Option<i64>, remote_place, remote_folder| Pending {
+            id: 1,
+            remote_id: None,
+            mailbox: None,
+            uid: None,
+            message_id: None,
+            place,
+            folder: home.map(|id| (id, "x".to_owned())),
+            unread: false,
+            pinned: false,
+            remote_place,
+            remote_folder,
+            remote_unread: false,
+            remote_pinned: false,
+        };
+        let trash = folder(5, Some(FolderRole::Trash));
+        let junk = folder(6, Some(FolderRole::Spam));
+        assert!(moves_through(
+            &change(Place::Trash, None, Place::Inbox, None),
+            &trash
+        ));
+        assert!(moves_through(
+            &change(Place::Inbox, None, Place::Trash, None),
+            &trash
+        ));
+        assert!(!moves_through(
+            &change(Place::Archive, None, Place::Inbox, None),
+            &trash
+        ));
+        assert!(moves_through(
+            &change(Place::Folder, Some(6), Place::Inbox, None),
+            &junk
+        ));
+        assert!(moves_through(
+            &change(Place::Inbox, None, Place::Folder, Some(6)),
+            &junk
+        ));
+        assert!(!moves_through(
+            &change(Place::Folder, Some(7), Place::Folder, Some(8)),
+            &junk
+        ));
     }
 
     #[test]

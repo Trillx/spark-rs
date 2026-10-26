@@ -39,6 +39,7 @@ impl Peer {
             host: "127.0.0.1".into(),
             port: listener.local_addr().unwrap().port(),
             security: Security::Plain,
+            trusted_cert: None,
         };
         let commands = Arc::new(Mutex::new(Vec::new()));
         // UID 2 was marked deleted by another mail client and must survive.

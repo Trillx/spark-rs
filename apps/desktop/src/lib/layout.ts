@@ -1,5 +1,5 @@
 import { Bell, MailOpen, Newspaper, Pin, UserPlus, Users, Zap, type LucideIcon } from "lucide-react";
-import type { AccountId, AccountView, FolderView, Message } from "../types";
+import type { AccountId, AccountView, BadgeCount, FolderView, Message } from "../types";
 import { asThread, conversationOf, indexConversations, participantNames } from "./conversation";
 import { datePeriod } from "./format";
 import { showsRecipients } from "./recipients";
@@ -408,6 +408,19 @@ export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListCon
     if (hasAccountRows(key)) listAccounts[key] = perAccount(counted);
   }
   return { inbox: unread.length, accounts: perAccount(unread), lists, listAccounts };
+}
+
+/**
+ * The app icon badge's number: the Inbox's conversations, all of them or only
+ * unread ones, as the sidebar counts them, leaving out `excluded` accounts.
+ */
+export function badgeCount(messages: Message[], badge: BadgeCount, excluded: AccountId[]): number {
+  if (badge === "off") return 0;
+  return oneEach(
+    messages.filter(
+      (m) => m.state === "inbox" && !m.screening && (badge === "inbox" || m.unread) && !excluded.includes(m.account),
+    ),
+  ).length;
 }
 
 /** One email per conversation. */

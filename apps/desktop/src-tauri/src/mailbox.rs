@@ -10,6 +10,7 @@ use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
+use spark_mail::{Error, Service, Untrusted};
 use spark_store::{
     Account, AccountKind, Category, Contact, Folder, FolderRole, MessageState, OutboxFile, Patch,
     now_ms,
@@ -126,6 +127,46 @@ pub struct SyncView {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<i64>,
+    /// The sync failed on a server certificate the user may trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<Untrusted>,
+}
+
+/// A failed command, for the UI: what went wrong, and for a server
+/// certificate the system doesn't trust, which one, so the user can choose
+/// to trust it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Failure {
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate: Option<Untrusted>,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            certificate: None,
+        }
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(e: Error) -> Self {
+        Self {
+            certificate: certificate_of(&e),
+            message: e.to_string(),
+        }
+    }
+}
+
+/// The certificate a failure was about, if it was one the user may trust.
+pub(crate) fn certificate_of(e: &Error) -> Option<Untrusted> {
+    match e {
+        Error::Certificate(untrusted) => Some((**untrusted).clone()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -494,6 +535,48 @@ pub async fn delete_folder(
     Ok(())
 }
 
+/// Deletes messages for good on their servers. Returns how many went.
+#[tauri::command]
+pub async fn delete_forever(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    ids: Vec<i64>,
+) -> Result<usize, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.delete_forever(&ids));
+    }
+    let removed = mailbox.live.engine.delete_forever(&ids).await;
+    // Some may have gone before one failed.
+    let _ = app.emit("mailbox-changed", ());
+    removed.map_err(text)
+}
+
+/// Deletes everything in these folders (of any accounts) for good on their
+/// servers. Returns how many emails went.
+#[tauri::command]
+pub async fn empty_folders(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    ids: Vec<i64>,
+) -> Result<usize, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.empty_folders(&ids));
+    }
+    let mut emptied = 0;
+    let mut failed = None;
+    for id in ids {
+        match mailbox.live.engine.empty_folder(id).await {
+            Ok(count) => emptied += count,
+            Err(e) => failed = Some(e),
+        }
+    }
+    let _ = app.emit("mailbox-changed", ());
+    match failed {
+        Some(e) => Err(text(e)),
+        None => Ok(emptied),
+    }
+}
+
 #[tauri::command]
 pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<MessageContent, String> {
     if !mailbox.live() {
@@ -769,9 +852,13 @@ pub async fn add_gmail_account(
     email: String,
     app_password: String,
     label: String,
-) -> Result<AccountView, String> {
+    trusted_imap: Option<String>,
+    trusted_smtp: Option<String>,
+) -> Result<AccountView, Failure> {
     prepare_account_add(&app, &mailbox)?;
-    let (imap, smtp) = gmail_servers();
+    let (mut imap, mut smtp) = gmail_servers();
+    imap.trusted_cert = trusted_imap;
+    smtp.trusted_cert = trusted_smtp;
     let account = mailbox
         .live
         .engine
@@ -783,8 +870,7 @@ pub async fn add_gmail_account(
             imap,
             smtp,
         )
-        .await
-        .map_err(text)?;
+        .await?;
     Ok(mailbox.added(&app, account))
 }
 
@@ -800,25 +886,48 @@ pub async fn add_imap_account(
     imap_port: u16,
     smtp_host: String,
     smtp_port: u16,
-) -> Result<AccountView, String> {
+    trusted_imap: Option<String>,
+    trusted_smtp: Option<String>,
+) -> Result<AccountView, Failure> {
     if imap_host.trim().is_empty() || smtp_host.trim().is_empty() {
-        return Err("Enter the IMAP and SMTP servers.".into());
+        return Err("Enter the IMAP and SMTP servers.".to_owned().into());
     }
     prepare_account_add(&app, &mailbox)?;
+    let imap = Server {
+        trusted_cert: trusted_imap,
+        ..Server::new(&imap_host, imap_port)
+    };
+    let smtp = Server {
+        trusted_cert: trusted_smtp,
+        ..Server::new(&smtp_host, smtp_port)
+    };
     let account = mailbox
         .live
         .engine
-        .add_password_account(
-            AccountKind::Imap,
-            &email,
-            &password,
-            &label,
-            Server::new(&imap_host, imap_port),
-            Server::new(&smtp_host, smtp_port),
-        )
-        .await
-        .map_err(text)?;
+        .add_password_account(AccountKind::Imap, &email, &password, &label, imap, smtp)
+        .await?;
     Ok(mailbox.added(&app, account))
+}
+
+/// Trusts the certificate an IMAP account's server showed, where the system
+/// doesn't, and checks for mail with it.
+#[tauri::command]
+pub fn trust_certificate(
+    mailbox: State<'_, Mailbox>,
+    account: i64,
+    service: Service,
+    fingerprint: String,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        return Err("Demo accounts have no servers.".into());
+    }
+    mailbox
+        .live
+        .engine
+        .trust_certificate(account, service, &fingerprint)
+        .map_err(text)?;
+    mailbox.live.sync_now();
+    Ok(())
 }
 
 /// Opens Microsoft sign-in in the browser; resolves when it's done.

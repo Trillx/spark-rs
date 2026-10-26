@@ -15,9 +15,12 @@ pub mod parse;
 pub mod search;
 pub mod signature;
 pub mod smtp;
+pub mod tls;
 pub mod utf7;
 
 use std::fmt::Display;
+
+use serde::{Deserialize, Serialize};
 
 pub use engine::{AccountConfig, CalendarStatus, Engine, Round, Secrets};
 
@@ -45,6 +48,30 @@ pub enum Error {
     Config(String),
     #[error("The message no longer exists on the server.")]
     Gone,
+    /// The server's certificate isn't trusted; the user may trust it anyway
+    /// (`Engine::trust_certificate`).
+    #[error("The security certificate of {} isn't trusted: {}.", .0.host, .0.reason)]
+    Certificate(Box<Untrusted>),
+}
+
+/// One of an IMAP account's two servers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Service {
+    Imap,
+    Smtp,
+}
+
+/// A server certificate the system doesn't trust.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Untrusted {
+    pub service: Service,
+    pub host: String,
+    /// The certificate's SHA-256 (`tls::fingerprint`), which trusting it records.
+    pub fingerprint: String,
+    /// Why the system refused it, e.g. "it has expired".
+    pub reason: String,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

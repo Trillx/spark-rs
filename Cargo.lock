@@ -2415,11 +2415,11 @@ dependencies = [
  "percent-encoding",
  "quoted_printable",
  "rustls",
+ "rustls-platform-verifier",
  "socket2",
  "tokio",
  "tokio-rustls",
  "url",
- "webpki-roots",
 ]
 
 [[package]]
@@ -4283,6 +4283,7 @@ dependencies = [
  "mail-parser",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "sha2",
@@ -4291,7 +4292,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
- "webpki-roots",
 ]
 
 [[package]]

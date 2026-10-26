@@ -32,7 +32,10 @@ export type ActionId =
   | "pageDown"
   | "pageUp"
   | "top"
-  | "bottom";
+  | "bottom"
+  | "selectAll"
+  | "selectNext"
+  | "selectPrev";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -79,6 +82,10 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   pageUp: [{ key: "PageUp" }],
   top: [{ key: "Home" }, { key: "ArrowUp", mod: true }],
   bottom: [{ key: "End" }, { key: "ArrowDown", mod: true }],
+  /** Selecting conversations for a batch action: all of the list, or one more below or above. */
+  selectAll: [{ key: "a", mod: true }],
+  selectNext: [{ key: "ArrowDown", shift: true }],
+  selectPrev: [{ key: "ArrowUp", shift: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {

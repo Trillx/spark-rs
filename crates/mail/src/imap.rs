@@ -13,8 +13,8 @@
 use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -22,7 +22,6 @@ use async_imap::imap_proto::NameAttribute;
 use async_imap::types::{Fetch, Flag};
 use async_imap::{Client, Session as ImapSession};
 use futures_util::TryStreamExt;
-use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use spark_store::{
     Account, AccountKind, Added, Folder, FolderRole, Incoming, Location, Pending, Place, Pushed,
@@ -34,7 +33,7 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
 use crate::search::{self, SERVER_HITS};
-use crate::{BLOCKED, Error, OLDER_STEP, Result, parse, utf7};
+use crate::{BLOCKED, Error, OLDER_STEP, Result, Service, parse, tls, utf7};
 
 pub const INBOX: &str = "INBOX";
 /// Messages fetched on the first sync of an account.
@@ -72,6 +71,10 @@ pub struct Server {
     pub host: String,
     pub port: u16,
     pub security: Security,
+    /// The fingerprint (`tls::fingerprint`) of a certificate the system
+    /// doesn't trust and the user does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_cert: Option<String>,
 }
 
 impl Server {
@@ -80,6 +83,7 @@ impl Server {
             host: host.trim().to_owned(),
             port,
             security: Security::for_port(port),
+            trusted_cert: None,
         }
     }
 }
@@ -195,10 +199,7 @@ pub async fn login(server: &Server, username: &str, password: &str) -> Result<Se
     let client = match server.security {
         Security::Plain => greeted(Client::new(Stream::Plain(tcp))).await?,
         Security::Tls => {
-            greeted(Client::new(Stream::Tls(Box::new(
-                tls(&server.host, tcp).await?,
-            ))))
-            .await?
+            greeted(Client::new(Stream::Tls(Box::new(tls(server, tcp).await?)))).await?
         }
         Security::StartTls => {
             let mut client = greeted(Client::new(Stream::Plain(tcp))).await?;
@@ -207,7 +208,7 @@ pub async fn login(server: &Server, username: &str, password: &str) -> Result<Se
                 unreachable!("STARTTLS starts from a plain stream")
             };
             // No second greeting after STARTTLS.
-            Client::new(Stream::Tls(Box::new(tls(&server.host, tcp).await?)))
+            Client::new(Stream::Tls(Box::new(tls(server, tcp).await?)))
         }
     };
     let session = timeout(NETWORK_TIMEOUT, client.login(username, password))
@@ -230,28 +231,15 @@ async fn greeted(mut client: Client<Stream>) -> Result<Client<Stream>> {
     }
 }
 
-pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("aws-lc-rs supports the default TLS versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Arc::new(config)
-}
-
-async fn tls(host: &str, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
-    let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::network(host, e))?;
+async fn tls(server: &Server, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
+    let host = &server.host;
+    let trusted = server.trusted_cert.as_deref();
     timeout(
         NETWORK_TIMEOUT,
-        tokio_rustls::TlsConnector::from(tls_config()).connect(name, tcp),
+        tls::connect(Service::Imap, host, tcp, trusted),
     )
     .await
     .map_err(|_| Error::network(host, "TLS handshake timed out"))?
-    .map_err(|e| Error::network(host, e))
 }
 
 /// Finds (or, if the server has none, creates) the folders Done and Delete
@@ -1047,31 +1035,7 @@ pub async fn push(
     };
     let mut pushed = 0;
     for p in pending {
-        // Where is it now? At its known location if that folder still
-        // exists; else found by Message-ID (mail that left the inbox), or
-        // for filed mail, in a folder that lists it.
-        let mut found = match (&p.mailbox, p.uid) {
-            (Some(mailbox), Some(uid)) => Some((mailbox.clone(), uid)),
-            _ => None,
-        };
-        if let Some((mailbox, _)) = &found {
-            match session.select(mailbox).await {
-                Ok(current) => {
-                    // A UID identifies a message only within its UIDVALIDITY
-                    // generation. The next sync may not have noticed a reset yet.
-                    if !uid_is_current(store, state, &p, mailbox, current.uid_validity)? {
-                        found = None;
-                    }
-                }
-                // Renamed or deleted elsewhere.
-                Err(async_imap::error::Error::No(_)) => found = None,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if found.is_none() {
-            found = locate(session, store, state, &p).await?;
-        }
-        let Some((mailbox, uid)) = found else {
+        let Some((mailbox, uid)) = find(session, store, state, &p).await? else {
             lock(store).drop_pending(p.id)?;
             continue;
         };
@@ -1165,6 +1129,101 @@ pub async fn push(
         pushed += 1;
     }
     Ok(pushed)
+}
+
+/// Where a message is on the server now, with that mailbox selected: at its
+/// known location if that folder still exists; else found by Message-ID
+/// (mail that left the inbox), or for filed mail, in a folder that lists it.
+/// `None` if the server no longer has it.
+async fn find(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    state: &SyncState,
+    p: &Pending,
+) -> Result<Option<(String, u32)>> {
+    if let (Some(mailbox), Some(uid)) = (&p.mailbox, p.uid) {
+        match session.select(mailbox).await {
+            // A UID identifies a message only within its UIDVALIDITY
+            // generation. The next sync may not have noticed a reset yet.
+            Ok(current) => {
+                if uid_is_current(store, state, p, mailbox, current.uid_validity)? {
+                    return Ok(Some((mailbox.clone(), uid)));
+                }
+            }
+            // Renamed or deleted elsewhere.
+            Err(async_imap::error::Error::No(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    locate(session, store, state, p).await
+}
+
+/// Deletes stored messages from the server for good, wherever it has them
+/// now, and from the store. On Gmail, expunging mail from a label only
+/// takes the label off, so mail outside Trash and Spam goes to Trash first
+/// and is expunged there. Needs UIDPLUS: a plain EXPUNGE would also delete
+/// what other clients marked deleted. Returns how many went.
+pub async fn delete_forever(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    state: &SyncState,
+    spam: Option<&str>,
+    ids: &[i64],
+) -> Result<usize> {
+    let caps = session.capabilities().await?;
+    if !caps.has_str("UIDPLUS") {
+        return Err(Error::Server(
+            "This mail server can't delete single emails for good (it lacks UIDPLUS).".into(),
+        ));
+    }
+    let gmail = caps.has_str("X-GM-EXT-1");
+    let trash = folder(state, Place::Trash).expect("Trash has a mailbox");
+    let mut removed = 0;
+    for &id in ids {
+        let Some(p) = lock(store).pending_for(id)? else {
+            continue;
+        };
+        let mut found = find(session, store, state, &p).await?;
+        if gmail
+            && let Some((mailbox, uid)) = &found
+            && *mailbox != trash
+            && Some(mailbox.as_str()) != spam
+        {
+            session.uid_mv(uid.to_string(), &trash).await?;
+            found = search(session, &trash, &p).await?;
+        }
+        if let Some((_, uid)) = found {
+            let _: Vec<Fetch> = session
+                .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+                .await?
+                .try_collect()
+                .await?;
+            let _: Vec<_> = session
+                .uid_expunge(uid.to_string())
+                .await?
+                .try_collect()
+                .await?;
+        }
+        // Gone from the server either way.
+        removed += lock(store).remove_messages(&[id])?;
+    }
+    Ok(removed)
+}
+
+/// Deletes every message in a mailbox for good. Returns how many there were.
+pub async fn empty_folder(session: &mut Session, mailbox: &str) -> Result<u32> {
+    let selected = session.select(mailbox).await?;
+    if selected.exists == 0 {
+        return Ok(0);
+    }
+    let _: Vec<Fetch> = session
+        .uid_store("1:*", "+FLAGS.SILENT (\\Deleted)")
+        .await?
+        .try_collect()
+        .await?;
+    // Everything in the mailbox goes, so a plain EXPUNGE is safe here.
+    let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    Ok(selected.exists)
 }
 
 /// The whole raw message, wherever the server keeps it now: at its known

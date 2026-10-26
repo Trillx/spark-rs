@@ -26,9 +26,11 @@ import { SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, clamp, startHorizontalDrag }
 import { hint, shortcutLabel } from "../lib/shortcuts";
 import {
   FOLDER_COLORS,
+  SYSTEM_LISTS,
   dropPatch,
   folderIdOf,
   hasAccountRows,
+  isSystemList,
   listInfo,
   moveInSidebar,
   pinToTop,
@@ -73,6 +75,11 @@ export interface SidebarActions {
   deleteList: (key: ListKey) => Promise<void>;
   /** A message dragged from the list onto a list here; `account` for an account row. */
   drop: (m: Message, key: ListKey, account?: AccountId) => void;
+  markAllRead: (key: ListKey) => void;
+  /** Whether a list's mail can all be deleted for good (Trash, Spam, folders that aren't Gmail labels). */
+  canEmpty: (key: ListKey) => boolean;
+  /** Asks, then deletes all of a list's mail for good. */
+  empty: (key: ListKey) => void;
   calendar: () => void;
 }
 
@@ -784,6 +791,9 @@ function RowMenu({
         : item("Pin to the top", change((l) => pinToTop(l, key)))}
       {item(section === "recents" ? "Remove from Recents" : "Remove from Sidebar", change((l) => removeFromSidebar(l, key)))}
       {countable && item(layout.hiddenBadges.includes(key) ? "Show Badge" : "Hide Badge", change((l) => toggleBadge(l, key)))}
+      {key !== "drafts" && item("Mark All as Read", () => actions.markAllRead(key))}
+      {actions.canEmpty(key) &&
+        item(`Empty ${name || (isSystemList(key) ? SYSTEM_LISTS[key].label : "Folder")}…`, () => actions.empty(key), true)}
       {(folder || smart) && (
         <li role="none" className="menu-title px-2 pb-1 pt-2 text-xs font-normal">
           <span className="p-0">Color</span>

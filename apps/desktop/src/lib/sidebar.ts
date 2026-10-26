@@ -368,6 +368,10 @@ export function dropPatch(
       return m.state === "deleted" ? undefined : { state: "deleted" };
     case "pins":
       return m.pinned ? undefined : { pinned: true };
+    case "spam": {
+      const spam = folders.find((f) => f.account === m.account && f.role === "spam");
+      return !spam || (m.state === "filed" && m.folder === spam.id) ? undefined : { folder: spam.id };
+    }
   }
   const folder = folders.find((f) => f.id === folderIdOf(key));
   if (!folder || !isUserFolder(folder) || !folder.selectable || folder.account !== m.account) return undefined;

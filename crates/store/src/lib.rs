@@ -552,6 +552,35 @@ const LEAVING: &str = "changed_at != 0 AND remote_place = 'folder' AND remote_fo
 /// change is pushed, syncs of that folder keep listing it.
 const ARRIVING: &str = "changed_at != 0 AND state = 'filed' AND home_folder_id = ?1";
 
+/// A message's local and server sides, for `Pending`; see `pending_row`.
+const PENDING_SELECT: &str = "SELECT m.id, m.remote_id, m.mailbox, m.uid, m.message_id, m.state,
+        m.unread, m.pinned, m.remote_place, m.remote_unread, m.remote_pinned,
+        m.home_folder_id, f.remote_id, m.remote_folder_id
+     FROM messages m LEFT JOIN folders f ON f.id = m.home_folder_id";
+
+fn pending_row(r: &Row) -> Result<Pending> {
+    let place = parse_state(&r.get::<_, String>(5)?).place();
+    let home: (Option<i64>, Option<String>) = (r.get(11)?, r.get(12)?);
+    Ok(Pending {
+        id: r.get(0)?,
+        remote_id: r.get(1)?,
+        mailbox: r.get(2)?,
+        uid: r.get(3)?,
+        message_id: r.get(4)?,
+        place,
+        folder: match home {
+            (Some(id), Some(remote_id)) if place == Place::Folder => Some((id, remote_id)),
+            _ => None,
+        },
+        unread: r.get(6)?,
+        pinned: r.get(7)?,
+        remote_place: parse_place(&r.get::<_, String>(8)?),
+        remote_folder: r.get(13)?,
+        remote_unread: r.get(9)?,
+        remote_pinned: r.get(10)?,
+    })
+}
+
 const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, unread, pinned, \
      priority, screening, from_name, from_address, subject, snippet, date, attachments, \
      (SELECT group_concat(folder_id) FROM folder_members WHERE message_id = messages.id), \
@@ -1163,37 +1192,56 @@ impl Store {
     /// Local changes for an account that are at least `settle_ms` old (the
     /// undo window), oldest first.
     pub fn pending(&self, account_id: i64, now: i64, settle_ms: i64) -> Result<Vec<Pending>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.remote_id, m.mailbox, m.uid, m.message_id, m.state, m.unread, m.pinned,
-                    m.remote_place, m.remote_unread, m.remote_pinned,
-                    m.home_folder_id, f.remote_id, m.remote_folder_id
-             FROM messages m LEFT JOIN folders f ON f.id = m.home_folder_id
+        let mut stmt = self.conn.prepare(&format!(
+            "{PENDING_SELECT}
              WHERE m.account_id = ?1 AND m.changed_at != 0 AND m.changed_at <= ?2
-             ORDER BY m.changed_at",
-        )?;
-        stmt.query_map(params![account_id, now - settle_ms], |r| {
-            let place = parse_state(&r.get::<_, String>(5)?).place();
-            let home: (Option<i64>, Option<String>) = (r.get(11)?, r.get(12)?);
-            Ok(Pending {
-                id: r.get(0)?,
-                remote_id: r.get(1)?,
-                mailbox: r.get(2)?,
-                uid: r.get(3)?,
-                message_id: r.get(4)?,
-                place,
-                folder: match home {
-                    (Some(id), Some(remote_id)) if place == Place::Folder => Some((id, remote_id)),
-                    _ => None,
-                },
-                unread: r.get(6)?,
-                pinned: r.get(7)?,
-                remote_place: parse_place(&r.get::<_, String>(8)?),
-                remote_folder: r.get(13)?,
-                remote_unread: r.get(9)?,
-                remote_pinned: r.get(10)?,
-            })
-        })?
-        .collect()
+             ORDER BY m.changed_at"
+        ))?;
+        stmt.query_map(params![account_id, now - settle_ms], pending_row)?
+            .collect()
+    }
+
+    /// A message as `pending` describes it, changed or not: for finding it
+    /// on the server to delete it there.
+    pub fn pending_for(&self, id: i64) -> Result<Option<Pending>> {
+        self.conn
+            .query_row(
+                &format!("{PENDING_SELECT} WHERE m.id = ?1"),
+                [id],
+                pending_row,
+            )
+            .optional()
+    }
+
+    /// Forgets messages the server deleted for good. Returns how many went.
+    pub fn remove_messages(&self, ids: &[i64]) -> Result<usize> {
+        let mut removed = 0;
+        for id in ids {
+            removed += self
+                .conn
+                .execute("DELETE FROM messages WHERE id = ?1", [id])?;
+        }
+        Ok(removed)
+    }
+
+    /// Forgets the mail the server kept in a folder that was just emptied
+    /// there: IMAP mail located in its mailbox, and Graph mail filed in it
+    /// (or in Deleted Items, for the trash folder). Mail changed since the
+    /// folder was emptied stays for the next sync to sort out. Returns how
+    /// many went.
+    pub fn forget_emptied(&self, folder_id: i64) -> Result<usize> {
+        let Some(folder) = self.folder(folder_id)? else {
+            return Ok(0);
+        };
+        let trash = folder.role == Some(FolderRole::Trash);
+        self.conn.execute(
+            "DELETE FROM messages
+             WHERE account_id = ?1 AND changed_at = 0
+               AND (mailbox = ?2
+                    OR (remote_place = 'folder' AND remote_folder_id = ?3)
+                    OR (?4 AND remote_place = 'trash'))",
+            params![folder.account_id, folder.remote_id, folder.id, trash],
+        )
     }
 
     /// Records that the server now matches `p`'s local side. If the user

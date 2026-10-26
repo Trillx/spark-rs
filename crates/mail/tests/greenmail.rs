@@ -46,6 +46,7 @@ fn plain(host: &str, port: u16) -> Server {
         host: host.into(),
         port,
         security: Security::Plain,
+        trusted_cert: None,
     }
 }
 
@@ -1295,4 +1296,88 @@ async fn imap_blocked_mail_moves_to_the_blocked_folder() {
     assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
     assert_eq!(other.select("INBOX").await.unwrap().exists, 2);
     assert_eq!(other.select("Blocked").await.unwrap().exists, 2);
+}
+
+#[tokio::test]
+async fn imap_deletes_for_good() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("purge{}@example.com", now_ms());
+    for subject in ["Keep", "Trash me", "Junk A", "Back out"] {
+        deliver(&smtp, "Ana Ruiz <ana@x.com>", &me, subject, false).await;
+    }
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    engine.run(account.id, true).await.unwrap();
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.create("Junk").await.unwrap();
+    // Mail in Junk that was never downloaded here goes too.
+    other
+        .append("Junk", None, None, raw("never-seen@x.com", "Unseen junk"))
+        .await
+        .unwrap();
+    let list = Round {
+        list_folders: true,
+        ..Default::default()
+    };
+    engine.run_round(account.id, &list).await.unwrap();
+    let junk = folder_id(&engine, "Junk");
+    let spam = engine.store().folder(junk).unwrap().unwrap();
+    assert_eq!(spam.role, Some(FolderRole::Spam));
+
+    // Delete Forever on mail in Trash: gone from the server and from here.
+    let trashed = find(&engine, "Trash me");
+    back_in_time(
+        &engine,
+        trashed.id,
+        Patch {
+            state: Some(MessageState::Deleted),
+            ..Default::default()
+        },
+    );
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
+    assert_eq!(count(&mut other, "Trash", "Trash me").await, 1);
+    assert_eq!(engine.delete_forever(&[trashed.id]).await.unwrap(), 1);
+    assert_eq!(count(&mut other, "Trash", "Trash me").await, 0);
+    assert!(engine.store().message(trashed.id).unwrap().is_none());
+
+    // Two into Spam: one pushed, one moved back out before its push.
+    let spam_patch = Patch {
+        folder: Some(junk),
+        ..Default::default()
+    };
+    let junk_a = find(&engine, "Junk A");
+    let back_out = find(&engine, "Back out");
+    back_in_time(&engine, junk_a.id, spam_patch.clone());
+    back_in_time(&engine, back_out.id, spam_patch);
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 2);
+    engine
+        .store()
+        .update(
+            back_out.id,
+            &Patch {
+                state: Some(MessageState::Inbox),
+                ..Default::default()
+            },
+            now_ms(),
+        )
+        .unwrap();
+
+    // Emptying Spam pushes that move first, so only what Spam shows goes.
+    assert_eq!(engine.empty_folder(junk).await.unwrap(), 2);
+    assert_eq!(other.examine("Junk").await.unwrap().exists, 0);
+    assert!(engine.store().message(junk_a.id).unwrap().is_none());
+    assert_eq!(count(&mut other, "INBOX", "Back out").await, 1);
+    assert_eq!(find(&engine, "Back out").state, MessageState::Inbox);
+    assert_eq!(find(&engine, "Keep").state, MessageState::Inbox);
+    assert_eq!(count(&mut other, "INBOX", "Keep").await, 1);
 }

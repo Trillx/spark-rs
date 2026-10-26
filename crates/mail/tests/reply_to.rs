@@ -206,6 +206,7 @@ async fn cached_imap_mail_gains_reply_to_without_downloading_the_body() {
         host: "127.0.0.1".into(),
         port: listener.local_addr().unwrap().port(),
         security: Security::Plain,
+        trusted_cert: None,
     };
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();

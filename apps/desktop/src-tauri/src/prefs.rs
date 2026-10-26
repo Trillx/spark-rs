@@ -1,5 +1,5 @@
 //! Settings → Notifications: which new mail shows a notification, its sound,
-//! the meeting pop-up, and running in the background. Saved as `prefs.json`
+//! the app icon badge, the meeting pop-up, and running in the background. Saved as `prefs.json`
 //! in the app's config directory.
 
 use std::collections::BTreeMap;
@@ -28,12 +28,27 @@ pub enum NotifyFor {
     Off,
 }
 
+/// What the app icon's badge counts, as Spark's App icon badge setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Badge {
+    /// Unread conversations in the Inbox ("New messages only").
+    #[default]
+    New,
+    /// Every conversation in the Inbox ("Whole Inbox").
+    Inbox,
+    Off,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Prefs {
     pub notify: NotifyFor,
     /// Windows' New Mail sound with each notification.
     pub sound: bool,
+    pub badge: Badge,
+    /// Accounts the badge leaves out, by id.
+    pub badge_excluded: Vec<i64>,
     /// Closing the window leaves spark-rs in the notification area, still
     /// syncing; Quit is in the icon's menu.
     pub keep_running: bool,
@@ -59,6 +74,8 @@ impl Default for Prefs {
         Self {
             notify: NotifyFor::People,
             sound: true,
+            badge: Badge::New,
+            badge_excluded: Vec::new(),
             keep_running: true,
             open_at_login: false,
             meeting_popup: true,

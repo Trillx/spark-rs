@@ -14,6 +14,7 @@ import type {
   AgentSendingEvent,
   AgentsView,
   AccountView,
+  Failure,
   FolderRole,
   FolderView,
   InlineImages,
@@ -32,6 +33,7 @@ import type {
   SignaturesView,
   DefaultSignature,
   SyncStatusEvent,
+  Untrusted,
   UpdatesView,
   UpdateProgress,
 } from "./types";
@@ -50,9 +52,50 @@ export function listAccounts(): Promise<AccountView[]> {
   return Promise.resolve(structuredClone(BROWSER_ACCOUNTS));
 }
 
-/** Checks the login before saving; the error string is user-facing. */
-export function addGmailAccount(email: string, appPassword: string, label: string): Promise<AccountView> {
-  if (isTauri()) return invoke("add_gmail_account", { email, appPassword, label });
+/** The certificates the user chose to trust while adding an account, by fingerprint. */
+export interface TrustedCerts {
+  trustedImap?: string;
+  trustedSmtp?: string;
+}
+
+/**
+ * Checks the login before saving. Rejects with a `Failure`, whose certificate
+ * is set when a server's certificate needs the user's trust (`TrustedCerts`).
+ */
+export function addGmailAccount(
+  email: string,
+  appPassword: string,
+  label: string,
+  trusted: TrustedCerts = {},
+): Promise<AccountView> {
+  if (isTauri()) return invoke("add_gmail_account", { email, appPassword, label, ...noTrust, ...trusted });
+  return Promise.reject(DESKTOP_ONLY);
+}
+
+const noTrust = { trustedImap: null, trustedSmtp: null };
+
+/** A rejection's text: a `Failure`'s message, or the error itself. */
+export function failureText(error: unknown): string {
+  return failureOf(error).message;
+}
+
+export function failureOf(error: unknown): Failure {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const { message, certificate } = error as Failure;
+    return { message: String(message), certificate };
+  }
+  return { message: String(error) };
+}
+
+/** Trusts the certificate an IMAP account's server showed, then checks for mail with it. */
+export function trustCertificate(account: AccountId, certificate: Untrusted): Promise<void> {
+  if (isTauri()) {
+    return invoke("trust_certificate", {
+      account,
+      service: certificate.service,
+      fingerprint: certificate.fingerprint,
+    });
+  }
   return Promise.reject(DESKTOP_ONLY);
 }
 
@@ -68,8 +111,9 @@ export interface ImapAccountForm {
   smtpPort: number;
 }
 
-export function addImapAccount(form: ImapAccountForm): Promise<AccountView> {
-  if (isTauri()) return invoke("add_imap_account", { ...form });
+/** Rejects as `addGmailAccount` does. */
+export function addImapAccount(form: ImapAccountForm, trusted: TrustedCerts = {}): Promise<AccountView> {
+  if (isTauri()) return invoke("add_imap_account", { ...form, ...noTrust, ...trusted });
   return Promise.reject(DESKTOP_ONLY);
 }
 
@@ -313,6 +357,36 @@ export function deleteFolder(id: number): Promise<void> {
   return Promise.reject(DEMO_FOLDERS);
 }
 
+/** Deletes messages for good on their servers; resolves to how many went. */
+export function deleteForever(ids: number[]): Promise<number> {
+  if (isTauri()) return invoke("delete_forever", { ids });
+  const before = browserMailbox.length;
+  for (let i = browserMailbox.length - 1; i >= 0; i--) {
+    if (ids.includes(browserMailbox[i].id)) browserMailbox.splice(i, 1);
+  }
+  return Promise.resolve(before - browserMailbox.length);
+}
+
+/**
+ * Deletes everything in these folders (of any accounts) for good on their
+ * servers, including mail not downloaded here; resolves to how many emails went.
+ */
+export function emptyFolders(ids: number[]): Promise<number> {
+  if (isTauri()) return invoke("empty_folders", { ids });
+  const before = browserMailbox.length;
+  for (let i = browserMailbox.length - 1; i >= 0; i--) {
+    const m = browserMailbox[i];
+    const inside = BROWSER_FOLDERS.some(
+      (f) =>
+        ids.includes(f.id) &&
+        f.account === m.account &&
+        (f.role === "trash" ? m.state === "deleted" : m.state === "filed" && m.folder === f.id),
+    );
+    if (inside) browserMailbox.splice(i, 1);
+  }
+  return Promise.resolve(before - browserMailbox.length);
+}
+
 // ---- attachments ----
 
 /** Downloads attachment `index` and opens it in its default app. Program files are refused. */
@@ -545,6 +619,15 @@ export function savePrefs(prefs: Prefs): Promise<Prefs> {
   if (isTauri()) return invoke("save_prefs", { prefs });
   browserPrefs = { ...prefs };
   return Promise.resolve({ ...prefs });
+}
+
+/**
+ * Shows `count` on the app's taskbar button, 0 for none. On Windows that's
+ * an overlay icon, `icon` (32×32 RGBA, see `lib/badge`).
+ */
+export function setBadge(count: number, icon: number[] | null): Promise<void> {
+  if (isTauri()) return invoke("set_badge", { count, icon });
+  return Promise.resolve();
 }
 
 /** Rejects with a user-facing reason, e.g. notifications are off for the app in Windows. */
@@ -780,6 +863,8 @@ function saveBrowserDraft(draft: OutgoingDraft): number {
 let browserPrefs: Prefs = {
   notify: "people",
   sound: true,
+  badge: "new",
+  badgeExcluded: [],
   keepRunning: true,
   openAtLogin: false,
   meetingPopup: true,

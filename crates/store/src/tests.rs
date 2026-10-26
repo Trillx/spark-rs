@@ -2177,3 +2177,63 @@ fn version_12_databases_move_blocked_mail_out_of_the_inbox() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn emptied_folders_forget_what_the_server_kept_there() {
+    let (mut store, account) = store_with_imap_account();
+    store
+        .replace_folders(
+            account,
+            &[
+                remote("Trash", None, "Trash", Some(FolderRole::Trash)),
+                remote("Junk", None, "Junk", Some(FolderRole::Spam)),
+            ],
+        )
+        .unwrap();
+    let id_of = |store: &Store, name: &str| {
+        store
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == name)
+            .unwrap()
+            .id
+    };
+    let (trash, junk) = (id_of(&store, "Trash"), id_of(&store, "Junk"));
+    let in_folder = |store: &mut Store, folder: i64, uid: u32| {
+        let m = Incoming {
+            mailbox: Some(if folder == trash { "Trash" } else { "Junk" }.into()),
+            ..incoming(account, uid, "a@x.com")
+        };
+        new_id(store.add_folder_message(folder, &m).unwrap())
+    };
+    let deleted = in_folder(&mut store, trash, 1);
+    let spam = in_folder(&mut store, junk, 2);
+    let rescued = in_folder(&mut store, junk, 3);
+    let kept = new_id(
+        store
+            .add_incoming(&incoming(account, 4, "b@x.com"), false)
+            .unwrap(),
+    );
+    // Moved out of Junk since it was emptied, not pushed yet.
+    let back = Patch {
+        state: Some(MessageState::Inbox),
+        ..Default::default()
+    };
+    store.update(rescued, &back, 10).unwrap();
+
+    assert_eq!(store.forget_emptied(junk).unwrap(), 1);
+    assert!(store.message(spam).unwrap().is_none());
+    assert!(store.message(rescued).unwrap().is_some());
+    assert!(store.message(deleted).unwrap().is_some());
+    assert_eq!(store.forget_emptied(trash).unwrap(), 1);
+    assert!(store.message(deleted).unwrap().is_none());
+    assert!(store.message(kept).unwrap().is_some());
+
+    // Where the server has a message, changed or not.
+    let p = store.pending_for(rescued).unwrap().unwrap();
+    assert_eq!((p.place, p.remote_place), (Place::Inbox, Place::Folder));
+    assert_eq!(p.mailbox.as_deref(), Some("Junk"));
+    assert!(store.pending_for(spam).unwrap().is_none());
+    assert_eq!(store.remove_messages(&[kept, spam]).unwrap(), 1);
+}

@@ -251,6 +251,36 @@ impl DemoMailbox {
         apply(message, patch, &folders())?;
         Ok(message.clone())
     }
+
+    /// Deletes messages for good. Returns how many went.
+    pub fn delete_forever(&self, ids: &[i64]) -> usize {
+        let mut messages = self.0.lock().unwrap();
+        let before = messages.len();
+        messages.retain(|m| !ids.contains(&m.id));
+        before - messages.len()
+    }
+
+    /// Deletes everything in these folders for good: deleted mail for a
+    /// trash folder, the mail filed there for others. Returns how many went.
+    pub fn empty_folders(&self, ids: &[i64]) -> usize {
+        let folders = folders();
+        let mut messages = self.0.lock().unwrap();
+        let before = messages.len();
+        messages.retain(|m| {
+            !ids.iter().any(|id| {
+                folders.iter().any(|f| {
+                    f.id == *id
+                        && f.account == m.account
+                        && if f.role == Some(FolderRole::Trash) {
+                            m.state == MessageState::Deleted
+                        } else {
+                            m.state == MessageState::Filed && m.folder == Some(f.id)
+                        }
+                })
+            })
+        });
+        before - messages.len()
+    }
 }
 
 /// Drafts, like the real ones but in memory.

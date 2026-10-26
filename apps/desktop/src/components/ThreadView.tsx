@@ -16,6 +16,8 @@ import {
   Pin,
   Reply,
   ReplyAll,
+  ShieldAlert,
+  ShieldCheck,
   Text,
   Trash2,
   Zap,
@@ -50,7 +52,14 @@ import SummaryCard, { type SummaryState } from "./SummaryCard";
 export interface ThreadActions {
   close: () => void;
   done: (m: Message) => void;
+  /** Its conversation to Trash; deleted for good if it's there already. */
   trash: (m: Message) => void;
+  /** Just this email, as `trash` does. */
+  trashOne: (m: Message) => void;
+  /** Move to Spam, or Not Spam for mail in Spam. */
+  spam: (m: Message) => void;
+  inSpam: (m: Message) => boolean;
+  deleteForever: (m: Message) => void;
   priority: (m: Message) => void;
   read: (m: Message) => void;
   pin: (m: Message) => void;
@@ -341,9 +350,11 @@ function Toolbar({
           onClick={() => actions.done(m)}
         />
       </div>
-      {m.state !== "deleted" && (
-        <ToolbarButton tip={hint("Move to Trash", "trash")} Icon={Trash2} onClick={() => actions.trash(m)} />
-      )}
+      <ToolbarButton
+        tip={hint(m.state === "deleted" ? "Delete Forever" : "Move to Trash", "trash")}
+        Icon={Trash2}
+        onClick={() => actions.trash(m)}
+      />
       <ToolbarButton
         tip={m.priority ? hint("Remove from Priority", "priority") : hint("Mark as Priority", "priority", "priority")}
         Icon={Zap}
@@ -510,7 +521,18 @@ function SummarizeButton({
   );
 }
 
-function MessageMenuItems({ message: m, actions }: { message: Message; actions: ThreadActions }) {
+/** `single` is one email's menu (its card's ⋯), where Trash takes only that email. */
+function MessageMenuItems({
+  message: m,
+  actions,
+  single = false,
+}: {
+  message: Message;
+  actions: ThreadActions;
+  single?: boolean;
+}) {
+  const spam = actions.inSpam(m);
+  const deleted = m.state === "deleted";
   return (
     <>
       <MenuItem label="Reply" detail={shortcutLabel("reply")} icon={<Reply size={15} />} onSelect={() => actions.reply(m)} />
@@ -527,6 +549,22 @@ function MessageMenuItems({ message: m, actions }: { message: Message; actions: 
         onSelect={() => actions.forward(m)}
       />
       <li role="none" className="my-0.5 h-px bg-hairline" />
+      <MenuItem
+        label={spam ? "Not Spam" : "Move to Spam"}
+        icon={spam ? <ShieldCheck size={15} /> : <ShieldAlert size={15} />}
+        onSelect={() => actions.spam(m)}
+      />
+      {single && (
+        <MenuItem
+          label={deleted ? "Delete Forever" : "Move to Trash"}
+          icon={<Trash2 size={15} />}
+          danger={deleted}
+          onSelect={() => actions.trashOne(m)}
+        />
+      )}
+      {!single && spam && (
+        <MenuItem label="Delete Forever" icon={<Trash2 size={15} />} danger onSelect={() => actions.deleteForever(m)} />
+      )}
       <MenuItem label="Block Sender" icon={<Ban size={15} />} danger onSelect={() => actions.block(m)} />
     </>
   );
@@ -633,7 +671,7 @@ function MessageCard({
               </button>
             )}
           >
-            <MessageMenuItems message={m} actions={actions} />
+            <MessageMenuItems message={m} actions={actions} single />
           </Dropdown>
         </div>
       </header>

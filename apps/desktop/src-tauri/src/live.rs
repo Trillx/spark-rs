@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 use futures_util::future::join_all;
 use serde::Serialize;
 use spark_mail::engine::inbox_has_older;
-use spark_mail::{Engine, Error, Round};
+use spark_mail::{Engine, Error, Round, Untrusted};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{Notify, oneshot};
 
-use crate::mailbox::{SyncStatus, SyncView};
+use crate::mailbox::{SyncStatus, SyncView, certificate_of};
 use crate::notify;
 use crate::secrets::MailSecrets;
 
@@ -82,11 +82,15 @@ struct SyncEvent {
 #[serde(rename_all = "camelCase")]
 struct SendEvent {
     id: i64,
+    account: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     draft_id: Option<i64>,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// The send failed on a server certificate the user may trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate: Option<Untrusted>,
 }
 
 impl Live {
@@ -345,16 +349,20 @@ async fn work(
                     let event = match outcome.result {
                         Ok(true) => SendEvent {
                             id: outcome.id,
+                            account: account_id,
                             draft_id: outcome.draft_id,
                             status: "sent",
                             message: None,
+                            certificate: None,
                         },
                         Ok(false) => continue,
                         Err(e) => SendEvent {
                             id: outcome.id,
+                            account: account_id,
                             draft_id: outcome.draft_id,
                             status: "failed",
                             message: Some(e.to_string()),
+                            certificate: certificate_of(&e),
                         },
                     };
                     let _ = app.emit("send-status", event);
@@ -385,8 +393,8 @@ async fn work(
                 folders.extend(watched.lock().unwrap().iter());
                 set_status(SyncView {
                     status: SyncStatus::Syncing,
-                    message: None,
                     last_sync,
+                    ..Default::default()
                 });
             }
             let round = Round {
@@ -409,8 +417,8 @@ async fn work(
                         last_sync = Some(now_ms());
                         set_status(SyncView {
                             status: SyncStatus::Idle,
-                            message: None,
                             last_sync,
+                            ..Default::default()
                         });
                     }
                     for e in &report.folder_errors {
@@ -433,6 +441,7 @@ async fn work(
                         status: SyncStatus::Error,
                         message: Some(describe(&e)),
                         last_sync,
+                        certificate: certificate_of(&e),
                     });
                 }
             }

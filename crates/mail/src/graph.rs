@@ -1388,15 +1388,22 @@ impl Graph {
     /// Deletes a draft for good, as Outlook does once it's sent; where
     /// that isn't offered, into Deleted Items.
     pub async fn delete_draft(&self, id: &str) -> Result<()> {
-        let draft_path = format!("/me/messages/{}", path(id));
+        self.delete_forever(id).await
+    }
+
+    /// Deletes a message for good; where that isn't offered, into Deleted
+    /// Items (or out of it, into Recoverable Items). One that's gone already
+    /// is fine.
+    pub async fn delete_forever(&self, id: &str) -> Result<()> {
+        let message_path = format!("/me/messages/{}", path(id));
         let deleted = self
             .send(
-                self.request(Method::POST, &format!("{draft_path}/permanentDelete"))
+                self.request(Method::POST, &format!("{message_path}/permanentDelete"))
                     .json(&json!({})),
             )
             .await;
         let deleted = match deleted {
-            Err(Error::Server(_)) => self.send(self.request(Method::DELETE, &draft_path)).await,
+            Err(Error::Server(_)) => self.send(self.request(Method::DELETE, &message_path)).await,
             other => other,
         };
         match deleted {
@@ -1404,7 +1411,30 @@ impl Graph {
             Err(e) => Err(e),
         }
     }
+
+    /// Deletes every message in a folder for good, a page at a time.
+    /// Returns how many there were.
+    pub async fn empty_folder(&self, folder_id: &str) -> Result<usize> {
+        let page = format!(
+            "/me/mailFolders/{}/messages?$select=id&$top={EMPTY_PAGE}",
+            path(folder_id)
+        );
+        let mut deleted = 0;
+        loop {
+            let listed: Page<Listed> = self.json(self.request(Method::GET, &page)).await?;
+            if listed.value.is_empty() {
+                return Ok(deleted);
+            }
+            for m in &listed.value {
+                self.delete_forever(&m.id).await?;
+            }
+            deleted += listed.value.len();
+        }
+    }
 }
+
+/// Messages deleted per page when emptying a folder.
+const EMPTY_PAGE: usize = 100;
 
 /// A message body as Graph takes it: HTML with a signature, else text.
 fn body(bodies: &Bodies) -> Value {

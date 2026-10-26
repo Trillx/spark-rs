@@ -11,6 +11,24 @@ export interface SyncStatus {
   message?: string;
   /** Unix ms of the last finished sync. */
   lastSync?: number;
+  /** It failed on a server certificate the user may trust. */
+  certificate?: Untrusted;
+}
+
+/** A server certificate the system doesn't trust (an IMAP account's IMAP or SMTP server). */
+export interface Untrusted {
+  service: "imap" | "smtp";
+  host: string;
+  /** SHA-256, as colon-separated hex pairs; trusting the certificate records it. */
+  fingerprint: string;
+  /** Why the system refused it; it finishes "…isn't trusted: ". */
+  reason: string;
+}
+
+/** How some commands fail: the message, and the certificate if that's what it was. */
+export interface Failure {
+  message: string;
+  certificate?: Untrusted;
 }
 
 export interface AccountView {
@@ -114,6 +132,9 @@ export interface FolderView {
 /** Which new mail shows a notification. `people` is Spark's smart notifications. */
 export type NotifyFor = "people" | "all" | "off";
 
+/** What the app icon's badge counts: unread conversations in the Inbox, all of them, or nothing. */
+export type BadgeCount = "new" | "inbox" | "off";
+
 /** Someone to suggest in a recipient field or an @mention. */
 export interface Contact {
   /** "" when their mail gave no name. */
@@ -126,6 +147,9 @@ export interface Prefs {
   notify: NotifyFor;
   /** Windows' New Mail sound with each notification. */
   sound: boolean;
+  badge: BadgeCount;
+  /** Accounts the badge leaves out. */
+  badgeExcluded: AccountId[];
   /** Closing the window leaves the app running in the notification area. */
   keepRunning: boolean;
   /** Start in the background when the user signs in to Windows. */
@@ -366,8 +390,12 @@ export interface SyncStatusEvent extends SyncStatus {
 /** Payload of the `send-status` event; `id` is the outbox id `sendMessage` returned. */
 export interface SendStatusEvent {
   id: number;
+  /** The account it was sent from. */
+  account: AccountId;
   /** The exact failed email recovered in Drafts, also for agent sends. */
   draftId?: number;
   status: "sent" | "failed";
   message?: string;
+  /** It failed on the SMTP server's certificate, which the user may trust. */
+  certificate?: Untrusted;
 }

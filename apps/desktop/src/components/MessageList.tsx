@@ -44,6 +44,8 @@ interface Props {
   view: ListView;
   selectedId: number | null;
   openId: number | null;
+  /** Rows selected for a batch action. */
+  picked: ReadonlySet<number>;
   rows: RowActions;
   gatekeeper: GatekeeperActions;
   onDoneAll: (items: Message[]) => void;
@@ -72,6 +74,8 @@ interface Props {
   older: { loading: boolean; onNearEnd: () => void } | null;
   /** The search is still being put to the mail servers. */
   searchingServers: boolean;
+  /** Set for lists that can be emptied (Trash, Spam, folders): deletes all their mail for good. */
+  onEmpty?: () => void;
 }
 
 const SEARCH_TIPS = [
@@ -96,6 +100,7 @@ export default function MessageList(props: Props) {
       count={model.threads.get(m.id)?.count}
       names={model.threads.get(m.id)?.names}
       selected={m.id === selectedRow}
+      picked={props.picked.has(m.id)}
       actions={rows}
       inPriorityCard={inPriorityCard}
       recipients={model.recipients}
@@ -345,6 +350,7 @@ function Toolbar({
   onSearchKeyDown,
   onCompose,
   onSaveSearch,
+  onEmpty,
   searchRef,
 }: Props) {
   const iconButton = "btn btn-ghost btn-sm btn-square text-text-2 hover:text-base-content";
@@ -467,6 +473,15 @@ function Toolbar({
       {view.sub?.kind !== "gatekeeper" && (
         <div className="ml-auto flex items-center gap-1">
           {view.folder === "inbox" && !view.sub && <DoneSwitch on={view.showDone} onToggle={onToggleDone} />}
+          {onEmpty && !view.sub && model.order.length > 0 && (
+            <button
+              className="btn btn-ghost btn-sm px-2 font-medium text-error"
+              data-tip="Delete every email in it for good"
+              onClick={onEmpty}
+            >
+              Empty
+            </button>
+          )}
           <button className={iconButton} {...tipAttrs(hint("Search", "search"))} aria-label="Search" onClick={onSearchOpen}>
             <Search size={18} />
           </button>

@@ -22,6 +22,8 @@ import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 
 export interface RowActions {
   open: (id: number) => void;
+  /** Ctrl/⌘-click adds the row to the selection or takes it out; Shift-click selects up to it. */
+  pick: (id: number, range: boolean) => void;
   done: (m: Message) => void;
   pin: (m: Message) => void;
   snooze: (m: Message) => void;
@@ -38,8 +40,8 @@ export interface RowActions {
  * account ring, sender / subject / snippet. A row stands for a conversation:
  * its newest email in the list, with who wrote in it and a count badge.
  * Hover shows a Done circle in the leading column and swaps the date for the
- * row actions. Memoized: a list has thousands, and most renders change none
- * of them.
+ * row actions. Rows picked for a batch action show a check there instead.
+ * Memoized: a list has thousands, and most renders change none of them.
  */
 export default memo(MessageRow);
 
@@ -48,6 +50,7 @@ function MessageRow({
   count = 1,
   names,
   selected,
+  picked = false,
   actions,
   inPriorityCard = false,
   recipients = false,
@@ -58,6 +61,8 @@ function MessageRow({
   /** Who wrote in the conversation, in place of the sender. */
   names?: string;
   selected: boolean;
+  /** In the selection for a batch action. */
+  picked?: boolean;
   actions: RowActions;
   /** Rows on the peach Priority card hover in its own tint. */
   inPriorityCard?: boolean;
@@ -77,6 +82,7 @@ function MessageRow({
   }, [selected]);
 
   const done = m.state === "done";
+  const deleted = m.state === "deleted";
   const snoozed = m.state === "snoozed" && m.snoozedUntil !== undefined;
   const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
   const to = recipients ? recipientNames(m.to) : null;
@@ -86,16 +92,21 @@ function MessageRow({
       ref={ref}
       role="option"
       data-row={m.id}
-      aria-selected={selected}
-      onClick={() => actions.open(m.id)}
-      // Onto a sidebar list: a folder, Inbox, Archive, Trash or Pins.
+      aria-selected={selected || picked}
+      onClick={(e) => {
+        if (e.ctrlKey || e.metaKey || e.shiftKey) actions.pick(m.id, e.shiftKey);
+        else actions.open(m.id);
+      }}
+      // Onto a sidebar list: a folder, Inbox, Archive, Trash, Spam or Pins.
       onPointerDown={(e) => dragMessage(e, m)}
       className={`group grid h-[70px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 ${
-        selected ? "bg-row-selected" : hover
+        selected || picked ? "bg-row-selected" : hover
       }`}
     >
       <span className="flex h-5 items-center justify-center">
-        {done ? (
+        {picked ? (
+          <LeadingButton title="Deselect" picked onClick={() => actions.pick(m.id, false)} />
+        ) : done ? (
           <LeadingButton title="Move to Inbox" filled onClick={() => actions.done(m)} />
         ) : (
           <>
@@ -137,9 +148,11 @@ function MessageRow({
             )}
           </span>
           <div className="ml-auto hidden shrink-0 items-center gap-0.5 pl-2 group-hover:flex">
-            {m.state !== "deleted" && (
-              <HoverButton title={hint("Move to Trash", "trash")} Icon={Trash2} onClick={() => actions.trash(m)} />
-            )}
+            <HoverButton
+              title={hint(deleted ? "Delete Forever" : "Move to Trash", "trash")}
+              Icon={Trash2}
+              onClick={() => actions.trash(m)}
+            />
             <HoverButton
               title={hint(m.priority ? "Remove from Priority" : "Mark as Priority", "priority")}
               Icon={Zap}
@@ -193,8 +206,18 @@ function MessageRow({
   );
 }
 
-/** The leading column's Done circle: outline on hover, filled for Done mail. */
-function LeadingButton({ title, filled = false, onClick }: { title: Tip; filled?: boolean; onClick: () => void }) {
+/** The leading column's Done circle: outline on hover, filled for Done mail; a check for picked rows. */
+function LeadingButton({
+  title,
+  filled = false,
+  picked = false,
+  onClick,
+}: {
+  title: Tip;
+  filled?: boolean;
+  picked?: boolean;
+  onClick: () => void;
+}) {
   return (
     <button
       {...tipAttrs(title)}
@@ -204,10 +227,10 @@ function LeadingButton({ title, filled = false, onClick }: { title: Tip; filled?
         onClick();
       }}
       className={`grid size-[18px] place-items-center rounded-full ${
-        filled ? "bg-primary text-primary-content" : "text-text-2 hover:text-primary"
+        filled || picked ? "bg-primary text-primary-content" : "text-text-2 hover:text-primary"
       }`}
     >
-      {filled ? <Check size={12} strokeWidth={2.5} /> : <CircleCheck size={18} />}
+      {filled || picked ? <Check size={12} strokeWidth={2.5} /> : <CircleCheck size={18} />}
     </button>
   );
 }

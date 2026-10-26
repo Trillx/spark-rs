@@ -64,6 +64,7 @@ import {
   addMicrosoftAccount,
   cancelSignIn,
   deleteSignature,
+  failureOf,
   getAgents,
   getPrefs,
   openExternal,
@@ -76,6 +77,8 @@ import {
   setAgentAccess,
   setDefaultSignature,
   testNotification,
+  trustCertificate,
+  type TrustedCerts,
 } from "../api";
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo } from "../lib/format";
@@ -85,15 +88,18 @@ import type {
   AccountView,
   AgentAccess,
   AgentsView,
+  BadgeCount,
   DefaultSignature,
   NotifyFor,
   Prefs,
   Signature,
   SignaturesView,
   SyncStatus,
+  Untrusted,
 } from "../types";
 import AccountMark from "./AccountMark";
 import About from "./About";
+import { CertificateDialog } from "./Dialog";
 import type { Updates } from "../lib/updates";
 import Dropdown, { MenuItem } from "./Dropdown";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
@@ -380,7 +386,7 @@ function AccountsPage({ onChanged }: { onChanged: () => void }) {
 
 /** One account: color, label, address and sync state, with Rename and Remove for real accounts. */
 function AccountRow({ account: a, now, onChanged }: { account: AccountView; now: number; onChanged: () => void }) {
-  const [mode, setMode] = useState<"view" | "rename" | "remove">("view");
+  const [mode, setMode] = useState<"view" | "rename" | "remove" | "trust">("view");
   const [label, setLabel] = useState(a.label);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   /** Esc in the label field: the blur that follows must not save. */
@@ -448,6 +454,11 @@ function AccountRow({ account: a, now, onChanged }: { account: AccountView; now:
             {a.email} · {a.provider}
           </div>
           {!a.demo && <SyncLine sync={a.sync} now={now} />}
+          {!a.demo && a.sync.certificate && (
+            <button className="text-xs font-medium leading-[18px] text-primary hover:underline" onClick={() => setMode("trust")}>
+              Review the certificate…
+            </button>
+          )}
         </div>
         {a.demo ? (
           <span className="rounded-full bg-base-300 px-2 text-[11px] font-medium leading-[18px] text-text-2">Demo</span>
@@ -510,8 +521,51 @@ function AccountRow({ account: a, now, onChanged }: { account: AccountView; now:
           <StatusLine status={status} />
         </div>
       )}
+      {mode === "trust" && a.sync.certificate && (
+        <CertificateDialog
+          certificate={a.sync.certificate}
+          onTrust={async () => {
+            await trustCertificate(a.id, a.sync.certificate!);
+            onChanged();
+          }}
+          onClose={() => setMode("view")}
+        />
+      )}
     </div>
   );
+}
+
+/**
+ * Adding an account whose server shows a certificate the system doesn't
+ * trust: `failed` asks the user about it (`dialog`), and if they trust it,
+ * `retry` tries again with it trusted. Other failures are returned to show.
+ */
+function useCertificateTrust() {
+  const [trusted, setTrusted] = useState<TrustedCerts>({});
+  const [asking, setAsking] = useState<{ certificate: Untrusted; retry: (trusted: TrustedCerts) => void } | null>(
+    null,
+  );
+
+  function failed(error: unknown, retry: (trusted: TrustedCerts) => void): string | null {
+    const failure = failureOf(error);
+    if (!failure.certificate) return failure.message;
+    setAsking({ certificate: failure.certificate, retry });
+    return null;
+  }
+
+  const dialog = asking && (
+    <CertificateDialog
+      certificate={asking.certificate}
+      onTrust={() => {
+        const { service, fingerprint } = asking.certificate;
+        const next = { ...trusted, [service === "imap" ? "trustedImap" : "trustedSmtp"]: fingerprint };
+        setTrusted(next);
+        asking.retry(next);
+      }}
+      onClose={() => setAsking(null)}
+    />
+  );
+  return { trusted, failed, dialog };
 }
 
 function SyncLine({ sync, now }: { sync: SyncStatus; now: number }) {
@@ -589,23 +643,29 @@ function GmailForm({ onAdded, onCancel }: FormProps) {
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const trust = useCertificateTrust();
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
+  async function add(trusted = trust.trusted) {
     setBusy(true);
     setError(null);
     try {
       // Google shows app passwords in groups of four; the spaces aren't part of it.
-      await addGmailAccount(email.trim(), password.replace(/\s+/g, ""), label.trim() || "Personal");
+      await addGmailAccount(email.trim(), password.replace(/\s+/g, ""), label.trim() || "Personal", trusted);
       onAdded();
     } catch (err) {
-      setError(String(err));
+      setError(trust.failed(err, (next) => void add(next)));
       setBusy(false);
     }
   }
 
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    void add();
+  }
+
   return (
-    <form onSubmit={(e) => void submit(e)}>
+    <form onSubmit={submit}>
+      {trust.dialog}
       <Intro>
         Google requires an app password for this. Turn on 2-Step Verification, then create one at{" "}
         <button type="button" className="text-primary hover:underline" onClick={() => void openExternal(APP_PASSWORDS_URL)}>
@@ -784,32 +844,41 @@ function ImapForm({ onAdded, onCancel }: FormProps) {
   const smtpPort = port(form.smtpPort);
   const ready = form.email.trim() && form.password && imapHost && smtpHost && imapPort && smtpPort;
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    if (!ready) return;
+  const trust = useCertificateTrust();
+
+  async function add(trusted = trust.trusted) {
     setBusy(true);
     setError(null);
     try {
-      await addImapAccount({
-        email: form.email.trim(),
-        password: form.password,
-        label: form.label.trim() || domain || "Mail",
-        imapHost,
-        imapPort,
-        smtpHost,
-        smtpPort,
-      });
+      await addImapAccount(
+        {
+          email: form.email.trim(),
+          password: form.password,
+          label: form.label.trim() || domain || "Mail",
+          imapHost,
+          imapPort,
+          smtpHost,
+          smtpPort,
+        },
+        trusted,
+      );
       onAdded();
     } catch (err) {
-      setError(String(err));
+      setError(trust.failed(err, (next) => void add(next)));
       setBusy(false);
     }
+  }
+
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    if (ready) void add();
   }
 
   const portInput = "input input-sm h-8 w-20 rounded-lg border-hairline bg-base-100 text-[13px] focus:outline-primary";
   const hostInput = "input input-sm h-8 w-[178px] rounded-lg border-hairline bg-base-100 text-[13px] focus:outline-primary";
   return (
-    <form onSubmit={(e) => void submit(e)}>
+    <form onSubmit={submit}>
+      {trust.dialog}
       <fieldset disabled={busy}>
         <Group title="Account">
           <Row label="Email" htmlFor="imap-email">
@@ -1080,6 +1149,12 @@ function CommandRow({ label, description, command }: { label: string; descriptio
 
 // ---- Notifications ----
 
+const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
+  { key: "new", label: "New emails" },
+  { key: "inbox", label: "Whole Inbox" },
+  { key: "off", label: "Off" },
+];
+
 const NOTIFY_CHOICES: { key: NotifyFor; label: string; detail: string }[] = [
   { key: "people", label: "Smart", detail: "Only mail from people" },
   { key: "all", label: "All", detail: "Every new email" },
@@ -1113,6 +1188,7 @@ function usePrefs() {
 
 function NotificationsPage() {
   const { prefs, status, setStatus, change } = usePrefs();
+  const accounts = useAccounts().filter((a) => !a.demo);
 
   async function test() {
     setStatus({ kind: "busy", what: "Sending…" });
@@ -1173,6 +1249,47 @@ function NotificationsPage() {
             Send test
           </button>
         </Row>
+      </Group>
+
+      <Group title="App icon badge">
+        <Row
+          label="Badge count"
+          description="The number on spark-rs's taskbar button: unread conversations in the Inbox, or all of them."
+          htmlFor="badge-count"
+        >
+          <select
+            id="badge-count"
+            value={prefs.badge}
+            onChange={(e) => void change({ badge: e.target.value as BadgeCount })}
+            className="select select-sm h-8 w-40 rounded-lg border-hairline text-[13px]"
+          >
+            {BADGE_CHOICES.map((c) => (
+              <option key={c.key} value={c.key}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </Row>
+        {accounts.length > 1 &&
+          accounts.map((a) => {
+            const included = !prefs.badgeExcluded.includes(a.id);
+            return (
+              <Row key={a.id} label={a.label} description={a.email} htmlFor={`badge-${a.id}`}>
+                <Switch
+                  id={`badge-${a.id}`}
+                  on={included}
+                  disabled={prefs.badge === "off"}
+                  onToggle={() =>
+                    void change({
+                      badgeExcluded: included
+                        ? [...prefs.badgeExcluded, a.id]
+                        : prefs.badgeExcluded.filter((id) => id !== a.id),
+                    })
+                  }
+                />
+              </Row>
+            );
+          })}
       </Group>
 
       <Group title="Meetings">

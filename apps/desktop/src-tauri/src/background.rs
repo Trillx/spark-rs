@@ -1,10 +1,11 @@
 //! Running in the background: the icon in the notification area, closing the
-//! window to it, and opening at sign-in. While the window is hidden the sync
-//! workers keep going and new mail shows as notifications (`notify.rs`).
+//! window to it, opening at sign-in, and the badge on the taskbar button.
+//! While the window is hidden the sync workers keep going and new mail shows
+//! as notifications (`notify.rs`).
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Window, WindowEvent};
+use tauri::{App, AppHandle, Manager, WebviewWindow, Window, WindowEvent};
 
 use crate::mailbox::Mailbox;
 use crate::notify;
@@ -152,5 +153,27 @@ mod tests {
     fn the_sign_in_entry_starts_hidden() {
         assert!(started_in_background([r"C:\spark-rs.exe", "--background"]));
         assert!(!started_in_background([r"C:\spark-rs.exe"]));
+    }
+}
+
+/// Shows `count` on the app's taskbar button; 0 takes it away. Windows has
+/// no count badge, so there the UI draws one (32px square, RGBA) for the
+/// button's overlay icon.
+#[tauri::command]
+pub fn set_badge(window: WebviewWindow, count: u32, icon: Option<Vec<u8>>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        const BADGE_SIZE: u32 = 32;
+        let size = (BADGE_SIZE * BADGE_SIZE * 4) as usize;
+        let icon = icon
+            .filter(|rgba| count > 0 && rgba.len() == size)
+            .map(|rgba| tauri::image::Image::new_owned(rgba, BADGE_SIZE, BADGE_SIZE));
+        window.set_overlay_icon(icon).map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = icon;
+        let count = (count > 0).then_some(i64::from(count));
+        window.set_badge_count(count).map_err(|e| e.to_string())
     }
 }

@@ -8,6 +8,7 @@ import {
   CircleCheck,
   Circle,
   Clock,
+  CheckCheck,
   Copy,
   Download,
   FileText,
@@ -16,6 +17,7 @@ import {
   Forward,
   Inbox,
   LayoutGrid,
+  Mail,
   List,
   ListChecks,
   MailOpen,
@@ -29,6 +31,8 @@ import {
   Search,
   Send,
   Settings as SettingsIcon,
+  ShieldAlert,
+  ShieldCheck,
   Signature,
   Sparkles,
   Text,
@@ -57,7 +61,10 @@ import {
   cancelSend,
   createFolder,
   deleteFolder,
+  deleteForever,
   discardDraft,
+  emptyFolders,
+  getPrefs,
   listAccounts,
   listFolders,
   listMessages,
@@ -81,11 +88,14 @@ import {
   saveAttachment,
   saveDraft,
   sendMessage,
+  setBadge,
   syncFolders,
   syncNow,
+  trustCertificate,
   updateMessage,
   watchFolders,
 } from "./api";
+import BulkPanel, { type BulkActions, type Selection } from "./components/BulkPanel";
 import type { AiRequest } from "./components/AiMenu";
 import CalendarScreen from "./components/CalendarScreen";
 import CommandCenter, { type Command } from "./components/CommandCenter";
@@ -98,7 +108,7 @@ import Composer, {
   type Draft,
   type Writing,
 } from "./components/Composer";
-import { PromptDialog } from "./components/Dialog";
+import { CertificateDialog, ConfirmDialog, PromptDialog } from "./components/Dialog";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
 import type { RowActions } from "./components/MessageRow";
 import Settings, { type SettingsPage } from "./components/Settings";
@@ -110,6 +120,7 @@ import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./component
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { replyRecipients } from "./lib/addresses";
+import { badgeIcon } from "./lib/badge";
 import { clearContent, loadContent } from "./lib/content";
 import {
   asThread,
@@ -131,6 +142,7 @@ import {
 import { loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
   INBOX_MODES,
+  badgeCount,
   buildList,
   sidebarCounts,
   type AccountFilter,
@@ -187,17 +199,32 @@ import {
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import { useSearchHits, useServerSearch } from "./lib/search";
 import type {
+  AccountId,
   AccountView,
   AgentSendingEvent,
   FolderView,
   Message,
   MessagePatch,
+  Prefs,
   SendStatusEvent,
   SyncStatusEvent,
+  Untrusted,
 } from "./types";
 
 /** `targetId` points the actions at one row (its ⋯) rather than the current message. */
-type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetId: number };
+type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetIds: number[] };
+
+/** A question before something that can't be undone, or a big batch (`ConfirmDialog`). */
+interface Confirm {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  danger?: boolean;
+  run: () => Promise<void> | void;
+}
+
+/** Batch actions on more emails than this ask first, as Spark's do. */
+const HEAVY_BATCH = 100;
 
 /** What AI does in a composer (by `composerKey`), and its body before AI started. */
 type ComposerWriting = Writing & { composer: number; request: AiRequest; before: string };
@@ -237,6 +264,7 @@ const ICONS = {
   folder: { Icon: Folder, className: "text-primary" },
   download: { Icon: Download, className: "text-primary" },
   error: { Icon: CircleAlert, className: "text-error" },
+  spam: { Icon: ShieldAlert, className: "text-error" },
   agent: { Icon: Bot, className: "text-primary" },
 } satisfies Record<string, ToastIcon>;
 
@@ -298,6 +326,18 @@ export default function App() {
   /** Drafts deleted while their Undo toast is up: hidden now, deleted when it's gone. */
   const [discarding, setDiscarding] = useState<ReadonlySet<number>>(new Set());
   const [palette, setPalette] = useState<Palette | null>(null);
+  /** List rows (conversations) selected for a batch action. */
+  const [picked, setPicked] = useState<ReadonlySet<number>>(new Set());
+  /** Where Shift-click and Shift+arrow selections reach from. */
+  const pickAnchor = useRef<number | null>(null);
+  const [confirm, setConfirm] = useState<Confirm | null>(null);
+  /** A server certificate to ask about, from a sync or send that failed on it. */
+  const [certificate, setCertificate] = useState<{ account: AccountId; certificate: Untrusted } | null>(null);
+  /** Settings → Notifications → App icon badge. */
+  const [badgePrefs, setBadgePrefs] = useState<Pick<Prefs, "badge" | "badgeExcluded">>({
+    badge: "new",
+    badgeExcluded: [],
+  });
   /** +AI summaries by message id, kept while the app runs. */
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
   const summaryRun = useRef(0);
@@ -365,6 +405,15 @@ export default function App() {
   const current = openMessage ?? selected;
   const searching = view.search !== null;
   const syncing = accounts.some((a) => a.sync.status === "syncing");
+  const demo = isDemoMode(accounts);
+  const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
+  /** The selected rows still listed, in list order. */
+  const pickedRows = useMemo(() => model.order.filter((id) => picked.has(id)), [model.order, picked]);
+  const pickedMessages = pickedRows.flatMap((id) => byId.get(id) ?? []);
+  const badge = useMemo(
+    () => (demo ? 0 : badgeCount(listed, badgePrefs.badge, badgePrefs.badgeExcluded)),
+    [demo, listed, badgePrefs],
+  );
 
   useEffect(() => {
     void reloadFolders();
@@ -438,7 +487,20 @@ export default function App() {
       (view) => view && setAiProvider(presetLabel(view.preset)),
       () => {},
     );
+    void getPrefs().then(
+      ({ badge, badgeExcluded }) => setBadgePrefs({ badge, badgeExcluded }),
+      () => {},
+    );
   }, [settingsPage]);
+
+  useEffect(() => {
+    void setBadge(badge, badge > 0 ? badgeIcon(badge) : null).catch(() => {});
+  }, [badge]);
+
+  // Rows that left the list leave the selection.
+  useEffect(() => {
+    if (pickedRows.length !== picked.size) setPicked(new Set(pickedRows));
+  }, [pickedRows, picked]);
 
   // ---- data ----
 
@@ -463,6 +525,25 @@ export default function App() {
       setMessages((ms) => ms.map((m) => (m.id === id ? saved : m)));
     } catch (error) {
       showToast(`Couldn't update the message: ${String(error)}`);
+      void reloadMessages();
+    }
+  }
+
+  /** `update` for many messages at once, e.g. a batch action: one re-render before saving and one after. */
+  async function updateAll(changes: { id: number; patch: MessagePatch }[]) {
+    if (changes.length === 1) return update(changes[0].id, changes[0].patch);
+    const patches = new Map(changes.map((c) => [c.id, c.patch]));
+    setMessages((ms) => ms.map((m) => (patches.has(m.id) ? patched(m, patches.get(m.id)!) : m)));
+    const results = await Promise.allSettled(changes.map((c) => updateMessage(c.id, c.patch)));
+    const saved = new Map<number, Message>();
+    let failure: unknown;
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") saved.set(changes[i].id, r.value);
+      else failure ??= r.reason;
+    });
+    setMessages((ms) => ms.map((m) => saved.get(m.id) ?? m));
+    if (failure !== undefined) {
+      showToast(`Couldn't update the messages: ${String(failure)}`);
       void reloadMessages();
     }
   }
@@ -539,11 +620,12 @@ export default function App() {
     if (e.status !== "error" || syncErrors.current.get(e.account) === e.message) return;
     syncErrors.current.set(e.account, e.message);
     const label = accounts.find((a) => a.id === e.account)?.label ?? "Mail";
+    const untrusted = e.certificate;
     showToast(
       `${label}: ${e.message ?? "Couldn't check for new mail."}`,
-      () => openSettings("accounts"),
+      untrusted ? () => setCertificate({ account: e.account, certificate: untrusted }) : () => openSettings("accounts"),
       ICONS.error,
-      { actionLabel: "Settings", duration: ERROR_TOAST_MS },
+      { actionLabel: untrusted ? "Review" : "Settings", duration: ERROR_TOAST_MS },
     );
   }
 
@@ -554,6 +636,16 @@ export default function App() {
     if (sent?.draftId !== undefined || e.draftId !== undefined) void reloadMessages();
     if (e.status !== "failed") return;
     const recovered = e.draftId;
+    const untrusted = e.certificate;
+    if (untrusted) {
+      showToast(
+        `Couldn't send: ${e.message ?? "the server's certificate isn't trusted."} It's back in Drafts.`,
+        () => setCertificate({ account: e.account, certificate: untrusted }),
+        ICONS.error,
+        { actionLabel: "Review", duration: ERROR_TOAST_MS },
+      );
+      return;
+    }
     showToast(
       `Couldn't send: ${e.message ?? "the server refused the message."}`,
       recovered !== undefined ? () => void editDraft({ id: recovered }) : sent && (() => openComposer(sent)),
@@ -622,9 +714,9 @@ export default function App() {
     const cursor = { selectedId, openId };
 
     moveOffMessages(leaving);
-    for (const c of changes) void update(c.id, c.patch);
+    void updateAll(changes);
     return () => {
-      for (const c of changes) void update(c.id, c.previous);
+      void updateAll(changes.map((c) => ({ id: c.id, patch: c.previous })));
       if (leaving.length) {
         setSelectedId(cursor.selectedId);
         setOpenId(cursor.openId);
@@ -723,6 +815,7 @@ export default function App() {
   }
 
   function moveCursor(step: 1 | -1) {
+    clearPicked();
     const order = model.order;
     if (!order.length) return;
     const anchor = openId ?? selectedId;
@@ -733,6 +826,7 @@ export default function App() {
   }
 
   function changeView(next: Partial<ListView>, keepThread = false) {
+    clearPicked();
     const merged = { ...view, ...next };
     if (merged.folder !== view.folder || merged.account !== view.account || merged.mode !== view.mode) {
       setSticky(new Set());
@@ -840,9 +934,10 @@ export default function App() {
 
   const closeSearch = () => changeView({ search: null }, true);
 
-  /** Esc: the folder picker and sidebar overlay, then the thread, then a sub-list, then search. */
+  /** Esc: the folder picker and sidebar overlay, then the selection, then the thread, then a sub-list, then search. */
   function closeTopmost() {
     if (pickerOpen || sidebarMode === "overlay") closeSidebar();
+    else if (pickedRows.length) clearPicked();
     else if (openId !== null) setOpenId(null);
     else if (view.sub) changeView({ sub: null });
     else if (searching) closeSearch();
@@ -878,15 +973,30 @@ export default function App() {
     else act([own(m)], { [key]: true }, on, icon);
   }
 
+  /** The account's Spam folder (Junk Email on Microsoft 365). */
+  const spamFolder = (account: AccountId) => folders.find((f) => f.account === account && f.role === "spam");
+  const inSpam = (m: Message) => m.state === "filed" && m.folder !== undefined && m.folder === spamFolder(m.account)?.id;
+
   const actions = {
     done: (m: Message) =>
       m.state === "done"
         ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
         : act(together(m), { state: "done" }, "Marked as Done", ICONS.done),
+    /** Mail already in Trash is deleted for good, after asking. */
     trash: (m: Message) => {
-      if (isDraft(m, folders)) discardListed(m);
-      else if (m.state !== "deleted") act(together(m), { state: "deleted" }, "Moved to Trash", ICONS.trash);
+      if (isDraft(m, folders)) discardListed([m]);
+      else if (m.state === "deleted") deleteForeverAsk(together(m));
+      else act(together(m), { state: "deleted" }, "Moved to Trash", ICONS.trash);
     },
+    /** Just this email of its conversation, from its card's menu. */
+    trashOne: (m: Message) => {
+      const one = own(m);
+      if (isDraft(one, folders)) discardListed([one]);
+      else if (one.state === "deleted") deleteForeverAsk([one]);
+      else act([one], { state: "deleted" }, "Moved to Trash", ICONS.trash);
+    },
+    spam: (m: Message) => spam([m]),
+    deleteForever: (m: Message) => deleteForeverAsk(together(m)),
     pin: (m: Message) => flag(m, "pinned", "Pinned", "Unpinned", ICONS.pin),
     priority: (m: Message) => flag(m, "priority", "Marked as Priority", "Removed from Priority", ICONS.priority),
     /** Reading marks the whole conversation read; unread marks `m`. */
@@ -909,6 +1019,224 @@ export default function App() {
     accept: (m: Message) => act([m], { screening: false }, "Sender accepted", ICONS.accept),
     block: (m: Message) => act([m], { state: "blocked" }, "Sender blocked", ICONS.block),
   };
+
+  /** Move to Spam, or for mail in Spam, Not Spam: back to the Inbox. Rows stand for their conversations. */
+  function spam(rows: Message[]) {
+    if (rows.length && rows.every(inSpam)) {
+      act(rows.flatMap(together), { state: "inbox" }, "Marked as Not Spam", ICONS.inbox);
+      return;
+    }
+    const movable = rows.filter((m) => !inSpam(m) && !isDraft(m, folders) && spamFolder(m.account));
+    if (!movable.length) {
+      showToast("This account has no Spam folder", undefined, ICONS.error);
+      return;
+    }
+    act(movable.flatMap(together), (m) => ({ folder: spamFolder(m.account)!.id }), "Moved to Spam", ICONS.spam);
+  }
+
+  /** Deletes emails for good, after asking: there's no undo, as in Spark. */
+  function deleteForeverAsk(emails: Message[]) {
+    const ids = emails.map((m) => m.id);
+    if (!ids.length) return;
+    const one = ids.length === 1;
+    setConfirm({
+      title: one ? "Delete email" : "Delete emails",
+      message: one
+        ? "Do you want to permanently delete this email?"
+        : `Do you want to permanently delete these ${ids.length} emails?`,
+      confirmLabel: "Delete",
+      run: async () => {
+        await deleteForever(ids);
+        moveOffMessages(ids);
+        setMessages((ms) => ms.filter((m) => !ids.includes(m.id)));
+        showToast(one ? "Email deleted" : `${plural(ids.length, "email")} deleted`, undefined, ICONS.trash);
+      },
+    });
+  }
+
+  /** The server folders behind a list that can be emptied: Trash, Spam, or a folder that isn't a Gmail label. */
+  function emptiable(key: ListKey, account: AccountFilter = "all"): FolderView[] {
+    if (key !== "trash" && key !== "spam" && folderIdOf(key) === undefined) return [];
+    const ids = listFolderIds(key, folders, accountOf(account));
+    const gmail = (f: FolderView) => accounts.find((a) => a.id === f.account)?.kind === "gmail";
+    return folders.filter(
+      (f) => ids.includes(f.id) && (f.role === "trash" || f.role === "spam" || (f.role === undefined && !gmail(f))),
+    );
+  }
+
+  /** Deletes everything in a list's server folders for good, after asking; also mail not downloaded here. */
+  function emptyList(key: ListKey, account: AccountFilter = "all") {
+    const targets = emptiable(key, account);
+    if (!targets.length) return;
+    const name = isSystemList(key) ? SYSTEM_LISTS[key].label : targets[0].name;
+    setConfirm({
+      title: `Empty ${name}`,
+      message: `Do you want to permanently delete all emails inside the ${name} folder? This can't be undone.`,
+      confirmLabel: "Empty",
+      run: async () => {
+        const deleted = await emptyFolders(targets.map((f) => f.id));
+        await reloadMessages();
+        showToast(`${plural(deleted, "email")} deleted`, undefined, ICONS.trash);
+      },
+    });
+  }
+
+  /** Mark all as Read (or Unread): every email a list shows, the open one by default. */
+  function markAll(unread: boolean, key?: ListKey) {
+    const list = key === undefined ? model : buildList(listed, { ...INITIAL_VIEW, folder: key, mode: "simple" }, new Set(), ctx);
+    const ids = listedIds(list);
+    const targets = listed.filter((m) => ids.has(m.id) && m.unread !== unread && !isDraft(m, folders));
+    if (!targets.length) {
+      showToast(unread ? "Everything here is unread" : "Everything here is read", undefined, ICONS.read);
+      return;
+    }
+    act(targets, { unread }, `${plural(targets.length, "email")} marked as ${unread ? "unread" : "read"}`, ICONS.read);
+  }
+
+  // ---- selection ----
+
+  function clearPicked() {
+    if (picked.size) setPicked(new Set());
+    pickAnchor.current = null;
+  }
+
+  /**
+   * Ctrl/⌘-click puts a row in the selection or takes it out; Shift-click
+   * adds the rows from where the selection started. The cursor's row is in
+   * a new selection too.
+   */
+  function pickRow(id: number, range: boolean) {
+    const order = model.order;
+    const cursor = selectedId === null ? null : rowOf(selectedId);
+    const next = new Set(pickedRows.length ? pickedRows : cursor !== null && order.includes(cursor) ? [cursor] : []);
+    const anchor = pickAnchor.current ?? cursor ?? id;
+    const [from, to] = [order.indexOf(anchor), order.indexOf(id)];
+    if (range && from >= 0 && to >= 0) {
+      for (const x of order.slice(Math.min(from, to), Math.max(from, to) + 1)) next.add(x);
+    } else if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    pickAnchor.current = range ? anchor : id;
+    setPicked(next);
+  }
+
+  /** Shift+↓ / Shift+↑: the row below or above the cursor joins the selection, and the cursor moves there. */
+  function pickNext(step: 1 | -1) {
+    const order = model.order;
+    if (!order.length) return;
+    const cursor = selectedId === null ? null : rowOf(selectedId);
+    const i = cursor === null ? -1 : order.indexOf(cursor);
+    const next = order[clamp(i + step, 0, order.length - 1)];
+    const set = new Set(pickedRows.length ? pickedRows : i >= 0 ? [cursor!] : []);
+    set.add(next);
+    pickAnchor.current ??= cursor ?? next;
+    setPicked(set);
+    setSelectedId(next);
+  }
+
+  /** A batch action on the selected conversations (or `rows`); a big one asks first. */
+  function batch(run: (rows: Message[]) => void, rows = pickedMessages) {
+    if (!rows.length) return;
+    const emails = rows.reduce((n, m) => n + threadOf(m).length, 0);
+    if (emails <= HEAVY_BATCH) return run(rows);
+    setConfirm({
+      title: "Proceed with a batch action?",
+      message: `This acts on ${plural(emails, "email")} at once.`,
+      confirmLabel: "Proceed",
+      danger: false,
+      run: () => run(rows),
+    });
+  }
+
+  const conversationCount = (rows: Message[]) => plural(rows.length, "conversation");
+  const pinnedThread = (m: Message) => threadOf(m).some((x) => x.pinned);
+  const priorityThread = (m: Message) => threadOf(m).some((x) => x.priority);
+
+  const selection: Selection = {
+    count: pickedMessages.length,
+    allDone: pickedMessages.every((m) => m.state === "done"),
+    anyUnread: pickedMessages.some((m) => threadOf(m).some((x) => x.unread)),
+    allPinned: pickedMessages.every(pinnedThread),
+    allPriority: pickedMessages.every(priorityThread),
+    allAside: pickedMessages.every((m) => m.state === "aside"),
+    allSpam: pickedMessages.every(inSpam),
+    allDeleted: pickedMessages.every((m) => m.state === "deleted"),
+  };
+
+  const bulk: BulkActions = {
+    done: () =>
+      batch((rows) =>
+        rows.every((m) => m.state === "done")
+          ? act(rows.flatMap(together), { state: "inbox" }, `${conversationCount(rows)} moved to Inbox`, ICONS.inbox)
+          : doneAll(rows),
+      ),
+    trash: () =>
+      batch((rows) => {
+        if (rows.every((m) => m.state === "deleted")) return deleteForeverAsk(rows.flatMap(together));
+        const drafts = rows.filter((m) => isDraft(m, folders)).map((m) => m.id);
+        const mail = rows.filter((m) => !isDraft(m, folders) && m.state !== "deleted").flatMap(together);
+        const undo = mail.length ? apply(mail, () => ({ state: "deleted" })) : undefined;
+        const text = `${conversationCount(rows)} moved to Trash`;
+        if (drafts.length) {
+          moveOffMessages(drafts);
+          discardLater(drafts, undo, text);
+        } else showToast(text, undo, ICONS.trash);
+      }),
+    read: () =>
+      batch((rows) => {
+        const unread = rows.flatMap(threadOf).filter((x) => x.unread);
+        if (unread.length) act(unread, { unread: false }, `${conversationCount(rows)} marked as read`, ICONS.read);
+        else act(rows.map(own), { unread: true }, `${conversationCount(rows)} marked as unread`, ICONS.read);
+      }),
+    pin: () =>
+      batch((rows) =>
+        rows.every(pinnedThread)
+          ? act(rows.flatMap(threadOf).filter((x) => x.pinned), { pinned: false }, `${conversationCount(rows)} unpinned`, ICONS.pin)
+          : act(rows.filter((m) => !pinnedThread(m)).map(own), { pinned: true }, `${conversationCount(rows)} pinned`, ICONS.pin),
+      ),
+    priority: () =>
+      batch((rows) =>
+        rows.every(priorityThread)
+          ? act(
+              rows.flatMap(threadOf).filter((x) => x.priority),
+              { priority: false },
+              `${conversationCount(rows)} removed from Priority`,
+              ICONS.priority,
+            )
+          : act(
+              rows.filter((m) => !priorityThread(m)).map(own),
+              { priority: true },
+              `${conversationCount(rows)} marked as Priority`,
+              ICONS.priority,
+            ),
+      ),
+    aside: () =>
+      batch((rows) =>
+        rows.every((m) => m.state === "aside")
+          ? act(rows.flatMap(together), { state: "inbox" }, `${conversationCount(rows)} moved to Inbox`, ICONS.inbox)
+          : act(
+              rows.filter((m) => m.state !== "aside").flatMap(together),
+              { state: "aside" },
+              `${conversationCount(rows)} set aside`,
+              ICONS.aside,
+            ),
+      ),
+    snooze: (p) => batch((rows) => snoozeRows(rows, p)),
+    spam: () => batch(spam),
+    clear: clearPicked,
+  };
+
+  function snoozeRows(rows: Message[], p: LaterPreset) {
+    if (rows.length === 1) return actions.snooze(rows[0], p);
+    act(
+      rows.flatMap(together),
+      { state: "snoozed", snoozedUntil: laterTime(p) },
+      `${conversationCount(rows)} snoozed until ${p.label.toLowerCase()}`,
+      ICONS.snooze,
+    );
+  }
 
   /** A card's or sub-list's rows, each with its conversation. */
   function doneAll(items: Message[]) {
@@ -934,7 +1262,7 @@ export default function App() {
     blockAll: (items) => act(items, { state: "blocked" }, senders(items, "blocked"), ICONS.block),
   };
 
-  const snoozeMenu = (m: Message) => setPalette({ kind: "snooze", targetId: m.id });
+  const snoozeMenu = (m: Message) => setPalette({ kind: "snooze", targetIds: [m.id] });
 
   /**
    * A row dragged onto a sidebar list: its conversation filed in a folder, or
@@ -945,7 +1273,8 @@ export default function App() {
     const patch = m && dropPatch(m, key, folders, account);
     if (!m || !patch) return;
     const moved = together(m);
-    if (isDraft(m, folders)) discardListed(m);
+    if (isDraft(m, folders)) discardListed([m]);
+    else if (key === "spam") act(moved, patch, "Moved to Spam", ICONS.spam);
     else if (patch.folder !== undefined) {
       const name = folders.find((f) => f.id === patch.folder)?.name ?? "the folder";
       act(moved, patch, `Moved to ${name}`, ICONS.folder);
@@ -1030,24 +1359,25 @@ export default function App() {
    * Deletes a saved draft once the Undo toast is gone (sooner if another toast
    * replaces it); until then it's out of the lists. `undo` also runs on Undo.
    */
-  function discardLater(id: number | undefined, undo?: () => void) {
-    if (id === undefined) {
-      if (undo) showToast("Draft discarded", undo, ICONS.trash);
+  function discardLater(ids: number[], undo?: () => void, text = "Draft discarded") {
+    if (!ids.length) {
+      if (undo) showToast(text, undo, ICONS.trash);
       return;
     }
-    setDiscarding((s) => new Set(s).add(id));
-    const keep = () => setDiscarding((s) => new Set([...s].filter((x) => x !== id)));
+    setDiscarding((s) => new Set([...s, ...ids]));
+    const keep = () => setDiscarding((s) => new Set([...s].filter((x) => !ids.includes(x))));
     const timer = window.setTimeout(() => {
-      discardDraft(id).then(
+      Promise.all(ids.map((id) => discardDraft(id))).then(
         () => reloadMessages().then(keep),
         (error) => {
           keep();
+          void reloadMessages();
           showToast(`Couldn't delete the draft: ${String(error)}`, undefined, ICONS.error);
         },
       );
     }, TOAST_MS);
     showToast(
-      "Draft discarded",
+      text,
       () => {
         window.clearTimeout(timer);
         keep();
@@ -1057,10 +1387,11 @@ export default function App() {
     );
   }
 
-  /** Move to Trash on a draft in the list. */
-  function discardListed(m: Message) {
-    moveOffMessages([m.id]);
-    discardLater(m.id);
+  /** Move to Trash on drafts in the list. */
+  function discardListed(ms: Message[]) {
+    const ids = ms.map((m) => m.id);
+    moveOffMessages(ids);
+    discardLater(ids, undefined, ids.length === 1 ? "Draft discarded" : `${plural(ids.length, "draft")} discarded`);
   }
 
   /** The composer's Delete Draft: it closes, and its saved draft goes too. Undo brings both back. */
@@ -1071,7 +1402,7 @@ export default function App() {
     const session = composerKey;
     setDraft(null);
     const id = await savedDraftId(closed, session);
-    discardLater(id, draftHasContent(closed) ? () => openComposer({ ...closed, draftId: id }) : undefined);
+    discardLater(id === undefined ? [] : [id], draftHasContent(closed) ? () => openComposer({ ...closed, draftId: id }) : undefined);
   }
 
   /** From the account the Inbox is narrowed to, else the first. */
@@ -1251,7 +1582,8 @@ export default function App() {
     const unchanged = draftKey(closed) === draftSaved;
     setDraft(null);
     if (!draftHasContent(closed)) {
-      discardLater(await savedDraftId(closed, session));
+      const id = await savedDraftId(closed, session);
+      discardLater(id === undefined ? [] : [id]);
       return;
     }
     if (unchanged) {
@@ -1274,7 +1606,8 @@ export default function App() {
    */
   async function send() {
     if (!draft || writing?.status === "writing") return;
-    if (!draft.to.trim()) {
+    // Cc or Bcc alone will do, as for a mailing list sent in Bcc.
+    if (![draft.to, draft.cc, draft.bcc].some((field) => field.trim())) {
       showToast("Add at least one recipient");
       return;
     }
@@ -1379,7 +1712,7 @@ export default function App() {
       case "prev":
         return moveCursor(-1);
       case "open":
-        if (selectedId !== null) openListed(selectedId);
+        if (selectedId !== null && !pickedRows.length) openListed(selectedId);
         return;
       case "close":
         return closeTopmost();
@@ -1406,6 +1739,26 @@ export default function App() {
       case "top":
       case "bottom":
         return scrollByKey(action);
+      case "selectAll":
+        return setPicked(new Set(model.order));
+      case "selectNext":
+        return pickNext(1);
+      case "selectPrev":
+        return pickNext(-1);
+    }
+    if (pickedRows.length) {
+      switch (action) {
+        case "done":
+        case "trash":
+        case "read":
+        case "pin":
+        case "priority":
+        case "aside":
+          return bulk[action]();
+        case "snooze":
+          return setPalette({ kind: "snooze", targetIds: pickedRows });
+      }
+      return;
     }
     const m = current;
     if (!m) return;
@@ -1543,12 +1896,30 @@ export default function App() {
           },
           {
             id: "trash",
-            label: "Move to Trash",
-            keywords: "delete",
+            label: m.state === "deleted" ? "Delete Forever" : "Move to Trash",
+            keywords: "delete remove permanently",
             Icon: Trash2,
             shortcut: shortcutLabel("trash"),
             run: () => actions.trash(m),
           },
+          {
+            id: "spam",
+            label: inSpam(m) ? "Not Spam" : "Move to Spam",
+            keywords: "junk",
+            Icon: inSpam(m) ? ShieldCheck : ShieldAlert,
+            run: () => actions.spam(m),
+          },
+          ...(inSpam(m)
+            ? [
+                {
+                  id: "delete-forever",
+                  label: "Delete Forever",
+                  keywords: "delete remove permanently",
+                  Icon: Trash2,
+                  run: () => actions.deleteForever(m),
+                },
+              ]
+            : []),
           { id: "reply", label: "Reply", Icon: Reply, shortcut: shortcutLabel("reply"), run: () => reply(m) },
           {
             id: "reply-all",
@@ -1595,6 +1966,27 @@ export default function App() {
       },
       { id: "search", label: "Search", keywords: "find", Icon: Search, shortcut: shortcutLabel("search"), run: openSearch },
       { id: "sync", label: "Check for new mail", keywords: "sync refresh fetch receive", Icon: RefreshCw, run: checkMail },
+      {
+        id: "select-all",
+        label: "Select All",
+        keywords: "pick choose emails batch",
+        Icon: CheckCheck,
+        shortcut: shortcutLabel("selectAll"),
+        run: () => setPicked(new Set(model.order)),
+      },
+      { id: "mark-all-read", label: "Mark All as Read", keywords: "seen", Icon: MailOpen, run: () => markAll(false) },
+      { id: "mark-all-unread", label: "Mark All as Unread", keywords: "seen", Icon: Mail, run: () => markAll(true) },
+      ...(emptiable(view.folder, view.account).length && !searching
+        ? [
+            {
+              id: "empty",
+              label: `Empty ${model.title}`,
+              keywords: "delete all permanently trash spam junk folder",
+              Icon: Trash2,
+              run: () => emptyList(view.folder, view.account),
+            },
+          ]
+        : []),
       { id: "go-inbox", label: "Go to Inbox", keywords: "folder", Icon: Inbox, run: () => selectList("inbox") },
       ...SYSTEM_ORDER.map((key) => ({
         id: `go-${key}`,
@@ -1687,14 +2079,14 @@ export default function App() {
     ];
   }
 
-  const snoozeTarget = palette?.kind === "snooze" ? messages.find((m) => m.id === palette.targetId) : undefined;
-  const snoozeCommands: Command[] = snoozeTarget
+  const snoozeTargets = palette?.kind === "snooze" ? palette.targetIds.flatMap((id) => byId.get(id) ?? []) : [];
+  const snoozeCommands: Command[] = snoozeTargets.length
     ? LATER_PRESETS.map((p) => ({
         id: p.key,
         label: p.label,
         Icon: Clock,
         detail: presetDetail(p),
-        run: () => actions.snooze(snoozeTarget, p),
+        run: () => batch((rows) => snoozeRows(rows, p), snoozeTargets),
       }))
     : [];
 
@@ -1702,7 +2094,11 @@ export default function App() {
 
   // Stable, so typing in the composer doesn't re-render every (memoized) row.
   const rows = useLatest<RowActions>({
-    open: openListed,
+    open: (id) => {
+      clearPicked();
+      openListed(id);
+    },
+    pick: pickRow,
     done: actions.done,
     pin: actions.pin,
     snooze: snoozeMenu,
@@ -1715,6 +2111,7 @@ export default function App() {
 
   const threadActions: ThreadActions = {
     ...actions,
+    inSpam,
     close: () => setOpenId(null),
     summarize,
     stopSummary,
@@ -1764,6 +2161,9 @@ export default function App() {
     renameList,
     deleteList,
     drop: dropMessage,
+    markAllRead: (key) => markAll(false, key),
+    canEmpty: (key) => emptiable(key).length > 0,
+    empty: (key) => emptyList(key),
     calendar: () => {
       setCalendarFocus(undefined);
       setCalendarOpen(true);
@@ -1789,7 +2189,7 @@ export default function App() {
           syncing={syncing}
           updateAvailable={Boolean(updates.view?.available)}
           pickerOpen={pickerOpen}
-          demo={isDemoMode(accounts)}
+          demo={demo}
           calendarOpen={calendarOpen}
           actions={sidebarActions}
         />
@@ -1812,6 +2212,7 @@ export default function App() {
                 view={view}
                 selectedId={selectedId}
                 openId={openId}
+                picked={picked}
                 rows={rows}
                 gatekeeper={gatekeeper}
                 onDoneAll={doneAll}
@@ -1834,7 +2235,9 @@ export default function App() {
                 scrollRef={listScroll}
                 older={older && { loading: loadingOlder, onNearEnd: reachBack }}
                 searchingServers={searchingServers}
+                onEmpty={emptiable(view.folder, view.account).length ? () => emptyList(view.folder, view.account) : undefined}
               />
+              {!twoColumns && pickedRows.length > 0 && <BulkPanel compact selection={selection} actions={bulk} />}
               {twoColumns && (
                 <Splitter
                   width={listWidthUsed}
@@ -1849,7 +2252,9 @@ export default function App() {
               className="flex min-w-0 flex-1 flex-col pt-8"
               onPointerDownCapture={() => (scrollPane.current = "reader")}
             >
-              {openMessage ? (
+              {twoColumns && pickedRows.length > 0 ? (
+                <BulkPanel selection={selection} actions={bulk} />
+              ) : openMessage ? (
                 <ThreadView
                   key={openMessage.id}
                   message={asThread(openMessage, conversation)}
@@ -1915,7 +2320,13 @@ export default function App() {
         {palette?.kind === "snooze" && (
           <CommandCenter
             key="snooze"
-            title={snoozeTarget ? `Snooze · ${snoozeTarget.subject}` : "Snooze"}
+            title={
+              snoozeTargets.length > 1
+                ? `Snooze · ${conversationCount(snoozeTargets)}`
+                : snoozeTargets.length
+                  ? `Snooze · ${snoozeTargets[0].subject}`
+                  : "Snooze"
+            }
             placeholder="Snooze until…"
             commands={snoozeCommands}
             onRun={(c) => {
@@ -1951,6 +2362,24 @@ export default function App() {
             confirmLabel="Save"
             onSubmit={(name) => saveSmartFolder(name, savingSearch)}
             onClose={() => setSavingSearch(null)}
+          />
+        )}
+
+        {confirm && (
+          <ConfirmDialog
+            title={confirm.title}
+            message={confirm.message}
+            confirmLabel={confirm.confirmLabel}
+            danger={confirm.danger}
+            onConfirm={confirm.run}
+            onClose={() => setConfirm(null)}
+          />
+        )}
+        {certificate && (
+          <CertificateDialog
+            certificate={certificate.certificate}
+            onTrust={() => trustCertificate(certificate.account, certificate.certificate)}
+            onClose={() => setCertificate(null)}
           />
         )}
 
