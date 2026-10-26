@@ -9,7 +9,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 use spark_mail::draft::{self, Draft};
 use spark_mail::signature;
-use spark_store::{Account, AccountKind, Category, MessageState, Patch, Query, Store};
+use spark_store::{
+    Account, AccountKind, Category, Change, Decision, GatekeeperMode, MessageState, Patch, Query,
+    Screen, Store, domain_of,
+};
 
 use super::Access;
 
@@ -62,7 +65,7 @@ pub fn catalog() -> Value {
     };
     let mut list_props = json!({
         "account": account,
-        "folder": { "type": "string", "enum": ["inbox", "new_senders", "snoozed", "set_aside", "done", "trash"], "description": "Default inbox. new_senders is mail from senders the user hasn't accepted yet." },
+        "folder": { "type": "string", "enum": ["inbox", "new_senders", "snoozed", "set_aside", "done", "trash"], "description": "Default inbox. new_senders is mail from senders the user hasn't accepted yet; it's left out of inbox unless the user's Gatekeeper screens new senders inside the inbox." },
         "category": { "type": "string", "enum": ["people", "notifications", "newsletters"], "description": "Only this kind of mail." },
         "unread_only": { "type": "boolean" },
     });
@@ -103,6 +106,14 @@ pub fn catalog() -> Value {
             }, "required": ["ids", "action"] },
         },
         {
+            "name": "decide_senders",
+            "description": "Gatekeeper: accept or block senders, or everyone at their domains, for every account. Accepting takes their mail out of new_senders (and blocked mail back to the inbox); blocking moves their inbox mail to the Blocked folder, and their future mail too. Domains of free mail providers such as gmail.com can't be decided as a whole. Needs triage access to every account, since the decision counts for all of them.",
+            "inputSchema": { "type": "object", "properties": {
+                "senders": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Email addresses, e.g. from list_messages." },
+                "action": { "type": "string", "enum": ["accept", "block", "accept_domain", "block_domain"], "description": "The _domain actions decide for everyone at each sender's domain." },
+            }, "required": ["senders", "action"] },
+        },
+        {
             "name": "send_email",
             "description": format!("Sends a plain-text email from one of the user's accounts. Needs send access. It waits {} seconds in spark-rs's outbox, where the user can undo it. To reply, pass reply_to with the message id: the recipient and subject default to the original's. The account's signature (see list_accounts) goes below the body, so never end the body with a sign-off or the user's name; when the user wants a different closing, pass no_signature and write it yourself.", SEND_DELAY_MS / 1000),
             "inputSchema": { "type": "object", "properties": {
@@ -132,6 +143,7 @@ pub fn call(cx: &mut Context, name: &str, args: &Value) -> Outcome {
         "search_messages" => search_messages(cx, args),
         "read_message" => read_message(cx, args),
         "update_messages" => update_messages(cx, args),
+        "decide_senders" => decide_senders(cx, args),
         "send_email" => send_email(cx, args),
         other => Err(format!("spark-rs has no tool named {other}.")),
     };
@@ -231,8 +243,10 @@ fn list_accounts(cx: &mut Context) -> ToolResult {
 fn list_messages(cx: &mut Context, args: &Value) -> ToolResult {
     let accounts = cx.accounts(Access::Read, int(args, "account")?)?;
     let folder = args["folder"].as_str().unwrap_or("inbox");
+    // As in Spark, new senders' mail is in the inbox unless the Gatekeeper screens it before.
+    let before = cx.store.gatekeeper_mode().map_err(db)? == GatekeeperMode::BeforeInbox;
     let wanted = |m: &spark_store::Message| match folder {
-        "inbox" => m.state == MessageState::Inbox && !m.screening,
+        "inbox" => m.state == MessageState::Inbox && !(m.screening && before),
         "new_senders" => m.state == MessageState::Inbox && m.screening,
         "snoozed" => m.state == MessageState::Snoozed,
         "set_aside" => m.state == MessageState::Aside,
@@ -390,6 +404,74 @@ fn update_messages(cx: &mut Context, args: &Value) -> ToolResult {
     let summary = done.replace("{}", &emails(ids.len()));
     Ok((
         json!({ "updated": ids, "note": "Changes reach the server after a few seconds." }),
+        Some(Effect::Changed { summary }),
+    ))
+}
+
+fn decide_senders(cx: &mut Context, args: &Value) -> ToolResult {
+    let senders: Vec<&str> = args["senders"]
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .ok_or("Pass the senders' addresses.")?
+        .iter()
+        .map(|s| {
+            s.as_str()
+                .map(str::trim)
+                .ok_or("Senders are email addresses.")
+        })
+        .collect::<Result<_, _>>()?;
+    let action = args["action"].as_str().unwrap_or("");
+    let (decision, by_domain) = match action {
+        "accept" => (Decision::Accepted, false),
+        "block" => (Decision::Blocked, false),
+        "accept_domain" => (Decision::Accepted, true),
+        "block_domain" => (Decision::Blocked, true),
+        other => return Err(format!("There's no action {other:?}.")),
+    };
+    // A decision counts for every account, so it needs triage in all of them.
+    for account in cx.store.accounts().map_err(db)? {
+        cx.check(&account, Access::Triage, "accept or block senders")?;
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    for address in senders {
+        let screen = if by_domain {
+            Screen::Domain(
+                domain_of(address).ok_or_else(|| format!("{address} isn't an email address."))?,
+            )
+        } else {
+            Screen::Sender(address.to_owned())
+        };
+        if !changes.iter().any(|c| c.screen == screen) {
+            changes.push(Change {
+                screen,
+                decision: Some(decision),
+            });
+        }
+    }
+    cx.store
+        .decide(&changes, cx.now)
+        .map_err(|e| e.to_string())?;
+    let verb = if decision == Decision::Accepted {
+        "accepted"
+    } else {
+        "blocked"
+    };
+    let summary = if by_domain {
+        let domains: Vec<&str> = changes
+            .iter()
+            .filter_map(|c| match &c.screen {
+                Screen::Domain(d) => Some(d.as_str()),
+                Screen::Sender(_) => None,
+            })
+            .collect();
+        format!("{verb} everyone at {}", domains.join(", "))
+    } else if changes.len() == 1 {
+        format!("{verb} 1 sender")
+    } else {
+        format!("{verb} {} senders", changes.len())
+    };
+    Ok((
+        json!({ "decided": changes.len(), "note": "Their mail follows in every account; moves reach the server after a few seconds." }),
         Some(Effect::Changed { summary }),
     ))
 }
@@ -719,6 +801,34 @@ mod tests {
             run(&mut store, &access, "list_accounts", json!({}))
                 .effect
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn deciding_senders_needs_triage_everywhere_and_moves_their_mail() {
+        let (mut store, work, home) = mailbox();
+        let mut access = BTreeMap::from([(work, Access::Triage), (home, Access::Read)]);
+        let block = json!({ "senders": ["news@vendor.com"], "action": "block" });
+        let refused = run(&mut store, &access, "decide_senders", block.clone());
+        assert!(refused.is_error);
+        assert!(refused.text.contains("me@home.com"), "{}", refused.text);
+
+        access.insert(home, Access::Triage);
+        let blocked = run(&mut store, &access, "decide_senders", block);
+        assert!(!blocked.is_error, "{}", blocked.text);
+        let news = store.search("Weekly").unwrap()[0].clone();
+        assert_eq!(news.state, MessageState::Blocked);
+        assert!(
+            matches!(blocked.effect, Some(Effect::Changed { ref summary }) if summary == "blocked 1 sender")
+        );
+
+        let public = json!({ "senders": ["someone@gmail.com"], "action": "block_domain" });
+        assert!(run(&mut store, &access, "decide_senders", public).is_error);
+        let domain =
+            json!({ "senders": ["ana@parts.com", "bob@parts.com"], "action": "accept_domain" });
+        let accepted = run(&mut store, &access, "decide_senders", domain);
+        assert!(
+            matches!(accepted.effect, Some(Effect::Changed { ref summary }) if summary == "accepted everyone at parts.com")
         );
     }
 

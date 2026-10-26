@@ -45,7 +45,7 @@ Last full check: 2026-10-26.
 | Feature | spark-rs | Notes |
 |---|:-:|---|
 | Priority | 🟡 | Priority conversations and the Priority card; no priority senders |
-| Gatekeeper | ✅ | Accept or block a new sender or a whole domain once for every account; blocked mail moves to a Blocked folder on the server |
+| Gatekeeper | ✅ | Spark's three modes (before the Inbox, inside it, off); accept or block a new sender or a whole domain once for every account; colleagues, people you've written to and big companies get through without asking; blocked mail moves to a Blocked folder on the server |
 | Group by Sender & Domain | ❌ | |
 | Smart Folders | ✅ | Save any search as a smart folder; its search can't be edited afterwards |
 | Mute Threads | ❌ | |

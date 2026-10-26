@@ -392,7 +392,8 @@ account under Settings → Agents:
 
 - **Read**: list, search and read mail.
 - **Triage**: also mark mail Done, read, pinned, set aside, snoozed or deleted.
-  Changes reach the server after the usual undo window.
+  Changes reach the server after the usual undo window. With triage in every
+  account, agents can also accept or block senders and domains.
 - **Send**: also send email as you. spark-rs holds each one for 30 seconds
   and shows it with Undo (or a notification while the window is hidden).
 
