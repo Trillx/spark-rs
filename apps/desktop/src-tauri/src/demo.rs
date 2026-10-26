@@ -12,7 +12,10 @@ use serde::Deserialize;
 use spark_mail::draft::{Draft, OutgoingAttachment};
 use spark_mail::invite::{Answer, Card, Kind, Person};
 use spark_mail::{drafts, parse};
-use spark_store::{AccountKind, Category, FolderRole, MessageState, Patch, now_ms};
+use spark_store::{
+    AccountKind, Category, Contact, FolderRole, Incoming, MessageState, NewAccount, Patch, Store,
+    now_ms,
+};
 
 use crate::mailbox::{AccountView, FolderView, Message, SyncView};
 
@@ -127,6 +130,38 @@ struct DemoEntry {
     invite: Option<DemoInvite>,
 }
 
+/// The demo accounts and their mail in a store of their own, for recipient
+/// suggestions.
+fn people(messages: &[Message]) -> Store {
+    let mut store = Store::open_in_memory().expect("an in-memory database opens");
+    for a in accounts() {
+        store
+            .add_account(&NewAccount {
+                kind: a.kind,
+                email: &a.email,
+                name: &a.name,
+                label: &a.label,
+                config: "{}",
+            })
+            .expect("a demo account is stored");
+    }
+    for m in messages {
+        let incoming = Incoming {
+            account_id: m.account,
+            message_id: Some(format!("<demo-{}@spark-rs>", m.id)),
+            from_name: m.from.clone(),
+            from_address: m.address.clone(),
+            to: m.to.clone(),
+            date: m.timestamp,
+            ..Default::default()
+        };
+        store
+            .add_incoming(&incoming, false)
+            .expect("a demo message is stored");
+    }
+    store
+}
+
 /// A demo email's calendar invite, starting `start_minutes` from now.
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,11 +180,13 @@ struct DemoInvite {
     attendees: Vec<Person>,
 }
 
-/// The messages, the drafts, and the answers given to demo invitations.
+/// The messages, the drafts, the answers given to demo invitations, and the
+/// people in the demo mail.
 pub struct DemoMailbox(
     Mutex<Vec<Message>>,
     Mutex<DemoDrafts>,
     Mutex<HashMap<i64, Answer>>,
+    Mutex<Store>,
 );
 
 /// Drafts saved in the demo as the composer had them, and drafts being
@@ -162,11 +199,26 @@ struct DemoDrafts {
 
 impl DemoMailbox {
     pub fn load() -> Self {
+        let messages = demo_messages(now_ms());
+        let people = people(&messages);
         Self(
-            Mutex::new(demo_messages(now_ms())),
+            Mutex::new(messages),
             Mutex::new(DemoDrafts::default()),
             Mutex::default(),
+            Mutex::new(people),
         )
+    }
+
+    /// The people matching `query`, as real accounts suggest them.
+    pub fn suggest_contacts(&self, query: &str, limit: usize) -> Vec<Contact> {
+        let people = self.3.lock().unwrap();
+        people
+            .suggest_contacts(query, now_ms(), limit)
+            .unwrap_or_default()
+    }
+
+    pub fn never_suggest(&self, address: &str) {
+        let _ = self.3.lock().unwrap().never_suggest(address);
     }
 
     /// The answer given to message `id`'s invitation.
@@ -283,6 +335,11 @@ impl DemoMailbox {
     pub fn send(&self, draft: &Draft) -> i64 {
         // Ids only need to be unique.
         let id = now_ms();
+        let _ = self
+            .3
+            .lock()
+            .unwrap()
+            .record_sent(&drafts::sent_to(draft), id);
         if let Some(saved) = draft.draft_id {
             let mut messages = self.0.lock().unwrap();
             if let Some(i) = messages.iter().position(|m| m.id == saved && is_draft(m)) {

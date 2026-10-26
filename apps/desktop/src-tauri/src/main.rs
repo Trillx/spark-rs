@@ -53,6 +53,8 @@ fn main() {
             mailbox::list_messages,
             mailbox::search_messages,
             mailbox::search_servers,
+            mailbox::suggest_contacts,
+            mailbox::never_suggest_contact,
             mailbox::list_folders,
             mailbox::watch_folders,
             mailbox::sync_folders,

@@ -14,7 +14,8 @@ use lettre::address::Envelope;
 use lettre::message::Mailbox;
 use lettre::message::header::{HeaderName, HeaderValue};
 use spark_store::{
-    Account, Attachment, DraftCopy, DraftSave, DraftUpload, FolderRole, Location, OutboxFile, Store,
+    Account, Attachment, Contact, DraftCopy, DraftSave, DraftUpload, FolderRole, Location,
+    OutboxFile, Store,
 };
 
 use crate::attachment::{self, AttachmentData, mime_for};
@@ -256,6 +257,18 @@ pub fn recipients(field: &str) -> Vec<Mailbox> {
         .into_iter()
         .filter_map(|part| draft::recipients(part).ok())
         .flatten()
+        .collect()
+}
+
+/// Everyone a draft goes to, as the store notes them for recipient suggestions.
+pub fn sent_to(draft: &Draft) -> Vec<Contact> {
+    [&draft.to, &draft.cc, &draft.bcc]
+        .into_iter()
+        .flat_map(|field| recipients(field))
+        .map(|m| Contact {
+            name: m.name.unwrap_or_default(),
+            address: m.email.to_string(),
+        })
         .collect()
 }
 

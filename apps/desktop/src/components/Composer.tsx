@@ -17,20 +17,32 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ChangeEvent,
   type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
   type RefObject,
 } from "react";
-import { describeFiles, onFileDrag, pickFiles, resolveSignature } from "../api";
-import type { AccountId, LocalFile, OutgoingAttachment, OutgoingDraft, Signature } from "../types";
+import { describeFiles, getPrefs, onFileDrag, pickFiles, resolveSignature } from "../api";
+import type { AccountId, Contact, LocalFile, OutgoingAttachment, OutgoingDraft, Signature } from "../types";
 import { useAccounts } from "../lib/accounts";
+import {
+  completeMention,
+  entryFor,
+  joinAddresses,
+  mentionAt,
+  parseEntry,
+  splitAddresses,
+  type Mention,
+} from "../lib/addresses";
+import { caretPoint } from "../lib/caret";
 import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import AiMenu, { type AiRequest } from "./AiMenu";
 import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
+import Recipients, { SuggestionList, displayName, useSuggestions, type RecipientsHandle } from "./Recipients";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import SignaturePicker from "./SignaturePicker";
@@ -38,6 +50,14 @@ import SignaturePicker from "./SignaturePicker";
 /** What mail servers take; the Rust side refuses more. */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const ATTACH_KEYS = IS_MAC ? "⇧⌘A" : "Ctrl+Shift+A";
+/** How many people an @mention suggests, as in Spark. */
+const MENTION_SUGGESTIONS = 6;
+
+interface MentionEdit {
+  before: string;
+  after: string;
+  added: Contact | null;
+}
 
 export interface Draft {
   title: string;
@@ -218,7 +238,7 @@ export default function Composer({
   /** While AI writes the body, it's read-only and can't be sent. */
   ai?: ComposerAi;
 }) {
-  const toRef = useRef<HTMLInputElement>(null);
+  const recipientsRef = useRef<RecipientsHandle>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
   const quoteRef = useRef<HTMLTextAreaElement>(null);
   const signatureRef = useRef<SignatureFrameHandle>(null);
@@ -274,24 +294,128 @@ export default function Composer({
     window.setTimeout(() => signatureRef.current?.focus(), 50);
   }
 
+  // Replies arrive with a recipient, so they start in the body; anything else starts in To.
+  const [startInTo] = useState(() => !draft.to);
   useEffect(() => {
-    // Replies arrive with a recipient, so they start in the body.
-    if (draft.to) {
-      bodyRef.current?.focus();
-      bodyRef.current?.setSelectionRange(draft.body.length, draft.body.length);
-    } else {
-      toRef.current?.focus();
-    }
+    if (startInTo) return;
+    bodyRef.current?.focus();
+    bodyRef.current?.setSelectionRange(draft.body.length, draft.body.length);
   }, []); // only when the composer opens
+
+  const [suggest, setSuggest] = useState(true);
+  useEffect(() => {
+    getPrefs().then(
+      (p) => setSuggest(p.suggestRecipients),
+      () => {},
+    );
+  }, []);
 
   function onKeyDown(e: KeyboardEvent) {
     const mod = IS_MAC ? e.metaKey : e.ctrlKey;
+    const key = e.key.toLowerCase();
     if (mod && e.key === "Enter") {
       e.preventDefault();
       if (!busy) onSend();
-    } else if (mod && e.shiftKey && e.key.toLowerCase() === "a") {
+    } else if (mod && e.shiftKey && key === "a") {
       e.preventDefault();
       void attach();
+    } else if (mod && e.shiftKey && (key === "c" || key === "b")) {
+      e.preventDefault();
+      recipientsRef.current?.focus(key === "c" ? "cc" : "bcc");
+    }
+  }
+
+  // @mentions in the body: picking someone puts their name in the text and adds them to To.
+  const [mention, setMention] = useState<Mention | null>(null);
+  const mentionHistory = useRef<{ undo: MentionEdit[]; redo: MentionEdit[] }>({ undo: [], redo: [] });
+  const mentioned = useSuggestions(mention?.query ?? "", MENTION_SUGGESTIONS);
+  const [mentionAnchor, setMentionAnchor] = useState<CSSProperties | null>(null);
+
+  function trackMention(el: HTMLTextAreaElement) {
+    const caret = el.selectionStart;
+    setMention(caret === el.selectionEnd ? mentionAt(el.value, caret) : null);
+  }
+
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !mention || mentioned.list.length === 0) return setMentionAnchor(null);
+    const point = caretPoint(el, mention.start);
+    const left = Math.max(8, Math.min(point.left - 12, window.innerWidth - 408));
+    // Under the line, or over it when there's no room below.
+    setMentionAnchor(
+      point.top + point.height + 240 < window.innerHeight
+        ? { position: "fixed", left, top: point.top + point.height + 4 }
+        : { position: "fixed", left, bottom: window.innerHeight - point.top + 4 },
+    );
+  }, [mention, mentioned.list.length]);
+
+  function pickMention(contact: Contact) {
+    const el = bodyRef.current;
+    if (!el || !mention) return;
+    const done = completeMention(draft.body, mention, el.selectionStart, displayName(contact));
+    const address = contact.address.toLowerCase();
+    const listed = [draft.to, draft.cc, draft.bcc]
+      .flatMap(splitAddresses)
+      .some((e) => parseEntry(e).address.toLowerCase() === address);
+    mentionHistory.current.undo.push({ before: draft.body, after: done.text, added: listed ? null : contact });
+    mentionHistory.current.redo = [];
+    // Use the editor's insertion command so the mention is one native undo step.
+    const end = draft.body.length - (done.text.length - done.caret);
+    el.focus();
+    el.setSelectionRange(mention.start, end);
+    document.execCommand("insertText", false, done.text.slice(mention.start, done.caret));
+    onChange({
+      body: done.text,
+      ...(listed ? {} : { to: joinAddresses([...splitAddresses(draft.to), entryFor(contact)]) }),
+    });
+    setMention(null);
+    requestAnimationFrame(() => el.setSelectionRange(done.caret, done.caret));
+  }
+
+  function onBodyChange(e: ChangeEvent<HTMLTextAreaElement>) {
+    if (writing?.status === "done") ai?.dismiss();
+    const body = e.target.value;
+    const patch: Partial<Draft> = { body };
+    const inputType = (e.nativeEvent as InputEvent).inputType;
+    const history = mentionHistory.current;
+    const undo = history.undo.at(-1);
+    const redo = history.redo.at(-1);
+    if (inputType === "historyUndo" && undo && (body === undo.before || draft.body === undo.after)) {
+      history.undo.pop();
+      history.redo.push(undo);
+      if (undo.added) {
+        const address = undo.added.address.toLowerCase();
+        patch.to = joinAddresses(splitAddresses(draft.to).filter((entry) => parseEntry(entry).address.toLowerCase() !== address));
+      }
+    } else if (inputType === "historyRedo" && redo && (body === redo.after || draft.body === redo.before)) {
+      history.redo.pop();
+      history.undo.push(redo);
+      if (redo.added) {
+        const address = redo.added.address.toLowerCase();
+        const listed = [draft.to, draft.cc, draft.bcc].flatMap(splitAddresses)
+          .some((entry) => parseEntry(entry).address.toLowerCase() === address);
+        if (!listed) patch.to = joinAddresses([...splitAddresses(draft.to), entryFor(redo.added)]);
+      }
+    } else if (inputType !== "historyUndo" && inputType !== "historyRedo") {
+      history.redo = [];
+    }
+    onChange(patch);
+    trackMention(e.target);
+  }
+
+  function onBodyKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    const list = mentioned.list;
+    if (e.nativeEvent.isComposing || list.length === 0 || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      mentioned.move(e.key === "ArrowDown" ? 1 : -1, list.length);
+    } else if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey) {
+      e.preventDefault();
+      pickMention(list[Math.min(mentioned.active, list.length - 1)]);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      mentioned.dismiss();
     }
   }
 
@@ -347,37 +471,13 @@ export default function Composer({
         </IconButton>
       </div>
 
-      <Field label="To">
-        <input
-          ref={toRef}
-          className="min-w-0 flex-1 bg-transparent outline-none"
-          placeholder="name@example.com"
-          value={draft.to}
-          onChange={(e) => onChange({ to: e.target.value })}
-        />
-        {!draft.showCc && <TextToggle onClick={() => onChange({ showCc: true })}>Cc</TextToggle>}
-        {!draft.showBcc && <TextToggle onClick={() => onChange({ showBcc: true })}>Bcc</TextToggle>}
-      </Field>
-      {draft.showCc && (
-        <Field label="Cc">
-          <input
-            autoFocus
-            className="min-w-0 flex-1 bg-transparent outline-none"
-            value={draft.cc}
-            onChange={(e) => onChange({ cc: e.target.value })}
-          />
-        </Field>
-      )}
-      {draft.showBcc && (
-        <Field label="Bcc">
-          <input
-            autoFocus
-            className="min-w-0 flex-1 bg-transparent outline-none"
-            value={draft.bcc}
-            onChange={(e) => onChange({ bcc: e.target.value })}
-          />
-        </Field>
-      )}
+      <Recipients
+        ref={recipientsRef}
+        values={draft}
+        suggest={suggest}
+        autoFocus={startInTo}
+        onChange={onChange}
+      />
       <Field>
         <input
           className="min-w-0 flex-1 bg-transparent font-medium outline-none placeholder:font-normal placeholder:text-text-3"
@@ -414,12 +514,22 @@ export default function Composer({
           value={draft.body}
           readOnly={busy}
           aria-busy={busy}
-          onChange={(e) => {
-            // Typing over AI's text makes it yours: no more Undo.
-            if (writing?.status === "done") ai?.dismiss();
-            onChange({ body: e.target.value });
-          }}
+          onChange={onBodyChange}
+          onSelect={(e) => trackMention(e.currentTarget)}
+          onKeyDown={onBodyKeyDown}
+          onBlur={() => setMention(null)}
         />
+        {mentionAnchor && (
+          <SuggestionList
+            className="w-[400px]"
+            style={mentionAnchor}
+            contacts={mentioned.list}
+            active={Math.min(mentioned.active, mentioned.list.length - 1)}
+            onHover={mentioned.setActive}
+            onPick={pickMention}
+            onNever={mentioned.never}
+          />
+        )}
         {showSignature && (
           <div className="relative px-4 pb-3" data-signature>
             <SignaturePicker
@@ -703,14 +813,6 @@ function Field({ label, children }: { label?: string; children: ReactNode }) {
       {label && <span className="w-8 shrink-0 text-text-2">{label}</span>}
       {children}
     </div>
-  );
-}
-
-function TextToggle({ onClick, children }: { onClick: () => void; children: ReactNode }) {
-  return (
-    <button className="rounded px-1 text-xs text-text-2 hover:text-base-content" onClick={onClick}>
-      {children}
-    </button>
   );
 }
 

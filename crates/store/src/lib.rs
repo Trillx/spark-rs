@@ -16,12 +16,14 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 mod calendar;
+mod contacts;
 mod conversations;
 mod drafts;
 mod search;
 mod signatures;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
+pub use contacts::Contact;
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
 pub use rusqlite::Error;
 pub use search::{Query, Term};
@@ -602,6 +604,10 @@ impl Store {
         if version < 10 {
             conn.execute_batch(signatures::SCHEMA_SIGNATURES)?;
             conn.pragma_update(None, "user_version", 10)?;
+        }
+        if version < 11 {
+            conn.execute_batch(contacts::SCHEMA_CONTACTS)?;
+            conn.pragma_update(None, "user_version", 11)?;
         }
         Ok(Self { conn })
     }

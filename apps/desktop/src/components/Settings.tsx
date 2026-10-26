@@ -33,6 +33,7 @@ import {
   Send,
   Server,
   Sparkles,
+  SquarePen,
   Sun,
   Trash2,
   UsersRound,
@@ -95,12 +96,13 @@ import Dropdown, { MenuItem } from "./Dropdown";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import { tipAttrs } from "../lib/tooltip";
 
-export type SettingsPage = "accounts" | "signatures" | "ai" | "agents" | "notifications" | "appearance";
+export type SettingsPage = "accounts" | "composer" | "signatures" | "ai" | "agents" | "notifications" | "appearance";
 
 /** Nav groups, in order. Only pages that exist so far. */
 const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
   [
     { key: "accounts", label: "Accounts", Icon: UsersRound },
+    { key: "composer", label: "Composer", Icon: SquarePen },
     { key: "signatures", label: "Signatures", Icon: SignatureIcon },
     { key: "ai", label: "AI", Icon: Sparkles },
     { key: "agents", label: "Agents", Icon: Bot },
@@ -215,6 +217,7 @@ export default function Settings({
           <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10">
             <div className="max-w-[560px]">
               {page === "accounts" && <AccountsPage onChanged={onAccountsChanged} />}
+              {page === "composer" && <ComposerPage />}
               {page === "signatures" && <SignaturesPage />}
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
@@ -1076,7 +1079,8 @@ const NOTIFY_CHOICES: { key: NotifyFor; label: string; detail: string }[] = [
   { key: "off", label: "Off", detail: "No notifications" },
 ];
 
-function NotificationsPage() {
+/** The app's preferences, and changing them: saved at once, and put back if saving fails. */
+function usePrefs() {
   const [prefs, setPrefs] = useState<Prefs | null>(null);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
 
@@ -1096,6 +1100,12 @@ function NotificationsPage() {
       setStatus({ kind: "error", text: String(error) });
     }
   }
+
+  return { prefs, status, setStatus, change };
+}
+
+function NotificationsPage() {
+  const { prefs, status, setStatus, change } = usePrefs();
 
   async function test() {
     setStatus({ kind: "busy", what: "Sending…" });
@@ -1222,6 +1232,31 @@ function NotificationsPage() {
         </Row>
       </Group>
 
+      <StatusLine status={status} />
+    </>
+  );
+}
+
+// ---- Composer ----
+
+function ComposerPage() {
+  const { prefs, status, change } = usePrefs();
+  if (!prefs) return <StatusLine status={status} />;
+  return (
+    <>
+      <Group title="Recipients">
+        <Row
+          label="Suggest recipients"
+          description="Suggests people from your mail as you type in To, Cc and Bcc."
+          htmlFor="suggest-recipients"
+        >
+          <Switch
+            id="suggest-recipients"
+            on={prefs.suggestRecipients}
+            onToggle={() => void change({ suggestRecipients: !prefs.suggestRecipients })}
+          />
+        </Row>
+      </Group>
       <StatusLine status={status} />
     </>
   );

@@ -89,7 +89,14 @@ export interface FolderView {
 /** Which new mail shows a notification. `people` is Spark's smart notifications. */
 export type NotifyFor = "people" | "all" | "off";
 
-/** Settings → Notifications. */
+/** Someone to suggest in a recipient field or an @mention. */
+export interface Contact {
+  /** "" when their mail gave no name. */
+  name: string;
+  address: string;
+}
+
+/** Settings → Notifications and Composer. */
 export interface Prefs {
   notify: NotifyFor;
   /** Windows' New Mail sound with each notification. */
@@ -104,6 +111,8 @@ export interface Prefs {
   meetingPopupGuestsOnly: boolean;
   /** A chime as a meeting appears in the pop-up. */
   meetingPopupSound: boolean;
+  /** Suggest people from the user's mail while they type in To, Cc and Bcc. */
+  suggestRecipients: boolean;
 }
 
 /** What agents may do in an account; each level includes the ones before. */

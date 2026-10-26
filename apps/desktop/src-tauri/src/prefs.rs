@@ -45,6 +45,8 @@ pub struct Prefs {
     pub meeting_popup_guests_only: bool,
     /// A chime as a meeting appears in the pop-up.
     pub meeting_popup_sound: bool,
+    /// Suggest people from the user's mail while they type in To, Cc and Bcc.
+    pub suggest_recipients: bool,
     /// The "still running" notice has been shown, on the first close.
     pub told_keep_running: bool,
     /// What agents may do in each account, by account id; absent is none.
@@ -62,6 +64,7 @@ impl Default for Prefs {
             meeting_popup: true,
             meeting_popup_guests_only: true,
             meeting_popup_sound: true,
+            suggest_recipients: true,
             told_keep_running: false,
             agent_access: BTreeMap::new(),
         }

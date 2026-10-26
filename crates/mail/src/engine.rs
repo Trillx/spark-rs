@@ -687,6 +687,7 @@ impl Engine {
         for (id, json) in due {
             let parsed = serde_json::from_str::<Draft>(&json);
             let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
+            let recipients = parsed.as_ref().map(drafts::sent_to).unwrap_or_default();
             let result = match parsed {
                 Ok(draft) => self.send_draft(account_id, id, &draft).await,
                 Err(e) => Err(Error::Config(format!(
@@ -700,6 +701,8 @@ impl Engine {
                         self.store().discard_draft(saved)?;
                     }
                     self.store().finish_send(id)?;
+                    // Delivery is complete even if learning its recipients fails.
+                    let _ = self.store().record_sent(&recipients, now_ms());
                     Ok(true)
                 }
                 // Offline or the server is busy: keep it queued.

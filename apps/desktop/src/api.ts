@@ -8,6 +8,7 @@ import type {
   AccountId,
   CalendarEvent,
   CalendarList,
+  Contact,
   AgentAccess,
   AgentSendingEvent,
   AgentsView,
@@ -131,6 +132,27 @@ export function searchMessages(query: string): Promise<number[] | null> {
 export function searchServers(query: string): Promise<number> {
   if (isTauri()) return invoke("search_servers", { query });
   return Promise.resolve(0);
+}
+
+/** The people from the user's mail to suggest for what's typed in a recipient field, best first. */
+export function suggestContacts(query: string): Promise<Contact[]> {
+  if (isTauri()) return invoke("suggest_contacts", { query });
+  const q = query.trim().toLowerCase();
+  if (!q) return Promise.resolve([]);
+  // The browser preview just matches the demo's senders.
+  const people = new Map<string, Contact>();
+  for (const m of browserMailbox) people.set(m.address.toLowerCase(), { name: m.from, address: m.address });
+  return Promise.resolve(
+    [...people.values()].filter((c) => !browserContactExceptions.has(c.address.toLowerCase())
+      && `${c.name} ${c.address}`.toLowerCase().includes(q)).slice(0, 20),
+  );
+}
+
+/** Stops suggesting `address`. */
+export function neverSuggestContact(address: string): Promise<void> {
+  if (isTauri()) return invoke("never_suggest_contact", { address });
+  browserContactExceptions.add(address.toLowerCase());
+  return Promise.resolve();
 }
 
 export function getMessageContent(id: number): Promise<MessageContent> {
@@ -647,6 +669,7 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, 
 const browserHtml = new Map(demo.flatMap((m) => (m.html ? [[m.id, m.html] as const] : [])));
 
 const browserAnswers = new Map<number, InviteAnswer>();
+const browserContactExceptions = new Set<string>();
 
 /** Like demo::invite: the demo message's invite, starting on the half hour `startMinutes` from now. */
 function browserInvite(m: Message): InviteCard | undefined {
@@ -738,6 +761,7 @@ let browserPrefs: Prefs = {
   meetingPopup: true,
   meetingPopupGuestsOnly: true,
   meetingPopupSound: true,
+  suggestRecipients: true,
 };
 
 /** Snoozed mail whose time has come goes back to the Inbox, unread, as the Rust side does. */

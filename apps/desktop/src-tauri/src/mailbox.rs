@@ -11,7 +11,8 @@ use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
 use spark_store::{
-    Account, AccountKind, Category, Folder, FolderRole, MessageState, OutboxFile, Patch, now_ms,
+    Account, AccountKind, Category, Contact, Folder, FolderRole, MessageState, OutboxFile, Patch,
+    now_ms,
 };
 use tauri::{AppHandle, Emitter, State, Window};
 
@@ -320,6 +321,39 @@ pub fn search_messages(
     }
     let found = mailbox.live.engine.store().search(&query).map_err(text)?;
     Ok(Some(found.into_iter().map(|m| m.id).collect()))
+}
+
+/// How many people a recipient field suggests at most.
+const SUGGESTIONS: usize = 20;
+
+/// The people to suggest for what's typed in a recipient field, best first.
+#[tauri::command]
+pub fn suggest_contacts(
+    mailbox: State<'_, Mailbox>,
+    query: String,
+) -> Result<Vec<Contact>, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.suggest_contacts(&query, SUGGESTIONS));
+    }
+    let store = mailbox.live.engine.store();
+    store
+        .suggest_contacts(&query, now_ms(), SUGGESTIONS)
+        .map_err(text)
+}
+
+/// Stops suggesting `address` (the ✕ on a suggestion).
+#[tauri::command]
+pub fn never_suggest_contact(mailbox: State<'_, Mailbox>, address: String) -> Result<(), String> {
+    if !mailbox.live() {
+        mailbox.demo.never_suggest(&address);
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .never_suggest(&address)
+        .map_err(text)
 }
 
 /// Puts a search to every account's server and stores the mail they find
