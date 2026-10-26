@@ -66,6 +66,10 @@ Created in [T3 Code](https://t3.codes).
   the tray, notifications, and drafts that save offline. Passwords and keys
   stay in Windows Credential Manager.
 
+[spark-rs and Spark, feature by feature](https://git.cafe/michael/spark-rs/blob/main/FEATURES.md)
+goes through every feature on Spark's pricing page and shows which ones
+spark-rs has, has in part, or doesn't have yet.
+
 <table>
   <tr>
     <td width="50%" valign="top">
