@@ -37,6 +37,7 @@ import {
   SquarePen,
   Sun,
   Trash2,
+  UserCheck,
   UsersRound,
   X,
   type LucideIcon,
@@ -90,6 +91,7 @@ import type {
   AgentsView,
   BadgeCount,
   DefaultSignature,
+  GatekeeperMode,
   NotifyFor,
   Prefs,
   Signature,
@@ -105,7 +107,16 @@ import Dropdown, { MenuItem } from "./Dropdown";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import { tipAttrs } from "../lib/tooltip";
 
-export type SettingsPage = "accounts" | "composer" | "signatures" | "ai" | "agents" | "notifications" | "appearance" | "about";
+export type SettingsPage =
+  | "accounts"
+  | "composer"
+  | "signatures"
+  | "ai"
+  | "agents"
+  | "gatekeeper"
+  | "notifications"
+  | "appearance"
+  | "about";
 
 /** Nav groups, in order. Only pages that exist so far. */
 const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
@@ -117,6 +128,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
     { key: "agents", label: "Agents", Icon: Bot },
   ],
   [
+    { key: "gatekeeper", label: "Gatekeeper", Icon: UserCheck },
     { key: "notifications", label: "Notifications", Icon: Bell },
     { key: "appearance", label: "Appearance", Icon: Palette },
   ],
@@ -138,6 +150,8 @@ export default function Settings({
   minimize,
   onMinimize,
   onAccountsChanged,
+  gatekeeper,
+  onGatekeeper,
   updates,
 }: {
   page: SettingsPage;
@@ -150,6 +164,8 @@ export default function Settings({
   onMinimize: (on: boolean) => void;
   /** After an add, rename or remove, so the list updates without waiting for the event. */
   onAccountsChanged: () => void;
+  gatekeeper: GatekeeperMode;
+  onGatekeeper: (mode: GatekeeperMode) => void;
   updates: Updates;
 }) {
   const tabRefs = useRef<Partial<Record<SettingsPage, HTMLButtonElement | null>>>({});
@@ -234,6 +250,7 @@ export default function Settings({
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "about" && <About updates={updates} />}
+              {page === "gatekeeper" && <GatekeeperPage mode={gatekeeper} onMode={onGatekeeper} />}
               {page === "notifications" && <NotificationsPage />}
               {page === "appearance" && (
                 <AppearancePage theme={theme} onTheme={onTheme} minimize={minimize} onMinimize={onMinimize} />
@@ -1147,6 +1164,57 @@ function CommandRow({ label, description, command }: { label: string; descriptio
   );
 }
 
+// ---- Gatekeeper ----
+
+const GATEKEEPER_CHOICES: { key: GatekeeperMode; label: string; detail: string }[] = [
+  {
+    key: "beforeInbox",
+    label: "Screen new senders before the Inbox",
+    detail: "Their mail waits in New senders at the top of the Inbox, out of the list until you accept them.",
+  },
+  {
+    key: "insideInbox",
+    label: "Screen new senders inside the Inbox",
+    detail: "Their mail goes to the Inbox, and asks you to accept or block the sender when you open it.",
+  },
+  {
+    key: "off",
+    label: "Don't screen new senders",
+    detail: "Everyone goes to the Inbox, including whoever is waiting now. You can still block a sender from an email's ⋯ menu.",
+  },
+];
+
+function GatekeeperPage({ mode, onMode }: { mode: GatekeeperMode; onMode: (mode: GatekeeperMode) => void }) {
+  return (
+    <section className="mb-7">
+      <p className="mb-4 px-1 text-[13px] leading-5 text-text-2">
+        The Gatekeeper keeps unwanted mail out of your Inbox: the first time someone writes, you accept or block them.
+      </p>
+      <div role="radiogroup" aria-label="Gatekeeper mode" className="grid gap-2">
+        {GATEKEEPER_CHOICES.map((c) => (
+          <button
+            key={c.key}
+            role="radio"
+            aria-checked={mode === c.key}
+            onClick={() => mode !== c.key && onMode(c.key)}
+            className={`rounded-2xl border px-3.5 py-3 text-left ${
+              mode === c.key ? "border-primary bg-primary/5 ring-1 ring-primary" : "border-hairline hover:border-splitter"
+            }`}
+          >
+            <span className="block text-[13px] font-semibold leading-5">{c.label}</span>
+            <span className="block text-xs leading-4 text-text-2">{c.detail}</span>
+          </button>
+        ))}
+      </div>
+      <p className="mt-2 px-1 text-xs leading-[18px] text-text-2">
+        A decision counts for all your accounts, and you can accept or block a whole domain from an email. Colleagues
+        at your work domain, people you've written to, and notifications from a few big companies (GitHub, Google,
+        Microsoft…) get through without asking. A blocked sender's mail goes to the Blocked folder on the server.
+      </p>
+    </section>
+  );
+}
+
 // ---- Notifications ----
 
 const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
@@ -1235,8 +1303,8 @@ function NotificationsPage() {
           ))}
         </div>
         <p className="mt-2 px-1 text-xs leading-[18px] text-text-2">
-          Smart leaves out notifications and newsletters. Mail from new senders waits in the Gatekeeper without a
-          notification, and while the spark-rs window is in front, new mail just appears in the list.
+          Smart leaves out notifications and newsletters. Mail waiting in New senders doesn't notify, and while the
+          spark-rs window is in front, new mail just appears in the list.
         </p>
       </section>
 

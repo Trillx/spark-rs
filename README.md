@@ -45,6 +45,8 @@ Created in [T3 Code](https://t3.codes).
   any app: spark-rs checks Sent), and a few big companies' notifications
   skip it. A blocked sender's mail goes to a Blocked folder on the server,
   as in Spark, so it leaves the inbox on your phone and in webmail too.
+  Settings → Gatekeeper screens new senders before the Inbox (the default),
+  inside it (the email asks when you open it), or not at all.
 - **Work and personal mail together.** Microsoft 365 through Microsoft Graph,
   Gmail with an app password, and any IMAP server, in one inbox.
 - **Fast triage.** Done, snooze, pin, Set Aside and Priority on single keys,

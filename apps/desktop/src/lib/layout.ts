@@ -1,5 +1,5 @@
 import { Bell, MailOpen, Newspaper, Pin, UserPlus, Users, Zap, type LucideIcon } from "lucide-react";
-import type { AccountId, AccountView, BadgeCount, FolderView, Message } from "../types";
+import type { AccountId, AccountView, BadgeCount, FolderView, GatekeeperMode, Message } from "../types";
 import { asThread, conversationOf, indexConversations, participantNames } from "./conversation";
 import { datePeriod } from "./format";
 import { showsRecipients } from "./recipients";
@@ -93,7 +93,12 @@ export interface ListContext {
   seen: number[];
   /** The search index's answers, for `matchesQuery`. */
   hits?: SearchHits;
+  /** Where new senders wait; their mail is inbox mail unless that's before the Inbox. */
+  gatekeeper?: GatekeeperMode;
 }
+
+/** Mail waiting in New Senders, out of the lists until its sender is accepted. */
+const waiting = (m: Message, mode: GatekeeperMode = "beforeInbox") => m.screening && mode === "beforeInbox";
 
 /** Message ids the search index found, per free text (`searchText`). */
 export type SearchHits = ReadonlyMap<string, ReadonlySet<number>>;
@@ -104,20 +109,26 @@ const newestFirst = (a: Message, b: Message) => b.timestamp - a.timestamp;
 const isLive = (m: Message) => m.state !== "deleted" && m.state !== "blocked";
 
 /**
- * Inbox messages for the account filter, split into accepted mail and
- * Gatekeeper screening. With `showDone`, Done mail stays in `mail`.
+ * Inbox messages for the account filter, split into the list's mail and
+ * New Senders, which is empty unless the Gatekeeper screens before the
+ * Inbox. With `showDone`, Done mail stays in `mail`.
  */
-export function inboxMessages(messages: Message[], account: AccountFilter, showDone = false) {
+export function inboxMessages(
+  messages: Message[],
+  account: AccountFilter,
+  showDone = false,
+  mode: GatekeeperMode = "beforeInbox",
+) {
   const inbox = messages
     .filter(
       (m) =>
-        (m.state === "inbox" || (showDone && m.state === "done" && !m.screening)) &&
+        (m.state === "inbox" || (showDone && m.state === "done" && !waiting(m, mode))) &&
         (account === "all" || m.account === account),
     )
     .sort(newestFirst);
   return {
-    mail: inbox.filter((m) => !m.screening),
-    screening: inbox.filter((m) => m.screening && m.state === "inbox"),
+    mail: inbox.filter((m) => !waiting(m, mode)),
+    screening: inbox.filter((m) => waiting(m, mode) && m.state === "inbox"),
   };
 }
 
@@ -225,7 +236,7 @@ export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, c
   const live = messages.filter(isLive);
   switch (key) {
     case "pins":
-      return live.filter((m) => m.pinned && !m.screening).sort(newestFirst);
+      return live.filter((m) => m.pinned && !waiting(m, ctx.gatekeeper)).sort(newestFirst);
     case "snoozed":
     case "aside":
       return live.filter((m) => m.state === key).sort(newestFirst);
@@ -273,7 +284,7 @@ export function buildList(
     return { ...rows.model(title, blocks), recipients: showsRecipients(view.folder, ctx.folders) };
   }
 
-  const inbox = inboxMessages(messages, view.account, view.showDone);
+  const inbox = inboxMessages(messages, view.account, view.showDone, ctx.gatekeeper);
   const mail = rows.of(inbox.mail);
   const screening = inbox.screening;
   const title = (view.account !== "all" && accounts.find((a) => a.id === view.account)?.label) || "Inbox";
@@ -393,7 +404,7 @@ export interface SidebarCounts {
 
 /** Sidebar counters, for the Inbox and the lists in `keys`. Like the lists, they count conversations. */
 export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListContext = EMPTY_CONTEXT): SidebarCounts {
-  const unread = oneEach(messages.filter((m) => m.state === "inbox" && !m.screening && m.unread));
+  const unread = oneEach(messages.filter((m) => m.state === "inbox" && !waiting(m, ctx.gatekeeper) && m.unread));
   const lists: Partial<Record<ListKey, number>> = {};
   const listAccounts: SidebarCounts["listAccounts"] = {};
   for (const key of keys) {
@@ -404,7 +415,7 @@ export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListCon
     } else if (key === "snoozed" || key === "aside") {
       counted = oneEach(listItems(messages, key, ctx));
     } else if (key === "spam" || folderIdOf(key) !== undefined) {
-      counted = oneEach(listItems(messages, key, ctx).filter((m) => m.unread && !m.screening));
+      counted = oneEach(listItems(messages, key, ctx).filter((m) => m.unread && !waiting(m, ctx.gatekeeper)));
     } else continue;
     lists[key] = counted.length;
     if (hasAccountRows(key)) listAccounts[key] = perAccount(counted);
@@ -416,11 +427,17 @@ export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListCon
  * The app icon badge's number: the Inbox's conversations, all of them or only
  * unread ones, as the sidebar counts them, leaving out `excluded` accounts.
  */
-export function badgeCount(messages: Message[], badge: BadgeCount, excluded: AccountId[]): number {
+export function badgeCount(
+  messages: Message[],
+  badge: BadgeCount,
+  excluded: AccountId[],
+  mode: GatekeeperMode = "beforeInbox",
+): number {
   if (badge === "off") return 0;
   return oneEach(
     messages.filter(
-      (m) => m.state === "inbox" && !m.screening && (badge === "inbox" || m.unread) && !excluded.includes(m.account),
+      (m) =>
+        m.state === "inbox" && !waiting(m, mode) && (badge === "inbox" || m.unread) && !excluded.includes(m.account),
     ),
   ).length;
 }

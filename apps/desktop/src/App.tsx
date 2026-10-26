@@ -62,6 +62,7 @@ import {
   createFolder,
   decideSenders,
   deleteFolder,
+  getGatekeeperMode,
   deleteForever,
   discardDraft,
   emptyFolders,
@@ -88,6 +89,7 @@ import {
   saveAllAttachments,
   saveAttachment,
   saveDraft,
+  saveGatekeeperMode,
   sendMessage,
   setBadge,
   syncFolders,
@@ -205,6 +207,7 @@ import type {
   AccountView,
   AgentSendingEvent,
   FolderView,
+  GatekeeperMode,
   Message,
   MessagePatch,
   Prefs,
@@ -345,6 +348,7 @@ export default function App() {
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
   const summaryRun = useRef(0);
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null);
+  const [gatekeeperMode, setGatekeeperMode] = useState<GatekeeperMode>("beforeInbox");
   /** The calendar shows in place of the list and the reader. */
   const [calendarOpen, setCalendarOpen] = useState(false);
   /** A day the calendar was asked to show, by the meeting pop-up. */
@@ -378,8 +382,8 @@ export default function App() {
   const hits = useSearchHits([view.search ?? "", ...layout.smartFolders.map((f) => f.query)], messages);
   const searchingServers = useServerSearch(isDemoMode(accounts) ? null : view.search, reloadMessages);
   const ctx: ListContext = useMemo(
-    () => ({ accounts, folders, smartFolders: layout.smartFolders, seen, hits }),
-    [accounts, folders, layout.smartFolders, seen, hits],
+    () => ({ accounts, folders, smartFolders: layout.smartFolders, seen, hits, gatekeeper: gatekeeperMode }),
+    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode],
   );
   const listed = useMemo(
     () => (discarding.size ? messages.filter((m) => !discarding.has(m.id)) : messages),
@@ -414,12 +418,13 @@ export default function App() {
   const pickedRows = useMemo(() => model.order.filter((id) => picked.has(id)), [model.order, picked]);
   const pickedMessages = pickedRows.flatMap((id) => byId.get(id) ?? []);
   const badge = useMemo(
-    () => (demo ? 0 : badgeCount(listed, badgePrefs.badge, badgePrefs.badgeExcluded)),
-    [demo, listed, badgePrefs],
+    () => (demo ? 0 : badgeCount(listed, badgePrefs.badge, badgePrefs.badgeExcluded, gatekeeperMode)),
+    [demo, listed, badgePrefs, gatekeeperMode],
   );
 
   useEffect(() => {
     void reloadFolders();
+    void getGatekeeperMode().then(setGatekeeperMode, () => {});
     void Promise.all([listAccounts(), listMessages()]).then(
       ([loadedAccountList, loaded]) => {
         loadedAccounts.current = accountSet(loadedAccountList);
@@ -590,8 +595,23 @@ export default function App() {
         }
         void reloadMessages();
         void reloadFolders();
+        // The demo keeps its own mode.
+        if (demoChanged) void getGatekeeperMode().then(setGatekeeperMode, () => {});
       },
       (error) => showToast(`Couldn't load accounts: ${String(error)}`, undefined, ICONS.error),
+    );
+  }
+
+  /** Settings → Gatekeeper. Turning it off accepts everyone waiting, so the list reloads. */
+  function changeGatekeeper(mode: GatekeeperMode) {
+    const before = gatekeeperMode;
+    setGatekeeperMode(mode);
+    void saveGatekeeperMode(mode).then(
+      () => void reloadMessages(),
+      (error) => {
+        setGatekeeperMode(before);
+        showToast(`Couldn't change the Gatekeeper: ${String(error)}`, undefined, ICONS.error);
+      },
     );
   }
 
@@ -2381,6 +2401,8 @@ export default function App() {
             minimize={minimize}
             onMinimize={changeMinimize}
             onAccountsChanged={() => void reloadAccounts()}
+            gatekeeper={gatekeeperMode}
+            onGatekeeper={changeGatekeeper}
           />
         )}
 

@@ -528,7 +528,7 @@ export function getGatekeeperMode(): Promise<GatekeeperMode> {
 }
 
 /** Turning the Gatekeeper off accepts everyone waiting in it. */
-export function setGatekeeperMode(mode: GatekeeperMode): Promise<void> {
+export function saveGatekeeperMode(mode: GatekeeperMode): Promise<void> {
   if (isTauri()) return invoke("set_gatekeeper_mode", { mode });
   browserMode = mode;
   if (mode === "off") {
