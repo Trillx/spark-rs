@@ -127,6 +127,13 @@ impl PrefsState {
         self.current.lock().unwrap().clone()
     }
 
+    /// Keep the grant valid for the whole operation, including acquiring the
+    /// mail store lock, rather than using a snapshot after account deletion.
+    pub fn with_agent_access<T>(&self, run: impl FnOnce(&BTreeMap<i64, Access>) -> T) -> T {
+        let current = self.current.lock().unwrap();
+        run(&current.agent_access)
+    }
+
     /// Changes and saves the prefs. In memory they change even if saving
     /// fails, so the session behaves as the user asked.
     pub fn update(&self, change: impl FnOnce(&mut Prefs)) -> Result<Prefs, String> {
@@ -134,6 +141,64 @@ impl PrefsState {
         change(&mut current);
         current.save(&self.dir)?;
         Ok(current.clone())
+    }
+
+    /// Grant edits and account deletion use the same lock, so a grant cannot
+    /// be restored after it was revoked but before the account is removed.
+    pub fn set_agent_access(
+        &self,
+        account: i64,
+        access: Access,
+        exists: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<Prefs, String> {
+        let mut current = self.current.lock().unwrap();
+        if !exists()? {
+            return Err("That account was removed.".into());
+        }
+        if access == Access::None {
+            current.agent_access.remove(&account);
+        } else {
+            current.agent_access.insert(account, access);
+        }
+        current.save(&self.dir)?;
+        Ok(current.clone())
+    }
+
+    /// Persist revocation before deleting an account, whose SQLite id may
+    /// then be reused. If saving fails, the account must remain in place.
+    pub fn revoke_agent_access_before<T>(
+        &self,
+        account: i64,
+        remove: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut current = self.current.lock().unwrap();
+        current.agent_access.remove(&account);
+        current.save(&self.dir)?;
+        remove()
+    }
+
+    /// Remove grants left by older versions for accounts that no longer
+    /// exist, before agents can connect or an account can reuse an id.
+    pub fn retain_agent_accounts(&self, accounts: &[i64]) -> Result<(), String> {
+        let mut current = self.current.lock().unwrap();
+        let before = current.agent_access.len();
+        current.agent_access.retain(|id, _| accounts.contains(id));
+        if current.agent_access.len() != before {
+            current.save(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// Retry persistence even when startup already pruned the in-memory map
+    /// but could not write it. A new account must not reuse a grant on disk.
+    pub fn prepare_account_add(
+        &self,
+        accounts: impl FnOnce() -> Result<Vec<i64>, String>,
+    ) -> Result<(), String> {
+        let mut current = self.current.lock().unwrap();
+        let accounts = accounts()?;
+        current.agent_access.retain(|id, _| accounts.contains(id));
+        current.save(&self.dir)
     }
 }
 

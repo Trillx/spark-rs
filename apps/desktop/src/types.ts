@@ -338,6 +338,8 @@ export interface SyncStatusEvent extends SyncStatus {
 /** Payload of the `send-status` event; `id` is the outbox id `sendMessage` returned. */
 export interface SendStatusEvent {
   id: number;
+  /** The exact failed email recovered in Drafts, also for agent sends. */
+  draftId?: number;
   status: "sent" | "failed";
   message?: string;
 }

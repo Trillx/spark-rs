@@ -549,11 +549,12 @@ export default function App() {
     const sent = outbox.current.get(e.id);
     outbox.current.delete(e.id);
     // A saved draft it came from is gone now, or back in Drafts if it failed.
-    if (sent?.draftId !== undefined) void reloadMessages();
+    if (sent?.draftId !== undefined || e.draftId !== undefined) void reloadMessages();
     if (e.status !== "failed") return;
+    const recovered = e.draftId;
     showToast(
       `Couldn't send: ${e.message ?? "the server refused the message."}`,
-      sent && (() => openComposer(sent)),
+      recovered !== undefined ? () => void editDraft({ id: recovered }) : sent && (() => openComposer(sent)),
       ICONS.error,
       { actionLabel: "Edit", duration: ERROR_TOAST_MS },
     );
@@ -1011,7 +1012,7 @@ export default function App() {
   }, [draft, draftSaved, composerKey]);
 
   /** A draft from Drafts, in the composer. Already open there, it stays as it is. */
-  async function editDraft(m: Message) {
+  async function editDraft(m: Pick<Message, "id">) {
     setSelectedId(m.id);
     const open = composer.current;
     if (open.draft && (draftIds.current.get(open.key) ?? open.draft.draftId) === m.id) return;

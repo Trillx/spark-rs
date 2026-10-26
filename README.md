@@ -172,11 +172,16 @@ Delete, read and pinned go back to the server after the 6-second undo
 window; Done archives (All Mail on Gmail). Snooze, Set Aside, Priority and
 new-sender screening stay on this computer.
 
+On IMAP servers, moving mail requires MOVE or UIDPLUS, and removing old
+server drafts requires UIDPLUS. The app reports an error when safe removal
+isn't supported.
+
 Closing the composer saves the message to the account's Drafts folder
 (it's also saved as you type), on this computer at once and on the server
 with the next sync, so it works offline. Opening a draft from Drafts edits
 it; sending it or Delete Draft removes it from the server too, and undoing
-the send keeps it. Sent and Drafts list who the mail is to.
+the send keeps it. If a send is permanently rejected, its latest content and
+copied files return to Drafts. Sent and Drafts list who the mail is to.
 
 Signatures are in Settings → Signatures, where you write them or paste one
 in (or edit the HTML). Each address starts new mail with its default: Most

@@ -956,9 +956,9 @@ pub async fn push(
     let caps = session.capabilities().await?;
     let server = Capabilities {
         can_move: caps.has_str("MOVE"),
+        uidplus: caps.has_str("UIDPLUS"),
         gmail: caps.has_str("X-GM-EXT-1"),
     };
-    let mut selected: Option<String> = None;
     let mut pushed = 0;
     for p in pending {
         // Where is it now? At its known location if that folder still
@@ -968,26 +968,39 @@ pub async fn push(
             (Some(mailbox), Some(uid)) => Some((mailbox.clone(), uid)),
             _ => None,
         };
-        if let Some((mailbox, _)) = &found
-            && selected.as_deref() != Some(mailbox.as_str())
-        {
+        if let Some((mailbox, _)) = &found {
             match session.select(mailbox).await {
-                Ok(_) => selected = Some(mailbox.clone()),
-                // Renamed or deleted elsewhere.
-                Err(async_imap::error::Error::No(_)) => {
-                    selected = None;
-                    found = None;
+                Ok(current) => {
+                    // A UID identifies a message only within its UIDVALIDITY
+                    // generation. The next sync may not have noticed a reset yet.
+                    if !uid_is_current(store, state, &p, mailbox, current.uid_validity)? {
+                        found = None;
+                    }
                 }
+                // Renamed or deleted elsewhere.
+                Err(async_imap::error::Error::No(_)) => found = None,
                 Err(e) => return Err(e.into()),
             }
         }
         if found.is_none() {
-            found = locate(session, store, state, &p, &mut selected).await?;
+            found = locate(session, store, state, &p).await?;
         }
         let Some((mailbox, uid)) = found else {
             lock(store).drop_pending(p.id)?;
             continue;
         };
+
+        // Check before changing flags or copying: without a scoped expunge,
+        // a move could permanently delete other clients' deleted messages.
+        let destination = folder(state, p.place)
+            .or_else(|| p.folder.as_ref().map(|(_, home)| home.clone()))
+            .unwrap_or_else(|| mailbox.clone());
+        let how = transfer(server, state, &mailbox);
+        if destination != mailbox && how == Transfer::Unsupported {
+            return Err(Error::Server(
+                "This mail server needs MOVE or UIDPLUS to move mail safely.".into(),
+            ));
+        }
 
         let mut flags = Vec::new();
         if p.unread != p.remote_unread {
@@ -1027,14 +1040,14 @@ pub async fn push(
         }
 
         // Filed mail goes to its home folder; without one it stays put.
-        let destination = folder(state, p.place)
-            .or_else(|| p.folder.as_ref().map(|(_, home)| home.clone()))
-            .unwrap_or_else(|| mailbox.clone());
         let moved = if destination != mailbox {
-            let done = match transfer(server, state, &mailbox) {
+            let done = match how {
                 Transfer::Move => session.uid_mv(uid.to_string(), &destination).await,
                 Transfer::CopyAndExpunge => move_by_copy(session, uid, &destination).await,
                 Transfer::Copy => session.uid_copy(uid.to_string(), &destination).await,
+                Transfer::Unsupported => {
+                    unreachable!("unsupported moves were rejected before flags")
+                }
             };
             match done {
                 Ok(()) => true,
@@ -1133,59 +1146,112 @@ async fn locate(
     store: &Mutex<Store>,
     state: &SyncState,
     p: &Pending,
-    selected: &mut Option<String>,
 ) -> Result<Option<(String, u32)>> {
     if let Some(mailbox) = &p.mailbox
-        && let Some(found) = search(session, mailbox, p, selected).await?
+        && let Some(found) = search(session, mailbox, p).await?
     {
         return Ok(Some(found));
     }
     let Some(mailbox) = folder(state, p.remote_place) else {
         let candidates = lock(store).member_locations(p.id)?;
         for (mailbox, uid) in candidates {
-            match session.select(&mailbox).await {
-                Ok(_) => {
-                    *selected = Some(mailbox.clone());
-                    return Ok(Some((mailbox, uid)));
+            if p.message_id.is_some() {
+                if let Some(found) = search(session, &mailbox, p).await? {
+                    return Ok(Some(found));
                 }
-                Err(async_imap::error::Error::No(_)) => *selected = None,
-                Err(e) => return Err(e.into()),
+            } else {
+                match session.select(&mailbox).await {
+                    Ok(current) => {
+                        if uid_is_current(store, state, p, &mailbox, current.uid_validity)? {
+                            return Ok(Some((mailbox, uid)));
+                        }
+                    }
+                    Err(async_imap::error::Error::No(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         return Ok(None);
     };
-    search(session, &mailbox, p, selected).await
+    search(session, &mailbox, p).await
 }
 
-/// The newest message in `mailbox` with `p`'s Message-ID, leaving the
-/// mailbox selected. `None` if it isn't there or the mailbox is gone.
+/// Whether a stored UID belongs to the mailbox generation selected now.
+fn uid_is_current(
+    store: &Mutex<Store>,
+    state: &SyncState,
+    p: &Pending,
+    mailbox: &str,
+    actual: Option<u32>,
+) -> Result<bool> {
+    let expected = if mailbox.eq_ignore_ascii_case(INBOX) {
+        state.uid_validity
+    } else {
+        let store = lock(store);
+        let Some(at) = store.location(p.id)? else {
+            return Ok(false);
+        };
+        store
+            .folders()?
+            .into_iter()
+            .find(|f| f.account_id == at.account_id && f.remote_id == mailbox)
+            .and_then(|f| serde_json::from_str::<FolderState>(&f.sync_state).ok())
+            .and_then(|s| s.uid_validity)
+    };
+    Ok(expected.is_some() && expected == actual)
+}
+
+/// The newest message in `mailbox` with exactly `p`'s Message-ID, leaving
+/// the mailbox selected. `None` if it isn't there or the mailbox is gone.
 async fn search(
     session: &mut Session,
     mailbox: &str,
     p: &Pending,
-    selected: &mut Option<String>,
 ) -> Result<Option<(String, u32)>> {
     let Some(message_id) = &p.message_id else {
         return Ok(None);
     };
     match session.select(mailbox).await {
-        Ok(_) => *selected = Some(mailbox.to_owned()),
-        Err(async_imap::error::Error::No(_)) => {
-            *selected = None;
-            return Ok(None);
-        }
+        Ok(_) => {}
+        Err(async_imap::error::Error::No(_)) => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    // HEADER search matches substrings, so the bare id finds it with or without brackets.
+    Ok(find_message_id(session, message_id)
+        .await?
+        .into_iter()
+        .max()
+        .map(|uid| (mailbox.to_owned(), uid)))
+}
+
+/// Exact identities in the selected mailbox. HEADER SEARCH alone matches
+/// substrings, so candidates must be checked before destructive commands.
+pub(crate) async fn find_message_id(session: &mut Session, message_id: &str) -> Result<Vec<u32>> {
     let query = format!("HEADER Message-ID {}", quoted(message_id));
-    let found = session.uid_search(query).await?;
-    Ok(found.into_iter().max().map(|uid| (mailbox.to_owned(), uid)))
+    let found: Vec<u32> = session.uid_search(query).await?.into_iter().collect();
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+    let headers: Vec<Fetch> = session
+        .uid_fetch(
+            uid_set(&found),
+            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await?
+        .try_collect()
+        .await?;
+    let expected = parse::bare_id(message_id);
+    Ok(headers
+        .iter()
+        .filter(|f| f.header().and_then(parse::message_id).as_ref() == Some(&expected))
+        .filter_map(|f| f.uid)
+        .collect())
 }
 
 /// What the server can do, for moving mail.
 #[derive(Clone, Copy, Debug)]
 struct Capabilities {
     can_move: bool,
+    uidplus: bool,
     gmail: bool,
 }
 
@@ -1198,6 +1264,8 @@ enum Transfer {
     /// Out of Gmail's All Mail, which keeps every message (expunging it
     /// there deletes it): the copy adds the other folder's label.
     Copy,
+    /// Neither MOVE nor a scoped expunge is available.
+    Unsupported,
 }
 
 fn transfer(server: Capabilities, state: &SyncState, from: &str) -> Transfer {
@@ -1205,8 +1273,10 @@ fn transfer(server: Capabilities, state: &SyncState, from: &str) -> Transfer {
         Transfer::Copy
     } else if server.can_move {
         Transfer::Move
-    } else {
+    } else if server.uidplus {
         Transfer::CopyAndExpunge
+    } else {
+        Transfer::Unsupported
     }
 }
 
@@ -1221,7 +1291,11 @@ async fn move_by_copy(
         .await?
         .try_collect()
         .await?;
-    let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    let _: Vec<_> = session
+        .uid_expunge(uid.to_string())
+        .await?
+        .try_collect()
+        .await?;
     Ok(())
 }
 
@@ -1410,6 +1484,7 @@ mod tests {
     fn mail_leaves_gmails_all_mail_by_copy() {
         let gmail = Capabilities {
             can_move: true,
+            uidplus: true,
             gmail: true,
         };
         let state = SyncState {
@@ -1425,6 +1500,7 @@ mod tests {
         // Elsewhere an archive folder is a folder like any other.
         let imap = Capabilities {
             can_move: true,
+            uidplus: true,
             gmail: false,
         };
         let state = SyncState {
@@ -1434,6 +1510,7 @@ mod tests {
         assert_eq!(transfer(imap, &state, "Archive"), Transfer::Move);
         let old = Capabilities {
             can_move: false,
+            uidplus: true,
             gmail: false,
         };
         assert_eq!(transfer(old, &state, "Travel"), Transfer::CopyAndExpunge);

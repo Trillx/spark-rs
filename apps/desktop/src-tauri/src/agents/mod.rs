@@ -67,6 +67,17 @@ impl Access {
 /// Listens for `spark-cli` and writes where to find this app to
 /// `agent-endpoint.json` in the local data folder.
 pub fn start(app: &AppHandle) -> Result<(), String> {
+    let accounts: Vec<_> = app
+        .state::<Mailbox>()
+        .live
+        .engine
+        .store()
+        .accounts()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    app.state::<PrefsState>().retain_agent_accounts(&accounts)?;
     let path = app
         .path()
         .app_local_data_dir()
@@ -147,18 +158,18 @@ struct SendingEvent {
 }
 
 fn run(app: &AppHandle, agent: &str, name: &str, args: &Value) -> tools::Outcome {
-    let access = app.state::<PrefsState>().get().agent_access;
+    let prefs = app.state::<PrefsState>();
     let mailbox = app.state::<Mailbox>();
-    let outcome = {
+    let outcome = prefs.with_agent_access(|access| {
         let mut store = mailbox.live.engine.store();
         let mut cx = tools::Context {
             store: &mut store,
-            access: &access,
+            access,
             agent,
             now: now_ms(),
         };
         tools::call(&mut cx, name, args)
-    };
+    });
     match &outcome.effect {
         Some(Effect::Changed { summary }) => {
             let _ = app.emit("mailbox-changed", ());
@@ -278,12 +289,14 @@ pub fn set_agent_access(
     account: i64,
     access: Access,
 ) -> Result<AgentsView, String> {
-    let saved = prefs.update(|p| {
-        if access == Access::None {
-            p.agent_access.remove(&account);
-        } else {
-            p.agent_access.insert(account, access);
-        }
+    let saved = prefs.set_agent_access(account, access, || {
+        mailbox
+            .live
+            .engine
+            .store()
+            .account(account)
+            .map(|a| a.is_some())
+            .map_err(|e| e.to_string())
     })?;
     view(&mailbox, &saved.agent_access)
 }
@@ -291,6 +304,173 @@ pub fn set_agent_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spark_store::{AccountKind, NewAccount, Store};
+
+    fn account(store: &Store, email: &str) -> i64 {
+        store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email,
+                name: "Me",
+                label: "Test",
+                config: "{}",
+            })
+            .unwrap()
+            .id
+    }
+
+    fn prefs(name: &str) -> (PrefsState, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("spark-agent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (PrefsState::load(dir.clone()), dir)
+    }
+
+    fn tool(prefs: &PrefsState, store: &mut Store, name: &str, args: Value) -> tools::Outcome {
+        prefs.with_agent_access(|access| {
+            tools::call(
+                &mut tools::Context {
+                    store,
+                    access,
+                    agent: "Test agent",
+                    now: now_ms(),
+                },
+                name,
+                &args,
+            )
+        })
+    }
+
+    #[test]
+    fn removing_an_account_revokes_access_before_its_id_is_reused() {
+        let mut store = Store::open_in_memory().unwrap();
+        let kept = account(&store, "kept@example.test");
+        let old = account(&store, "old@example.test");
+        let (prefs, dir) = prefs("reused-account");
+        for id in [kept, old] {
+            prefs
+                .set_agent_access(id, Access::Send, || {
+                    Ok(store.account(id).unwrap().is_some())
+                })
+                .unwrap();
+        }
+        prefs
+            .revoke_agent_access_before(old, || {
+                // Revocation is on disk even if the process stops during deletion.
+                assert!(
+                    !PrefsState::load(dir.clone())
+                        .get()
+                        .agent_access
+                        .contains_key(&old)
+                );
+                store.remove_account(old).map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let new = account(&store, "private@example.test");
+        assert_eq!(new, old, "exercise SQLite's reused account id");
+        let reloaded = PrefsState::load(dir.clone());
+        let listed = tool(&reloaded, &mut store, "list_accounts", json!({}));
+        assert!(!listed.is_error, "{}", listed.text);
+        let listed: Value = serde_json::from_str(&listed.text).unwrap();
+        assert_eq!(listed["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["accounts"][0]["email"], "kept@example.test");
+        let denied = tool(
+            &reloaded,
+            &mut store,
+            "send_email",
+            json!({ "account": new, "to": "recipient@example.test", "body": "Hello" }),
+        );
+        assert!(denied.is_error, "a new mailbox must need a new grant");
+        assert!(denied.text.contains("no access"), "{}", denied.text);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_removes_legacy_grants_before_an_account_reuses_the_id() {
+        let mut store = Store::open_in_memory().unwrap();
+        let old = account(&store, "old@example.test");
+        let (prefs, dir) = prefs("legacy-grants");
+        prefs
+            .update(|p| {
+                p.agent_access.insert(old, Access::Send);
+            })
+            .unwrap();
+        store.remove_account(old).unwrap();
+        let restarted = PrefsState::load(dir.clone());
+        let ids: Vec<_> = store
+            .accounts()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        restarted.retain_agent_accounts(&ids).unwrap();
+        let new = account(&store, "private@example.test");
+        assert_eq!(new, old);
+        let reloaded = PrefsState::load(dir.clone());
+        let listed = tool(&reloaded, &mut store, "list_accounts", json!({}));
+        let listed: Value = serde_json::from_str(&listed.text).unwrap();
+        assert_eq!(listed["accounts"], json!([]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_revocation_save_keeps_the_account_in_place() {
+        let store = Store::open_in_memory().unwrap();
+        let id = account(&store, "old@example.test");
+        let (prefs, dir) = prefs("failed-revocation");
+        prefs
+            .set_agent_access(id, Access::Send, || Ok(true))
+            .unwrap();
+        // A directory where the temporary file should be makes the write fail.
+        std::fs::create_dir(dir.join("prefs.json.tmp")).unwrap();
+        let result = prefs
+            .revoke_agent_access_before(id, || store.remove_account(id).map_err(|e| e.to_string()));
+        assert!(result.is_err());
+        assert!(store.account(id).unwrap().is_some());
+        assert!(!prefs.get().agent_access.contains_key(&id));
+        assert_eq!(
+            PrefsState::load(dir.clone()).get().agent_access[&id],
+            Access::Send
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn adding_accounts_requires_persisting_a_failed_startup_cleanup() {
+        let store = Store::open_in_memory().unwrap();
+        let old = account(&store, "old@example.test");
+        let (prefs, dir) = prefs("failed-startup-cleanup");
+        prefs
+            .set_agent_access(old, Access::Send, || Ok(true))
+            .unwrap();
+        store.remove_account(old).unwrap();
+        std::fs::create_dir(dir.join("prefs.json.tmp")).unwrap();
+        assert!(prefs.retain_agent_accounts(&[]).is_err());
+        assert!(prefs.get().agent_access.is_empty());
+        assert_eq!(
+            PrefsState::load(dir.clone()).get().agent_access[&old],
+            Access::Send
+        );
+        // The in-memory prune must not hide the failed disk write on retry.
+        assert!(prefs.prepare_account_add(|| Ok(vec![])).is_err());
+        std::fs::remove_dir(dir.join("prefs.json.tmp")).unwrap();
+        prefs.prepare_account_add(|| Ok(vec![])).unwrap();
+        let new = account(&store, "private@example.test");
+        assert_eq!(new, old);
+        assert!(PrefsState::load(dir.clone()).get().agent_access.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grant_edits_cannot_leave_permissions_for_an_absent_account() {
+        let store = Store::open_in_memory().unwrap();
+        let (prefs, dir) = prefs("absent-account");
+        let result =
+            prefs.set_agent_access(1, Access::Send, || Ok(store.account(1).unwrap().is_some()));
+        assert_eq!(result.unwrap_err(), "That account was removed.");
+        assert!(prefs.get().agent_access.is_empty());
+        assert!(PrefsState::load(dir.clone()).get().agent_access.is_empty());
+        assert!(!dir.exists());
+    }
 
     #[test]
     fn levels_include_the_ones_before() {

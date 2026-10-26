@@ -14,7 +14,7 @@ use spark_store::{
     Account, AccountKind, Category, Contact, Folder, FolderRole, MessageState, OutboxFile, Patch,
     now_ms,
 };
-use tauri::{AppHandle, Emitter, State, Window};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use crate::demo::{self, DemoMailbox};
 use crate::files::{self, LocalFile};
@@ -741,6 +741,19 @@ pub fn update_message(
         .ok_or_else(|| format!("no message with id {id}"))
 }
 
+fn prepare_account_add(app: &AppHandle, mailbox: &Mailbox) -> Result<(), String> {
+    app.state::<crate::prefs::PrefsState>()
+        .prepare_account_add(|| {
+            mailbox
+                .live
+                .engine
+                .store()
+                .accounts()
+                .map(|accounts| accounts.into_iter().map(|account| account.id).collect())
+                .map_err(text)
+        })
+}
+
 #[tauri::command]
 pub async fn add_gmail_account(
     app: AppHandle,
@@ -749,6 +762,7 @@ pub async fn add_gmail_account(
     app_password: String,
     label: String,
 ) -> Result<AccountView, String> {
+    prepare_account_add(&app, &mailbox)?;
     let (imap, smtp) = gmail_servers();
     let account = mailbox
         .live
@@ -782,6 +796,7 @@ pub async fn add_imap_account(
     if imap_host.trim().is_empty() || smtp_host.trim().is_empty() {
         return Err("Enter the IMAP and SMTP servers.".into());
     }
+    prepare_account_add(&app, &mailbox)?;
     let account = mailbox
         .live
         .engine
@@ -807,6 +822,7 @@ pub async fn add_microsoft_account(
     tenant: String,
     label: String,
 ) -> Result<AccountView, String> {
+    prepare_account_add(&app, &mailbox)?;
     let cancelled = mailbox.live.sign_in_cancel();
     let sign_in = mailbox
         .live
@@ -827,9 +843,16 @@ pub fn cancel_sign_in(mailbox: State<'_, Mailbox>) {
 }
 
 #[tauri::command]
-pub fn remove_account(app: AppHandle, mailbox: State<'_, Mailbox>, id: i64) -> Result<(), String> {
-    mailbox.live.stop(id);
-    mailbox.live.engine.remove_account(id).map_err(text)?;
+pub fn remove_account(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    prefs: State<'_, crate::prefs::PrefsState>,
+    id: i64,
+) -> Result<(), String> {
+    prefs.revoke_agent_access_before(id, || {
+        mailbox.live.stop(id);
+        mailbox.live.engine.remove_account(id).map_err(text)
+    })?;
     let _ = app.emit("accounts-changed", ());
     let _ = app.emit("mailbox-changed", ());
     Ok(())
@@ -878,9 +901,9 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
     draft::check_attachment_size(&draft.attachments).map_err(text)?;
     // Copies of local files go into the outbox, so a later send doesn't
     // depend on the originals.
-    let queued = local_files(&draft)?;
     let json = serde_json::to_string(&draft).map_err(text)?;
     let mut store = mailbox.live.engine.store();
+    let queued = local_files(&draft, &store)?;
     let id = store
         .queue_send(draft.account, &json, draft.send_at, &queued)
         .map_err(text)?;
@@ -922,18 +945,49 @@ pub fn cancel_send(mailbox: State<'_, Mailbox>, id: i64) -> Result<bool, String>
     mailbox.live.engine.store().cancel_send(id).map_err(text)
 }
 
-/// Copies of a draft's files from this computer, in order.
-fn local_files(draft: &Draft) -> Result<Vec<OutboxFile>, String> {
+/// Copies of a draft's files from this computer, in order. A recovered draft
+/// can use its saved bytes after the original file has moved or disappeared.
+fn local_files(draft: &Draft, store: &spark_store::Store) -> Result<Vec<OutboxFile>, String> {
     let mut files = Vec::new();
+    let mut saved: Option<(Draft, Vec<OutboxFile>)> = None;
     for a in &draft.attachments {
-        if let OutgoingAttachment::File { path, name, .. } = a {
-            let data = std::fs::read(path).map_err(|e| format!("Couldn't read {name}: {e}"))?;
-            files.push(OutboxFile {
+        let OutgoingAttachment::File { path, name, size } = a else {
+            continue;
+        };
+        let file = match std::fs::read(path) {
+            Ok(data) => OutboxFile {
                 name: name.clone(),
                 mime: mime_for(name).into(),
                 data,
-            });
-        }
+            },
+            Err(e) => {
+                let missing = || format!("Couldn't read {name}: {e}");
+                if saved.is_none() {
+                    let id = draft.draft_id.ok_or_else(missing)?;
+                    let json = store.draft(id).map_err(text)?.ok_or_else(missing)?;
+                    saved = Some((
+                        serde_json::from_str(&json).map_err(text)?,
+                        store.draft_files(id).map_err(text)?,
+                    ));
+                }
+                let (original, copies) = saved.as_ref().expect("loaded above");
+                // Copies contain only File attachments. Locate this exact
+                // saved attachment rather than substituting a removed file
+                // when the composer changed their order or added another.
+                let position = original
+                    .attachments
+                    .iter()
+                    .filter(|a| matches!(a, OutgoingAttachment::File { .. }))
+                    .position(|original| original == a)
+                    .ok_or_else(missing)?;
+                copies
+                    .get(position)
+                    .filter(|f| f.name == *name && f.data.len() as u64 == *size)
+                    .cloned()
+                    .ok_or_else(missing)?
+            }
+        };
+        files.push(file);
     }
     Ok(files)
 }
@@ -946,7 +1000,7 @@ pub fn save_draft(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, Stri
     if !mailbox.live() {
         return mailbox.demo.save_draft(draft);
     }
-    let files = local_files(&draft)?;
+    let files = local_files(&draft, &mailbox.live.engine.store())?;
     mailbox.live.engine.save_draft(&draft, &files).map_err(text)
 }
 
@@ -990,6 +1044,139 @@ pub fn open_external(url: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spark_store::{NewAccount, Store};
+
+    fn attachment_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spark-draft-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn draft_account(store: &Store) -> Account {
+        store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.test",
+                name: "Me",
+                label: "Test",
+                // An invalid server configuration fails locally, without network access.
+                config: "{}",
+            })
+            .unwrap()
+    }
+
+    fn file_attachment(path: &std::path::Path, size: u64) -> OutgoingAttachment {
+        OutgoingAttachment::File {
+            path: path.to_string_lossy().into_owned(),
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            size,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recovered_draft_can_save_and_send_after_its_original_file_is_deleted() {
+        struct NoSecrets;
+        impl spark_mail::Secrets for NoSecrets {
+            fn get(&self, _: &str) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        let account = draft_account(&store);
+        let dir = attachment_dir("recovered-files");
+        let path = dir.join("plan.txt");
+        std::fs::write(&path, b"saved attachment").unwrap();
+        let draft = Draft {
+            account: account.id,
+            to: "recipient@example.test".into(),
+            body: "Please keep this".into(),
+            attachments: vec![file_attachment(&path, 16)],
+            ..Default::default()
+        };
+        let files = local_files(&draft, &store).unwrap();
+        let queued = store
+            .queue_send(
+                account.id,
+                &serde_json::to_string(&draft).unwrap(),
+                0,
+                &files,
+            )
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let engine = spark_mail::Engine::new(
+            std::sync::Arc::new(std::sync::Mutex::new(store)),
+            std::sync::Arc::new(NoSecrets),
+        );
+        let result = engine.send_due(account.id).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].result.is_err());
+        let mut store = engine.store();
+        assert!(store.outbox_files(queued).unwrap().is_empty());
+        let id = store.messages().unwrap()[0].id;
+        let recovered = spark_mail::drafts::open(&store, id).unwrap().unwrap();
+        let copied = local_files(&recovered, &store).unwrap();
+        assert_eq!(copied, files);
+        let id =
+            spark_mail::drafts::save(&mut store, &account, &recovered, &copied, now_ms()).unwrap();
+        assert_eq!(store.draft_files(id).unwrap(), files);
+        let retry = store
+            .queue_send(
+                account.id,
+                &serde_json::to_string(&recovered).unwrap(),
+                0,
+                &copied,
+            )
+            .unwrap();
+        assert_eq!(store.outbox_files(retry).unwrap(), files);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_files_match_the_original_attachment_after_reordering() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = draft_account(&store);
+        let dir = attachment_dir("file-identity");
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(&second, b"two").unwrap();
+        let draft = Draft {
+            account: account.id,
+            attachments: vec![
+                file_attachment(&first, 3),
+                OutgoingAttachment::Message {
+                    message: 42,
+                    index: 0,
+                    name: "remote.txt".into(),
+                    size: 1,
+                },
+                file_attachment(&second, 3),
+            ],
+            ..Default::default()
+        };
+        let files = local_files(&draft, &store).unwrap();
+        let id = spark_mail::drafts::save(&mut store, &account, &draft, &files, now_ms()).unwrap();
+        std::fs::remove_file(&first).unwrap();
+        std::fs::remove_file(&second).unwrap();
+        let mut opened = spark_mail::drafts::open(&store, id).unwrap().unwrap();
+        opened.attachments.remove(0);
+        assert_eq!(
+            local_files(&opened, &store).unwrap(),
+            vec![files[1].clone()]
+        );
+        // The same name and size at a different path is a new attachment.
+        opened.attachments[1] = file_attachment(&dir.join("elsewhere/second.txt"), 3);
+        assert!(local_files(&opened, &store).is_err());
+        // When its original exists, use its current bytes rather than an old copy.
+        opened.attachments[1] = file_attachment(&second, 3);
+        std::fs::write(&second, b"new").unwrap();
+        assert_eq!(local_files(&opened, &store).unwrap()[0].data, b"new");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn paragraphs_split_on_blank_lines() {

@@ -126,6 +126,8 @@ impl Report {
 #[derive(Debug)]
 pub struct SendOutcome {
     pub id: i64,
+    /// The editable draft recovered after a permanent failure.
+    pub draft_id: Option<i64>,
     /// `Ok(true)` sent; `Ok(false)` will be retried; `Err` failed for good.
     pub result: Result<bool>,
 }
@@ -688,12 +690,13 @@ impl Engine {
             let parsed = serde_json::from_str::<Draft>(&json);
             let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
             let recipients = parsed.as_ref().map(drafts::sent_to).unwrap_or_default();
-            let result = match parsed {
-                Ok(draft) => self.send_draft(account_id, id, &draft).await,
+            let result = match &parsed {
+                Ok(draft) => self.send_draft(account_id, id, draft).await,
                 Err(e) => Err(Error::Config(format!(
                     "The queued message is unreadable: {e}"
                 ))),
             };
+            let mut draft_id = None;
             let result = match result {
                 Ok(()) => {
                     // The saved draft it came from is done with, here and on the server.
@@ -711,11 +714,29 @@ impl Engine {
                     Ok(false)
                 }
                 Err(e) => {
-                    self.store().finish_send(id)?;
+                    if let Ok(draft) = parsed {
+                        let mut store = self.store();
+                        let account = store
+                            .account(account_id)?
+                            .ok_or_else(|| Error::Config("That account was removed.".into()))?;
+                        let files = store.outbox_files(id)?;
+                        draft_id = Some(drafts::recover_failed_send(
+                            &mut store,
+                            &account,
+                            &draft,
+                            &files,
+                            now_ms(),
+                            id,
+                        )?);
+                    }
                     Err(e)
                 }
             };
-            outcomes.push(SendOutcome { id, result });
+            outcomes.push(SendOutcome {
+                id,
+                draft_id,
+                result,
+            });
         }
         Ok(outcomes)
     }
@@ -1212,6 +1233,226 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(text: &str) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spark_store::{FolderRole, OutboxFile, RemoteFolder};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct TestSecrets;
+
+    impl Secrets for TestSecrets {
+        fn get(&self, _: &str) -> Result<Option<String>, String> {
+            Ok(Some("test-password".into()))
+        }
+
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// One SMTP delivery, rejecting its recipients or accepting its DATA.
+    async fn smtp_delivery(code: u16) -> (Server, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(socket);
+            stream
+                .get_mut()
+                .write_all(b"220 test ESMTP\r\n")
+                .await
+                .unwrap();
+            let mut data = false;
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let reply = if data {
+                    if line != ".\r\n" {
+                        continue;
+                    }
+                    data = false;
+                    "250 Queued\r\n".to_owned()
+                } else if line.starts_with("EHLO") {
+                    "250-test\r\n250 AUTH PLAIN\r\n".to_owned()
+                } else if line.starts_with("AUTH") {
+                    "235 Authenticated\r\n".to_owned()
+                } else if line.starts_with("RCPT") {
+                    format!("{code} Recipient\r\n")
+                } else if line.starts_with("DATA") {
+                    data = true;
+                    "354 Continue\r\n".to_owned()
+                } else if line.starts_with("QUIT") {
+                    stream.get_mut().write_all(b"221 Bye\r\n").await.unwrap();
+                    break;
+                } else {
+                    "250 OK\r\n".to_owned()
+                };
+                stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (
+            Server {
+                host: "127.0.0.1".into(),
+                port,
+                security: imap::Security::Plain,
+            },
+            task,
+        )
+    }
+
+    fn test_account(store: &mut Store, smtp: Server) -> Account {
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Test",
+                config: &to_json(&AccountConfig::Imap {
+                    username: "me@example.com".into(),
+                    imap: Server::new("127.0.0.1", 993),
+                    smtp,
+                }),
+            })
+            .unwrap();
+        store
+            .replace_folders(
+                account.id,
+                &[RemoteFolder {
+                    remote_id: "Drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        account
+    }
+
+    #[tokio::test]
+    async fn permanent_send_failure_recovers_exact_draft_and_files_across_restart() {
+        for saved_before in [false, true] {
+            let (smtp, delivery) = smtp_delivery(550).await;
+            let path = std::env::temp_dir().join(format!(
+                "spark-failed-send-{}.sqlite",
+                drafts::new_message_id("test")
+            ));
+            let mut store = Store::open(&path).unwrap();
+            let account = test_account(&mut store, smtp);
+            let files = vec![OutboxFile {
+                name: "plan.pdf".into(),
+                mime: "application/pdf".into(),
+                data: b"exact queued attachment".to_vec(),
+            }];
+            let mut draft = Draft {
+                account: account.id,
+                to: "Recipient <recipient@example.com>".into(),
+                cc: "cc@example.com".into(),
+                bcc: "bcc@example.com".into(),
+                subject: "Latest subject".into(),
+                body: "Latest edits before Send".into(),
+                signature: Some("<p>Personal signature</p>".into()),
+                signature_id: Some(42),
+                quote: Some("Forwarded original".into()),
+                in_reply_to: Some("original@example.com".into()),
+                references: Some("earlier@example.com".into()),
+                attachments: vec![OutgoingAttachment::File {
+                    path: "/original-was-removed/plan.pdf".into(),
+                    name: "plan.pdf".into(),
+                    size: files[0].data.len() as u64,
+                }],
+                ..Default::default()
+            };
+            if saved_before {
+                let old = Draft {
+                    body: "Old autosave".into(),
+                    ..draft.clone()
+                };
+                draft.draft_id = Some(drafts::save(&mut store, &account, &old, &[], 1).unwrap());
+            }
+            let id = store
+                .queue_send(account.id, &to_json(&draft), 0, &files)
+                .unwrap();
+            if let Some(saved) = draft.draft_id {
+                store.hold_draft_for_send(id, saved).unwrap();
+            }
+            let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+            let outcomes = engine.send_due(account.id).await.unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(outcomes[0].result, Err(Error::Server(_))));
+            let recovered = outcomes[0]
+                .draft_id
+                .expect("failure names its recovered draft");
+            if let Some(saved) = draft.draft_id {
+                assert_eq!(recovered, saved, "replace the stale autosave");
+            }
+            delivery.await.unwrap();
+            drop(engine);
+
+            let mut reopened = Store::open(&path).unwrap();
+            draft.draft_id = Some(recovered);
+            assert_eq!(drafts::open(&reopened, recovered).unwrap(), Some(draft));
+            assert_eq!(reopened.messages().unwrap().len(), 1);
+            assert_eq!(reopened.draft_files(recovered).unwrap(), files);
+            assert!(reopened.outbox_files(id).unwrap().is_empty());
+            assert!(
+                reopened
+                    .claim_due_sends(account.id, i64::MAX)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                reopened.draft_uploads(account.id, i64::MAX).unwrap().len(),
+                1
+            );
+            drop(reopened);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_and_retryable_sends_keep_their_existing_lifecycle() {
+        for code in [250, 450] {
+            let (smtp, delivery) = smtp_delivery(code).await;
+            let mut store = Store::open_in_memory().unwrap();
+            let account = test_account(&mut store, smtp);
+            let mut draft = Draft {
+                account: account.id,
+                to: "recipient@example.com".into(),
+                body: "Send me".into(),
+                ..Default::default()
+            };
+            let saved = drafts::save(&mut store, &account, &draft, &[], 1).unwrap();
+            draft.draft_id = Some(saved);
+            let id = store
+                .queue_send(account.id, &to_json(&draft), 0, &[])
+                .unwrap();
+            store.hold_draft_for_send(id, saved).unwrap();
+            let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+            let outcomes = engine.send_due(account.id).await.unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert!(matches!(outcomes[0].result, Ok(sent) if sent == (code == 250)));
+            assert!(outcomes[0].draft_id.is_none());
+            delivery.await.unwrap();
+            let mut store = engine.store();
+            assert_eq!(store.is_draft(saved).unwrap(), code == 450);
+            assert!(
+                store.messages().unwrap().is_empty(),
+                "retrying draft stays held"
+            );
+            if code == 450 {
+                assert!(
+                    store
+                        .claim_due_sends(account.id, now_ms())
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(store.cancel_send(id).unwrap(), "retry remains cancellable");
+                assert_eq!(drafts::open(&store, saved).unwrap(), Some(draft));
+                assert_eq!(store.messages().unwrap().len(), 1, "Undo restores Drafts");
+            }
+        }
+    }
 
     #[test]
     fn configs_keep_their_shape() {

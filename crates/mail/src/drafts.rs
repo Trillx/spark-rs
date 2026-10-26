@@ -64,6 +64,29 @@ pub fn save(
     files: &[OutboxFile],
     now: i64,
 ) -> Result<i64> {
+    save_with(store, account, draft, files, now, None)
+}
+
+/// Saves the failed email before its outbox copy is removed.
+pub(crate) fn recover_failed_send(
+    store: &mut Store,
+    account: &Account,
+    draft: &Draft,
+    files: &[OutboxFile],
+    now: i64,
+    outbox_id: i64,
+) -> Result<i64> {
+    save_with(store, account, draft, files, now, Some(outbox_id))
+}
+
+fn save_with(
+    store: &mut Store,
+    account: &Account,
+    draft: &Draft,
+    files: &[OutboxFile],
+    now: i64,
+    outbox_id: Option<i64>,
+) -> Result<i64> {
     let threading = threading(store, draft)?;
     let saved = Draft {
         draft_id: None,
@@ -91,27 +114,27 @@ pub fn save(
     } else {
         &account.name
     };
-    Ok(store.save_draft(
-        draft.draft_id,
-        &DraftSave {
-            account_id: account.id,
-            draft: &json,
-            from_name,
-            from_address: &account.email,
-            to: &display_list(&draft.to),
-            cc: &display_list(&draft.cc),
-            bcc: &display_list(&draft.bcc),
-            subject: draft.subject.trim(),
-            snippet: &parse::snippet(&bodies.text),
-            text: &bodies.text,
-            html: bodies.html.as_deref(),
-            in_reply_to: threading.as_ref().map(|(id, _)| id.as_str()),
-            references: threading.as_ref().map(|(_, refs)| refs.as_str()),
-            attachments: &attachments,
-            files,
-        },
-        now,
-    )?)
+    let save = DraftSave {
+        account_id: account.id,
+        draft: &json,
+        from_name,
+        from_address: &account.email,
+        to: &display_list(&draft.to),
+        cc: &display_list(&draft.cc),
+        bcc: &display_list(&draft.bcc),
+        subject: draft.subject.trim(),
+        snippet: &parse::snippet(&bodies.text),
+        text: &bodies.text,
+        html: bodies.html.as_deref(),
+        in_reply_to: threading.as_ref().map(|(id, _)| id.as_str()),
+        references: threading.as_ref().map(|(_, refs)| refs.as_str()),
+        attachments: &attachments,
+        files,
+    };
+    Ok(match outbox_id {
+        Some(id) => store.save_failed_send(id, draft.draft_id, &save, now)?,
+        None => store.save_draft(draft.draft_id, &save, now)?,
+    })
 }
 
 /// A saved draft for the composer: as last saved here while it waits to go
@@ -553,8 +576,8 @@ async fn upload_imap(
     Ok(None)
 }
 
-/// Deletes a draft's server copy: by Message-ID where known (checked
-/// against its UID), else by UID. Already gone is fine.
+/// Deletes a draft's server copy by its verified Message-ID. A UID without
+/// generation metadata is insufficient; an already missing copy is fine.
 async fn remove_imap(session: &mut Session, copy: &DraftCopy, uidplus: bool) -> Result<()> {
     let Some(mailbox) = &copy.mailbox else {
         return Ok(());
@@ -566,18 +589,26 @@ async fn remove_imap(session: &mut Session, copy: &DraftCopy, uidplus: bool) -> 
     }
     let uids: Vec<u32> = match &copy.message_id {
         Some(id) => {
-            let found = session
-                .uid_search(format!("HEADER Message-ID {}", imap::quoted(id)))
-                .await?;
+            let found = imap::find_message_id(session, id).await?;
             match copy.uid {
                 Some(uid) if found.contains(&uid) => vec![uid],
-                _ => found.into_iter().collect(),
+                _ => found,
             }
         }
-        None => copy.uid.into_iter().collect(),
+        None if copy.uid.is_some() => {
+            return Err(Error::Server(
+                "That saved draft has no Message-ID, so it cannot be removed safely.".into(),
+            ));
+        }
+        None => Vec::new(),
     };
     if uids.is_empty() {
         return Ok(());
+    }
+    if !uidplus {
+        return Err(Error::Server(
+            "This mail server needs UIDPLUS to remove saved drafts safely.".into(),
+        ));
     }
     let set = imap::uid_set(&uids);
     let result: async_imap::error::Result<()> = async {
@@ -586,11 +617,7 @@ async fn remove_imap(session: &mut Session, copy: &DraftCopy, uidplus: bool) -> 
             .await?
             .try_collect()
             .await?;
-        if uidplus {
-            let _: Vec<_> = session.uid_expunge(&set).await?.try_collect().await?;
-        } else {
-            let _: Vec<_> = session.expunge().await?.try_collect().await?;
-        }
+        let _: Vec<_> = session.uid_expunge(&set).await?.try_collect().await?;
         Ok(())
     }
     .await;

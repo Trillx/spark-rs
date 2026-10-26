@@ -82,6 +82,8 @@ struct SyncEvent {
 #[serde(rename_all = "camelCase")]
 struct SendEvent {
     id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_id: Option<i64>,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
@@ -343,12 +345,14 @@ async fn work(
                     let event = match outcome.result {
                         Ok(true) => SendEvent {
                             id: outcome.id,
+                            draft_id: outcome.draft_id,
                             status: "sent",
                             message: None,
                         },
                         Ok(false) => continue,
                         Err(e) => SendEvent {
                             id: outcome.id,
+                            draft_id: outcome.draft_id,
                             status: "failed",
                             message: Some(e.to_string()),
                         },

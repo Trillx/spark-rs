@@ -83,6 +83,64 @@ fn upload_of(store: &Store, account_id: i64) -> DraftUpload {
 }
 
 #[test]
+fn failed_send_recovery_rolls_back_without_losing_outbox_or_old_draft() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let old = save(&mut store, account_id, None, "Old autosave", 1);
+    let files = [OutboxFile {
+        name: "latest.txt".into(),
+        mime: "text/plain".into(),
+        data: b"exact queued bytes".to_vec(),
+    }];
+    let outbox = store
+        .queue_send(account_id, "latest payload", 0, &files)
+        .unwrap();
+    store.hold_draft_for_send(outbox, old).unwrap();
+    store.claim_due_sends(account_id, 0).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_outbox_delete BEFORE DELETE ON outbox
+         BEGIN SELECT RAISE(ABORT, 'cannot delete outbox'); END;",
+        )
+        .unwrap();
+
+    let result = store.save_failed_send(
+        outbox,
+        Some(old),
+        &DraftSave {
+            account_id,
+            draft: "latest payload",
+            from_name: "Me",
+            from_address: "me@example.com",
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            subject: "Latest",
+            snippet: "Latest",
+            text: "Latest",
+            html: None,
+            in_reply_to: None,
+            references: None,
+            attachments: &[],
+            files: &files,
+        },
+        2,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        store.draft(old).unwrap().as_deref(),
+        Some(r#"{"body":"Old autosave"}"#)
+    );
+    assert_eq!(store.draft_files(old).unwrap()[0].data, b"Old autosave");
+    assert_eq!(store.outbox_files(outbox).unwrap(), files);
+    store.requeue_interrupted_sends().unwrap();
+    assert_eq!(
+        store.claim_due_sends(account_id, 0).unwrap(),
+        [(outbox, "latest payload".into())]
+    );
+}
+
+#[test]
 fn a_saved_draft_lists_in_drafts_and_waits_to_upload() {
     let (mut store, account_id, drafts) = store_with_drafts();
     let id = save(&mut store, account_id, None, "First go", 1_000);

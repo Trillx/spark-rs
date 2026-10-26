@@ -120,117 +120,24 @@ impl Store {
     /// changed starts over in the new one. Returns the draft's message id.
     pub fn save_draft(&mut self, existing: Option<i64>, save: &DraftSave, now: i64) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let kept = match existing {
-            Some(id) if is_draft_in(&tx, id)? => {
-                let account_id: i64 =
-                    tx.query_row("SELECT account_id FROM messages WHERE id = ?1", [id], |r| {
-                        r.get(0)
-                    })?;
-                if account_id == save.account_id {
-                    Some(id)
-                } else {
-                    discard_in(&tx, id)?;
-                    None
-                }
-            }
-            _ => None,
-        };
-        let id = match kept {
-            Some(id) => {
-                // Until it's uploaded, the old copy's attachments are what
-                // the draft's own refer to.
-                let attachments = match server_copy(&tx, id)? {
-                    Some(_) => None,
-                    None => Some(json(save.attachments)),
-                };
-                tx.execute(
-                    "UPDATE messages SET from_name = ?2, from_address = ?3, to_list = ?4,
-                        cc_list = ?5, bcc_list = ?6, subject = ?7, snippet = ?8, date = ?9,
-                        text_body = ?10, html_body = ?14, in_reply_to = ?11, refs = ?12,
-                        attachments = COALESCE(?13, attachments)
-                     WHERE id = ?1",
-                    params![
-                        id,
-                        save.from_name,
-                        save.from_address,
-                        json(save.to),
-                        json(save.cc),
-                        json(save.bcc),
-                        save.subject,
-                        save.snippet,
-                        now,
-                        save.text,
-                        save.in_reply_to,
-                        save.references,
-                        attachments,
-                        save.html
-                    ],
-                )?;
-                id
-            }
-            None => {
-                let m = Incoming {
-                    account_id: save.account_id,
-                    in_reply_to: save.in_reply_to.map(str::to_owned),
-                    references: save.references.map(str::to_owned),
-                    from_name: save.from_name.to_owned(),
-                    from_address: save.from_address.to_owned(),
-                    to: save.to.to_vec(),
-                    cc: save.cc.to_vec(),
-                    bcc: save.bcc.to_vec(),
-                    subject: save.subject.to_owned(),
-                    snippet: save.snippet.to_owned(),
-                    date: now,
-                    text: save.text.to_owned(),
-                    html: save.html.map(str::to_owned),
-                    attachments: save.attachments.to_vec(),
-                    category: Category::People,
-                    ..Default::default()
-                };
-                insert_message(&tx, &m, MessageState::Filed, false, Place::Folder)?
-            }
-        };
-        tx.execute(
-            "INSERT OR IGNORE INTO folder_members (folder_id, message_id)
-             SELECT id, ?2 FROM folders WHERE account_id = ?1 AND role = 'drafts'
-             ORDER BY position LIMIT 1",
-            params![save.account_id, id],
-        )?;
-        // Saves within one millisecond still order.
-        tx.execute(
-            "INSERT INTO draft_uploads (message_id, draft, saved_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT (message_id) DO UPDATE SET draft = excluded.draft,
-                saved_at = MAX(excluded.saved_at, draft_uploads.saved_at + 1)",
-            params![id, save.draft, now],
-        )?;
-        // Autosaves mostly change the text: files that are the same stay.
-        let same_files = {
-            let mut stmt = tx.prepare(
-                "SELECT name, mime, data FROM draft_files WHERE message_id = ?1 ORDER BY position",
-            )?;
-            let stored: Vec<OutboxFile> = stmt
-                .query_map([id], |r| {
-                    Ok(OutboxFile {
-                        name: r.get(0)?,
-                        mime: r.get(1)?,
-                        data: r.get(2)?,
-                    })
-                })?
-                .collect::<Result<_>>()?;
-            stored == save.files
-        };
-        if same_files {
-            tx.commit()?;
-            return Ok(id);
-        }
-        tx.execute("DELETE FROM draft_files WHERE message_id = ?1", [id])?;
-        for (position, f) in save.files.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO draft_files (message_id, position, name, mime, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, position as i64, f.name, f.mime, f.data],
-            )?;
-        }
+        let id = save_in(&tx, existing, save, now)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Recovers a permanently failed send as an editable draft. The outbox
+    /// and its copied files are removed only when the exact draft is saved,
+    /// in the same transaction, so a restart cannot lose the failed email.
+    pub fn save_failed_send(
+        &mut self,
+        outbox_id: i64,
+        existing: Option<i64>,
+        save: &DraftSave,
+        now: i64,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        let id = save_in(&tx, existing, save, now)?;
+        tx.execute("DELETE FROM outbox WHERE id = ?1", [outbox_id])?;
         tx.commit()?;
         Ok(id)
     }
@@ -453,6 +360,121 @@ impl Store {
             )
             .optional()
     }
+}
+
+/// Writes the draft inside the caller's transaction.
+fn save_in(conn: &Connection, existing: Option<i64>, save: &DraftSave, now: i64) -> Result<i64> {
+    let kept = match existing {
+        Some(id) if is_draft_in(conn, id)? => {
+            let account_id: i64 =
+                conn.query_row("SELECT account_id FROM messages WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+            if account_id == save.account_id {
+                Some(id)
+            } else {
+                discard_in(conn, id)?;
+                None
+            }
+        }
+        _ => None,
+    };
+    let id = match kept {
+        Some(id) => {
+            // Until it's uploaded, the old copy's attachments are what
+            // the draft's own refer to.
+            let attachments = match server_copy(conn, id)? {
+                Some(_) => None,
+                None => Some(json(save.attachments)),
+            };
+            conn.execute(
+                "UPDATE messages SET from_name = ?2, from_address = ?3, to_list = ?4,
+                    cc_list = ?5, bcc_list = ?6, subject = ?7, snippet = ?8, date = ?9,
+                    text_body = ?10, html_body = ?14, in_reply_to = ?11, refs = ?12,
+                    attachments = COALESCE(?13, attachments)
+                 WHERE id = ?1",
+                params![
+                    id,
+                    save.from_name,
+                    save.from_address,
+                    json(save.to),
+                    json(save.cc),
+                    json(save.bcc),
+                    save.subject,
+                    save.snippet,
+                    now,
+                    save.text,
+                    save.in_reply_to,
+                    save.references,
+                    attachments,
+                    save.html
+                ],
+            )?;
+            id
+        }
+        None => {
+            let m = Incoming {
+                account_id: save.account_id,
+                in_reply_to: save.in_reply_to.map(str::to_owned),
+                references: save.references.map(str::to_owned),
+                from_name: save.from_name.to_owned(),
+                from_address: save.from_address.to_owned(),
+                to: save.to.to_vec(),
+                cc: save.cc.to_vec(),
+                bcc: save.bcc.to_vec(),
+                subject: save.subject.to_owned(),
+                snippet: save.snippet.to_owned(),
+                date: now,
+                text: save.text.to_owned(),
+                html: save.html.map(str::to_owned),
+                attachments: save.attachments.to_vec(),
+                category: Category::People,
+                ..Default::default()
+            };
+            insert_message(conn, &m, MessageState::Filed, false, Place::Folder)?
+        }
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO folder_members (folder_id, message_id)
+         SELECT id, ?2 FROM folders WHERE account_id = ?1 AND role = 'drafts'
+         ORDER BY position LIMIT 1",
+        params![save.account_id, id],
+    )?;
+    // Saves within one millisecond still order.
+    conn.execute(
+        "INSERT INTO draft_uploads (message_id, draft, saved_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT (message_id) DO UPDATE SET draft = excluded.draft,
+            saved_at = MAX(excluded.saved_at, draft_uploads.saved_at + 1)",
+        params![id, save.draft, now],
+    )?;
+    // Autosaves mostly change the text: files that are the same stay.
+    let same_files = {
+        let mut stmt = conn.prepare(
+            "SELECT name, mime, data FROM draft_files WHERE message_id = ?1 ORDER BY position",
+        )?;
+        let stored: Vec<OutboxFile> = stmt
+            .query_map([id], |r| {
+                Ok(OutboxFile {
+                    name: r.get(0)?,
+                    mime: r.get(1)?,
+                    data: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_>>()?;
+        stored == save.files
+    };
+    if same_files {
+        return Ok(id);
+    }
+    conn.execute("DELETE FROM draft_files WHERE message_id = ?1", [id])?;
+    for (position, f) in save.files.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO draft_files (message_id, position, name, mime, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, position as i64, f.name, f.mime, f.data],
+        )?;
+    }
+    Ok(id)
 }
 
 fn is_draft_in(conn: &Connection, id: i64) -> Result<bool> {
