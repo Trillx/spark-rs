@@ -1,97 +1,46 @@
 import { useEffect, useState } from "react";
 import { getInlineImages, getMessageContent } from "../api";
 import type { InlineImages, InviteAnswer, MessageContent } from "../types";
+import { loadCache } from "./cache";
 
-// Message bodies load on demand and stay cached while the app runs, so
-// reopening a thread (or forwarding it) is instant. Failed loads aren't cached.
-// Embedded images come from the server the same way; being data URLs, only
-// the most recently shown INLINE_CACHE_MAX messages' are kept.
+// Message bodies load on demand and the most recently used stay cached while
+// the app runs, so reopening a thread (or forwarding it) is instant. Failed
+// loads aren't cached. Embedded images come from the server the same way, kept
+// to a budget of their own: being data URLs, they're big. Sizes are estimated
+// as two bytes a character (see `estimateBytes`).
 
-const cache = new Map<number, MessageContent>();
-const pending = new Map<number, Promise<MessageContent>>();
-const inlineCache = new Map<number, InlineImages>();
-const inlinePending = new Map<number, Promise<InlineImages>>();
-const INLINE_CACHE_MAX = 100;
+const MiB = 1024 * 1024;
+/** A few hundred ordinary bodies (their HTML and text, ~100–300 KiB as estimated): modest on an 8 GB ARM laptop. */
+const CONTENT_BUDGET = 64 * MiB;
+/** 8M characters, which no ordinary email comes near; a bigger one shows but loads again next time. */
+const CONTENT_ENTRY_MAX = CONTENT_BUDGET / 4;
+/** More room than bodies, as a miss downloads the message again: a few dozen image-heavy newsletters. */
+const INLINE_BUDGET = 96 * MiB;
+/** About 9 MB of images as base64; attachment.rs allows 20 MiB a message, and sets that heavy aren't kept. */
+const INLINE_ENTRY_MAX = INLINE_BUDGET / 4;
+
+const contents = loadCache({ fetch: getMessageContent, budget: CONTENT_BUDGET, entryMax: CONTENT_ENTRY_MAX });
+const inline = loadCache({ fetch: getInlineImages, budget: INLINE_BUDGET, entryMax: INLINE_ENTRY_MAX });
 const NO_IMAGES: InlineImages = Object.freeze({});
-/** Bumped by `clearContent`, so a load that started before it isn't cached. */
-let generation = 0;
 
 export function loadContent(id: number): Promise<MessageContent> {
-  const cached = cache.get(id);
-  if (cached) return Promise.resolve(cached);
-  let request = pending.get(id);
-  if (!request) {
-    const started = generation;
-    const settle = () => {
-      if (started === generation) pending.delete(id);
-    };
-    request = getMessageContent(id).then(
-      (content) => {
-        settle();
-        if (started === generation) cache.set(id, content);
-        return content;
-      },
-      (error: unknown) => {
-        settle();
-        throw error;
-      },
-    );
-    pending.set(id, request);
-  }
-  return request;
+  return contents.load(id);
 }
 
 /** An answer sent to the invitation a message carries, kept in its cached content for next time. */
 export function cacheInviteAnswer(id: number, answer: InviteAnswer) {
-  const content = cache.get(id);
-  if (content?.invite) cache.set(id, { ...content, invite: { ...content.invite, answer } });
+  contents.update(id, (content) => (content.invite ? { ...content, invite: { ...content.invite, answer } } : content));
 }
 
 /** After the account set changes, ids may now name other messages. */
 export function clearContent() {
-  generation++;
-  cache.clear();
-  pending.clear();
-  inlineCache.clear();
-  inlinePending.clear();
+  contents.clear();
+  inline.clear();
 }
 
 /** Cached embedded images, marked as just used. */
 function cachedInline(id: number): InlineImages | null {
-  const images = inlineCache.get(id);
-  if (!images) return null;
-  inlineCache.delete(id);
-  inlineCache.set(id, images);
-  return images;
-}
-
-function loadInlineImages(id: number): Promise<InlineImages> {
-  let request = inlinePending.get(id);
-  if (!request) {
-    const started = generation;
-    const settle = () => {
-      if (started === generation) inlinePending.delete(id);
-    };
-    request = getInlineImages(id).then(
-      (images) => {
-        settle();
-        if (started === generation) {
-          inlineCache.set(id, images);
-          for (const oldest of inlineCache.keys()) {
-            if (inlineCache.size <= INLINE_CACHE_MAX) break;
-            inlineCache.delete(oldest);
-          }
-        }
-        return images;
-      },
-      (error: unknown) => {
-        settle();
-        throw error;
-      },
-    );
-    inlinePending.set(id, request);
-  }
-  return request;
+  return inline.get(id) ?? null;
 }
 
 /**
@@ -110,7 +59,7 @@ export function useInlineImages(id: number, wanted: boolean): InlineImages | nul
     setImages(cached);
     if (cached) return;
     let live = true;
-    loadInlineImages(id).then(
+    inline.load(id).then(
       (loaded) => live && setImages(loaded),
       () => live && setImages(NO_IMAGES),
     );
@@ -130,13 +79,13 @@ export type ContentState =
 export function useMessageContent(id: number): [ContentState, () => void] {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ContentState>(() => {
-    const cached = cache.get(id);
+    const cached = contents.get(id);
     return cached ? { status: "ready", content: cached } : { status: "loading" };
   });
 
   useEffect(() => {
     let live = true;
-    const cached = cache.get(id);
+    const cached = contents.get(id);
     if (cached) {
       setState({ status: "ready", content: cached });
       return;
