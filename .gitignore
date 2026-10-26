@@ -6,3 +6,4 @@ node_modules/
 /build-info.json
 /release
 /tools/release/stop-installed-cli.exe
+__pycache__/

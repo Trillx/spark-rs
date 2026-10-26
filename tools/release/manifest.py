@@ -9,9 +9,12 @@ import re
 import subprocess
 import tomllib
 
-# Git pathspecs, deliberately shared by counting and the commit subjects.
+# Git pathspecs, shared by counting and commit subjects. Keep this definition
+# stable after the first publication: changing history's classification can
+# lower the number installed copies use to order updates.
 APP_PATHS = ["apps", "crates", "Cargo.toml", "Cargo.lock", ".cargo",
-             "rust-toolchain*", "tools/cross", "tools/release", ".github/workflows/release.yml"]
+             "rust-toolchain*", "tools/cross", "tools/release/build.sh", "tools/release/manifest.py",
+             ":(exclude)apps/**/*.test.ts", ":(exclude)crates/*/tests/**", ":(exclude)**/tests.rs"]
 
 
 def git(*args):

@@ -75,6 +75,7 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - run: npm ci && npm run build && npm test
         working-directory: apps/desktop
+      - run: python3 -m unittest discover -s tools/release -p test_manifest.py
       - run: tools/cross/run.sh cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: tools/cross/run.sh cargo test --locked --workspace
 
