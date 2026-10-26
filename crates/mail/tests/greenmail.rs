@@ -1404,17 +1404,23 @@ async fn imap_people_written_to_elsewhere_skip_the_gatekeeper() {
         .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
         .await
         .unwrap();
-    let first = Round {
-        fetch: true,
-        list_folders: true,
-        ..Default::default()
-    };
-    engine.run_round(account.id, &first).await.unwrap();
+    engine.run(account.id, true).await.unwrap();
 
+    // Dana replies before spark-rs knows where Sent is: she waits for now.
     deliver(&smtp, "Dana <dana@fabrikam.org>", &me, "Re: Hello", false).await;
     deliver(&smtp, "Eve <eve@fabrikam.org>", &me, "Cold pitch", false).await;
     let report = engine.run(account.id, true).await.unwrap();
     assert_eq!(report.new, 2);
+    assert!(find(&engine, "Re: Hello").screening);
+
+    // A later round with nothing new still asks Sent about the senders waiting.
+    let later = Round {
+        fetch: true,
+        list_folders: true,
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &later).await.unwrap();
+    assert_eq!(report.new, 0);
     assert!(!find(&engine, "Re: Hello").screening);
     assert!(find(&engine, "Cold pitch").screening);
 }

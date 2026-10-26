@@ -737,6 +737,7 @@ impl Store {
             ],
         )?;
         let id = self.conn.last_insert_rowid();
+        gatekeeper::welcome_colleagues(&self.conn, new.email, now_ms())?;
         Ok(self.account(id)?.expect("just inserted"))
     }
 
@@ -1232,7 +1233,8 @@ impl Store {
     }
 
     /// Records that the server now matches `p`'s local side. If the user
-    /// changed the message again meanwhile, it stays pending.
+    /// changed the message again meanwhile, it stays pending, also when the
+    /// change took it back to where the server had it before the push.
     pub fn mark_pushed(&self, p: &Pending, at: Pushed) -> Result<()> {
         // Filed mail is in its home folder now, or stayed where it was.
         let remote_folder = match p.place {
@@ -1248,6 +1250,7 @@ impl Store {
                                          ELSE 'inbox' END
                          AND (?2 != 'folder' OR home_folder_id IS NULL OR home_folder_id IS ?7)
                          AND unread = ?3 AND pinned = ?4 THEN 0
+                    WHEN changed_at = 0 THEN ?8
                     ELSE changed_at END
              WHERE id = ?1",
             params![
@@ -1257,7 +1260,8 @@ impl Store {
                 p.pinned,
                 at.mailbox,
                 at.uid,
-                remote_folder
+                remote_folder,
+                now_ms()
             ],
         )?;
         Ok(())

@@ -2551,3 +2551,95 @@ fn emptied_folders_forget_what_the_server_kept_there() {
     assert!(store.pending_for(spam).unwrap().is_none());
     assert_eq!(store.remove_messages(&[kept, spam]).unwrap(), 1);
 }
+
+#[test]
+fn a_change_made_while_its_push_is_on_the_way_is_pushed_after_it() {
+    let (mut store, account) = store_with_account();
+    let id = arrive(&mut store, account, 1, "spam@x.com").id;
+    decide(
+        &mut store,
+        sender("spam@x.com"),
+        Some(Decision::Blocked),
+        10,
+    );
+    let moving = store.pending(account, now_ms() + 1, 0).unwrap();
+    // The move to Blocked is on its way when the user accepts the sender again.
+    decide(
+        &mut store,
+        sender("spam@x.com"),
+        Some(Decision::Accepted),
+        20,
+    );
+    store
+        .mark_pushed(
+            &moving[0],
+            Pushed {
+                mailbox: Some("Blocked"),
+                uid: None,
+            },
+        )
+        .unwrap();
+    let back = store.pending(account, now_ms() + 1, 0).unwrap();
+    assert_eq!(back.len(), 1, "the way back is still to push");
+    assert_eq!(
+        (back[0].id, back[0].place, back[0].remote_place),
+        (id, Place::Inbox, Place::Blocked)
+    );
+
+    // The same for the user's own moves: Done, then back to the Inbox while it's pushed.
+    let other = arrive(&mut store, account, 2, "ana@x.com").id;
+    let state = |s| Patch {
+        state: Some(s),
+        ..Default::default()
+    };
+    store.update(other, &state(MessageState::Done), 30).unwrap();
+    let archiving = store.pending(account, 31, 0).unwrap();
+    store
+        .update(other, &state(MessageState::Inbox), 40)
+        .unwrap();
+    for p in archiving.iter().filter(|p| p.id == other) {
+        store
+            .mark_pushed(
+                p,
+                Pushed {
+                    mailbox: Some("Archive"),
+                    uid: None,
+                },
+            )
+            .unwrap();
+    }
+    let undo = store.pending(account, now_ms() + 1, 0).unwrap();
+    assert!(
+        undo.iter()
+            .any(|p| p.id == other && p.place == Place::Inbox && p.remote_place == Place::Archive),
+        "{undo:?}"
+    );
+}
+
+#[test]
+fn senders_accepted_later_leave_the_gatekeeper_everywhere() {
+    let (mut store, work) = store_with_account();
+    let waiting = arrive(&mut store, work, 1, "ana@x.com").id;
+    let boss = arrive(&mut store, work, 2, "boss@contoso.com").id;
+    assert!(store.message(boss).unwrap().unwrap().screening);
+
+    // Another account's first sync has mail from Ana, and it's at Contoso.
+    let contoso = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: "me@contoso.com",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    assert!(
+        !store.message(boss).unwrap().unwrap().screening,
+        "a colleague now"
+    );
+    store
+        .add_incoming(&incoming(contoso, 3, "ana@x.com"), false)
+        .unwrap();
+    assert!(!store.message(waiting).unwrap().unwrap().screening);
+}

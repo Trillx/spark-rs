@@ -465,9 +465,37 @@ pub(crate) fn arrival(
                 "INSERT OR IGNORE INTO gatekeeper_senders (address, status) VALUES (?1, 'accepted')",
                 [address],
             )?;
+            // Accepted for every account, so their mail waiting in another
+            // account's Gatekeeper comes out too. (Through the sender index:
+            // a first sync gets here for most of its senders.)
+            conn.execute(
+                "UPDATE messages SET screening = 0
+                 WHERE account_id IN (SELECT id FROM accounts) AND from_address = ?1 AND screening = 1",
+                [address],
+            )?;
             (MessageState::Inbox, false)
         }
     })
+}
+
+/// A new account's colleagues (at its domain, unless anyone can have an
+/// address there) waiting in the Gatekeeper get through, as in Spark.
+pub(crate) fn welcome_colleagues(conn: &Connection, email: &str, now: i64) -> Result<()> {
+    let Some(domain) = domain_of(email).filter(|d| !is_public_domain(d)) else {
+        return Ok(());
+    };
+    let waiting: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT from_address FROM messages
+             WHERE screening = 1 AND substr(from_address, instr(from_address, '@') + 1) = ?1 COLLATE NOCASE",
+        )?;
+        stmt.query_map([domain], |r| r.get(0))?
+            .collect::<Result<_>>()?
+    };
+    for address in waiting {
+        resettle(conn, &address, now)?;
+    }
+    Ok(())
 }
 
 /// Moves a sender's stored mail to match the decision about them: inbox

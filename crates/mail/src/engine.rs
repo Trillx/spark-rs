@@ -31,8 +31,12 @@ use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
 pub const SETTLE_MS: i64 = 6_000;
 /// A send that failed on the network is retried after this long.
 const SEND_RETRY_MS: i64 = 60_000;
-/// How many new senders a round asks the Sent folder about, at most.
+/// How many waiting senders a round asks the Sent folder about, at most.
 const SENT_CHECKS: usize = 20;
+/// A waiting sender the Sent folder didn't have is asked about again after
+/// this long (the user may have written to them elsewhere since), or when
+/// they write again.
+const SENT_RECHECK_MS: i64 = 60 * 60_000;
 
 /// Where passwords and refresh tokens live (the OS credential store in the
 /// apps). An empty value deletes.
@@ -172,6 +176,9 @@ pub struct Engine {
     /// move can't land between an empty's look at what's pending and its
     /// expunge.
     turns: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
+    /// Senders waiting in an account's Gatekeeper that its Sent folder
+    /// didn't have, by account and lowercased address, with when it was asked.
+    not_written_to: Mutex<HashMap<(i64, String), i64>>,
 }
 
 impl Engine {
@@ -182,6 +189,7 @@ impl Engine {
             tokens: Mutex::new(HashMap::new()),
             calendars: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            not_written_to: Mutex::new(HashMap::new()),
         }
     }
 
@@ -483,13 +491,13 @@ impl Engine {
                         Err(e) => folder_failed(folder, e, &mut report)?,
                     }
                 }
-                let waiting = self.waiting_senders(&report.arrived)?;
+                let waiting = self.waiting_senders(account_id, round, &report.arrived)?;
                 if !waiting.is_empty()
                     && let Some(sent) = self.sent_folder(account_id)?
-                    // A failed check leaves them waiting; it doesn't fail the round.
+                    // A failed check leaves them to the next round; it doesn't fail this one.
                     && let Ok(found) = imap::written_to(&mut session, &sent, &waiting).await
                 {
-                    self.accept_senders(&found)?;
+                    self.written_to(account_id, &waiting, &found)?;
                 }
                 let _ = session.logout().await;
             }
@@ -552,35 +560,77 @@ impl Engine {
                         Err(e) => folder_failed(folder, e, &mut report)?,
                     }
                 }
-                let waiting = self.waiting_senders(&report.arrived)?;
+                let waiting = self.waiting_senders(account_id, round, &report.arrived)?;
                 if !waiting.is_empty()
                     && let Ok(found) = graph.written_to(&waiting).await
                 {
-                    self.accept_senders(&found)?;
+                    self.written_to(account_id, &waiting, &found)?;
                 }
             }
         }
         Ok(report)
     }
 
-    /// The senders of new mail still waiting in the Gatekeeper, to ask the
-    /// Sent folder about: the user may have written to them elsewhere
-    /// (Spark reads Sent for the same reason).
-    fn waiting_senders(&self, arrived: &[i64]) -> Result<Vec<String>> {
+    /// Senders waiting in the account's Gatekeeper to ask its Sent folder
+    /// about, on rounds that fetch: the user may have written to them
+    /// elsewhere (Spark reads Sent for the same reason). Those asked lately
+    /// without luck wait, unless they've written again.
+    fn waiting_senders(
+        &self,
+        account_id: i64,
+        round: &Round,
+        arrived: &[i64],
+    ) -> Result<Vec<String>> {
+        if !round.fetch {
+            return Ok(Vec::new());
+        }
         let store = self.store();
-        let mut senders: Vec<String> = Vec::new();
+        let mut asked = self
+            .not_written_to
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for id in arrived {
-            if let Some(m) = store.message(*id)?
-                && m.screening
-                && !senders
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&m.from_address))
-            {
-                senders.push(m.from_address);
+            if let Some(m) = store.message(*id)? {
+                asked.remove(&(account_id, m.from_address.to_lowercase()));
             }
         }
-        senders.truncate(SENT_CHECKS);
+        let now = now_ms();
+        let mut senders: Vec<String> = Vec::new();
+        for address in store.screened_senders(account_id)? {
+            let key = (account_id, address.to_lowercase());
+            let lately = asked.get(&key).is_some_and(|at| now - at < SENT_RECHECK_MS);
+            if !lately && !senders.iter().any(|s| s.eq_ignore_ascii_case(&address)) {
+                senders.push(address);
+            }
+            if senders.len() == SENT_CHECKS {
+                break;
+            }
+        }
         Ok(senders)
+    }
+
+    /// The Sent folder had mail to `found` of the `asked`: they're accepted.
+    fn written_to(&self, account_id: i64, asked: &[String], found: &[String]) -> Result<()> {
+        let now = now_ms();
+        {
+            let mut not = self
+                .not_written_to
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for address in asked {
+                let key = (account_id, address.to_lowercase());
+                if found.iter().any(|f| f.eq_ignore_ascii_case(address)) {
+                    not.remove(&key);
+                } else {
+                    not.insert(key, now);
+                }
+            }
+        }
+        let store = self.store();
+        for address in found {
+            store.accept_sender(address, now)?;
+        }
+        Ok(())
     }
 
     /// The account's Sent folder, as an IMAP mailbox name.
@@ -591,14 +641,6 @@ impl Engine {
             .into_iter()
             .find(|f| f.account_id == account_id && f.role == Some(FolderRole::Sent))
             .map(|f| f.remote_id))
-    }
-
-    fn accept_senders(&self, senders: &[String]) -> Result<()> {
-        let store = self.store();
-        for address in senders {
-            store.accept_sender(address, now_ms())?;
-        }
-        Ok(())
     }
 
     /// Puts a search (in the search field's syntax) to the account's server
