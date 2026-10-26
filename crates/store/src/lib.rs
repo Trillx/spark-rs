@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -586,6 +587,28 @@ const PENDING_SELECT: &str = "SELECT m.id, m.remote_id, m.mailbox, m.uid, m.mess
         m.home_folder_id, f.remote_id, m.remote_folder_id
      FROM messages m LEFT JOIN folders f ON f.id = m.home_folder_id";
 
+/// The rows of `PENDING_SELECT` that `Store::pending` returns: account
+/// `?1`'s changes made at `?2` or before. `changed_at != 0` lets it use the
+/// `messages_pending` index, which also gives the order.
+const PENDING_SETTLED: &str = "WHERE m.account_id = ?1 AND m.changed_at != 0 AND m.changed_at <= ?2
+     ORDER BY m.changed_at";
+
+/// `Store::wake_snoozed` at time `?1`. Its first two conditions are the
+/// `messages_due_snooze` index's, so it only looks at snoozed mail.
+static WAKE_SNOOZED: LazyLock<String> = LazyLock::new(|| {
+    let blocked = gatekeeper::SENDER_BLOCKED;
+    format!(
+        "UPDATE messages SET
+            state = CASE WHEN {blocked} THEN 'blocked' ELSE 'inbox' END,
+            screening = CASE WHEN {blocked} THEN 0 ELSE screening END,
+            returned_at = CASE WHEN {blocked} THEN NULL ELSE snoozed_until END,
+            snoozed_until = NULL, unread = 1,
+            changed_at = CASE WHEN remote_unread = 1 AND NOT {blocked} THEN changed_at ELSE ?1 END
+         WHERE state = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1
+         RETURNING id"
+    )
+});
+
 fn pending_row(r: &Row) -> Result<Pending> {
     let place = parse_state(&r.get::<_, String>(5)?).place();
     let home: (Option<i64>, Option<String>) = (r.get(11)?, r.get(12)?);
@@ -765,6 +788,20 @@ impl Store {
                  ALTER TABLE messages ADD COLUMN files_key TEXT;",
             )?;
             tx.pragma_update(None, "user_version", 21)?;
+            tx.commit()?;
+        }
+        if version < 22 {
+            // The few messages the background timers check for every few
+            // seconds, so an idle check doesn't scan the whole mailbox:
+            // changes waiting to be pushed, and snoozed mail.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE INDEX messages_pending ON messages(account_id, changed_at)
+                    WHERE changed_at != 0;
+                 CREATE INDEX messages_due_snooze ON messages(snoozed_until)
+                    WHERE state = 'snoozed' AND snoozed_until IS NOT NULL;",
+            )?;
+            tx.pragma_update(None, "user_version", 22)?;
             tx.commit()?;
         }
         Ok(Self { conn })
@@ -1252,17 +1289,7 @@ impl Store {
     /// at the top (`returned_at`), or to Blocked if their sender was blocked
     /// meanwhile. Returns their ids.
     pub fn wake_snoozed(&self, now: i64) -> Result<Vec<i64>> {
-        let blocked = gatekeeper::SENDER_BLOCKED;
-        let mut stmt = self.conn.prepare(&format!(
-            "UPDATE messages SET
-                state = CASE WHEN {blocked} THEN 'blocked' ELSE 'inbox' END,
-                screening = CASE WHEN {blocked} THEN 0 ELSE screening END,
-                returned_at = CASE WHEN {blocked} THEN NULL ELSE snoozed_until END,
-                snoozed_until = NULL, unread = 1,
-                changed_at = CASE WHEN remote_unread = 1 AND NOT {blocked} THEN changed_at ELSE ?1 END
-             WHERE state = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1
-             RETURNING id"
-        ))?;
+        let mut stmt = self.conn.prepare(&WAKE_SNOOZED)?;
         stmt.query_map([now], |r| r.get(0))?.collect()
     }
 
@@ -1316,11 +1343,9 @@ impl Store {
     /// Local changes for an account that are at least `settle_ms` old (the
     /// undo window), oldest first.
     pub fn pending(&self, account_id: i64, now: i64, settle_ms: i64) -> Result<Vec<Pending>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{PENDING_SELECT}
-             WHERE m.account_id = ?1 AND m.changed_at != 0 AND m.changed_at <= ?2
-             ORDER BY m.changed_at"
-        ))?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{PENDING_SELECT} {PENDING_SETTLED}"))?;
         stmt.query_map(params![account_id, now - settle_ms], pending_row)?
             .collect()
     }

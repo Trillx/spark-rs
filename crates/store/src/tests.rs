@@ -891,6 +891,124 @@ fn snoozed_mail_comes_back_unread_when_its_time_comes() {
     assert_eq!(m.returned_at, Some(5_000));
 }
 
+/// How SQLite runs `sql` with `params`: its query plan, and the rows it
+/// stepped through in full scans, its sorts and its VM steps.
+fn run_counted(store: &Store, sql: &str, params: &[i64]) -> (String, i32, i32, i32) {
+    use rusqlite::StatementStatus::{FullscanStep, Sort, VmStep};
+    let params = rusqlite::params_from_iter(params);
+    let plan = store
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(params.clone(), |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap()
+        .join("; ");
+    let mut stmt = store.conn.prepare(sql).unwrap();
+    let mut rows = stmt.query(params).unwrap();
+    while rows.next().unwrap().is_some() {}
+    drop(rows);
+    (
+        plan,
+        stmt.get_status(FullscanStep),
+        stmt.get_status(Sort),
+        stmt.get_status(VmStep),
+    )
+}
+
+#[test]
+fn idle_timer_checks_only_look_at_pending_and_snoozed_mail() {
+    let (mut store, account) = store_with_account();
+    // A big mailbox with nothing to push and nothing snoozed.
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000)
+             INSERT INTO messages (account_id, remote_id, from_name, from_address, to_list,
+                 cc_list, subject, snippet, date, text_body, attachments, category, state,
+                 unread, pinned, remote_place, remote_unread, remote_pinned)
+             SELECT ?1, 'r' || i, 'Sender', 'sender@example.test', '[]', '[]', 'Message', '',
+                 i, '', '[]', 'people', 'inbox', 0, 0, 'inbox', 0, 0 FROM n",
+            [account],
+        )
+        .unwrap();
+    let pending = format!("{PENDING_SELECT} {PENDING_SETTLED}");
+    let check = |store: &Store, now: i64| {
+        let (plan, scanned, sorts, steps) = run_counted(store, &pending, &[account, now]);
+        assert!(
+            plan.contains("USING INDEX messages_pending (account_id=? AND changed_at<?)"),
+            "{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN") && !plan.contains("TEMP B-TREE"),
+            "{plan}"
+        );
+        assert_eq!((scanned, sorts), (0, 0), "{plan}");
+        assert!(steps < 1_000, "{steps} VM steps: {plan}");
+
+        let (plan, scanned, _, steps) = run_counted(store, &WAKE_SNOOZED, &[now]);
+        assert!(
+            plan.contains("INDEX messages_due_snooze (snoozed_until>? AND snoozed_until<?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN"), "{plan}");
+        assert_eq!(scanned, 0, "{plan}");
+        assert!(steps < 1_000, "{steps} VM steps: {plan}");
+    };
+    // The app never runs ANALYZE, so both with and without statistics.
+    check(&store, 100_000);
+    store.conn.execute_batch("ANALYZE").unwrap();
+    check(&store, 100_000);
+
+    // A few changes waiting to be pushed, some still in the undo window,
+    // and a due and a future snooze.
+    for (id, at) in [(10, 3_000), (20, 1_000), (30, 2_000)] {
+        let read = Patch {
+            unread: Some(true),
+            ..Default::default()
+        };
+        store.update(id, &read, at).unwrap();
+    }
+    for (id, until) in [(40, 5_000), (50, 9_000)] {
+        let snooze = Patch {
+            state: Some(MessageState::Snoozed),
+            snoozed_until: Some(until),
+            ..Default::default()
+        };
+        store.update(id, &snooze, 1_000).unwrap();
+    }
+    let ids = |pending: Vec<Pending>| pending.into_iter().map(|p| p.id).collect::<Vec<_>>();
+    check(&store, 4_000);
+    store.conn.execute_batch("ANALYZE").unwrap();
+    check(&store, 4_000);
+    assert_eq!(ids(store.pending(account, 3_500, 1_000).unwrap()), [20, 30]);
+    assert_eq!(
+        ids(store.pending(account, 4_000, 1_000).unwrap()),
+        [20, 30, 10]
+    );
+
+    assert_eq!(store.wake_snoozed(6_000).unwrap(), [40]);
+    let woken = store.message(40).unwrap().unwrap();
+    assert_eq!(woken.state, MessageState::Inbox);
+    assert!(woken.unread);
+    assert_eq!(woken.returned_at, Some(5_000));
+    assert_eq!(
+        store.message(50).unwrap().unwrap().state,
+        MessageState::Snoozed
+    );
+    // Waking marks it unread, which is pushed like any other change.
+    assert_eq!(
+        ids(store.pending(account, 6_500, 1_000).unwrap()),
+        [20, 30, 10]
+    );
+    assert_eq!(
+        ids(store.pending(account, 7_000, 1_000).unwrap()),
+        [20, 30, 10, 40]
+    );
+    check(&store, 10_000);
+}
+
 #[test]
 fn muting_covers_the_whole_conversation() {
     let (mut store, account) = store_with_account();
@@ -3307,4 +3425,41 @@ fn a_message_keeps_its_files_key_and_a_reused_id_gets_another() {
         store.files_key(next, "ddd").unwrap().as_deref(),
         Some("ddd")
     );
+}
+
+#[test]
+fn version_21_databases_index_pending_and_snoozed_mail() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v21-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v21.sqlite");
+    let _ = std::fs::remove_file(&path);
+    Store::open(&path)
+        .unwrap()
+        .conn
+        .execute_batch(
+            "DROP INDEX messages_pending;
+             DROP INDEX messages_due_snooze;
+             PRAGMA user_version = 21;",
+        )
+        .unwrap();
+    let indexes = |store: &Store| -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name IN ('messages_pending', 'messages_due_snooze') ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(
+        indexes(&Store::open(&path).unwrap()),
+        ["messages_due_snooze", "messages_pending"]
+    );
+    // Reopening a migrated database must not create them twice.
+    assert_eq!(indexes(&Store::open(&path).unwrap()).len(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
