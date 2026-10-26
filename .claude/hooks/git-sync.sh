@@ -6,6 +6,10 @@
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 
+# The repo's git hooks (.githooks) need a per-clone setting; turn them on
+# unless this clone already uses hooks of its own.
+[ -n "$(git config core.hooksPath)" ] || git config core.hooksPath .githooks
+
 branch=$(git symbolic-ref --short -q HEAD) || {
   echo "git: detached HEAD, nothing synced."
   exit 0

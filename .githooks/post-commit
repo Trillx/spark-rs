@@ -1,0 +1,21 @@
+#!/bin/sh
+# Reminds whoever just committed to keep FEATURES.md current (see "Feature
+# table" in AGENTS.md). It only prints; the commit always stands. Turned on by
+# `git config core.hooksPath .githooks`, which .claude/hooks/git-sync.sh runs.
+
+# Rebases replay commits that were checked when first made.
+for dir in rebase-merge rebase-apply; do
+  [ -d "$(git rev-parse --git-path "$dir")" ] && exit 0
+done
+git rev-parse -q --verify HEAD^2 >/dev/null && exit 0
+
+changed=$(git diff-tree --no-commit-id --name-only -r --root HEAD)
+echo "$changed" | grep -qx 'FEATURES.md' && exit 0
+# App code, as in tools/release/manifest.py, without tests.
+echo "$changed" | grep -E '^(apps|crates)/' | grep -Evq '\.test\.ts$|/tests/|/tests\.rs$' || exit 0
+
+cat >&2 <<'MSG'
+FEATURES.md: this commit changes the app but not the feature table. If it
+adds, finishes or removes a user-visible feature, update that row's mark and
+note and amend the commit before pushing (see "Feature table" in AGENTS.md).
+MSG

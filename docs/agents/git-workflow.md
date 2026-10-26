@@ -8,6 +8,7 @@ GitHub (`Trillx/spark-rs`) is a read-only mirror of `main`, there for release do
 
 - Run `git fetch origin` and `git status -sb`. Claude Code does this for you: the SessionStart hook in `.claude/settings.json` (`.claude/hooks/git-sync.sh`) fetches, fast-forwards a clean checkout that's behind, and reports anything else.
 - If the checkout is behind and clean, run `git pull --ff-only`.
+- The same hook turns on the repo's git hooks in `.githooks` (`git config core.hooksPath .githooks`, once per clone; run it yourself in a clone Claude Code hasn't opened). Their post-commit hook reminds you to update `FEATURES.md` when a commit changes the app.
 - If there are uncommitted changes or unpushed commits, or the checkout has diverged from origin, tell the user before editing anything. Never stash, reset or rebase their work without asking.
 
 ## Finishing a change
