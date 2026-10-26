@@ -10,6 +10,7 @@
 [![Windows on ARM and x64](https://img.shields.io/badge/Windows-ARM64%20%C2%B7%20x64-0078d4)](https://github.com/Trillx/spark-rs/releases/latest)
 [![Built with Rust and Tauri](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-b7410e)](https://v2.tauri.app)
 ![AI: bring your own key](https://img.shields.io/badge/AI-bring%20your%20own%20key-7c3aed)
+[![License: MIT](https://img.shields.io/badge/license-MIT-16a34a)](https://git.cafe/michael/spark-rs/blob/main/LICENSE)
 
 </div>
 
@@ -526,6 +527,13 @@ Keep a backup of both in the owner's password manager. The matching public
 key is committed in `tauri.conf.json`. Never commit the private key or its
 password. Losing them requires a new key and a manual reinstall for users;
 existing installed copies won't accept updates signed by a replacement key.
+
+## License
+
+spark-rs is open source under the
+[MIT License](https://git.cafe/michael/spark-rs/blob/main/LICENSE): you can
+use, change and share it freely, as long as the copyright notice stays
+with it.
 
 ---
 

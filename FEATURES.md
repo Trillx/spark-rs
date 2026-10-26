@@ -1,9 +1,9 @@
 # spark-rs and Spark, feature by feature
 
 spark-rs rebuilds [Spark](https://sparkmailapp.com), Readdle's email app, as
-a free Windows app with a Rust core. This page takes every feature on
-[Spark's pricing page](https://sparkmailapp.com/pricing), from all of its
-plans together, and shows how much of each spark-rs has. spark-rs has no
+a free, open-source Windows app with a Rust core. This page takes every
+feature on [Spark's pricing page](https://sparkmailapp.com/pricing), from
+all of its plans together, and shows how much of each spark-rs has. spark-rs has no
 plans: everything in it is free, and +AI runs on your own AI provider's key.
 
 | Mark | Meaning |
