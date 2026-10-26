@@ -431,6 +431,41 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
     );
     // Blocking is local: nothing to push.
     assert!(store.pending(account, 1_000, 0).unwrap().is_empty());
+
+    // Clearing out the Blocked list keeps the sender blocked.
+    let trash = Patch {
+        state: Some(MessageState::Deleted),
+        ..Default::default()
+    };
+    store.update(a, &trash, 20).unwrap();
+    let done = Patch {
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    store.update(b, &done, 21).unwrap();
+    let d = new_id(
+        store
+            .add_incoming(&incoming(account, 4, "spam@x.com"), true)
+            .unwrap(),
+    );
+    assert_eq!(
+        store.message(d).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+
+    // Moving one back to the Inbox unblocks them.
+    let inbox = Patch {
+        state: Some(MessageState::Inbox),
+        ..Default::default()
+    };
+    store.update(d, &inbox, 22).unwrap();
+    let e = new_id(
+        store
+            .add_incoming(&incoming(account, 5, "spam@x.com"), true)
+            .unwrap(),
+    );
+    let e = store.message(e).unwrap().unwrap();
+    assert_eq!((e.state, e.screening), (MessageState::Inbox, false));
 }
 
 #[test]

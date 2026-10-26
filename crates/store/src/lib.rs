@@ -1099,7 +1099,9 @@ impl Store {
                  WHERE account_id = ?1 AND from_address = ?2 AND state = 'inbox'",
                 params![sender.0, sender.1],
             )?;
-        } else if before.state == MessageState::Blocked && m.state != MessageState::Blocked {
+        } else if before.state == MessageState::Blocked && m.state == MessageState::Inbox {
+            // Back in the Inbox unblocks the sender. Trash, Done or a folder
+            // only moves the message: the sender stays blocked.
             set_sender_in(
                 &tx,
                 sender,
