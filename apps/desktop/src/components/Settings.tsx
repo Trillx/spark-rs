@@ -1936,10 +1936,10 @@ function AiPage() {
 
       <Group title="Privacy">
         <p className="px-4 py-3 text-xs leading-[18px] text-text-2">
-          When you use an AI feature on an email, its sender, date, subject and text are sent to{" "}
-          {presetLabel(preset)}
-          {form.baseUrl ? ` (${host(form.baseUrl)})` : ""} and handled under that provider's terms. Nothing is sent in
-          the background. Check your employer's policy before using AI on work mail.
+          When you use an AI feature, what it works on is sent to {presetLabel(preset)}
+          {form.baseUrl ? ` (${host(form.baseUrl)})` : ""} and handled under that provider's terms: an email's sender,
+          date, subject and text, and in the composer your request, your draft and your name for the sign-off. Nothing
+          is sent in the background. Check your employer's policy before using AI on work mail.
         </p>
       </Group>
     </>
