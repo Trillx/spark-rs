@@ -31,6 +31,10 @@ pub struct Draft {
     pub reply_to: Option<i64>,
     /// Unix ms: the end of the undo window, or the Send Later time.
     pub send_at: i64,
+    /// The user's schedule selection while editing a draft. Saving leaves
+    /// `send_at` at zero; only an explicit Send queues delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_later: Option<SendLater>,
     /// Files to attach, in order. Always written, even empty: the composer
     /// reads it as an array.
     #[serde(default)]
@@ -57,6 +61,13 @@ pub struct Draft {
     /// A forward's original, below the signature. Plain text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<String>,
+}
+
+/// A Send Later preset, fixed to the time the user chose it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendLater {
+    pub key: String,
+    pub at: i64,
 }
 
 /// What a draft sends: its text and, with a signature, HTML too, plus the

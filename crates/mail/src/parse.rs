@@ -52,6 +52,7 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         category: categorize(&from_address, signals),
         from_name,
         from_address,
+        reply_to: Some(display_list(m.reply_to())),
         to: display_list(m.to()),
         cc: display_list(m.cc()),
         bcc: display_list(m.bcc()),
@@ -168,6 +169,13 @@ pub fn message_id(headers: &[u8]) -> Option<String> {
         .parse_headers(headers)?
         .message_id()
         .map(bare_id)
+}
+
+/// Reply-To addresses from a fetched block of headers. None means the
+/// server did not provide parseable headers; an empty list means no Reply-To.
+pub fn reply_to(headers: &[u8]) -> Option<Vec<String>> {
+    let parsed = MessageParser::default().parse_headers(headers)?;
+    Some(display_list(parsed.reply_to()))
 }
 
 /// Message-IDs are stored without angle brackets.

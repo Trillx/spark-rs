@@ -216,6 +216,11 @@ it; sending it or Delete Draft removes it from the server too, and undoing
 the send keeps it. If a send is permanently rejected, its latest content and
 copied files return to Drafts. Sent and Drafts list who the mail is to.
 
+A Send Later choice stays with a saved draft on this computer, including
+after a restart or server sync. Click Schedule to queue it for delivery.
+Reply and Reply All use the message's Reply-To addresses when present and
+leave your own account out of the recipients.
+
 Signatures are in Settings → Signatures, where you write them or paste one
 in (or edit the HTML). Each address starts new mail with its default: Most
 recent (the signature last sent from it), No signature, or a particular one.

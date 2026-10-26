@@ -126,6 +126,8 @@ pub struct SyncReport {
     pub new: Vec<i64>,
     /// Messages that left the inbox elsewhere.
     pub gone: usize,
+    /// Cached messages whose Reply-To headers changed.
+    pub headers: usize,
     pub first: bool,
 }
 
@@ -467,10 +469,14 @@ pub async fn sync_folder(
     let limit = state.limit.unwrap_or(FOLDER_LIMIT);
     state.complete = mailbox.exists <= limit;
     let mut window: Vec<(u32, bool, bool)> = Vec::new();
+    let mut header_changes = 0;
     if mailbox.exists > 0 {
         let first = mailbox.exists.saturating_sub(limit) + 1;
         let fetched: Vec<Fetch> = session
-            .fetch(format!("{first}:*"), "(UID FLAGS)")
+            .fetch(
+                format!("{first}:*"),
+                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)])",
+            )
             .await?
             .try_collect()
             .await?;
@@ -478,12 +484,25 @@ pub async fn sync_folder(
             if let Some(uid) = f.uid {
                 let (unread, flagged) = read_flags(f);
                 window.push((uid, unread, flagged));
+                if let Some(headers) = f.header() {
+                    header_changes += usize::from(lock(store).observe_reply_to(&Incoming {
+                        account_id: folder.account_id,
+                        mailbox: Some(folder.remote_id.clone()),
+                        uid: Some(uid),
+                        message_id: parse::message_id(headers),
+                        reply_to: parse::reply_to(headers),
+                        ..Default::default()
+                    })?);
+                }
             }
         }
     }
 
     let known = lock(store).folder_uids(folder.id)?;
-    let mut report = FolderReport::default();
+    let mut report = FolderReport {
+        changed: header_changes,
+        ..Default::default()
+    };
     let mut members: Vec<(i64, Option<u32>)> = Vec::new();
     {
         let store = lock(store);
@@ -510,7 +529,7 @@ pub async fn sync_folder(
         let heads: Vec<Fetch> = session
             .uid_fetch(
                 uid_set(batch),
-                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)])",
             )
             .await?
             .try_collect()
@@ -533,6 +552,7 @@ pub async fn sync_folder(
                 mailbox: Some(folder.remote_id.clone()),
                 uid: Some(uid),
                 message_id,
+                reply_to: f.header().and_then(parse::reply_to),
                 unread,
                 flagged,
                 ..Default::default()
@@ -680,7 +700,10 @@ pub async fn sync_inbox(
     // Flags of everything else we track in the inbox.
     if !known.is_empty() {
         let flags: Vec<Fetch> = session
-            .uid_fetch(format!("{floor}:*"), "(UID FLAGS)")
+            .uid_fetch(
+                format!("{floor}:*"),
+                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)])",
+            )
             .await?
             .try_collect()
             .await?;
@@ -689,6 +712,16 @@ pub async fn sync_inbox(
             if let Some(uid) = fetch.uid.filter(|uid| known.contains(uid)) {
                 let (unread, flagged) = read_flags(fetch);
                 store.observe_flags(account_id, INBOX, uid, unread, flagged)?;
+                if let Some(headers) = fetch.header() {
+                    report.headers += usize::from(store.observe_reply_to(&Incoming {
+                        account_id,
+                        mailbox: Some(INBOX.into()),
+                        uid: Some(uid),
+                        message_id: parse::message_id(headers),
+                        reply_to: parse::reply_to(headers),
+                        ..Default::default()
+                    })?);
+                }
             }
         }
     }

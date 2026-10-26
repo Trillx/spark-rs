@@ -62,6 +62,33 @@ export function parseEntry(entry: string): Person {
   return { name, address: match[2].trim() };
 }
 
+interface ReplyEnvelope {
+  address: string;
+  replyTo?: string[];
+  to?: string[];
+  cc?: string[];
+}
+
+/** Recipients for Reply or Reply All; sent mail follows up with its recipients. */
+export function replyRecipients(message: ReplyEnvelope, ownAddress?: string, all = false) {
+  const own = ownAddress?.trim().toLowerCase();
+  const fromYou = own !== undefined && message.address.toLowerCase() === own;
+  const sender = message.address.toLowerCase();
+  const seen = new Set(["", "you", ...(own ? [own] : [])]);
+  const take = (list: string[], excludeSender = false) => list
+    .filter((entry) => {
+      const address = parseEntry(entry).address.toLowerCase();
+      if (seen.has(address) || (excludeSender && address === sender)) return false;
+      seen.add(address);
+      return true;
+    })
+    .map((entry) => entryFor(parseEntry(entry)));
+  const targets = message.replyTo?.length ? message.replyTo : [message.address];
+  const to = take(fromYou ? message.to ?? [] : targets);
+  if (all && !fromYou) to.push(...take(message.to ?? [], true));
+  return { to, cc: all ? take(message.cc ?? [], true) : [] };
+}
+
 export interface Mention {
   /** Where its "@" is. */
   start: number;

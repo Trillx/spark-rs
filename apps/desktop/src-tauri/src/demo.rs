@@ -151,6 +151,7 @@ fn people(messages: &[Message]) -> Store {
             message_id: Some(format!("<demo-{}@spark-rs>", m.id)),
             from_name: m.from.clone(),
             from_address: m.address.clone(),
+            reply_to: Some(m.reply_to.clone()),
             to: m.to.clone(),
             date: m.timestamp,
             ..Default::default()
@@ -282,6 +283,7 @@ impl DemoMailbox {
             screening: false,
             from: "Me".into(),
             address,
+            reply_to: Vec::new(),
             to: drafts::display_list(&draft.to),
             timestamp: now_ms(),
             subject: draft.subject.trim().to_owned(),
@@ -464,6 +466,7 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             screening: e.screening,
             from: e.from,
             address: e.address,
+            reply_to: Vec::new(),
             to: e.to,
             timestamp: now_ms - e.age_minutes * 60_000,
             subject: e.subject,

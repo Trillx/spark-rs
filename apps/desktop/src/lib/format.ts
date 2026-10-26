@@ -71,7 +71,7 @@ export function avatarColor(name: string) {
   return AVATAR_COLORS[hash % AVATAR_COLORS.length];
 }
 
-/** Snooze, send-later and reminder presets. */
+/** Snooze and Send Later presets. */
 export const LATER_PRESETS = [
   { key: "laterToday", label: "Later today" },
   { key: "tomorrow", label: "Tomorrow" },

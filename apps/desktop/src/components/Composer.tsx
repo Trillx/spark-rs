@@ -1,5 +1,4 @@
 import {
-  BellRing,
   CalendarClock,
   ChevronsUpDown,
   CircleCheck,
@@ -24,7 +23,8 @@ import {
   type RefObject,
 } from "react";
 import { describeFiles, getPrefs, onFileDrag, pickFiles, resolveSignature } from "../api";
-import type { AccountId, Contact, LocalFile, OutgoingAttachment, OutgoingDraft, Signature } from "../types";
+import type { Contact, LocalFile, Signature } from "../types";
+import type { Draft } from "../lib/composeDraft";
 import { useAccounts } from "../lib/accounts";
 import {
   completeMention,
@@ -36,7 +36,7 @@ import {
   type Mention,
 } from "../lib/addresses";
 import { caretPoint } from "../lib/caret";
-import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail, type Later } from "../lib/format";
+import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import AiMenu, { type AiRequest } from "./AiMenu";
@@ -46,6 +46,8 @@ import Recipients, { SuggestionList, displayName, useSuggestions, type Recipient
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import SignaturePicker from "./SignaturePicker";
+
+export { emptyDraft, draftHasContent, draftKey, outgoingDraft, savedDraft, type Draft } from "../lib/composeDraft";
 
 /** What mail servers take; the Rust side refuses more. */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -57,42 +59,6 @@ interface MentionEdit {
   before: string;
   after: string;
   added: Contact | null;
-}
-
-export interface Draft {
-  title: string;
-  to: string;
-  cc: string;
-  bcc: string;
-  showCc: boolean;
-  showBcc: boolean;
-  subject: string;
-  body: string;
-  from: AccountId;
-  sendLater: Later | null;
-  remind: Later | null;
-  doneAfter: boolean;
-  /** The message being replied to or forwarded; "Mark as Done after sending" applies to it. */
-  replyTo?: number;
-  /** `replyTo` is forwarded, not answered, so the message isn't sent as a reply. */
-  forward?: boolean;
-  /** Files from disk, and a forwarded message's own attachments. */
-  attachments: OutgoingAttachment[];
-  /** The saved draft this edits (opened from Drafts, or saved before). */
-  draftId?: number;
-  /** A reply's threading when its original isn't stored here. */
-  inReplyTo?: string;
-  references?: string;
-  /** The signature below the body, as HTML (it can be edited for this message); null for none. */
-  signature: string | null;
-  /** The saved signature it started as. */
-  signatureId: number | null;
-  /** Hidden for this message: it's sent without it, and Add Signature brings it back. */
-  signatureHidden: boolean;
-  /** The account the signature was chosen for. Another From chooses again. */
-  signatureFor?: AccountId;
-  /** A forward's original, below the signature. */
-  quote?: string;
 }
 
 /**
@@ -116,89 +82,6 @@ export interface ComposerAi {
   undo: () => void;
   dismiss: () => void;
   setUp: () => void;
-}
-
-export function emptyDraft(from: AccountId): Draft {
-  return {
-    title: "New message",
-    to: "",
-    cc: "",
-    bcc: "",
-    showCc: false,
-    showBcc: false,
-    subject: "",
-    body: "",
-    from,
-    sendLater: null,
-    remind: null,
-    doneAfter: false,
-    attachments: [],
-    signature: null,
-    signatureId: null,
-    signatureHidden: false,
-  };
-}
-
-/** A signature alone isn't content: a new message with just one is empty. */
-export function draftHasContent(d: Draft) {
-  return [d.to, d.cc, d.bcc, d.subject, d.body, d.quote ?? ""].some((s) => s.trim()) || d.attachments.length > 0;
-}
-
-/** The signature the draft goes out with, if any. */
-function sentSignature(d: Draft) {
-  return d.signatureHidden ? null : d.signature;
-}
-
-/** What a saved draft keeps, to tell whether there's anything new to save. */
-export function draftKey(d: Draft) {
-  return JSON.stringify([d.from, d.to, d.cc, d.bcc, d.subject, d.body, d.attachments, sentSignature(d), d.quote]);
-}
-
-/** The draft as the backend takes it, to save or to send at `sendAt`. */
-export function outgoingDraft(d: Draft, sendAt: number, draftId = d.draftId): OutgoingDraft {
-  return {
-    account: d.from,
-    to: d.to,
-    cc: d.cc,
-    bcc: d.bcc,
-    subject: d.subject,
-    body: d.body,
-    // A forward isn't a reply; it only carries replyTo for "Mark as Done after sending".
-    replyTo: d.forward ? undefined : d.replyTo,
-    sendAt,
-    attachments: d.attachments,
-    draftId,
-    inReplyTo: d.inReplyTo,
-    references: d.references,
-    signature: sentSignature(d) ?? undefined,
-    signatureId: sentSignature(d) !== null ? (d.signatureId ?? undefined) : undefined,
-    quote: d.quote,
-  };
-}
-
-/** A draft from Drafts, back in the composer. */
-export function savedDraft(saved: OutgoingDraft): Draft {
-  return {
-    ...emptyDraft(saved.account),
-    title: "Draft",
-    to: saved.to,
-    cc: saved.cc,
-    bcc: saved.bcc,
-    showCc: saved.cc.trim() !== "",
-    showBcc: saved.bcc.trim() !== "",
-    subject: saved.subject,
-    body: saved.body,
-    replyTo: saved.replyTo,
-    attachments: saved.attachments,
-    draftId: saved.draftId,
-    inReplyTo: saved.inReplyTo,
-    references: saved.references,
-    // It keeps the signature it was saved with, or none.
-    signature: saved.signature ?? null,
-    signatureId: saved.signatureId ?? null,
-    signatureFor: saved.account,
-    quote: saved.quote,
-  };
 }
 
 /**
@@ -648,18 +531,11 @@ export default function Composer({
         </div>
       )}
 
-      {(draft.sendLater || draft.remind) && (
+      {draft.sendLater && (
         <div className="flex shrink-0 flex-wrap gap-1.5 px-3 pb-2">
-          {draft.sendLater && (
-            <Chip onClear={() => onChange({ sendLater: null })}>
-              <CalendarClock size={13} /> Send {formatLater(draft.sendLater.at)}
-            </Chip>
-          )}
-          {draft.remind && (
-            <Chip onClear={() => onChange({ remind: null })}>
-              <BellRing size={13} /> Remind me {formatLater(draft.remind.at)}
-            </Chip>
-          )}
+          <Chip onClear={() => onChange({ sendLater: null })}>
+            <CalendarClock size={13} /> Send {formatLater(draft.sendLater.at)}
+          </Chip>
         </div>
       )}
 
@@ -698,31 +574,6 @@ export default function Composer({
             />
           ))}
           {draft.sendLater && <MenuItem label="Don't schedule" onSelect={() => onChange({ sendLater: null })} />}
-        </Dropdown>
-        <Dropdown
-          direction="up"
-          width="w-64"
-          trigger={({ toggle, open }) => (
-            <IconButton
-              title={{ label: "Remind me", card: open ? undefined : "remind" }}
-              active={open || draft.remind !== null}
-              onClick={toggle}
-            >
-              <BellRing size={17} />
-            </IconButton>
-          )}
-        >
-          <li className="menu-title px-2 py-1 text-[11px]">Remind me if no reply</li>
-          {LATER_PRESETS.map((p) => (
-            <MenuItem
-              key={p.key}
-              label={p.label}
-              detail={presetDetail(p)}
-              checked={draft.remind?.key === p.key}
-              onSelect={() => onChange({ remind: pickLater(p) })}
-            />
-          ))}
-          {draft.remind && <MenuItem label="No reminder" onSelect={() => onChange({ remind: null })} />}
         </Dropdown>
         <IconButton
           title={{ label: "Mark as Done after sending", card: "doneAfter" }}

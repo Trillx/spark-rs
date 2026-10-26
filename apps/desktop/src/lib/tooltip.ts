@@ -1,6 +1,5 @@
 import {
   ArrowDownLeft,
-  BellRing,
   CalendarClock,
   Check,
   CircleCheck,
@@ -84,13 +83,6 @@ export const CARDS = {
     body: "Pick when it goes out. Until then you can still cancel it.",
     Icon: CalendarClock,
     tint: "text-primary",
-  },
-  remind: {
-    question: "Waiting on an answer?",
-    action: "Get a reminder",
-    body: "Spark reminds you if nobody has replied by the time you pick.",
-    Icon: BellRing,
-    tint: "text-priority",
   },
   doneAfter: {
     question: "Reply and move on?",

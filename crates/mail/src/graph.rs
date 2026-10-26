@@ -63,7 +63,7 @@ const WELL_KNOWN: [(&str, Option<FolderRole>); 8] = [
 ];
 const FOLDER_SELECT: &str = "id,displayName,childFolderCount";
 
-const SELECT: &str = "subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,\
+const SELECT: &str = "subject,from,replyTo,toRecipients,ccRecipients,bccRecipients,receivedDateTime,\
      isRead,flag,bodyPreview,body,hasAttachments,internetMessageId,conversationId,\
      inferenceClassification";
 
@@ -86,6 +86,10 @@ pub(crate) fn http() -> reqwest::Client {
 #[serde(rename_all = "camelCase")]
 pub struct SyncState {
     pub delta_link: Option<String>,
+    /// The delta query selects Reply-To. Older cursors need one full header
+    /// refresh because Graph keeps the original query's selected fields.
+    #[serde(default)]
+    pub reply_to_selected: bool,
     /// Where the delta query's window starts (Unix ms); older mail comes
     /// through `older_inbox`.
     #[serde(default)]
@@ -121,14 +125,17 @@ struct Listed {
     /// Only searches ask for it.
     #[serde(default)]
     parent_folder_id: Option<String>,
+    reply_to: Option<Vec<GraphRecipient>>,
 }
-const LISTED: &str = "id,receivedDateTime,isRead,flag";
+const LISTED: &str = "id,receivedDateTime,isRead,flag,replyTo";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
     /// Ids of the messages stored for the first time.
     pub new: Vec<i64>,
     pub gone: usize,
+    /// Cached messages whose Reply-To headers changed.
+    pub headers: usize,
     pub first: bool,
 }
 
@@ -161,6 +168,7 @@ pub struct GraphMessage {
     pub odata_type: Option<String>,
     pub subject: Option<String>,
     pub from: Option<GraphRecipient>,
+    pub reply_to: Option<Vec<GraphRecipient>>,
     #[serde(default)]
     pub to_recipients: Vec<GraphRecipient>,
     #[serde(default)]
@@ -312,6 +320,10 @@ impl Graph {
         account_id: i64,
         state: &mut SyncState,
     ) -> Result<SyncReport> {
+        let replacing_legacy_cursor = !state.reply_to_selected && state.delta_link.is_some();
+        if !state.reply_to_selected {
+            state.delta_link = None;
+        }
         let first = state.delta_link.is_none();
         let mut report = SyncReport {
             first,
@@ -320,11 +332,30 @@ impl Graph {
         let mut url = match &state.delta_link {
             Some(link) => link.clone(),
             None => {
-                let since = first_sync_since(spark_store::now_ms());
+                let since = state
+                    .since
+                    .unwrap_or_else(|| first_sync_since(spark_store::now_ms()));
                 state.since = Some(since);
-                first_delta_url(since)
+                first_delta_url(since).replacen(GRAPH, &self.base, 1)
             }
         };
+        // A fresh snapshot omits messages removed before it began. Reconcile
+        // those cached rows when replacing an old cursor, within its window.
+        let mut missing = HashSet::new();
+        if replacing_legacy_cursor {
+            let store = lock(store);
+            let since = state.since.expect("a fresh query sets its window");
+            for message in store.messages()? {
+                if message.account_id == account_id
+                    && message.date >= since
+                    && let Some(location) = store.location(message.id)?
+                    && location.remote_place == Place::Inbox
+                    && let Some(remote_id) = location.remote_id
+                {
+                    missing.insert(remote_id);
+                }
+            }
+        }
         loop {
             let request = self
                 .request(Method::GET, &url)
@@ -339,15 +370,17 @@ impl Graph {
                 other => other?,
             };
             for m in page.value {
+                missing.remove(&m.id);
                 if m.removed.is_some() {
                     report.gone += lock(store).observe_gone_remote(account_id, &m.id)?;
                     continue;
                 }
-                // Updates without flags tell us nothing we use.
+                let mut incoming = to_incoming(account_id, &m);
+                report.headers += usize::from(lock(store).observe_reply_to(&incoming)?);
+                // A header-only delta must not overwrite the stored flags.
                 if m.is_read.is_none() {
                     continue;
                 }
-                let mut incoming = to_incoming(account_id, &m);
                 if !lock(store).has_remote_id(account_id, &m.id)? {
                     self.complete(&m, &mut incoming).await;
                 }
@@ -358,7 +391,11 @@ impl Graph {
             match (page.next_link, page.delta_link) {
                 (Some(next), _) => url = next,
                 (None, Some(delta)) => {
+                    for remote_id in &missing {
+                        report.gone += lock(store).observe_gone_remote(account_id, remote_id)?;
+                    }
                     state.delta_link = Some(delta);
+                    state.reply_to_selected = true;
                     return Ok(report);
                 }
                 (None, None) => {
@@ -498,6 +535,10 @@ impl Graph {
                 Incoming {
                     account_id,
                     remote_id: Some(listed.id.clone()),
+                    reply_to: listed
+                        .reply_to
+                        .as_ref()
+                        .map(|recipients| recipients.iter().filter_map(display).collect()),
                     unread,
                     flagged,
                     ..Default::default()
@@ -509,6 +550,7 @@ impl Graph {
             } else {
                 continue;
             };
+            changed += usize::from(lock(store).observe_reply_to(&incoming)?);
             let id = match lock(store).add_folder_message(folder.id, &incoming)? {
                 Added::New(id) | Added::Known(id) => id,
             };
@@ -1410,6 +1452,10 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         thread_id: m.conversation_id.clone(),
         from_name,
         from_address,
+        reply_to: m
+            .reply_to
+            .as_ref()
+            .map(|recipients| recipients.iter().filter_map(display).collect()),
         to: m.to_recipients.iter().filter_map(display).collect(),
         cc: m.cc_recipients.iter().filter_map(display).collect(),
         bcc: m.bcc_recipients.iter().filter_map(display).collect(),

@@ -345,6 +345,7 @@ mod tests {
             screening: false,
             from_name: from.into(),
             from_address: format!("{}@x.com", from.to_lowercase()),
+            reply_to: Vec::new(),
             subject: subject.into(),
             snippet: format!("About {subject}"),
             date: 0,

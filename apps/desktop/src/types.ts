@@ -1,3 +1,5 @@
+import type { Later } from "./lib/format";
+
 // Mirrors the serde types on the Rust side (camelCase JSON).
 
 export type AccountId = number;
@@ -72,6 +74,8 @@ export interface Message {
   snoozedUntil?: number;
   from: string;
   address: string;
+  /** Reply-To header recipients; absent or empty falls back to From. */
+  replyTo?: string[];
   /** Who it's to, e.g. "Ana Ruiz <ana@x.com>"; Sent and Drafts show them instead of the sender. */
   to?: string[];
   /** When the message arrived, in Unix milliseconds. */
@@ -170,6 +174,7 @@ export interface MessageContent {
   /** Display strings, e.g. "Ana Ruiz <ana@x.com>". */
   to: string[];
   cc: string[];
+  replyTo?: string[];
   attachments: Attachment[];
   /** The calendar invite it carries; the thread shows it in place of the body. */
   invite?: InviteCard;
@@ -318,6 +323,8 @@ export interface OutgoingDraft {
   replyTo?: number;
   /** Unix ms: the end of the undo window for a normal send, or the Send Later time. */
   sendAt: number;
+  /** The chosen schedule while editing; saving keeps sendAt at zero. */
+  sendLater?: Later;
   attachments: OutgoingAttachment[];
   /** The saved draft this was opened from or saved as; sending deletes it. */
   draftId?: number;

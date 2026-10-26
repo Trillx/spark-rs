@@ -114,9 +114,14 @@ fn save_with(
     } else {
         &account.name
     };
+    let send_later = draft
+        .send_later
+        .as_ref()
+        .map(|later| serde_json::to_string(later).expect("Send Later metadata serializes"));
     let save = DraftSave {
         account_id: account.id,
         draft: &json,
+        send_later: send_later.as_deref(),
         from_name,
         from_address: &account.email,
         to: &display_list(&draft.to),
@@ -188,6 +193,13 @@ pub fn open(store: &Store, id: i64) -> Result<Option<Draft>> {
         body: parts.body,
         reply_to,
         send_at: 0,
+        send_later: store
+            .draft_send_later(id)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|e| {
+                Error::Config(format!("Couldn't read the draft's Send Later time: {e}"))
+            })?,
         attachments: content
             .attachments
             .iter()
@@ -764,6 +776,111 @@ fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_later_survives_restart_and_draft_upload_without_queueing_delivery() {
+        let path = std::env::temp_dir().join(format!(
+            "spark-scheduled-draft-{}.sqlite",
+            new_message_id("test")
+        ));
+        let mut store = Store::open(&path).unwrap();
+        let account = store
+            .add_account(&spark_store::NewAccount {
+                kind: spark_store::AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Test",
+                config: "{}",
+            })
+            .unwrap();
+        store
+            .replace_folders(
+                account.id,
+                &[spark_store::RemoteFolder {
+                    remote_id: "Drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let schedule = serde_json::json!({"key": "tomorrow", "at": 2_000_000_000_000_i64});
+        let mut json = serde_json::to_value(draft()).unwrap();
+        json["sendLater"] = schedule.clone();
+        json["sendAt"] = serde_json::json!(2_000_000_000_000_i64);
+        let d: Draft = serde_json::from_value(json).unwrap();
+        let id = save(&mut store, &account, &d, &[], 1).unwrap();
+        drop(store);
+
+        let mut store = Store::open(&path).unwrap();
+        let opened = open(&store, id).unwrap().unwrap();
+        assert_eq!(opened.send_at, 0, "saving must never queue delivery");
+        assert_eq!(
+            serde_json::to_value(&opened).unwrap()["sendLater"],
+            schedule
+        );
+        assert!(
+            store
+                .claim_due_sends(account.id, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        let upload = store.draft_uploads(account.id, i64::MAX).unwrap().remove(0);
+        store
+            .draft_uploaded(
+                &upload,
+                &DraftCopy {
+                    mailbox: Some("Drafts".into()),
+                    uid: Some(10),
+                    message_id: Some("scheduled@example.com".into()),
+                    remote_id: None,
+                },
+                &[],
+            )
+            .unwrap();
+        assert!(
+            store.draft(id).unwrap().is_none(),
+            "upload removes the pending JSON"
+        );
+        drop(store);
+
+        let mut store = Store::open(&path).unwrap();
+        let opened = open(&store, id).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&opened).unwrap()["sendLater"],
+            schedule
+        );
+        let mut cleared = serde_json::to_value(opened).unwrap();
+        cleared["sendLater"] = serde_json::Value::Null;
+        let cleared: Draft = serde_json::from_value(cleared).unwrap();
+        save(&mut store, &account, &cleared, &[], 2).unwrap();
+        let upload = store.draft_uploads(account.id, i64::MAX).unwrap().remove(0);
+        store
+            .draft_uploaded(
+                &upload,
+                &DraftCopy {
+                    mailbox: Some("Drafts".into()),
+                    uid: Some(11),
+                    message_id: Some("resaved@example.com".into()),
+                    remote_id: None,
+                },
+                &[],
+            )
+            .unwrap();
+        assert!(
+            serde_json::to_value(open(&store, id).unwrap().unwrap()).unwrap()["sendLater"]
+                .is_null()
+        );
+        assert!(
+            store
+                .claim_due_sends(account.id, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn draft() -> Draft {
         Draft {

@@ -448,6 +448,7 @@ fn send_email(cx: &mut Context, args: &Value) -> ToolResult {
         body,
         reply_to: original.map(|m| m.id),
         send_at,
+        send_later: None,
         attachments: Vec::new(),
         draft_id: None,
         in_reply_to: None,

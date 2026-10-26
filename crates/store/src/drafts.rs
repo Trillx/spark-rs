@@ -48,6 +48,8 @@ pub struct DraftSave<'a> {
     pub account_id: i64,
     /// The composer's draft, JSON owned by the caller.
     pub draft: &'a str,
+    /// Local Send Later selection, kept after the upload queue is cleared.
+    pub send_later: Option<&'a str>,
     pub from_name: &'a str,
     pub from_address: &'a str,
     /// Display strings, e.g. `Ana Ruiz <ana@example.com>`.
@@ -153,6 +155,17 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT draft FROM draft_uploads WHERE message_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// A draft's local Send Later selection, even after server upload.
+    pub fn draft_send_later(&self, id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT send_later FROM draft_options WHERE message_id = ?1",
                 [id],
                 |r| r.get(0),
             )
@@ -440,6 +453,15 @@ fn save_in(conn: &Connection, existing: Option<i64>, save: &DraftSave, now: i64)
          ORDER BY position LIMIT 1",
         params![save.account_id, id],
     )?;
+    if let Some(send_later) = save.send_later {
+        conn.execute(
+            "INSERT INTO draft_options (message_id, send_later) VALUES (?1, ?2)
+             ON CONFLICT (message_id) DO UPDATE SET send_later = excluded.send_later",
+            params![id, send_later],
+        )?;
+    } else {
+        conn.execute("DELETE FROM draft_options WHERE message_id = ?1", [id])?;
+    }
     // Saves within one millisecond still order.
     conn.execute(
         "INSERT INTO draft_uploads (message_id, draft, saved_at) VALUES (?1, ?2, ?3)

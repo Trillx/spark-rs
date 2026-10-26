@@ -48,6 +48,7 @@ fn save(store: &mut Store, account_id: i64, existing: Option<i64>, body: &str, n
             &DraftSave {
                 account_id,
                 draft: &format!("{{\"body\":\"{body}\"}}"),
+                send_later: None,
                 from_name: "Me",
                 from_address: "me@example.com",
                 to: &to,
@@ -110,6 +111,7 @@ fn failed_send_recovery_rolls_back_without_losing_outbox_or_old_draft() {
         &DraftSave {
             account_id,
             draft: "latest payload",
+            send_later: Some(r#"{"key":"tomorrow","at":2000000000000}"#),
             from_name: "Me",
             from_address: "me@example.com",
             to: &[],
@@ -132,6 +134,10 @@ fn failed_send_recovery_rolls_back_without_losing_outbox_or_old_draft() {
         Some(r#"{"body":"Old autosave"}"#)
     );
     assert_eq!(store.draft_files(old).unwrap()[0].data, b"Old autosave");
+    assert!(
+        store.draft_send_later(old).unwrap().is_none(),
+        "schedule metadata also rolls back"
+    );
     assert_eq!(store.outbox_files(outbox).unwrap(), files);
     store.requeue_interrupted_sends().unwrap();
     assert_eq!(

@@ -70,6 +70,7 @@ pub mod tests {
             snoozed_until: None,
             from: "Dana Whitfield".into(),
             address: "dana@example.com".into(),
+            reply_to: Vec::new(),
             to: Vec::new(),
             timestamp: 1_790_000_000_000,
             subject: "Q4 budget review".into(),

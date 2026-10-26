@@ -1991,3 +1991,91 @@ fn version_5_databases_gain_conversations() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn reply_to_refreshes_full_headers_but_survives_flags_only_updates() {
+    let (mut store, account) = store_with_account();
+    let mut fetched = incoming(account, 1, "no-reply@example.test");
+    fetched.reply_to = Some(vec!["Help <help@example.test>".into()]);
+    let id = new_id(store.add_incoming(&fetched, false).unwrap());
+    assert_eq!(
+        store.message(id).unwrap().unwrap().reply_to,
+        ["Help <help@example.test>"]
+    );
+
+    fetched.reply_to = None;
+    fetched.unread = false;
+    assert_eq!(
+        store.add_incoming(&fetched, false).unwrap(),
+        Added::Known(id)
+    );
+    assert_eq!(
+        store.message(id).unwrap().unwrap().reply_to,
+        ["Help <help@example.test>"]
+    );
+    assert!(!store.message(id).unwrap().unwrap().unread);
+
+    fetched.reply_to = Some(vec!["New Help <new-help@example.test>".into()]);
+    assert!(store.observe_reply_to(&fetched).unwrap());
+    assert!(!store.observe_reply_to(&fetched).unwrap());
+    assert_eq!(
+        store.content(id).unwrap().unwrap().reply_to,
+        ["New Help <new-help@example.test>"]
+    );
+    fetched.reply_to = Some(Vec::new());
+    store.add_incoming(&fetched, false).unwrap();
+    assert!(store.message(id).unwrap().unwrap().reply_to.is_empty());
+    assert_eq!(
+        store.message(id).unwrap().unwrap().from_address,
+        "no-reply@example.test"
+    );
+}
+
+#[test]
+fn version_11_databases_gain_reply_to_and_draft_options_without_losing_mail() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v11-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v11.sqlite");
+    let _ = std::fs::remove_file(&path);
+    {
+        let conn = Connection::open(&path).unwrap();
+        for schema in [
+            SCHEMA,
+            SCHEMA_2,
+            SCHEMA_3,
+            SCHEMA_4,
+            drafts::SCHEMA_DRAFTS,
+            conversations::SCHEMA_CONVERSATIONS,
+            SCHEMA_7,
+            calendar::SCHEMA_CALENDAR,
+            search::SCHEMA_SEARCH,
+            signatures::SCHEMA_SIGNATURES,
+            contacts::SCHEMA_CONTACTS,
+        ] {
+            conn.execute_batch(schema).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, kind, email, name, label, color, config, position)
+             VALUES (1, 'imap', 'me@example.test', 'Me', 'Test', '#000', '{}', 0);
+             INSERT INTO messages (id, account_id, from_name, from_address, to_list, cc_list,
+                 subject, snippet, date, text_body, attachments, category, state, unread, pinned,
+                 remote_place, remote_unread, remote_pinned)
+             VALUES (1, 1, 'Sender', 'sender@example.test', '[]', '[]', 'Saved mail', '', 0,
+                 'Still here', '[]', 'people', 'inbox', 0, 0, 'inbox', 0, 0);",
+        )
+        .unwrap();
+    }
+    {
+        let store = Store::open(&path).unwrap();
+        let message = store.message(1).unwrap().unwrap();
+        assert_eq!(message.subject, "Saved mail");
+        assert!(message.reply_to.is_empty());
+        assert_eq!(store.content(1).unwrap().unwrap().text, "Still here");
+        assert!(store.content(1).unwrap().unwrap().reply_to.is_empty());
+        assert!(store.draft_send_later(1).unwrap().is_none());
+    }
+    // Reopening a migrated database must not run the DDL twice.
+    assert!(Store::open(&path).unwrap().message(1).unwrap().is_some());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -149,6 +149,8 @@ pub struct Incoming {
     pub references: Option<String>,
     pub from_name: String,
     pub from_address: String,
+    /// Reply-To recipients; None when a partial sync did not fetch headers.
+    pub reply_to: Option<Vec<String>>,
     /// Display strings, e.g. `Ana Ruiz <ana@example.com>`.
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -226,6 +228,8 @@ pub struct Message {
     pub screening: bool,
     pub from_name: String,
     pub from_address: String,
+    /// Reply-To display entries; an empty list means replies use From.
+    pub reply_to: Vec<String>,
     pub subject: String,
     pub snippet: String,
     pub date: i64,
@@ -243,6 +247,7 @@ pub struct Message {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Content {
+    pub reply_to: Vec<String>,
     pub text: String,
     pub html: Option<String>,
     pub to: Vec<String>,
@@ -542,7 +547,7 @@ const ARRIVING: &str = "changed_at != 0 AND state = 'filed' AND home_folder_id =
 const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, unread, pinned, \
      priority, screening, from_name, from_address, subject, snippet, date, attachments, \
      (SELECT group_concat(folder_id) FROM folder_members WHERE message_id = messages.id), \
-     CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id)";
+     CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id), reply_to_list";
 
 const FOLDER_COLUMNS: &str = "f.id, f.account_id, f.remote_id, p.id, f.name, f.role, f.selectable, \
      f.sync_state, f.synced_at";
@@ -608,6 +613,18 @@ impl Store {
         if version < 11 {
             conn.execute_batch(contacts::SCHEMA_CONTACTS)?;
             conn.pragma_update(None, "user_version", 11)?;
+        }
+        if version < 12 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN reply_to_list TEXT NOT NULL DEFAULT '[]';
+                 CREATE TABLE draft_options (
+                    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                    send_later TEXT NOT NULL
+                 );",
+            )?;
+            tx.pragma_update(None, "user_version", 12)?;
+            tx.commit()?;
         }
         Ok(Self { conn })
     }
@@ -720,6 +737,7 @@ impl Store {
     pub fn add_incoming(&mut self, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
         let tx = self.conn.transaction()?;
         if let Some(id) = find_stored(&tx, m)? {
+            refresh_reply_to(&tx, id, m)?;
             let (dirty, folder_only): (bool, bool) = tx.query_row(
                 "SELECT changed_at != 0, folder_only FROM messages WHERE id = ?1",
                 [id],
@@ -823,6 +841,15 @@ impl Store {
         Ok(())
     }
 
+    /// Header metadata for a message already stored. Flags-only updates
+    /// (`reply_to: None`) leave the addresses alone. Returns whether it changed.
+    pub fn observe_reply_to(&self, m: &Incoming) -> Result<bool> {
+        match find_stored(&self.conn, m)? {
+            Some(id) => refresh_reply_to(&self.conn, id, m),
+            None => Ok(false),
+        }
+    }
+
     /// Messages that left the server's inbox (another client archived or
     /// deleted them). Where nothing local is pending, they become Done.
     pub fn observe_gone_uids(
@@ -885,11 +912,12 @@ impl Store {
     pub fn content(&self, id: i64) -> Result<Option<Content>> {
         self.conn
             .query_row(
-                "SELECT text_body, html_body, to_list, cc_list, attachments, bcc_list, invite, rsvp
+                "SELECT text_body, html_body, to_list, cc_list, attachments, bcc_list, invite, rsvp, reply_to_list
                  FROM messages WHERE id = ?1",
                 [id],
                 |r| {
                     Ok(Content {
+                        reply_to: from_json(&r.get::<_, String>(8)?),
                         text: r.get(0)?,
                         html: r.get(1)?,
                         to: from_json(&r.get::<_, String>(2)?),
@@ -1318,6 +1346,7 @@ impl Store {
         let (state, place) = FolderRole::placement(role.as_deref().and_then(FolderRole::parse));
         let home = (place == Place::Folder).then_some(folder_id);
         let added = if let Some(id) = find_stored(&tx, m)? {
+            refresh_reply_to(&tx, id, m)?;
             let (dirty, remote_place, mailbox): (bool, String, Option<String>) = tx.query_row(
                 "SELECT changed_at != 0, remote_place, mailbox FROM messages WHERE id = ?1",
                 [id],
@@ -1702,6 +1731,17 @@ fn arrival(
     })
 }
 
+/// Full header fetches refresh reply addresses; flags-only fetches leave them alone.
+fn refresh_reply_to(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
+    let Some(recipients) = &m.reply_to else {
+        return Ok(false);
+    };
+    Ok(conn.execute(
+        "UPDATE messages SET reply_to_list = ?2 WHERE id = ?1 AND reply_to_list != ?2",
+        params![id, json(recipients)],
+    )? > 0)
+}
+
 fn insert_message(
     conn: &Connection,
     m: &Incoming,
@@ -1714,9 +1754,9 @@ fn insert_message(
             account_id, remote_id, mailbox, uid, message_id, thread_id, in_reply_to, refs,
             from_name, from_address, to_list, cc_list, subject, snippet, date,
             text_body, html_body, attachments, category, state, unread, pinned, screening,
-            remote_place, remote_unread, remote_pinned, bcc_list, invite)
+            remote_place, remote_unread, remote_pinned, bcc_list, invite, reply_to_list)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26)",
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27)",
         params![
             m.account_id,
             m.remote_id,
@@ -1744,6 +1784,7 @@ fn insert_message(
             place_str(place),
             json(&m.bcc),
             m.invite,
+            json(m.reply_to.as_deref().unwrap_or_default()),
         ],
     )?;
     let id = conn.last_insert_rowid();
@@ -1877,6 +1918,7 @@ fn message_row(r: &Row) -> Result<Message> {
         screening: r.get(8)?,
         from_name: r.get(9)?,
         from_address: r.get(10)?,
+        reply_to: from_json(&r.get::<_, String>(19)?),
         subject: r.get(11)?,
         snippet: r.get(12)?,
         date: r.get(13)?,

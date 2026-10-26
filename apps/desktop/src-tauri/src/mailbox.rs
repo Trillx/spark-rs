@@ -42,6 +42,9 @@ pub struct Message {
     pub screening: bool,
     pub from: String,
     pub address: String,
+    /// Reply-To display entries, when replies should use another address.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reply_to: Vec<String>,
     /// Who it's to: "Name <address>" or the bare address. Sent and Drafts
     /// list them instead of the sender.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -133,6 +136,8 @@ pub struct MessageContent {
     html: Option<String>,
     to: Vec<String>,
     cc: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reply_to: Vec<String>,
     attachments: Vec<AttachmentView>,
     /// The calendar invite it carries, shown as a card in place of the body.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,6 +244,7 @@ fn from_store(m: spark_store::Message) -> Message {
         screening: m.screening,
         from: m.from_name,
         address: m.from_address,
+        reply_to: m.reply_to,
         to: m.to,
         timestamp: m.date,
         subject: m.subject,
@@ -504,6 +510,7 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
                 m.to
             },
             cc: Vec::new(),
+            reply_to: m.reply_to,
             attachments: m
                 .attachment
                 .into_iter()
@@ -546,6 +553,7 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
         html: content.html,
         to: content.to,
         cc: content.cc,
+        reply_to: content.reply_to,
         attachments: content
             .attachments
             .into_iter()
@@ -1201,6 +1209,7 @@ mod tests {
             screening: false,
             from_name: "Ana".into(),
             from_address: "ana@x.com".into(),
+            reply_to: vec!["Help <help@x.com>".into()],
             subject: "Hi".into(),
             snippet: "…".into(),
             date: 9,
@@ -1214,6 +1223,7 @@ mod tests {
         assert_eq!(json["account"], 7);
         assert_eq!(json["from"], "Ana");
         assert_eq!(json["address"], "ana@x.com");
+        assert_eq!(json["replyTo"], serde_json::json!(["Help <help@x.com>"]));
         assert_eq!(json["timestamp"], 9);
         assert_eq!(json["snoozedUntil"], 5);
         assert_eq!(json["category"], "newsletters");

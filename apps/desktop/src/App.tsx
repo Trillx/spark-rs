@@ -109,6 +109,7 @@ import ThreadView, { type ThreadActions } from "./components/ThreadView";
 import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./components/UndoToast";
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
+import { replyRecipients } from "./lib/addresses";
 import { clearContent, loadContent } from "./lib/content";
 import {
   asThread,
@@ -123,7 +124,6 @@ import {
   LATER_PRESETS,
   formatFullDate,
   laterTime,
-  parseAddress,
   plural,
   presetDetail,
   type LaterPreset,
@@ -1084,17 +1084,11 @@ export default function App() {
 
   const fromYou = (m: Message) => isFromYou(m, accounts.find((a) => a.id === m.account));
 
-  /** Addresses on `list` other than the account's own. */
-  function othersOn(m: Message, list: string[]) {
-    const own = accounts.find((a) => a.id === m.account)?.email.toLowerCase();
-    return list.filter((r) => r !== "You" && parseAddress(r).address.toLowerCase() !== own);
-  }
-
-  /** To the sender; on an email you sent, to the people you sent it to. */
+  /** To Reply-To (or From); on sent mail, follow up with its recipients. */
   const reply = (m: Message) =>
     compose({
       title: "Reply",
-      to: fromYou(m) ? othersOn(m, m.to ?? []).join(", ") : m.address,
+      to: replyRecipients(m, accounts.find((a) => a.id === m.account)?.email).to.join(", "),
       subject: replySubject(m),
       from: m.account,
       replyTo: m.id,
@@ -1199,13 +1193,14 @@ export default function App() {
    */
   async function replyAll(m: Message) {
     const content = await loadContent(m.id).catch(() => null);
-    const sender = m.address.toLowerCase();
-    const others = (list: string[]) =>
-      othersOn(m, list).filter((r) => parseAddress(r).address.toLowerCase() !== sender);
-    const to = (
-      fromYou(m) ? othersOn(m, content?.to ?? m.to ?? []) : [m.address, ...others(content?.to ?? [])]
-    ).join(", ");
-    const cc = others(content?.cc ?? []).join(", ");
+    const recipients = replyRecipients(
+      // The refreshed list owns Reply-To; the cached body may predate a sync.
+      { ...m, to: content?.to ?? m.to, cc: content?.cc },
+      accounts.find((a) => a.id === m.account)?.email,
+      true,
+    );
+    const to = recipients.to.join(", ");
+    const cc = recipients.cc.join(", ");
     compose({
       title: "Reply all",
       to,

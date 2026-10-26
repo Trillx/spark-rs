@@ -83,6 +83,8 @@ pub struct Report {
     pub new: usize,
     pub gone: usize,
     pub pushed: usize,
+    /// Cached messages whose reply headers changed.
+    pub headers: usize,
     /// Ids of the new messages worth telling the user about: all of them,
     /// except on an account's first sync, which brings in mail they've
     /// already seen elsewhere.
@@ -103,7 +105,7 @@ pub struct Report {
 impl Report {
     /// Whether the message list needs reloading.
     pub fn changed(&self) -> bool {
-        self.new + self.gone + self.older + self.folder_changes + self.drafts > 0
+        self.new + self.gone + self.older + self.folder_changes + self.drafts + self.headers > 0
     }
 
     fn drafts_pushed(&mut self, pushed: DraftsReport) {
@@ -389,6 +391,7 @@ impl Engine {
                     // Keep the position even if part of the sync failed.
                     self.store().set_sync_state(account_id, &to_json(&state))?;
                     let sync = sync?;
+                    report.headers += sync.headers;
                     report.synced(sync.new, sync.gone, sync.first);
                 }
                 if round.older_inbox {
@@ -450,6 +453,7 @@ impl Engine {
                         .sync_inbox(&self.store, account_id, &mut state)
                         .await?;
                     self.store().set_sync_state(account_id, &to_json(&state))?;
+                    report.headers += sync.headers;
                     report.synced(sync.new, sync.gone, sync.first);
                 }
                 if round.older_inbox {
