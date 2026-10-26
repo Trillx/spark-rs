@@ -19,6 +19,17 @@ RUN rustup component add clippy rustfmt \
  && cargo install --locked cargo-xwin --version 0.23.1 \
  && rm -rf /usr/local/cargo/registry
 
+# The CLI bundles NSIS on Linux. Build the UI on the host before calling it;
+# the installer config disables its Node build hook inside this image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends nsis libayatana-appindicator3-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl --fail --location --retry 3 \
+      https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v2.12.4/cargo-tauri-x86_64-unknown-linux-gnu.tgz \
+      -o /tmp/cargo-tauri.tgz \
+ && tar -xzf /tmp/cargo-tauri.tgz -C /usr/local/cargo/bin cargo-tauri \
+ && rm /tmp/cargo-tauri.tgz
+
 # Caches are mounted from the host so builds run as the host user.
 ENV CARGO_HOME=/cache/cargo \
     XWIN_CACHE_DIR=/cache/xwin \

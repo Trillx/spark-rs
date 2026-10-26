@@ -1,8 +1,4 @@
-# Publishes a GitHub release for each new app version that reaches main. When
-# apps/desktop/src-tauri/tauri.conf.json has a version with no release yet,
-# builds spark-desktop and spark-cli for Windows ARM64 and x64, runs
-# `spark-cli doctor` on real Windows machines of both architectures, and
-# releases the zips as v<version>.
+# Only tested, installed, signed builds become visible to the updater.
 name: Release
 
 on:
@@ -22,31 +18,68 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      release: ${{ steps.version.outputs.release }}
+      tag: ${{ steps.version.outputs.tag }}
+      milestone: ${{ steps.version.outputs.milestone }}
+      build: ${{ steps.version.outputs.build }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - id: version
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
-          npm=$(jq -r .version apps/desktop/package.json)
-          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' apps/desktop/src-tauri/Cargo.toml | head -1)
-          if [ "$npm" != "$version" ] || [ "$cargo" != "$version" ]; then
-            echo "::error::Version mismatch: tauri.conf.json $version, package.json $npm, Cargo.toml $cargo"
-            exit 1
+          python3 tools/release/manifest.py metadata --output build-info.json
+          version=$(jq -r .version build-info.json)
+          base=$(jq -r .releaseVersion build-info.json)
+          number=$(jq -r .build.number build-info.json)
+          tag="build-$number"
+          milestone=false
+          if ! gh release view "v$base" >/dev/null 2>&1; then
+            tag="v$base"
+            milestone=true
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "v$version is already released"
-            echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release=true" >> "$GITHUB_OUTPUT"
+          build=true
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then build=false; fi
+          if gh release download --pattern latest.json --output previous.json 2>/dev/null; then
+            published=$(jq -r .version previous.json)
+            if [ "$published" = "$version" ]; then build=false; fi
+            old_number=$(jq -r .build.number previous.json)
+            if [ "$published" != "$version" ] && [ "$old_number" -ge "$number" ]; then
+              echo "::error::Build numbers must increase; main history may have been rewritten"
+              exit 1
+            fi
           fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "milestone=$milestone"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-info
+          path: build-info.json
+
+  checks:
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci && npm run build && npm test
+        working-directory: apps/desktop
+      - run: tools/cross/run.sh cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: tools/cross/run.sh cargo test --locked --workspace
 
   build:
-    needs: version
-    if: needs.version.outputs.release == 'true'
+    needs: [version, checks]
     strategy:
       matrix:
         include:
@@ -55,7 +88,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      NAME: spark-rs-v${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -66,30 +100,38 @@ jobs:
       - name: Build the UI
         working-directory: apps/desktop
         run: npm ci && npm run build
-      - name: Build spark-desktop and spark-cli
+      - name: Build and sign the installer
         env:
-          SPARK_CROSS_DOCKER_ARGS: -e XWIN_ARCH=${{ matrix.xwin }}
-        run: >-
-          tools/cross/run.sh cargo xwin build --release --locked --target ${{ matrix.target }}
-          -p spark-desktop -p spark-cli
+          SPARK_COMMIT: ${{ github.sha }}
+          SPARK_VERSION: ${{ env.VERSION }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SPARK_CROSS_DOCKER_ARGS: >-
+            -e XWIN_ARCH=${{ matrix.xwin }} -e SPARK_COMMIT -e SPARK_VERSION
+            -e TAURI_SIGNING_PRIVATE_KEY -e TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+        run: tools/cross/run.sh bash tools/release/build.sh "$TARGET"
       - name: Check the exes need no VC++ Redistributable
         run: |
           for exe in spark-desktop spark-cli; do
-            if tools/cross/run.sh llvm-readobj --coff-imports "target/${{ matrix.target }}/release/$exe.exe" \
-              | grep -iE 'Name: (vcruntime|msvcp)'; then
+            imports=$(tools/cross/run.sh llvm-readobj --coff-imports "target/$TARGET/release/$exe.exe")
+            if grep -iE 'Name: (vcruntime|msvcp)' <<< "$imports"; then
               echo "::error::$exe.exe needs the VC++ Redistributable"
               exit 1
             fi
           done
-      - name: Package
+      - name: Collect installer and updater signature
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          mkdir "$NAME"
-          cp target/${{ matrix.target }}/release/{spark-desktop,spark-cli}.exe "$NAME/"
-          zip -r "$NAME.zip" "$NAME"
+          mkdir release
+          source="target/$TARGET/release/bundle/nsis/spark-rs_${VERSION}_${ARCH}-setup.exe"
+          name="spark-rs-$VERSION-windows-$ARCH-setup.exe"
+          cp "$source" "release/$name"
+          cp "$source.sig" "release/$name.sig"
       - uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}
-          path: ${{ env.NAME }}.zip
+          path: release/*
           if-no-files-found: error
 
   smoke:
@@ -100,19 +142,16 @@ jobs:
           - { arch: arm64, runner: windows-11-arm }
           - { arch: x64, runner: windows-latest }
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    env:
-      NAME: spark-rs-v${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: windows-${{ matrix.arch }}
-      - name: spark-cli doctor
+          path: release
+      - name: Install, check the installed CLI, replace a running CLI, uninstall
         shell: pwsh
-        run: |
-          Expand-Archive "$env:NAME.zip" -DestinationPath .
-          & "./$env:NAME/spark-cli.exe" doctor
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: ./tools/release/smoke.ps1
 
   publish:
     needs: [version, smoke]
@@ -121,38 +160,57 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      MILESTONE: ${{ needs.version.outputs.milestone }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
+          name: build-info
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: windows-*
           path: release
           merge-multiple: true
-      - name: Write release notes
+      - name: Write the updater manifest and notes
         run: |
-          (cd release && sha256sum -- *.zip > SHA256SUMS.txt)
-          {
-            echo "## Download"
-            echo
-            echo "- Windows on ARM: \`spark-rs-v$VERSION-windows-arm64.zip\`"
-            echo "- Windows x64 (Intel/AMD): \`spark-rs-v$VERSION-windows-x64.zip\`"
-            echo
-            echo "Unzip and run \`spark-desktop.exe\`. It needs the WebView2 runtime, which Windows 11 includes."
-            echo "The exes aren't code-signed, so SmartScreen may warn the first time: More info → Run anyway."
-            echo
-            echo "## Changes"
-            echo
-            if previous=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null); then
-              git log --no-merges --format='- %s' "$previous..HEAD"
-            else
-              echo "First release."
-            fi
-          } > notes.md
-          cat notes.md
-      - name: Publish v${{ env.VERSION }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "v$VERSION" release/*
-          --target "$GITHUB_SHA" --title "spark-rs $VERSION" --notes-file notes.md
+          python3 tools/release/manifest.py manifest --info build-info.json --assets release \
+            --repository "$GITHUB_REPOSITORY" --tag "$TAG" --output release/latest.json
+          (cd release && sha256sum -- *.exe > SHA256SUMS.txt)
+          cat > notes.md <<'NOTES'
+          Download the Windows ARM64 installer for Windows on ARM, or x64 for Intel/AMD.
+          Run the installer, then add an account in Settings → Accounts.
+
+          spark-rs is unsigned. SmartScreen may require **More info → Run anyway**.
+          Smart App Control can block it outright. Managed PCs may block per-user installs.
+          See the README's Download section before installing.
+
+          Installed copies check for builds from main. Choose **Settings → About → Update and restart** to update.
+          NOTES
+          echo >> notes.md
+          jq -r '.build.commits[:10][] | "- " + .subject' build-info.json >> notes.md
+      - name: Publish only after all checks passed
+        run: |
+          title="Build ${VERSION}"
+          if [ "$MILESTONE" = true ]; then title="spark-rs ${VERSION%%+*} · build ${VERSION##*+}"; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --title "$title" --notes-file notes.md
+          else
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" \
+              --title "$title" --notes-file notes.md --draft
+          fi
+          gh release edit "$TAG" --draft=false --latest
+      - name: Retain the newest 20 builds and every named release
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name' > tags.txt
+          count=0
+          while IFS= read -r tag; do
+            case "$tag" in
+              build-*) count=$((count + 1)); if [ "$count" -gt 20 ]; then gh release delete "$tag" --yes --cleanup-tag; fi ;;
+            esac
+          done < tags.txt

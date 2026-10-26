@@ -87,6 +87,7 @@ interface Props {
   counts: SidebarCounts;
   /** Some account is syncing: the sync button spins until it's done. */
   syncing: boolean;
+  updateAvailable: boolean;
   pickerOpen: boolean;
   /** Only the demo accounts: their folders can't be changed. */
   demo: boolean;
@@ -218,7 +219,7 @@ function Rail(props: ViewProps) {
       {/* Clicking empty rail space opens the sidebar, like Spark. */}
       <div className="w-full flex-1" onClick={actions.open} />
       <div className="flex justify-center">
-        <SettingsAvatar onClick={actions.settings} />
+        <SettingsAvatar onClick={actions.settings} updateAvailable={props.updateAvailable} />
       </div>
     </nav>
   );
@@ -524,7 +525,7 @@ function Expanded(props: ViewProps) {
           className="flex h-[34px] w-full items-center gap-2 rounded-lg px-2 text-[13px] hover:bg-sidebar-hover hover:text-white"
           onClick={actions.settings}
         >
-          <SettingsAvatar />
+          <SettingsAvatar updateAvailable={props.updateAvailable} />
           Settings
         </button>
       </div>
@@ -878,10 +879,11 @@ function accountTitle(a: AccountView) {
   return `${a.label} · ${a.email} · ${a.provider}`;
 }
 
-function SettingsAvatar({ onClick }: { onClick?: () => void }) {
+function SettingsAvatar({ onClick, updateAvailable }: { onClick?: () => void; updateAvailable?: boolean }) {
   const face = (
-    <span className="grid size-[22px] place-items-center rounded-full bg-[#6d3ecf] text-[10px] font-semibold text-white">
+    <span className="relative grid size-[22px] place-items-center rounded-full bg-[#6d3ecf] text-[10px] font-semibold text-white">
       M
+      {updateAvailable && <span role="status" aria-label="Update available" className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-primary ring-2 ring-neutral" />}
     </span>
   );
   if (!onClick) return face;

@@ -99,6 +99,51 @@ impl spark_mail::Secrets for MailSecrets {
     }
 }
 
+/// Deletes every password, token and API key spark-rs saved. The uninstaller
+/// runs `spark-desktop.exe --forget-saved-passwords` for this when the user
+/// ticks "Also delete my mail data and saved passwords".
+#[cfg(target_os = "windows")]
+pub fn forget_all() -> Result<(), String> {
+    use windows::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredEnumerateW, CredFree,
+    };
+    use windows::core::PCWSTR;
+
+    // The Windows store names a credential `<user>.<service>`.
+    let mut count = 0;
+    let mut found: *mut *mut CREDENTIALW = std::ptr::null_mut();
+    // Fails with "not found" when there are none.
+    // Windows only supports a wildcard at the end of the filter, so enumerate
+    // names and select this service here. Credential values are never read.
+    if let Err(e) = unsafe { CredEnumerateW(PCWSTR::null(), None, &mut count, &mut found) } {
+        return if e.code() == windows::Win32::Foundation::ERROR_NOT_FOUND.to_hresult() {
+            Ok(())
+        } else {
+            Err(e.to_string())
+        };
+    }
+    let mut result = Ok(());
+    let found_slice = unsafe { std::slice::from_raw_parts(found, count as usize) };
+    for &credential in found_slice {
+        let credential = unsafe { &*credential };
+        let target = unsafe { credential.TargetName.to_string() }.unwrap_or_default();
+        if credential.Type == CRED_TYPE_GENERIC && target.ends_with(&format!(".{SERVICE}")) {
+            if let Err(e) =
+                unsafe { CredDeleteW(PCWSTR(credential.TargetName.0), CRED_TYPE_GENERIC, None) }
+            {
+                result = Err(e.to_string());
+            }
+        }
+    }
+    unsafe { CredFree(found as *const _) };
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn forget_all() -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

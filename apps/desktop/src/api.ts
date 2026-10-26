@@ -4,6 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import demo from "../demo/mailbox.json";
 import demoFolders from "../demo/folders.json";
+import { version as appVersion } from "../package.json";
 import type {
   AccountId,
   CalendarEvent,
@@ -31,6 +32,8 @@ import type {
   SignaturesView,
   DefaultSignature,
   SyncStatusEvent,
+  UpdatesView,
+  UpdateProgress,
 } from "./types";
 import { htmlText } from "./lib/signatures";
 
@@ -561,6 +564,27 @@ export function setAgentAccess(account: AccountId, access: AgentAccess): Promise
   if (isTauri()) return invoke("set_agent_access", { account, access });
   return Promise.reject(DESKTOP_ONLY);
 }
+
+// ---- updates ----
+
+export function getUpdates(): Promise<UpdatesView> {
+  if (isTauri()) return invoke("get_updates");
+  return Promise.resolve({
+    version: appVersion, build: null, commit: null, canUpdate: false,
+    checking: false, installing: false, checkedAt: null, available: null, error: null,
+  });
+}
+
+export function checkForUpdates(): Promise<UpdatesView> {
+  return isTauri() ? invoke("check_for_updates") : getUpdates();
+}
+
+export function installUpdate(): Promise<void> {
+  return isTauri() ? invoke("install_update") : Promise.reject(DESKTOP_ONLY);
+}
+
+export const onUpdatesChanged = (handler: (view: UpdatesView) => void) => on("updates-changed", handler);
+export const onUpdateProgress = (handler: (progress: UpdateProgress) => void) => on("update-progress", handler);
 
 // ---- events ----
 // Each returns its unsubscribe. In the browser nothing is ever emitted.

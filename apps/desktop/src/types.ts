@@ -31,6 +31,27 @@ export interface AccountView {
 }
 
 export type Category = "people" | "notifications" | "newsletters";
+
+/** Settings → About, also used for the sidebar's update dot. */
+export interface UpdatesView {
+  version: string;
+  build: number | null;
+  commit: string | null;
+  canUpdate: boolean;
+  checking: boolean;
+  installing: boolean;
+  checkedAt: number | null;
+  available: {
+    build: number;
+    behind: { count: number; estimated: boolean; commits: { sha: string; subject: string }[] };
+  } | null;
+  error: string | null;
+}
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+}
 /**
  * `done` is Spark's Done (archive); `aside` is Set Aside; `filed` lives in
  * another server folder (Sent, Spam, or one of the user's folders or labels).

@@ -7,7 +7,7 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
-image="spark-rs-cross:1.99.1"
+image="spark-rs-cross:1.99.1-installer"
 cache="${SPARK_CROSS_CACHE:-$HOME/.cache/spark-rs-cross}"
 
 if ! docker image inspect "$image" >/dev/null 2>&1; then

@@ -15,15 +15,25 @@ mod notify;
 mod prefs;
 mod secrets;
 mod signatures;
+mod updates;
 
 use tauri::Manager;
 
 fn main() {
+    // From the uninstaller, when the user asks to delete their data too.
+    if std::env::args().any(|arg| arg == "--forget-saved-passwords") {
+        if let Err(error) = secrets::forget_all() {
+            eprintln!("spark-rs: couldn't remove saved passwords: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     tauri::Builder::default()
         // First, so a second launch only brings this one's window forward.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             background::second_launch(app, args)
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             files::clear_opened();
             let config_dir = app.path().app_config_dir()?;
@@ -42,6 +52,8 @@ fn main() {
             }
             background::setup(app)?;
             meetings::start(app.handle());
+            app.manage(updates::Updates::default());
+            updates::start(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -112,6 +124,9 @@ fn main() {
             notify::test_notification,
             agents::get_agents,
             agents::set_agent_access,
+            updates::get_updates,
+            updates::check_for_updates,
+            updates::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start spark-rs")

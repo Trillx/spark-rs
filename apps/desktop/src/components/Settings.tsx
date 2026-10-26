@@ -21,6 +21,7 @@ import {
   Ellipsis,
   Eye,
   Inbox,
+  Info,
   KeyRound,
   LoaderCircle,
   Mail,
@@ -92,11 +93,13 @@ import type {
   SyncStatus,
 } from "../types";
 import AccountMark from "./AccountMark";
+import About from "./About";
+import type { Updates } from "../lib/updates";
 import Dropdown, { MenuItem } from "./Dropdown";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import { tipAttrs } from "../lib/tooltip";
 
-export type SettingsPage = "accounts" | "composer" | "signatures" | "ai" | "agents" | "notifications" | "appearance";
+export type SettingsPage = "accounts" | "composer" | "signatures" | "ai" | "agents" | "notifications" | "appearance" | "about";
 
 /** Nav groups, in order. Only pages that exist so far. */
 const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
@@ -111,6 +114,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
     { key: "notifications", label: "Notifications", Icon: Bell },
     { key: "appearance", label: "Appearance", Icon: Palette },
   ],
+  [{ key: "about", label: "About", Icon: Info }],
 ];
 const PAGES = NAV.flat();
 
@@ -128,6 +132,7 @@ export default function Settings({
   minimize,
   onMinimize,
   onAccountsChanged,
+  updates,
 }: {
   page: SettingsPage;
   onPage: (page: SettingsPage) => void;
@@ -139,6 +144,7 @@ export default function Settings({
   onMinimize: (on: boolean) => void;
   /** After an add, rename or remove, so the list updates without waiting for the event. */
   onAccountsChanged: () => void;
+  updates: Updates;
 }) {
   const tabRefs = useRef<Partial<Record<SettingsPage, HTMLButtonElement | null>>>({});
   const title = PAGES.find((p) => p.key === page)!.label;
@@ -221,6 +227,7 @@ export default function Settings({
               {page === "signatures" && <SignaturesPage />}
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
+              {page === "about" && <About updates={updates} />}
               {page === "notifications" && <NotificationsPage />}
               {page === "appearance" && (
                 <AppearancePage theme={theme} onTheme={onTheme} minimize={minimize} onMinimize={onMinimize} />

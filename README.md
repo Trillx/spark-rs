@@ -119,11 +119,44 @@ Created in [T3 Code](https://t3.codes).
 
 ## Download
 
-Releases are on the GitHub mirror:
-<https://github.com/Trillx/spark-rs/releases>. Take the `windows-arm64` zip
-for Windows on ARM or `windows-x64` for Intel and AMD, unzip it, and run
-`spark-desktop.exe`. The exes aren't code-signed, so SmartScreen may warn the
-first time (More info → Run anyway).
+Download the latest installer from the
+[GitHub mirror](https://github.com/Trillx/spark-rs/releases/latest).
+Choose `windows-arm64-setup.exe` for Windows on ARM or
+`windows-x64-setup.exe` for Intel and AMD. The installer puts spark-rs and
+spark-cli together in `%LOCALAPPDATA%\spark-rs` by default, creates a Start
+menu shortcut, and offers desktop and Run shortcuts. It doesn't need admin
+rights or change PATH. Open Settings → Accounts to add your first account.
+
+spark-rs isn't Authenticode-signed. SmartScreen may show a warning: choose
+**More info → Run anyway** if you trust the download. Windows 11's **Smart
+App Control** can block unsigned apps, including their updates, outright.
+It must be off for this unsigned build to run; check Windows Security → App
+& browser control before downloading. A managed work PC may also block
+apps installed in your user folder; ask your administrator about its policy.
+The updater uses a separate signature to verify downloads from this project.
+
+Moving from a zip copy: quit it completely, including its tray icon, run the
+installer, then delete the old extracted folder. Your mail and settings carry
+over. Re-copy agent commands from Settings → Agents so they use the installed
+`spark-cli.exe`. A running zip copy can intercept a new copy's launch.
+
+### Updates
+
+Installed copies check for completed builds from `main` on start and every
+four hours. A dot on Settings means an update is waiting. Settings → About
+shows the version, build, commit, how many **commits behind** you are, and the
+newest commit subjects. That count includes only app-changing commits in the
+newest finished build, so documentation changes and unfinished builds don't
+increase it. The last check remains visible offline.
+
+Choose **Update and restart**, confirm, and let the download finish. The
+installer ends agents using that installed spark-cli, replaces the app and
+CLI, and restarts spark-rs. Reconnect your agent if it doesn't reconnect on
+its own. Updates keep your mail, settings and saved passwords. Nothing
+installs until you choose it. Copies built locally can't update themselves.
+
+Uninstalling keeps mail and saved passwords by default. Select **Also delete
+my mail data and saved passwords** in the uninstaller to remove them too.
 
 ## Accounts
 
@@ -441,17 +474,41 @@ MSVC-style flags.
 
 Development happens on GitCafe (<https://git.cafe/michael/spark-rs>). GitHub
 (<https://github.com/Trillx/spark-rs>) is a read-only mirror that exists for
-its release downloads: every 15 minutes `.github/workflows/mirror.yml` copies
-`main` across, and anything pushed to GitHub directly is overwritten.
+its release downloads. `.github/workflows/mirror.yml` copies `main` across;
+anything pushed to GitHub directly is overwritten. A systemd user timer on
+the development server checks every minute and triggers that workflow when
+the branches differ. GitHub's scheduled mirror remains a fallback, but its
+schedule can be delayed for hours. Install the timer with
+`bash tools/mirror/install.sh` after logging in with `gh auth login` on that
+server. Its status and logs are available with
+`systemctl --user status spark-rs-mirror.timer` and
+`journalctl --user -u spark-rs-mirror.service`.
 
-To release, bump the version in `apps/desktop/src-tauri/tauri.conf.json`,
+Every push that changes the app produces an installer build for ARM64 and
+x64, numbered `X.Y.Z+N`. N counts app-changing commits along main's
+first-parent history; `tools/release/manifest.py` owns the path filter. Keep
+main's history intact: build numbers must increase and Windows caps them at
+65535. CI refuses publication if that condition fails.
+
+CI runs clippy and workspace tests, then builds the UI and both
+signed-for-update installers through `tools/cross/run.sh`. On real ARM64 and
+x64 Windows runners it installs each, runs the installed `spark-cli doctor`,
+replaces a running CLI in update mode, and checks that data survives an
+ordinary uninstall. Only then does it publish a GitHub build with
+`latest.json`. The latest 20 ordinary builds and all named releases are kept.
+
+For a named release, bump the version in `apps/desktop/src-tauri/tauri.conf.json`,
 `apps/desktop/src-tauri/Cargo.toml` and `apps/desktop/package.json` (they must
-match) and push to `main`. When that commit reaches GitHub,
-`.github/workflows/release.yml` builds both Windows targets, runs
-`spark-cli doctor` on a Windows ARM64 and a Windows x64 machine, and publishes
-the zips as release `v<version>`, with the commit subjects since the previous
-release as its notes. To run the mirror or the release without waiting, use
-`gh workflow run mirror -R Trillx/spark-rs` (or `release`).
+match) and push to `main`. That build is named `v<version>`; subsequent builds
+use `build-N`. Both feed the same updater. To trigger either workflow by hand,
+use `gh workflow run mirror.yml -R Trillx/spark-rs` (or `release.yml`).
+
+The updater key and its password live in the GitHub Actions secrets
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+Keep a backup of both in the owner's password manager. The matching public
+key is committed in `tauri.conf.json`. Never commit the private key or its
+password. Losing them requires a new key and a manual reinstall for users;
+existing installed copies won't accept updates signed by a replacement key.
 
 ---
 

@@ -1,0 +1,16 @@
+{
+  "build": { "beforeBuildCommand": "" },
+  "bundle": {
+    "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/spark-cli"],
+    "windows": {
+      "allowDowngrades": false,
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"],
+        "customLanguageFiles": { "English": "installer/English.nsh" },
+        "installerHooks": "installer/hooks.nsh"
+      }
+    }
+  }
+}

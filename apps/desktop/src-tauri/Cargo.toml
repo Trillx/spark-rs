@@ -9,6 +9,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 futures-util = "0.3.34"
 keyring-core = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
+# The app version (`X.Y.Z+N` for CI builds) is a `semver::Version`.
+semver = "1.0.28"
 serde_json = "1.0.154"
 open = "5.4.5"
 # Native open/save dialogs for attachments.
@@ -20,22 +22,27 @@ spark-store = { version = "0.1.0", path = "../../../crates/store" }
 tauri = { version = "2.12.5", features = ["tray-icon"] }
 # A second launch brings the running app forward instead of syncing twice.
 tauri-plugin-single-instance = "2.5.4"
+# Updates from main's builds (`updates.rs`). Without its default features it uses
+# the workspace's reqwest, whose TLS runs on aws-lc-rs: its own `rustls-tls`
+# feature brings in ring, which doesn't build for ARM64 Windows here.
+tauri-plugin-updater = { version = "2.14.0", default-features = false }
 tokio = { version = "1.54.1", features = ["macros", "net", "sync", "time"] }
 url = "2.5.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The OS credential store for API keys; see `ai/keys.rs`.
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
-# New-mail toasts (`notify.rs`), opening at sign-in (`background.rs`) and the
-# meeting chime (`chime.rs`). The same versions Tauri already uses.
-windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Media_Audio"] }
+# New-mail toasts (`notify.rs`), opening at sign-in (`background.rs`), the
+# meeting chime (`chime.rs`) and forgetting saved passwords on uninstall
+# (`secrets.rs`). The same versions Tauri already uses.
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Media_Audio", "Win32_Security_Credentials"] }
 windows-registry = "0.6.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = "1.0.0"
 
 [build-dependencies]
-tauri-build = "2.7.4"
+tauri-build = { version = "2.7.4", features = [] }
 
 # Embeds the built UI (apps/desktop/dist) in the binary. Without it the window
 # loads the Vite dev server at localhost:1420 and stays empty. `tauri dev`

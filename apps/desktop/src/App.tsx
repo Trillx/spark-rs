@@ -102,6 +102,7 @@ import { PromptDialog } from "./components/Dialog";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
 import type { RowActions } from "./components/MessageRow";
 import Settings, { type SettingsPage } from "./components/Settings";
+import { useUpdates } from "./lib/updates";
 import Sidebar, { type SidebarActions, type SidebarMode } from "./components/Sidebar";
 import { reduceSummary, startSummary, type SummaryState } from "./components/SummaryCard";
 import ThreadView, { type ThreadActions } from "./components/ThreadView";
@@ -313,6 +314,7 @@ export default function App() {
   const [aiProvider, setAiProvider] = useState("The AI provider");
   const [toast, setToast] = useState<ToastData | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
+  const updates = useUpdates((build) => showToast(`Updated to build ${build}`));
   const searchRef = useRef<HTMLInputElement>(null);
   /** The list's and the reader's scrolling elements, for Page Up/Down, Home and End. */
   const listScroll = useRef<HTMLDivElement>(null);
@@ -1759,7 +1761,7 @@ export default function App() {
     toggleLock,
     resize: (width) => setLayout((l) => ({ ...l, width })),
     sync: checkMail,
-    settings: () => openSettings(),
+    settings: () => openSettings(updates.view?.available ? "about" : lastSettingsPage.current),
     togglePicker,
     closePicker: () => setPickerOpen(false),
     newSmartFolder,
@@ -1790,6 +1792,7 @@ export default function App() {
           account={view.account}
           counts={counts}
           syncing={syncing}
+          updateAvailable={Boolean(updates.view?.available)}
           pickerOpen={pickerOpen}
           demo={isDemoMode(accounts)}
           calendarOpen={calendarOpen}
@@ -1930,6 +1933,7 @@ export default function App() {
 
         {settingsPage && (
           <Settings
+            updates={updates}
             page={settingsPage}
             onPage={(page) => {
               lastSettingsPage.current = page;

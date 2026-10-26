@@ -27,6 +27,14 @@
       "dangerousDisableAssetCspModification": ["style-src"]
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMzM0Y3MkUwNTlEQTJEOTAKUldTUUxkcFo0SEkvdzR1MDJpeGZSbmR3OUUrd3hSb3ptKzM3OE9lVnlFa2xLSURITDNXSXlCNHgK",
+      "endpoints": ["https://github.com/Trillx/spark-rs/releases/latest/download/latest.json"],
+      "requireSignedVersion": true,
+      "windows": { "installMode": "passive" }
+    }
+  },
   "bundle": {
     "active": false,
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
