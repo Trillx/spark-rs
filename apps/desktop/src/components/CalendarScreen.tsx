@@ -26,7 +26,6 @@ import {
   saveSidePanel,
   startOfDay,
   startOfMonth,
-  startOfWeek,
   stepAnchor,
   viewDays,
   type CalendarKind,
@@ -372,6 +371,7 @@ export default function CalendarScreen({
         {side && (
           <SidePanel
             docked={dockSide}
+            kind={kind}
             anchor={anchor}
             days={days}
             events={shown}
@@ -612,10 +612,16 @@ function Notices({
 }
 
 const weekdayInitial = new Intl.DateTimeFormat(undefined, { weekday: "narrow" });
+const yearFormat = new Intl.DateTimeFormat(undefined, { year: "numeric" });
 
-/** A small month to move around in, and the next meeting. Floats over the grid when the window is narrow. */
+/**
+ * A small month to move around in (a year of months in Month view, which
+ * already shows the month), and the next meeting. Floats over the grid
+ * when the window is narrow.
+ */
 function SidePanel({
   docked,
+  kind,
   anchor,
   days,
   events,
@@ -624,6 +630,7 @@ function SidePanel({
   onOpen,
 }: {
   docked: boolean;
+  kind: CalendarKind;
   anchor: number;
   days: number[];
   events: CalendarEvent[];
@@ -631,11 +638,6 @@ function SidePanel({
   onPickDay: (day: number) => void;
   onOpen: (e: CalendarEvent, anchor: DOMRect) => void;
 }) {
-  const [month, setMonth] = useState(() => startOfMonth(anchor));
-  useEffect(() => setMonth(startOfMonth(anchor)), [anchor]);
-  const grid = viewDays("month", month);
-  const today = startOfDay(now);
-  const shown = new Set(days);
   const next = nextMeeting(events, now);
 
   return (
@@ -645,54 +647,11 @@ function SidePanel({
         docked ? "" : "absolute inset-y-0 right-0 z-30 shadow-popup"
       }`}
     >
-      <div>
-        <div className="mb-2 flex items-center gap-1">
-          <h2 className="min-w-0 flex-1 truncate pl-1 text-[13px] font-semibold">{monthYear.format(month)}</h2>
-          <button
-            className="grid size-6 place-items-center rounded text-text-2 hover:bg-base-content/10"
-            aria-label="Previous month"
-            onClick={() => setMonth((m) => addMonths(m, -1))}
-          >
-            <ChevronLeft size={15} />
-          </button>
-          <button
-            className="grid size-6 place-items-center rounded text-text-2 hover:bg-base-content/10"
-            aria-label="Next month"
-            onClick={() => setMonth((m) => addMonths(m, 1))}
-          >
-            <ChevronRight size={15} />
-          </button>
-        </div>
-        <div className="grid grid-cols-7 text-center text-[11px]">
-          {Array.from({ length: 7 }, (_, i) => addDays(startOfWeek(month), i)).map((d) => (
-            <span key={d} className="pb-1 text-text-2">
-              {weekdayInitial.format(d)}
-            </span>
-          ))}
-          {grid.map((day) => {
-            const inMonth = new Date(day).getMonth() === new Date(month).getMonth();
-            const busy = onDay(events, day).length > 0;
-            return (
-              <button
-                key={day}
-                className={`relative mx-auto my-px grid size-7 place-items-center rounded-full text-xs ${
-                  day === today
-                    ? "bg-primary font-semibold text-primary-content"
-                    : shown.has(day)
-                      ? "bg-primary/12 font-medium"
-                      : inMonth
-                        ? "hover:bg-base-content/10"
-                        : "text-text-3 hover:bg-base-content/10"
-                }`}
-                onClick={() => onPickDay(day)}
-              >
-                {new Date(day).getDate()}
-                {busy && day !== today && <span className="absolute bottom-0.5 size-[3px] rounded-full bg-text-2" />}
-              </button>
-            );
-          })}
-        </div>
-      </div>
+      {kind === "month" ? (
+        <MonthPicker anchor={anchor} now={now} onPick={onPickDay} />
+      ) : (
+        <MiniMonth week={kind === "week"} anchor={anchor} days={days} events={events} now={now} onPickDay={onPickDay} />
+      )}
 
       <div className="rounded-xl border border-hairline p-3">
         <h2 className="text-[11px] font-semibold uppercase tracking-wide text-text-2">Next meeting</h2>
@@ -724,5 +683,125 @@ function SidePanel({
         )}
       </div>
     </aside>
+  );
+}
+
+/** The panel's title, with ‹ › to page through months or years. */
+function PanelNav({ title, unit, onStep }: { title: string; unit: string; onStep: (n: number) => void }) {
+  return (
+    <div className="mb-2 flex items-center gap-1">
+      <h2 className="min-w-0 flex-1 truncate pl-1 text-[13px] font-semibold">{title}</h2>
+      <button
+        className="grid size-6 place-items-center rounded text-text-2 hover:bg-base-content/10"
+        aria-label={`Previous ${unit}`}
+        onClick={() => onStep(-1)}
+      >
+        <ChevronLeft size={15} />
+      </button>
+      <button
+        className="grid size-6 place-items-center rounded text-text-2 hover:bg-base-content/10"
+        aria-label={`Next ${unit}`}
+        onClick={() => onStep(1)}
+      >
+        <ChevronRight size={15} />
+      </button>
+    </div>
+  );
+}
+
+/** Today filled; the days shown tinted: the day, or the week's whole row. */
+function MiniMonth({
+  week,
+  anchor,
+  days,
+  events,
+  now,
+  onPickDay,
+}: {
+  week: boolean;
+  anchor: number;
+  days: number[];
+  events: CalendarEvent[];
+  now: number;
+  onPickDay: (day: number) => void;
+}) {
+  const [month, setMonth] = useState(() => startOfMonth(anchor));
+  useEffect(() => setMonth(startOfMonth(anchor)), [anchor]);
+  const grid = viewDays("month", month);
+  const rows = Array.from({ length: grid.length / 7 }, (_, i) => grid.slice(i * 7, i * 7 + 7));
+  const today = startOfDay(now);
+  const shown = new Set(days);
+
+  return (
+    <div>
+      <PanelNav title={monthYear.format(month)} unit="month" onStep={(n) => setMonth((m) => addMonths(m, n))} />
+      <div className="grid grid-cols-7 text-center text-[11px]">
+        {grid.slice(0, 7).map((d) => (
+          <span key={d} className="pb-1 text-text-2">
+            {weekdayInitial.format(d)}
+          </span>
+        ))}
+      </div>
+      {rows.map((row) => (
+        <div
+          key={row[0]}
+          className={`my-px grid grid-cols-7 rounded-full ${week && row.some((d) => shown.has(d)) ? "bg-primary/12" : ""}`}
+        >
+          {row.map((day) => {
+            const inMonth = new Date(day).getMonth() === new Date(month).getMonth();
+            const busy = onDay(events, day).length > 0;
+            return (
+              <button
+                key={day}
+                className={`relative mx-auto grid size-7 place-items-center rounded-full text-xs ${
+                  day === today
+                    ? "bg-primary font-semibold text-primary-content"
+                    : `${!week && shown.has(day) ? "bg-primary/12 font-medium" : "hover:bg-base-content/10"} ${
+                        inMonth ? "" : "text-text-3"
+                      }`
+                }`}
+                onClick={() => onPickDay(day)}
+              >
+                {new Date(day).getDate()}
+                {busy && day !== today && <span className="absolute bottom-0.5 size-[3px] rounded-full bg-text-2" />}
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Month view's picker: a year of months, this one filled and the one shown tinted. */
+function MonthPicker({ anchor, now, onPick }: { anchor: number; now: number; onPick: (month: number) => void }) {
+  const [year, setYear] = useState(() => new Date(anchor).getFullYear());
+  useEffect(() => setYear(new Date(anchor).getFullYear()), [anchor]);
+  const shown = startOfMonth(anchor);
+  const current = startOfMonth(now);
+  const months = Array.from({ length: 12 }, (_, i) => new Date(year, i, 1).getTime());
+
+  return (
+    <div>
+      <PanelNav title={yearFormat.format(months[0])} unit="year" onStep={(n) => setYear((y) => y + n)} />
+      <div className="grid grid-cols-4 gap-1 text-xs">
+        {months.map((m) => (
+          <button
+            key={m}
+            className={`h-8 rounded-lg ${
+              m === current
+                ? "bg-primary font-semibold text-primary-content"
+                : m === shown
+                  ? "bg-primary/12 font-medium"
+                  : "hover:bg-base-content/10"
+            }`}
+            aria-current={m === shown ? "date" : undefined}
+            onClick={() => onPick(m)}
+          >
+            {shortMonth.format(m)}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }

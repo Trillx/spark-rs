@@ -8,6 +8,8 @@ import { Description, People, callService } from "./InviteCard";
 
 const WIDTH = 320;
 const GAP = 8;
+/** Below the window's title bar. */
+const TOP = 40;
 
 const ATTENDING: { answer: InviteAnswer; label: string; Icon: LucideIcon; tone: string }[] = [
   { answer: "accepted", label: "Yes", Icon: Check, tone: "bg-success/15 text-success" },
@@ -43,19 +45,34 @@ export default function EventPreview({
   const [error, setError] = useState<string | null>(null);
   const [place, setPlace] = useState<{ left: number; top: number } | null>(null);
 
+  // Placed again whenever it or the window changes size ("Read more", an error, details
+  // that arrive later), so it never runs off the bottom of the window.
   useLayoutEffect(() => {
     const box = ref.current;
     if (!box) return;
-    const height = box.offsetHeight;
-    if (modal) {
-      setPlace({ left: (window.innerWidth - WIDTH) / 2, top: Math.max(48, (window.innerHeight - height) / 2) });
-      return;
-    }
-    const right = anchor.right + GAP;
-    const left = right + WIDTH <= window.innerWidth - GAP ? right : Math.max(GAP, anchor.left - GAP - WIDTH);
-    const top = Math.min(Math.max(40, anchor.top), Math.max(40, window.innerHeight - height - GAP));
-    setPlace({ left, top });
-  }, [anchor, modal, e.id, error]);
+    let top: number | undefined;
+    const fit = () => {
+      const height = box.offsetHeight;
+      if (modal) {
+        setPlace({ left: (window.innerWidth - WIDTH) / 2, top: Math.max(48, (window.innerHeight - height) / 2) });
+        return;
+      }
+      const right = anchor.right + GAP;
+      const left = right + WIDTH <= window.innerWidth - GAP ? right : Math.max(GAP, anchor.left - GAP - WIDTH);
+      // Centred on the event at first; after that it only moves to stay in the window.
+      const wanted = top ?? anchor.top + anchor.height / 2 - height / 2;
+      top = Math.max(TOP, Math.min(wanted, window.innerHeight - height - GAP));
+      setPlace({ left, top });
+    };
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(box);
+    window.addEventListener("resize", fit);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", fit);
+    };
+  }, [anchor, modal, e.id]);
 
   useEffect(() => {
     const onPointer = (ev: PointerEvent) => {
@@ -83,6 +100,7 @@ export default function EventPreview({
     ...e.attendees.filter((p) => !e.organizer || p.address !== e.organizer.address).map((p) => ({ ...p, organizer: false })),
   ];
   const answerable = e.response !== "organizer" && !e.canceled;
+  const where = whereOf(e);
 
   const choose = (answer: InviteAnswer) => {
     if (answer === e.response) return;
@@ -131,9 +149,12 @@ export default function EventPreview({
             {e.callLink && (
               <Row Icon={Video}>
                 <div className="flex items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate" data-tip={e.callLink}>
-                    {callService(e.callLink)}
-                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate">{callService(e.callLink)}</div>
+                    <div className="select-text truncate text-xs text-text-2" data-tip={e.callLink}>
+                      {e.callLink}
+                    </div>
+                  </div>
                   <button
                     className="btn btn-primary btn-xs h-7 rounded-lg px-3"
                     onClick={() => void openExternal(e.callLink!)}
@@ -143,9 +164,19 @@ export default function EventPreview({
                 </div>
               </Row>
             )}
-            {e.location && (
+            {where && (
               <Row Icon={MapPin}>
-                <span className="select-text break-words">{e.location}</span>
+                {/^https?:\/\/\S+$/.test(where) ? (
+                  <button
+                    className="block max-w-full truncate text-left text-primary hover:underline"
+                    data-tip={where}
+                    onClick={() => void openExternal(where)}
+                  >
+                    {where}
+                  </button>
+                ) : (
+                  <span className="select-text break-words">{where}</span>
+                )}
               </Row>
             )}
             {e.repeats && (
@@ -201,6 +232,13 @@ export default function EventPreview({
       </div>
     </>
   );
+}
+
+/** The location, less the call link that has its own row; nothing if that was all of it. */
+function whereOf(e: CalendarEvent) {
+  let where = e.location?.trim() ?? "";
+  if (e.callLink) where = where.split(e.callLink).join(" ").replace(/^[\s,;|]+|[\s,;|]+$/g, "");
+  return where || undefined;
 }
 
 function Row({ Icon, children }: { Icon: LucideIcon; children: ReactNode }) {
