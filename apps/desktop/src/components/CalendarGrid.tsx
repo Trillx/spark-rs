@@ -103,7 +103,14 @@ export function WeekGrid({ days, events, calendars, now, selected, onOpen, onPic
   const n = days.length;
   const today = startOfDay(now);
   const nowMinutes = (now - today) / 60_000;
-  const allDay = events.filter(inAllDayRow).sort(compareEvents);
+  // Events come with a day either side of the view: keep only those on the days shown.
+  const allDay = events
+    .filter((e) => {
+      if (!inAllDayRow(e)) return false;
+      const { first, last } = eventDays(e);
+      return first <= days[n - 1] && last >= days[0];
+    })
+    .sort(compareEvents);
   const spans = allDay.map((e) => {
     const { first, last } = eventDays(e);
     const from = Math.max(0, days.findIndex((d) => d >= first));
