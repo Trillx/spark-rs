@@ -221,7 +221,7 @@ async fn fallback_move_only_expunges_its_target() {
     let (store, pending) = pending_move();
     let mut session = imap::login(&peer.server, "me", "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state(), pending)
+        imap::push(&mut session, &store, &mut state(), pending)
             .await
             .unwrap(),
         1
@@ -249,7 +249,7 @@ async fn unsupported_move_remains_pending_without_copying_or_flagging() {
             .pending(account_id, 100_000, 0)
             .unwrap();
         assert!(matches!(
-            imap::push(&mut session, &store, &state(), pending).await,
+            imap::push(&mut session, &store, &mut state(), pending).await,
             Err(Error::Server(_))
         ));
     }
@@ -350,7 +350,7 @@ async fn inbox_uid_reset_resolves_exact_message_before_mutation() {
     let (store, pending) = pending_move();
     let mut session = imap::login(&peer.server, "me", "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state(), pending)
+        imap::push(&mut session, &store, &mut state(), pending)
             .await
             .unwrap(),
         1
@@ -414,7 +414,7 @@ async fn folder_uid_reset_resolves_exact_message_before_mutation() {
     let store = Mutex::new(store);
     let mut session = imap::login(&peer.server, "me", "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state(), pending)
+        imap::push(&mut session, &store, &mut state(), pending)
             .await
             .unwrap(),
         1
@@ -435,7 +435,7 @@ async fn unknown_uid_generation_requires_message_identity() {
     state.uid_validity = None;
     let mut session = imap::login(&peer.server, "me", "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state, pending)
+        imap::push(&mut session, &store, &mut state, pending)
             .await
             .unwrap(),
         1
@@ -456,7 +456,7 @@ async fn reset_uid_without_message_id_never_mutates_reused_uid() {
     pending[0].message_id = None;
     let mut session = imap::login(&peer.server, "me", "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state(), pending)
+        imap::push(&mut session, &store, &mut state(), pending)
             .await
             .unwrap(),
         0
@@ -489,7 +489,7 @@ async fn missing_exact_message_never_moves_a_substring_match() {
     let (store, pending) = pending_move();
     let mut session = imap::login(&peer.server, "me", "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state(), pending)
+        imap::push(&mut session, &store, &mut state(), pending)
             .await
             .unwrap(),
         0

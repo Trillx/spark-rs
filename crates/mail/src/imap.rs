@@ -34,7 +34,7 @@ use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
 use crate::search::{self, SERVER_HITS};
-use crate::{Error, OLDER_STEP, Result, parse, utf7};
+use crate::{BLOCKED, Error, OLDER_STEP, Result, parse, utf7};
 
 pub const INBOX: &str = "INBOX";
 /// Messages fetched on the first sync of an account.
@@ -96,6 +96,10 @@ pub struct SyncState {
     pub complete: bool,
     pub archive: Option<String>,
     pub trash: Option<String>,
+    /// Where mail from blocked senders goes; found or made the first time
+    /// some has to.
+    #[serde(default)]
+    pub blocked: Option<String>,
 }
 
 /// Where a folder's sync stands, kept as JSON with the folder.
@@ -374,6 +378,11 @@ fn folders_from(listed: &[Listed], state: &SyncState) -> Vec<RemoteFolder> {
         if state.trash.as_deref() == Some(l.name.as_str()) {
             return Some(Some(FolderRole::Trash));
         }
+        if state.blocked.as_deref() == Some(l.name.as_str())
+            || (state.blocked.is_none() && is_blocked_folder(l))
+        {
+            return Some(Some(FolderRole::Blocked));
+        }
         // Another archive, trash or all-mail folder would show mail twice.
         if a.contains(&Attr::All) || a.contains(&Attr::Archive) || a.contains(&Attr::Trash) {
             return None;
@@ -437,6 +446,45 @@ fn folders_from(listed: &[Listed], state: &SyncState) -> Vec<RemoteFolder> {
         });
     }
     folders
+}
+
+/// Spark's Blocked folder: "Blocked" at the top, or in INBOX on servers
+/// that keep every folder there.
+fn is_blocked_folder(l: &Listed) -> bool {
+    let name = l.name.as_str();
+    let nested = l
+        .delimiter
+        .as_deref()
+        .and_then(|d| name.split_once(d))
+        .filter(|(parent, _)| parent.eq_ignore_ascii_case(INBOX))
+        .map(|(_, leaf)| leaf);
+    nested.unwrap_or(name).eq_ignore_ascii_case(BLOCKED)
+}
+
+/// The account's Blocked folder: the one found before, else one already
+/// on the server, else a new one.
+async fn blocked_folder(session: &mut Session, state: &mut SyncState) -> Result<String> {
+    if let Some(name) = &state.blocked {
+        return Ok(name.clone());
+    }
+    let names: Vec<_> = session
+        .list(Some(""), Some("*"))
+        .await?
+        .try_collect()
+        .await?;
+    let found = names.iter().find(|n| {
+        is_blocked_folder(&Listed {
+            name: n.name().to_owned(),
+            delimiter: n.delimiter().map(str::to_owned),
+            attributes: Vec::new(),
+        })
+    });
+    let name = match found {
+        Some(n) => n.name().to_owned(),
+        None => create_folder(session, None, BLOCKED).await?,
+    };
+    state.blocked = Some(name.clone());
+    Ok(name)
 }
 
 /// Brings a folder's newest messages (up to its limit) into the store and
@@ -974,18 +1022,23 @@ async fn fetch_messages(
 }
 
 /// Sends local changes to the server: flags (read, pinned as flagged), then
-/// the move for Done, Delete, filing into a folder, or back to the inbox.
-/// Returns how many messages were updated. A message the server no longer
-/// has is skipped for good.
+/// the move for Done, Delete, blocking, filing into a folder, or back to the
+/// inbox. Returns how many messages were updated. A message the server no
+/// longer has is skipped for good. Records the Blocked folder in `state`
+/// when it's first needed.
 pub async fn push(
     session: &mut Session,
     store: &Mutex<Store>,
-    state: &SyncState,
+    state: &mut SyncState,
     pending: Vec<Pending>,
 ) -> Result<usize> {
     if pending.is_empty() {
         return Ok(0);
     }
+    if pending.iter().any(|p| p.place == Place::Blocked) {
+        blocked_folder(session, state).await?;
+    }
+    let state = &*state;
     let caps = session.capabilities().await?;
     let server = Capabilities {
         can_move: caps.has_str("MOVE"),
@@ -1339,6 +1392,7 @@ fn folder(state: &SyncState, place: Place) -> Option<String> {
         Place::Inbox => Some(INBOX.into()),
         Place::Archive => Some(state.archive.clone().unwrap_or_else(|| "Archive".into())),
         Place::Trash => Some(state.trash.clone().unwrap_or_else(|| "Trash".into())),
+        Place::Blocked => state.blocked.clone(),
         Place::Folder => None,
     }
 }
@@ -1473,6 +1527,47 @@ mod tests {
                 ("[Gmail]/Trash", None, "Trash", Some(FolderRole::Trash)),
                 ("Entw&APw-rfe", None, "Entwürfe", None),
             ]
+        );
+    }
+
+    #[test]
+    fn blocked_folders_are_found_at_the_top_or_in_the_inbox() {
+        let state = SyncState::default();
+        let roles = |listed: &[Listed]| -> Vec<(String, Option<FolderRole>)> {
+            folders_from(listed, &state)
+                .into_iter()
+                .map(|f| (f.remote_id, f.role))
+                .collect()
+        };
+        assert_eq!(
+            roles(&[
+                listed("Blocked", "/", &[]),
+                listed("Work/Blocked", "/", &[])
+            ]),
+            [
+                ("Blocked".to_owned(), Some(FolderRole::Blocked)),
+                ("Work/Blocked".to_owned(), None)
+            ]
+        );
+        assert_eq!(
+            roles(&[listed("INBOX.Blocked", ".", &[])]),
+            [("INBOX.Blocked".to_owned(), Some(FolderRole::Blocked))]
+        );
+        // Once one is known, only that one is.
+        let state = SyncState {
+            blocked: Some("Spark/Blocked".into()),
+            ..Default::default()
+        };
+        let found = folders_from(
+            &[
+                listed("Blocked", "/", &[]),
+                listed("Spark/Blocked", "/", &[]),
+            ],
+            &state,
+        );
+        assert_eq!(
+            found.iter().map(|f| f.role).collect::<Vec<_>>(),
+            [None, Some(FolderRole::Blocked)]
         );
     }
 

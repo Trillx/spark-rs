@@ -27,7 +27,7 @@ use crate::draft::{Bodies, Draft, recipients};
 use crate::invite::Invite;
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::search::{self, SERVER_HITS};
-use crate::{Error, OLDER_STEP, Result};
+use crate::{BLOCKED, Error, OLDER_STEP, Result};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 /// How far back the first sync of a Microsoft account reaches.
@@ -459,8 +459,12 @@ impl Graph {
                     if Some(&f.id) == inbox.as_ref() || !listed {
                         continue;
                     }
+                    let role = well_known.get(&f.id).copied().flatten().or_else(|| {
+                        (parent.is_none() && f.display_name.eq_ignore_ascii_case(BLOCKED))
+                            .then_some(FolderRole::Blocked)
+                    });
                     folders.push(RemoteFolder {
-                        role: well_known.get(&f.id).copied().flatten(),
+                        role,
                         remote_id: f.id,
                         parent: parent.clone(),
                         name: f.display_name,
@@ -740,7 +744,12 @@ impl Graph {
                 f.account_id == account_id
                     && !matches!(
                         f.role,
-                        Some(FolderRole::Trash | FolderRole::Spam | FolderRole::Drafts)
+                        Some(
+                            FolderRole::Trash
+                                | FolderRole::Spam
+                                | FolderRole::Drafts
+                                | FolderRole::Blocked
+                        )
                     )
             })
             .map(|f| (f.remote_id.clone(), f))
@@ -838,6 +847,25 @@ impl Graph {
         self.send(self.request(Method::DELETE, &format!("/me/mailFolders/{}", path(id))))
             .await?;
         Ok(())
+    }
+
+    /// The id of the mailbox's Blocked folder (at the top, as Spark makes
+    /// it), made if there isn't one.
+    async fn blocked_folder(&self) -> Result<String> {
+        let filter = format!("displayName eq '{BLOCKED}'");
+        let found: Page<GraphFolder> = self
+            .json(self.request(
+                Method::GET,
+                &format!(
+                    "/me/mailFolders?$filter={}&$select={FOLDER_SELECT}",
+                    path(&filter)
+                ),
+            ))
+            .await?;
+        match found.value.into_iter().next() {
+            Some(f) => Ok(f.id),
+            None => self.create_folder(None, BLOCKED).await,
+        }
     }
 
     /// What a listing leaves out of a new message: its attachments, and
@@ -1061,6 +1089,11 @@ impl Graph {
     /// (Archive), Delete (Deleted Items), filing into a folder, or back to
     /// the inbox.
     pub async fn push(&self, store: &Mutex<Store>, pending: Vec<Pending>) -> Result<usize> {
+        let blocked = if pending.iter().any(|p| p.place == Place::Blocked) {
+            Some(self.blocked_folder().await?)
+        } else {
+            None
+        };
         let mut pushed = 0;
         for p in pending {
             let Some(id) = p.remote_id.clone() else {
@@ -1077,7 +1110,7 @@ impl Graph {
                     )
                     .await?;
                 }
-                if let Some(destination) = move_destination(&p) {
+                if let Some(destination) = move_destination(&p, blocked.as_deref()) {
                     self.send(
                         self.request(Method::POST, &format!("/me/messages/{}/move", path(&id)))
                             .json(&json!({ "destinationId": destination })),
@@ -1282,12 +1315,14 @@ impl Graph {
 }
 
 /// Where a pending change moves a message: a well-known folder name, or the
-/// id of the folder it's filed into. `None` if it stays where it is.
-fn move_destination(p: &Pending) -> Option<&str> {
+/// id of the folder it's filed into or of the Blocked folder (`blocked`).
+/// `None` if it stays where it is.
+fn move_destination<'a>(p: &'a Pending, blocked: Option<&'a str>) -> Option<&'a str> {
     let destination = match p.place {
         Place::Inbox => "inbox",
         Place::Archive => "archive",
         Place::Trash => "deleteditems",
+        Place::Blocked => blocked?,
         // Filed mail goes to its home folder; without one it stays put.
         Place::Folder => {
             let (id, remote_id) = p.folder.as_ref()?;
@@ -1672,37 +1707,46 @@ pub(crate) mod tests {
             folder: clients.clone(),
             ..pending(Place::Folder, Place::Inbox, None)
         };
-        assert_eq!(move_destination(&from_inbox), Some("AAMk-clients"));
+        assert_eq!(move_destination(&from_inbox, None), Some("AAMk-clients"));
         let from_projects = Pending {
             folder: clients.clone(),
             ..pending(Place::Folder, Place::Folder, Some(4))
         };
-        assert_eq!(move_destination(&from_projects), Some("AAMk-clients"));
+        assert_eq!(move_destination(&from_projects, None), Some("AAMk-clients"));
         // Already there (e.g. only read): no move.
         let read = Pending {
             folder: clients.clone(),
             ..pending(Place::Folder, Place::Folder, Some(5))
         };
-        assert_eq!(move_destination(&read), None);
+        assert_eq!(move_destination(&read, None), None);
         // Done undone after it reached Archive: back into the folder.
         let undone = Pending {
             folder: clients,
             ..pending(Place::Folder, Place::Archive, None)
         };
-        assert_eq!(move_destination(&undone), Some("AAMk-clients"));
+        assert_eq!(move_destination(&undone, None), Some("AAMk-clients"));
         // Done, back to the inbox, and filed without a known folder.
         assert_eq!(
-            move_destination(&pending(Place::Archive, Place::Folder, Some(5))),
+            move_destination(&pending(Place::Archive, Place::Folder, Some(5)), None),
             Some("archive")
         );
         assert_eq!(
-            move_destination(&pending(Place::Inbox, Place::Folder, Some(5))),
+            move_destination(&pending(Place::Inbox, Place::Folder, Some(5)), None),
             Some("inbox")
         );
         assert_eq!(
-            move_destination(&pending(Place::Folder, Place::Folder, Some(5))),
+            move_destination(&pending(Place::Folder, Place::Folder, Some(5)), None),
             None
         );
+        // Blocked mail goes to the Blocked folder, once it's known.
+        let blocked = pending(Place::Blocked, Place::Inbox, None);
+        assert_eq!(
+            move_destination(&blocked, Some("AAMk-blocked")),
+            Some("AAMk-blocked")
+        );
+        assert_eq!(move_destination(&blocked, None), None);
+        let there = pending(Place::Blocked, Place::Blocked, None);
+        assert_eq!(move_destination(&there, Some("AAMk-blocked")), None);
     }
 
     #[test]
@@ -1928,6 +1972,52 @@ pub(crate) mod tests {
             })
             .unwrap();
         (Mutex::new(store), account.id)
+    }
+
+    fn blocking(path: &str) -> Option<Value> {
+        Some(match path {
+            p if p.starts_with("/me/mailFolders?$filter=") => json!({ "value": [] }),
+            "/me/mailFolders" => json!({ "id": "AAMk-blocked", "displayName": "Blocked" }),
+            "/me/messages/m9/move" => json!({ "id": "m9" }),
+            _ => return None,
+        })
+    }
+
+    #[tokio::test]
+    async fn blocked_mail_moves_to_a_blocked_folder_made_for_it() {
+        let (store, account) = microsoft_store();
+        let id = {
+            let mut s = lock(&store);
+            let incoming = Incoming {
+                account_id: account,
+                remote_id: Some("m9".into()),
+                from_address: "spam@z.net".into(),
+                date: 1,
+                ..Default::default()
+            };
+            let Added::New(id) = s.add_incoming(&incoming, true).unwrap() else {
+                panic!("stored before");
+            };
+            let block = spark_store::Patch {
+                state: Some(spark_store::MessageState::Blocked),
+                ..Default::default()
+            };
+            s.update(id, &block, 1).unwrap();
+            id
+        };
+        let (base, seen) = stand_in(blocking).await;
+        let graph = Graph::with_base(&base, "token");
+        let pending = lock(&store).pending(account, 2, 0).unwrap();
+        assert_eq!(graph.push(&store, pending).await.unwrap(), 1);
+        let paths = seen.lock().unwrap().clone();
+        assert!(
+            paths[0].starts_with("/me/mailFolders?$filter="),
+            "{paths:?}"
+        );
+        assert_eq!(&paths[1..], ["/me/mailFolders", "/me/messages/m9/move"]);
+        let at = lock(&store).location(id).unwrap().unwrap();
+        assert_eq!(at.remote_place, Place::Blocked);
+        assert!(lock(&store).pending(account, 2, 0).unwrap().is_empty());
     }
 
     /// The `$skip`s of the listings with bodies among `paths`.

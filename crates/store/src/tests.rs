@@ -429,8 +429,30 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
         store.message(c).unwrap().unwrap().state,
         MessageState::Blocked
     );
-    // Blocking is local: nothing to push.
-    assert!(store.pending(account, 1_000, 0).unwrap().is_empty());
+    // Their mail moves to the Blocked folder.
+    let pending = store.pending(account, now_ms() + 1, 0).unwrap();
+    let mut moving: Vec<(i64, Place)> = pending.iter().map(|p| (p.id, p.place)).collect();
+    moving.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        moving,
+        [
+            (a, Place::Blocked),
+            (b, Place::Blocked),
+            (c, Place::Blocked)
+        ]
+    );
+    for p in &pending {
+        store
+            .mark_pushed(
+                p,
+                Pushed {
+                    mailbox: Some("Blocked"),
+                    uid: None,
+                },
+            )
+            .unwrap();
+    }
+    assert!(store.pending(account, now_ms() + 1, 0).unwrap().is_empty());
 
     // Clearing out the Blocked list keeps the sender blocked.
     let trash = Patch {
@@ -2112,5 +2134,46 @@ fn version_11_databases_gain_reply_to_and_draft_options_without_losing_mail() {
     }
     // Reopening a migrated database must not run the DDL twice.
     assert!(Store::open(&path).unwrap().message(1).unwrap().is_some());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn version_12_databases_move_blocked_mail_out_of_the_inbox() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v12-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v12.sqlite");
+    let _ = std::fs::remove_file(&path);
+    let (account, blocked) = {
+        let mut store = Store::open(&path).unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.test",
+                name: "Me",
+                label: "Test",
+                config: "{}",
+            })
+            .unwrap()
+            .id;
+        let id = new_id(
+            store
+                .add_incoming(&incoming(account, 1, "spam@x.com"), false)
+                .unwrap(),
+        );
+        // As version 12 left blocked mail: in the server's inbox, nothing to push.
+        store
+            .conn
+            .execute_batch(
+                "UPDATE messages SET state = 'blocked', changed_at = 0;
+                 PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        (account, id)
+    };
+    let store = Store::open(&path).unwrap();
+    let pending = store.pending(account, now_ms() + 1, 0).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!((pending[0].id, pending[0].place), (blocked, Place::Blocked));
+    drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -94,7 +94,7 @@ export interface Message {
 }
 
 /** What a server folder is for. User folders and labels have none. */
-export type FolderRole = "sent" | "drafts" | "archive" | "trash" | "spam" | "flagged";
+export type FolderRole = "sent" | "drafts" | "archive" | "trash" | "spam" | "flagged" | "blocked";
 
 /** A server folder or label of one account. */
 export interface FolderView {

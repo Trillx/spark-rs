@@ -76,7 +76,7 @@ pub enum MessageState {
     /// Set Aside: parked out of the inbox without a date.
     Aside,
     Deleted,
-    /// From a blocked sender. Kept on the server; hidden here.
+    /// From a blocked sender, in the account's Blocked folder.
     Blocked,
     /// In another server folder (Sent, Drafts, Spam, or one of the user's
     /// folders or labels); shown through that folder.
@@ -90,7 +90,8 @@ impl MessageState {
             Self::Done => Place::Archive,
             Self::Deleted => Place::Trash,
             Self::Filed => Place::Folder,
-            Self::Inbox | Self::Snoozed | Self::Aside | Self::Blocked => Place::Inbox,
+            Self::Blocked => Place::Blocked,
+            Self::Inbox | Self::Snoozed | Self::Aside => Place::Inbox,
         }
     }
 }
@@ -101,6 +102,8 @@ pub enum Place {
     Inbox,
     Archive,
     Trash,
+    /// The account's Blocked folder, made when first needed.
+    Blocked,
     /// Wherever the message's folder is; nothing to move.
     Folder,
 }
@@ -325,6 +328,8 @@ pub enum FolderRole {
     Spam,
     /// Gmail's Starred, which is Pins here.
     Flagged,
+    /// Where mail from blocked senders goes, as in Spark.
+    Blocked,
 }
 
 impl FolderRole {
@@ -336,6 +341,7 @@ impl FolderRole {
             Self::Trash => "trash",
             Self::Spam => "spam",
             Self::Flagged => "flagged",
+            Self::Blocked => "blocked",
         }
     }
 
@@ -347,6 +353,7 @@ impl FolderRole {
             "trash" => Self::Trash,
             "spam" => Self::Spam,
             "flagged" => Self::Flagged,
+            "blocked" => Self::Blocked,
             _ => return None,
         })
     }
@@ -356,6 +363,7 @@ impl FolderRole {
         match role {
             Some(Self::Archive) => (MessageState::Done, Place::Archive),
             Some(Self::Trash) => (MessageState::Deleted, Place::Trash),
+            Some(Self::Blocked) => (MessageState::Blocked, Place::Blocked),
             _ => (MessageState::Filed, Place::Folder),
         }
     }
@@ -626,6 +634,14 @@ impl Store {
             tx.pragma_update(None, "user_version", 12)?;
             tx.commit()?;
         }
+        if version < 13 {
+            // Blocked mail used to stay in the server's inbox: move it out.
+            conn.execute(
+                "UPDATE messages SET changed_at = ?1 WHERE state = 'blocked' AND remote_place != 'blocked'",
+                [now_ms()],
+            )?;
+            conn.pragma_update(None, "user_version", 13)?;
+        }
         Ok(Self { conn })
     }
 
@@ -752,7 +768,7 @@ impl Store {
                         remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
                         unread = ?5, pinned = ?6, state = ?7, screening = ?8, folder_only = 0,
                         remote_place = 'inbox', remote_folder_id = NULL,
-                        remote_unread = ?5, remote_pinned = ?6
+                        remote_unread = ?5, remote_pinned = ?6, changed_at = ?9
                      WHERE id = ?1",
                     params![
                         id,
@@ -762,20 +778,22 @@ impl Store {
                         m.unread,
                         m.flagged,
                         state_str(state),
-                        screening
+                        screening,
+                        arrival_change(state)
                     ],
                 )?;
                 tx.commit()?;
                 return Ok(Added::New(id));
             }
             // Flags follow the server where the user hasn't changed them;
-            // the place does if nothing local is waiting at all.
+            // the place does if nothing local is waiting at all (mail
+            // moved back to the inbox elsewhere, even out of Blocked).
             tx.execute(
                 "UPDATE messages SET
                     remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
                     unread = CASE WHEN unread = remote_unread THEN ?5 ELSE unread END,
                     pinned = CASE WHEN pinned = remote_pinned THEN ?6 ELSE pinned END,
-                    state = CASE WHEN ?7 = 0 AND state IN ('done', 'deleted', 'filed') THEN 'inbox' ELSE state END,
+                    state = CASE WHEN ?7 = 0 AND state IN ('done', 'deleted', 'filed', 'blocked') THEN 'inbox' ELSE state END,
                     remote_place = 'inbox', remote_folder_id = NULL,
                     remote_unread = ?5, remote_pinned = ?6, folder_only = 0
                  WHERE id = ?1",
@@ -787,6 +805,10 @@ impl Store {
 
         let (state, screening) = arrival(&tx, m, screen_new_senders)?;
         let id = insert_message(&tx, m, state, screening, Place::Inbox)?;
+        tx.execute(
+            "UPDATE messages SET changed_at = ?2 WHERE id = ?1",
+            params![id, arrival_change(state)],
+        )?;
         tx.commit()?;
         Ok(Added::New(id))
     }
@@ -1095,9 +1117,11 @@ impl Store {
         if m.state == MessageState::Blocked && before.state != MessageState::Blocked {
             set_sender_in(&tx, sender, Some("blocked"))?;
             tx.execute(
-                "UPDATE messages SET state = 'blocked', screening = 0
+                "UPDATE messages SET state = 'blocked', screening = 0,
+                    changed_at = CASE WHEN remote_place = 'blocked' AND remote_unread = unread
+                                           AND remote_pinned = pinned THEN 0 ELSE ?3 END
                  WHERE account_id = ?1 AND from_address = ?2 AND state = 'inbox'",
-                params![sender.0, sender.1],
+                params![sender.0, sender.1, now],
             )?;
         } else if before.state == MessageState::Blocked && m.state == MessageState::Inbox {
             // Back in the Inbox unblocks the sender. Trash, Done or a folder
@@ -1185,7 +1209,8 @@ impl Store {
                 mailbox = ?5, uid = ?6, remote_folder_id = (SELECT id FROM folders WHERE id = ?7),
                 changed_at = CASE
                     WHEN ?2 = CASE state WHEN 'done' THEN 'archive' WHEN 'deleted' THEN 'trash'
-                                         WHEN 'filed' THEN 'folder' ELSE 'inbox' END
+                                         WHEN 'blocked' THEN 'blocked' WHEN 'filed' THEN 'folder'
+                                         ELSE 'inbox' END
                          AND (?2 != 'folder' OR home_folder_id IS NULL OR home_folder_id IS ?7)
                          AND unread = ?3 AND pinned = ?4 THEN 0
                     ELSE changed_at END
@@ -1733,6 +1758,16 @@ fn arrival(
     })
 }
 
+/// `changed_at` for mail arriving in the inbox as `state`: mail from a
+/// blocked sender has to move to the Blocked folder.
+fn arrival_change(state: MessageState) -> i64 {
+    if state == MessageState::Blocked {
+        now_ms()
+    } else {
+        0
+    }
+}
+
 /// Full header fetches refresh reply addresses; flags-only fetches leave them alone.
 fn refresh_reply_to(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
     let Some(recipients) = &m.reply_to else {
@@ -2010,6 +2045,7 @@ fn place_str(p: Place) -> &'static str {
         Place::Inbox => "inbox",
         Place::Archive => "archive",
         Place::Trash => "trash",
+        Place::Blocked => "blocked",
         Place::Folder => "folder",
     }
 }
@@ -2018,6 +2054,7 @@ fn parse_place(s: &str) -> Place {
     match s {
         "archive" => Place::Archive,
         "trash" => Place::Trash,
+        "blocked" => Place::Blocked,
         "folder" => Place::Folder,
         _ => Place::Inbox,
     }

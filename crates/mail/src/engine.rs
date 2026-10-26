@@ -378,7 +378,7 @@ impl Engine {
                 let mut state: imap::SyncState = from_json(&account.sync_state);
                 let mut session = imap::login(&server, &username, &password).await?;
                 imap::find_folders(&mut session, &mut state).await?;
-                report.pushed = imap::push(&mut session, &self.store, &state, pending).await?;
+                report.pushed = imap::push(&mut session, &self.store, &mut state, pending).await?;
                 if draft_work {
                     let pushed =
                         drafts::push_imap(&mut session, &self.store, &account, &state, settled)

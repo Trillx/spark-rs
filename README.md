@@ -40,7 +40,9 @@ Created in [T3 Code](https://t3.codes).
 
 - **Smart Inbox.** Priority, Pins, People, Notifications and Newsletters as
   cards, or as one focused list. Mail from new senders waits in the
-  Gatekeeper until you accept or block the sender.
+  Gatekeeper until you accept or block the sender. A blocked sender's mail
+  goes to a Blocked folder on the server, as in Spark, so it leaves the inbox
+  on your phone and in webmail too.
 - **Work and personal mail together.** Microsoft 365 through Microsoft Graph,
   Gmail with an app password, and any IMAP server, in one inbox.
 - **Fast triage.** Done, snooze, pin, Set Aside and Priority on single keys,

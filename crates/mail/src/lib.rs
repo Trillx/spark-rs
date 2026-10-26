@@ -25,6 +25,9 @@ pub use engine::{AccountConfig, CalendarStatus, Engine, Round, Secrets};
 /// the user scrolls to the end of its list, as in Spark.
 pub const OLDER_STEP: usize = 100;
 
+/// The folder mail from blocked senders goes to, named as Spark names it.
+pub const BLOCKED: &str = "Blocked";
+
 /// Errors are phrased for the user; they never contain passwords or tokens.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

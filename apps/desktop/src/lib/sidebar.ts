@@ -47,7 +47,7 @@ export const SYSTEM_LISTS: Record<SystemList, { label: string; Icon: LucideIcon;
   archive: { label: "Archive", Icon: Archive, role: "archive" },
   spam: { label: "Spam", Icon: ShieldAlert, role: "spam" },
   trash: { label: "Trash", Icon: Trash2, role: "trash" },
-  blocked: { label: "Blocked", Icon: Ban },
+  blocked: { label: "Blocked", Icon: Ban, role: "blocked" },
   seen: { label: "Recently Seen", Icon: History },
 };
 

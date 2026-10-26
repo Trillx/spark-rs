@@ -679,7 +679,7 @@ async fn imap_moves_between_folders() {
         (Some(travel), vec![travel])
     );
     assert_eq!(count(&mut other, "Receipts", "Invoice 7").await, 1);
-    let state: imap::SyncState = serde_json::from_str(
+    let mut state: imap::SyncState = serde_json::from_str(
         &engine
             .store()
             .account(account.id)
@@ -691,7 +691,7 @@ async fn imap_moves_between_folders() {
     let pending = engine.store().pending(account.id, now_ms(), 0).unwrap();
     let mut session = imap::login(&imap, &me, "pw").await.unwrap();
     assert_eq!(
-        imap::push(&mut session, &store, &state, pending)
+        imap::push(&mut session, &store, &mut state, pending)
             .await
             .unwrap(),
         1
@@ -1204,4 +1204,95 @@ async fn imap_searches_reach_past_the_sync() {
     );
 
     let _ = other.logout().await;
+}
+
+#[tokio::test]
+async fn imap_blocked_mail_moves_to_the_blocked_folder() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("blocked{}@example.com", now_ms());
+    deliver(&smtp, "Ana <ana@x.com>", &me, "Known", false).await;
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store.clone(), Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    engine.run(account.id, true).await.unwrap();
+
+    deliver(&smtp, "Spam <spam@z.net>", &me, "Offer 1", false).await;
+    deliver(&smtp, "Spam <spam@z.net>", &me, "Offer 2", false).await;
+    engine.run(account.id, true).await.unwrap();
+    let offer = find(&engine, "Offer 1");
+    assert!(offer.screening);
+
+    // Blocking moves the sender's mail into a new Blocked folder.
+    back_in_time(
+        &engine,
+        offer.id,
+        Patch {
+            state: Some(MessageState::Blocked),
+            ..Default::default()
+        },
+    );
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 2);
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    assert_eq!(other.select("Blocked").await.unwrap().exists, 2);
+    assert_eq!(other.select("INBOX").await.unwrap().exists, 1);
+    assert_eq!(
+        account_state(&engine, account.id).blocked.as_deref(),
+        Some("Blocked")
+    );
+
+    // Syncing again leaves it blocked, and the folder list shows it as Blocked.
+    let round = Round {
+        fetch: true,
+        list_folders: true,
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &round).await.unwrap();
+    assert_eq!((report.new, report.gone), (0, 0));
+    assert_eq!(find(&engine, "Offer 2").state, MessageState::Blocked);
+    let folder = engine
+        .store()
+        .folders()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.account_id == account.id && f.remote_id == "Blocked")
+        .unwrap();
+    assert_eq!(folder.role, Some(FolderRole::Blocked));
+
+    // New mail from them is blocked on arrival, and moved once it settles.
+    deliver(&smtp, "Spam <spam@z.net>", &me, "Offer 3", false).await;
+    engine.run(account.id, true).await.unwrap();
+    assert_eq!(find(&engine, "Offer 3").state, MessageState::Blocked);
+    let mut state = account_state(&engine, account.id);
+    let pending = engine.store().pending(account.id, now_ms() + 1, 0).unwrap();
+    let mut session = imap::login(&imap, &me, "pw").await.unwrap();
+    assert_eq!(
+        imap::push(&mut session, &store, &mut state, pending)
+            .await
+            .unwrap(),
+        1
+    );
+    let _ = session.logout().await;
+    assert_eq!(other.select("Blocked").await.unwrap().exists, 3);
+
+    // Back to the Inbox from Blocked: moved back on the server.
+    back_in_time(
+        &engine,
+        offer.id,
+        Patch {
+            state: Some(MessageState::Inbox),
+            ..Default::default()
+        },
+    );
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
+    assert_eq!(other.select("INBOX").await.unwrap().exists, 2);
+    assert_eq!(other.select("Blocked").await.unwrap().exists, 2);
 }
