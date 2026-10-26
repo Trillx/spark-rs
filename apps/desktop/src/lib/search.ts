@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { searchMessages, searchServers } from "../api";
-import type { Message } from "../types";
+import type { AccountId, Message } from "../types";
 import { searchesServers, searchText, type SearchHits } from "./layout";
 
 /** How long a search rests before it goes to the mail servers, as in Spark. */
@@ -39,7 +39,11 @@ export function useSearchHits(queries: string[], messages: Message[]): SearchHit
  * yet, and calls `reload` when they found some. True from the first keystroke until they've
  * answered, so the list says it's still searching rather than that nothing was found.
  */
-export function useServerSearch(query: string | null, reload: () => Promise<void>): boolean {
+export function useServerSearch(
+  query: string | null,
+  reload: () => Promise<void>,
+  account?: AccountId,
+): boolean {
   const [asking, setAsking] = useState(false);
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
@@ -50,7 +54,7 @@ export function useServerSearch(query: string | null, reload: () => Promise<void
     let live = true;
     setAsking(true);
     const timer = setTimeout(() => {
-      searchServers(wanted)
+      searchServers(wanted, account)
         .then((found) => (found > 0 ? reloadRef.current() : undefined))
         .catch(() => {})
         .finally(() => {
@@ -62,7 +66,35 @@ export function useServerSearch(query: string | null, reload: () => Promise<void
       clearTimeout(timer);
       setAsking(false);
     };
-  }, [wanted]);
+  }, [wanted, account]);
 
   return asking;
+}
+
+/** Spark's recent searches: the last few, newest first, kept on this machine. */
+const RECENT_KEY = "spark-rs.recent-searches";
+const RECENT_MAX = 8;
+
+export function loadRecentSearches(): string[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]");
+    return Array.isArray(saved) ? saved.filter((q): q is string => typeof q === "string").slice(0, RECENT_MAX) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Puts `query` first; returns the new list. */
+export function rememberSearch(recent: string[], query: string): string[] {
+  const q = query.trim();
+  if (!q) return recent;
+  const next = [q, ...recent.filter((x) => x !== q)].slice(0, RECENT_MAX);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function forgetSearch(recent: string[], query: string): string[] {
+  const next = recent.filter((x) => x !== query);
+  localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+  return next;
 }

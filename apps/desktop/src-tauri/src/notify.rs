@@ -75,6 +75,72 @@ pub fn new_mail(app: &AppHandle, engine: &Engine, account_id: i64, ids: &[i64]) 
     }
 }
 
+/// Snoozed mail is back in the Inbox: one notification per message, or one
+/// for all if there are many, unless Settings → Notifications turned them
+/// off. Quiet while the window is in front, where the list shows it.
+pub fn snooze_returned(app: &AppHandle, engine: &Engine, ids: &[i64]) {
+    let prefs = app.state::<PrefsState>().get();
+    if !prefs.snooze_alert || background::in_front(app) {
+        return;
+    }
+    let returned: Vec<Message> = {
+        let store = engine.store();
+        ids.iter()
+            .filter_map(|&id| store.message(id).ok().flatten())
+            .collect()
+    };
+    // One sound for all of them, as for new mail.
+    let mut sound = prefs.sound;
+    for alert in returned_alerts(&returned) {
+        if let Err(e) = show(app, &alert, sound) {
+            eprintln!("spark-rs: couldn't show a notification: {e}");
+            return;
+        }
+        sound = false;
+    }
+}
+
+/// Spark's "Snoozed message returned to your Inbox", with sender and subject:
+/// one per conversation (its newest email), as the Inbox shows them.
+pub fn returned_alerts(returned: &[Message]) -> Vec<Alert> {
+    let mut newest: Vec<&Message> = Vec::new();
+    for m in returned {
+        match newest
+            .iter_mut()
+            .find(|x| x.account_id == m.account_id && x.conversation == m.conversation)
+        {
+            Some(kept) if kept.date < m.date => *kept = m,
+            Some(_) => {}
+            None => newest.push(m),
+        }
+    }
+    let returned = newest;
+    if returned.len() > MAX_SEPARATE {
+        return vec![Alert {
+            title: format!("{} snoozed emails returned to your Inbox", returned.len()),
+            lines: vec![senders(&returned)],
+            attribution: None,
+            message: None,
+        }];
+    }
+    returned
+        .into_iter()
+        .map(|m| Alert {
+            title: "Snoozed message returned to your Inbox".into(),
+            lines: vec![
+                sender(m).to_owned(),
+                if m.subject.trim().is_empty() {
+                    "(no subject)".into()
+                } else {
+                    m.subject.clone()
+                },
+            ],
+            attribution: None,
+            message: Some(m.id),
+        })
+        .collect()
+}
+
 /// Shown the first time closing the window leaves the app running.
 pub fn kept_running(app: &AppHandle) {
     let alert = Alert {
@@ -134,6 +200,7 @@ pub fn alerts(arrived: &[Message], notify: NotifyFor, account: Option<&str>) -> 
             m.unread
                 && m.state == MessageState::Inbox
                 && !m.screening
+                && !m.muted
                 && match notify {
                     NotifyFor::People => m.category == Category::People,
                     NotifyFor::All => true,
@@ -360,6 +427,8 @@ mod tests {
             folder: None,
             to: Vec::new(),
             conversation: id,
+            returned_at: None,
+            muted: false,
         }
     }
 
@@ -402,6 +471,23 @@ mod tests {
             },
         ];
         assert!(alerts(&arrived, NotifyFor::All, None).is_empty());
+    }
+
+    #[test]
+    fn a_returning_conversation_is_one_toast_and_muted_mail_none() {
+        let thread = |id, date| Message {
+            conversation: 1,
+            date,
+            ..message(id, "Ana", "Plan")
+        };
+        let returned = returned_alerts(&[thread(1, 10), thread(2, 30), thread(3, 20)]);
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].message, Some(2));
+        let muted = Message {
+            muted: true,
+            ..message(4, "Bob", "Quiet")
+        };
+        assert!(alerts(&[muted], NotifyFor::All, None).is_empty());
     }
 
     #[test]

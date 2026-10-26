@@ -76,6 +76,8 @@ fn main() {
             mailbox::rename_folder,
             mailbox::delete_folder,
             mailbox::delete_forever,
+            mailbox::set_muted,
+            mailbox::unsubscribe,
             mailbox::empty_folders,
             mailbox::get_message_content,
             mailbox::answer_invite,

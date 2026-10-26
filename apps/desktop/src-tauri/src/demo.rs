@@ -360,6 +360,17 @@ impl DemoMailbox {
         Ok(message.clone())
     }
 
+    /// Mutes or unmutes a conversation.
+    pub fn set_muted(&self, conversation: i64, muted: bool) {
+        let mut messages = self.0.lock().unwrap();
+        for m in messages
+            .iter_mut()
+            .filter(|m| m.conversation.unwrap_or(m.id) == conversation)
+        {
+            m.muted = muted;
+        }
+    }
+
     /// Deletes messages for good. Returns how many went.
     pub fn delete_forever(&self, ids: &[i64]) -> usize {
         let mut messages = self.0.lock().unwrap();
@@ -434,6 +445,8 @@ impl DemoMailbox {
             folders: vec![drafts_folder.id],
             folder: Some(drafts_folder.id),
             conversation: None,
+            returned_at: None,
+            muted: false,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -570,7 +583,7 @@ fn wake_snoozed(messages: &mut [Message], now: i64) {
     for m in messages {
         if m.state == MessageState::Snoozed && m.snoozed_until.is_some_and(|t| t <= now) {
             m.state = MessageState::Inbox;
-            m.snoozed_until = None;
+            m.returned_at = m.snoozed_until.take();
             m.unread = true;
         }
     }
@@ -609,6 +622,8 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             body: Some(e.body),
             attachment: e.attachment,
             conversation: e.conversation,
+            returned_at: None,
+            muted: false,
         })
         .collect()
 }

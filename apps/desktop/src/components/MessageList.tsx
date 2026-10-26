@@ -5,6 +5,7 @@ import {
   ChevronDown,
   CircleCheck,
   FolderSearch,
+  History,
   Pen,
   Search,
   SearchX,
@@ -78,6 +79,12 @@ interface Props {
   searchingServers: boolean;
   /** Set for lists that can be emptied (Trash, Spam, folders): deletes all their mail for good. */
   onEmpty?: () => void;
+  /** Past searches, newest first, offered while the field is empty. */
+  recentSearches: string[];
+  onForgetSearch: (query: string) => void;
+  /** The account a search is narrowed to, by label; null for all of them. */
+  searchScope: string | null;
+  onSearchAllAccounts: () => void;
 }
 
 const SEARCH_TIPS = [
@@ -124,18 +131,26 @@ export default function MessageList(props: Props) {
         onScroll={reachAtEnd}
       >
         {searching && !view.search!.trim() ? (
-          <SearchTips onPick={(q) => props.onSearchChange(q)} />
+          <SearchTips
+            recent={props.recentSearches}
+            onPick={(q) => props.onSearchChange(q)}
+            onForget={props.onForgetSearch}
+          />
         ) : searching && model.found === 0 ? (
           props.searchingServers ? (
             <SearchingServers />
           ) : (
-            <NoResults />
+            <>
+              {props.searchScope && <SearchScope {...props} />}
+              <NoResults />
+            </>
           )
         ) : (
           <>
             {searching && (
               <div className="flex h-9 items-center gap-2 px-3 text-[13px] text-text-2">
                 {plural(model.found ?? 0, "email")} found
+                {props.searchScope && <SearchScope {...props} inline />}
                 {props.searchingServers && (
                   <span
                     className="loading loading-spinner loading-xs text-text-3"
@@ -539,9 +554,51 @@ function DoneSwitch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   );
 }
 
-function SearchTips({ onPick }: { onPick: (query: string) => void }) {
+/** "in Work · Search all accounts", for a search narrowed to one account. */
+function SearchScope({ searchScope, onSearchAllAccounts, inline = false }: Props & { inline?: boolean }) {
+  return (
+    <span className={inline ? "contents" : "flex h-9 items-center gap-2 px-3 text-[13px] text-text-2"}>
+      in {searchScope} ·
+      <button className="font-medium text-primary hover:underline" onClick={onSearchAllAccounts}>
+        Search all accounts
+      </button>
+    </span>
+  );
+}
+
+function SearchTips({
+  recent,
+  onPick,
+  onForget,
+}: {
+  recent: string[];
+  onPick: (query: string) => void;
+  onForget: (query: string) => void;
+}) {
   return (
     <div className="px-1 pt-3">
+      {recent.length > 0 && (
+        <>
+          <div className="px-2 pb-1 text-[13px] text-text-2">Recent searches</div>
+          {recent.map((q) => (
+            <div key={q} className="group flex h-9 items-center rounded-lg pl-2 pr-1 hover:bg-row-hover">
+              <button className="flex min-w-0 flex-1 items-center gap-3 text-left text-[13px]" onClick={() => onPick(q)}>
+                <History size={14} className="shrink-0 text-text-3" />
+                <span className="truncate">{q}</span>
+              </button>
+              <button
+                className="hidden size-6 place-items-center rounded-full text-text-2 hover:bg-base-content/10 group-hover:grid"
+                aria-label={`Remove “${q}” from recent searches`}
+                data-tip="Remove"
+                onClick={() => onForget(q)}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+          <div className="h-2" />
+        </>
+      )}
       <div className="px-2 pb-1 text-[13px] text-text-2">Search tips</div>
       {SEARCH_TIPS.map((tip) => (
         <button

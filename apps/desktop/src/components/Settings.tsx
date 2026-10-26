@@ -1312,6 +1312,13 @@ function NotificationsPage() {
         <Row label="Sound" description="Windows' New Mail sound, set in Windows' sound settings." htmlFor="notify-sound">
           <Switch id="notify-sound" on={prefs.sound} disabled={off} onToggle={() => void change({ sound: !prefs.sound })} />
         </Row>
+        <Row
+          label="Snoozed mail returns"
+          description="A notification when snoozed mail comes back to the Inbox."
+          htmlFor="snooze-alert"
+        >
+          <Switch id="snooze-alert" on={prefs.snoozeAlert} onToggle={() => void change({ snoozeAlert: !prefs.snoozeAlert })} />
+        </Row>
         <Row label="Test notification" description="Check how new mail will look and sound.">
           <button className="btn btn-sm h-8 rounded-lg" disabled={status.kind === "busy"} onClick={() => void test()}>
             Send test

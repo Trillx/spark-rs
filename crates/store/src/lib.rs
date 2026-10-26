@@ -250,6 +250,11 @@ pub struct Message {
     /// The conversation it's part of (see `conversations`): messages that
     /// share it show together in the thread view.
     pub conversation: i64,
+    /// When it last came back from Snooze (Unix ms): the Inbox puts it
+    /// there, at the top, rather than at its date.
+    pub returned_at: Option<i64>,
+    /// Its conversation is muted: new mail in it doesn't notify.
+    pub muted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,7 +592,8 @@ fn pending_row(r: &Row) -> Result<Pending> {
 const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, unread, pinned, \
      priority, screening, from_name, from_address, subject, snippet, date, attachments, \
      (SELECT group_concat(folder_id) FROM folder_members WHERE message_id = messages.id), \
-     CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id), reply_to_list";
+     CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id), reply_to_list, \
+     returned_at, EXISTS (SELECT 1 FROM muted WHERE muted.conversation = COALESCE(messages.conversation, messages.id))";
 
 const FOLDER_COLUMNS: &str = "f.id, f.account_id, f.remote_id, p.id, f.name, f.role, f.selectable, \
      f.sync_state, f.synced_at";
@@ -679,6 +685,16 @@ impl Store {
             tx.execute_batch(gatekeeper::SCHEMA_GATEKEEPER)?;
             gatekeeper::migrate(&tx, now_ms())?;
             tx.pragma_update(None, "user_version", 14)?;
+            tx.commit()?;
+        }
+        if version < 15 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN returned_at INTEGER;
+                 -- Muted conversations, by id (`Message::conversation`).
+                 CREATE TABLE muted (conversation INTEGER PRIMARY KEY);",
+            )?;
+            tx.pragma_update(None, "user_version", 15)?;
             tx.commit()?;
         }
         Ok(Self { conn })
@@ -1137,14 +1153,27 @@ impl Store {
         self.message(id)
     }
 
-    /// Snoozed messages whose time has come go back to the inbox, unread.
-    pub fn wake_snoozed(&self, now: i64) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE messages SET state = 'inbox', snoozed_until = NULL, unread = 1,
-                changed_at = CASE WHEN remote_unread = 1 THEN changed_at ELSE ?1 END
-             WHERE state = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1",
-            [now],
-        )
+    /// Snoozed messages whose time has come go back to the inbox, unread,
+    /// at the top (`returned_at`). Returns their ids.
+    pub fn wake_snoozed(&self, now: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "UPDATE messages SET state = 'inbox', returned_at = snoozed_until, snoozed_until = NULL,
+                unread = 1, changed_at = CASE WHEN remote_unread = 1 THEN changed_at ELSE ?1 END
+             WHERE state = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1
+             RETURNING id",
+        )?;
+        stmt.query_map([now], |r| r.get(0))?.collect()
+    }
+
+    /// Mutes or unmutes a conversation (`Message::conversation`).
+    pub fn set_muted(&self, conversation: i64, muted: bool) -> Result<()> {
+        let sql = if muted {
+            "INSERT OR IGNORE INTO muted (conversation) VALUES (?1)"
+        } else {
+            "DELETE FROM muted WHERE conversation = ?1"
+        };
+        self.conn.execute(sql, [conversation])?;
+        Ok(())
     }
 
     /// Local changes for an account that are at least `settle_ms` old (the
@@ -1809,7 +1838,16 @@ fn insert_message(
         thread_id: m.thread_id.as_deref(),
         subject: &m.subject,
     };
-    conversations::link(conn, id, m.account_id, &threading)?;
+    let (conversation, merged) = conversations::link(conn, id, m.account_id, &threading)?;
+    // A muted conversation stays muted when mail joins it to another.
+    for from in merged {
+        if conn.execute("DELETE FROM muted WHERE conversation = ?1", [from])? > 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO muted (conversation) VALUES (?1)",
+                [conversation],
+            )?;
+        }
+    }
     Ok(id)
 }
 
@@ -1925,6 +1963,8 @@ fn message_row(r: &Row) -> Result<Message> {
         folder: r.get(16)?,
         to: from_json(&r.get::<_, String>(17)?),
         conversation: r.get(18)?,
+        returned_at: r.get(20)?,
+        muted: r.get(21)?,
     })
 }
 

@@ -27,10 +27,10 @@ Last full check: 2026-10-26.
 | Cross-Device Sync | ➖ | There's no sync server. Mail, read, Done, pins and folders go through your mail servers, so every device sees them; snooze, Set Aside, Priority and Gatekeeper decisions stay on the computer you set them on |
 | Smart Inbox | ✅ | Priority, Pins, People, Notifications and Newsletters as cards, or as one focused list |
 | Unified Inbox | ✅ | Every account in one inbox, with a row per account to see one alone |
-| Smart Search | 🟡 | Full-text search on your computer and on each mail server, with `from:`, `has:attachment`, `is:unread` and `date:today`; no plain-language searches such as "PDFs from Anna last week" |
+| Smart Search | 🟡 | Full-text search on your computer and on each mail server, in every account or just the one you're in, with `from:`, `has:attachment`, `is:unread` and `date:today`, search by sender and recent searches; no plain-language searches such as "PDFs from Anna last week" |
 | Smart Notifications | ✅ | Only mail from people notifies, unless you change it |
-| Scheduled Sends | 🟡 | Send Later with four presets; no custom time, and no list to change or cancel what's scheduled |
-| Snooze | 🟡 | Four presets and a Snoozed list; no custom time and no Unsnooze |
+| Scheduled Sends | 🟡 | Send Later with Spark's presets, from Later today to In a month; no custom time, and no list to change or cancel what's scheduled |
+| Snooze | 🟡 | Spark's presets, a custom date and time, and Discard Snooze; Snoozed lists mail by when it comes back, and it returns to the top of the Inbox with a notification. No Someday |
 | Set Aside | ✅ | |
 | Reminders | ❌ | |
 | Mark as Done | ✅ | Done archives on the server, with six seconds to undo |
@@ -48,7 +48,7 @@ Last full check: 2026-10-26.
 | Gatekeeper | ✅ | Spark's three modes (before the Inbox, inside it, off); accept or block a new sender or a whole domain once for every account; colleagues, people you've written to and big companies get through without asking; blocked mail moves to a Blocked folder on the server |
 | Group by Sender & Domain | ❌ | |
 | Smart Folders | ✅ | Save any search as a smart folder; its search can't be edited afterwards |
-| Mute Threads | ❌ | |
+| Mute Threads | ✅ | New mail in a muted conversation doesn't notify |
 | Templates | ❌ | |
 | Productivity Integrations | ❌ | |
 | Home Screen | ❌ | |

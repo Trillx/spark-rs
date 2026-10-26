@@ -859,12 +859,68 @@ fn snoozed_mail_comes_back_unread_when_its_time_comes() {
         ..Default::default()
     };
     store.update(id, &snooze, 1_000).unwrap();
-    assert_eq!(store.wake_snoozed(4_999).unwrap(), 0);
-    assert_eq!(store.wake_snoozed(5_000).unwrap(), 1);
+    assert!(store.wake_snoozed(4_999).unwrap().is_empty());
+    assert_eq!(store.wake_snoozed(5_000).unwrap(), [id]);
     let m = store.message(id).unwrap().unwrap();
     assert_eq!(m.state, MessageState::Inbox);
     assert!(m.unread);
     assert_eq!(m.snoozed_until, None);
+    assert_eq!(m.returned_at, Some(5_000));
+}
+
+#[test]
+fn muting_covers_the_whole_conversation() {
+    let (mut store, account) = store_with_account();
+    let first = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "a@x.com"), false)
+            .unwrap(),
+    );
+    let reply = Incoming {
+        in_reply_to: Some("<1@example.com>".into()),
+        subject: "Re: Message 1".into(),
+        ..incoming(account, 2, "b@x.com")
+    };
+    let second = new_id(store.add_incoming(&reply, false).unwrap());
+    let conversation = store.message(first).unwrap().unwrap().conversation;
+    assert_eq!(
+        store.message(second).unwrap().unwrap().conversation,
+        conversation
+    );
+
+    store.set_muted(conversation, true).unwrap();
+    assert!(store.message(first).unwrap().unwrap().muted);
+    assert!(store.message(second).unwrap().unwrap().muted);
+    store.set_muted(conversation, false).unwrap();
+    assert!(!store.message(second).unwrap().unwrap().muted);
+
+    // Mail that joins a muted conversation to another keeps it muted.
+    let plan = |uid, in_reply_to: Option<&str>, references: Option<&str>| Incoming {
+        subject: "Re: Plan".into(),
+        in_reply_to: in_reply_to.map(Into::into),
+        references: references.map(Into::into),
+        ..incoming(account, uid, "c@x.com")
+    };
+    let a = new_id(store.add_incoming(&plan(10, None, None), false).unwrap());
+    let b = new_id(
+        store
+            .add_incoming(&plan(11, Some("<99@example.com>"), None), false)
+            .unwrap(),
+    );
+    let muted = store.message(b).unwrap().unwrap().conversation;
+    assert_ne!(store.message(a).unwrap().unwrap().conversation, muted);
+    store.set_muted(muted, true).unwrap();
+    let c = new_id(
+        store
+            .add_incoming(
+                &plan(12, Some("<11@example.com>"), Some("<10@example.com>")),
+                false,
+            )
+            .unwrap(),
+    );
+    for id in [a, b, c] {
+        assert!(store.message(id).unwrap().unwrap().muted, "message {id}");
+    }
 }
 
 #[test]

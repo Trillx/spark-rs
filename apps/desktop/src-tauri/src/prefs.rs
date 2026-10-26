@@ -46,6 +46,8 @@ pub struct Prefs {
     pub notify: NotifyFor,
     /// Windows' New Mail sound with each notification.
     pub sound: bool,
+    /// A notification when snoozed mail comes back.
+    pub snooze_alert: bool,
     pub badge: Badge,
     /// Accounts the badge leaves out, by id.
     pub badge_excluded: Vec<i64>,
@@ -74,6 +76,7 @@ impl Default for Prefs {
         Self {
             notify: NotifyFor::People,
             sound: true,
+            snooze_alert: true,
             badge: Badge::New,
             badge_excluded: Vec::new(),
             keep_running: true,

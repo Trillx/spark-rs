@@ -3,6 +3,8 @@ import {
   ArrowDownLeft,
   ArrowLeft,
   Ban,
+  Bell,
+  BellOff,
   Check,
   ChevronDown,
   ChevronsDownUp,
@@ -13,9 +15,11 @@ import {
   Forward,
   Inbox,
   ListChecks,
+  MailX,
   Pin,
   Reply,
   ReplyAll,
+  Search,
   ShieldAlert,
   ShieldCheck,
   Text,
@@ -34,7 +38,7 @@ import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
 import { allowRemoteImages, remoteImagesAllowed, useInlineImages, useMessageContent } from "../lib/content";
 import {
-  LATER_PRESETS,
+  laterPresets,
   formatFullDate,
   formatLater,
   formatListDate,
@@ -69,6 +73,14 @@ export interface ThreadActions {
   pin: (m: Message) => void;
   aside: (m: Message) => void;
   snooze: (m: Message, preset: LaterPreset) => void;
+  /** Asks for a day and time to snooze until. */
+  snoozeCustom: (m: Message) => void;
+  unsnooze: (m: Message) => void;
+  /** Mutes or unmutes its conversation. */
+  mute: (m: Message) => void;
+  unsubscribe: (m: Message) => void;
+  /** Searches for the sender's mail. */
+  searchSender: (m: Message) => void;
   summarize: (m: Message, style: SummaryStyle) => void;
   stopSummary: (m: Message) => void;
   deleteSummary: (m: Message) => void;
@@ -249,6 +261,19 @@ export default function ThreadView({
             <ArrowDownLeft size={12} /> Set aside
           </Pill>
         )}
+        {m.muted && (
+          <Pill className="bg-base-200 text-text-2">
+            <BellOff size={12} /> Muted
+          </Pill>
+        )}
+        {m.category === "newsletters" && !scrolled && (
+          <button
+            className="ml-auto shrink-0 text-xs font-medium text-primary hover:underline"
+            onClick={() => actions.unsubscribe(m)}
+          >
+            Unsubscribe
+          </button>
+        )}
       </div>
       {blocked && <BlockedSenderCard message={m} actions={actions} />}
       <OverlayScroll
@@ -422,9 +447,11 @@ function Toolbar({
           </button>
         )}
       >
-        {LATER_PRESETS.map((p) => (
+        {m.state === "snoozed" && <MenuItem label="Discard Snooze" onSelect={() => actions.unsnooze(m)} />}
+        {laterPresets().map((p) => (
           <MenuItem key={p.key} label={p.label} detail={presetDetail(p)} onSelect={() => actions.snooze(m, p)} />
         ))}
+        <MenuItem label="Pick date & time…" onSelect={() => actions.snoozeCustom(m)} />
       </Dropdown>
       <SummarizeButton message={m} summary={summary} onJump={onJumpToSummary} actions={actions} />
       <div className="ml-auto">
@@ -572,6 +599,17 @@ function MessageMenuItems({
         icon={<Forward size={15} />}
         onSelect={() => actions.forward(m)}
       />
+      <MenuItem label="Search Emails by Sender" icon={<Search size={15} />} onSelect={() => actions.searchSender(m)} />
+      {!single && (
+        <MenuItem
+          label={m.muted ? "Unmute Conversation" : "Mute Conversation"}
+          icon={m.muted ? <Bell size={15} /> : <BellOff size={15} />}
+          onSelect={() => actions.mute(m)}
+        />
+      )}
+      {m.category === "newsletters" && (
+        <MenuItem label="Unsubscribe" icon={<MailX size={15} />} onSelect={() => actions.unsubscribe(m)} />
+      )}
       <li role="none" className="my-0.5 h-px bg-hairline" />
       <MenuItem
         label={spam ? "Not Spam" : "Move to Spam"}

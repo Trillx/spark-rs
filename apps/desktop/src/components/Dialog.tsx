@@ -143,6 +143,65 @@ export function ConfirmDialog({
   );
 }
 
+/** A day and time to pick, in the future: Snooze's custom date. Starts at `initial` (Unix ms). */
+export function DateTimeDialog({
+  title,
+  confirmLabel,
+  initial,
+  onSubmit,
+  onClose,
+}: {
+  title: string;
+  confirmLabel: string;
+  initial: number;
+  onSubmit: (at: number) => Promise<void> | void;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState(() => localInput(initial));
+  const { busy, error, run } = useAction(onClose);
+  const at = value ? new Date(value).getTime() : NaN;
+  const valid = Number.isFinite(at) && at > Date.now();
+
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    if (valid) void run(() => onSubmit(at));
+  }
+
+  return (
+    <Shell label={title} onClose={onClose}>
+      <form onSubmit={submit}>
+        <h2 className="text-base font-semibold">{title}</h2>
+        <input
+          type="datetime-local"
+          autoFocus
+          className="input input-sm mt-4 w-full"
+          value={value}
+          min={localInput(Date.now())}
+          onChange={(e) => setValue(e.target.value)}
+        />
+        {value && !valid && <p className="mt-2 text-[13px] text-error">Pick a time in the future.</p>}
+        {error && <p className="mt-2 text-[13px] text-error">{error}</p>}
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-primary btn-sm" disabled={busy || !valid}>
+            {busy && <span className="loading loading-spinner loading-xs" />}
+            {confirmLabel}
+          </button>
+        </div>
+      </form>
+    </Shell>
+  );
+}
+
+/** Unix ms as a `datetime-local` value, in local time to the minute. */
+function localInput(t: number) {
+  const d = new Date(t);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /**
  * Spark's "Security certificate issue": a server showed a certificate the
  * system doesn't trust. Trusting it trusts that exact certificate, by its

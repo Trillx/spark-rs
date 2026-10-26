@@ -16,6 +16,7 @@ pub mod search;
 pub mod signature;
 pub mod smtp;
 pub mod tls;
+pub mod unsubscribe;
 pub mod utf7;
 
 use std::fmt::Display;

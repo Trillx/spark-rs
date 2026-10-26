@@ -36,7 +36,7 @@ import {
   type Mention,
 } from "../lib/addresses";
 import { caretPoint } from "../lib/caret";
-import { LATER_PRESETS, formatBytes, formatLater, pickLater, presetDetail } from "../lib/format";
+import { formatBytes, formatLater, laterPresets, pickLater, presetDetail } from "../lib/format";
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import AiMenu, { type AiRequest } from "./AiMenu";
@@ -564,7 +564,7 @@ export default function Composer({
           )}
         >
           <li className="menu-title px-2 py-1 text-[11px]">Send later</li>
-          {LATER_PRESETS.map((p) => (
+          {laterPresets().map((p) => (
             <MenuItem
               key={p.key}
               label={p.label}

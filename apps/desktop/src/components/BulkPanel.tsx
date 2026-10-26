@@ -12,7 +12,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { LATER_PRESETS, plural, presetDetail, type LaterPreset } from "../lib/format";
+import { laterPresets, plural, presetDetail, type LaterPreset } from "../lib/format";
 import { hint } from "../lib/shortcuts";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import Dropdown, { MenuItem } from "./Dropdown";
@@ -26,6 +26,7 @@ export interface Selection {
   allPinned: boolean;
   allPriority: boolean;
   allAside: boolean;
+  allSnoozed: boolean;
   allSpam: boolean;
   allDeleted: boolean;
 }
@@ -38,6 +39,9 @@ export interface BulkActions {
   priority: () => void;
   aside: () => void;
   snooze: (preset: LaterPreset) => void;
+  /** Asks for a day and time. */
+  snoozeCustom: () => void;
+  unsnooze: () => void;
   spam: () => void;
   clear: () => void;
 }
@@ -113,9 +117,11 @@ function Buttons({ selection: s, actions }: { selection: Selection; actions: Bul
               </button>
             )}
           >
-            {LATER_PRESETS.map((p) => (
+            {s.allSnoozed && <MenuItem label="Discard Snooze" onSelect={actions.unsnooze} />}
+            {laterPresets().map((p) => (
               <MenuItem key={p.key} label={p.label} detail={presetDetail(p)} onSelect={() => actions.snooze(p)} />
             ))}
+            <MenuItem label="Pick date & time…" onSelect={actions.snoozeCustom} />
           </Dropdown>
           <Action
             tip={hint(s.allPinned ? "Unpin" : "Pin", "pin")}

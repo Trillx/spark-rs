@@ -1,7 +1,7 @@
 import { Bell, MailOpen, Newspaper, Pin, UserPlus, Users, Zap, type LucideIcon } from "lucide-react";
 import type { AccountId, AccountView, BadgeCount, FolderView, GatekeeperMode, Message } from "../types";
 import { asThread, conversationOf, indexConversations, participantNames } from "./conversation";
-import { datePeriod } from "./format";
+import { datePeriod, futurePeriod } from "./format";
 import { showsRecipients } from "./recipients";
 import type { ActionId } from "./shortcuts";
 import { folderIdOf, hasAccountRows, listFolderIds, listInfo, smartIdOf, type ListKey, type SmartFolder } from "./sidebar";
@@ -67,6 +67,28 @@ export const INBOX_MODES: { key: InboxMode; label: string; action: ActionId }[] 
   { key: "simple", label: "Simple list", action: "modeSimple" },
 ];
 
+/** The Inbox's mode for each account filter, as Spark keeps an inbox type per account. */
+const MODES_KEY = "spark-rs.inbox-modes";
+
+export function loadInboxMode(account: AccountFilter): InboxMode {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MODES_KEY) ?? "{}")[String(account)];
+    return INBOX_MODES.some((m) => m.key === saved) ? saved : "cards";
+  } catch {
+    return "cards";
+  }
+}
+
+export function saveInboxMode(account: AccountFilter, mode: InboxMode) {
+  let saved: Record<string, InboxMode> = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(MODES_KEY) ?? "{}");
+  } catch {
+    // A damaged entry is replaced.
+  }
+  localStorage.setItem(MODES_KEY, JSON.stringify({ ...saved, [String(account)]: mode }));
+}
+
 /** Card header icon colors. */
 export const CARDS: Record<CardKey, { label: string; Icon: LucideIcon; iconClass: string }> = {
   priority: { label: "Priority", Icon: Zap, iconClass: "bg-[#ffaa3b]" },
@@ -105,7 +127,11 @@ export type SearchHits = ReadonlyMap<string, ReadonlySet<number>>;
 
 const EMPTY_CONTEXT: ListContext = { accounts: [], folders: [], smartFolders: [], seen: [] };
 
+/** Where a message sorts in the Inbox: when it arrived, or when it came back from Snooze if that's later. */
+export const inboxTime = (m: Message) => Math.max(m.timestamp, m.returnedAt ?? 0);
 const newestFirst = (a: Message, b: Message) => b.timestamp - a.timestamp;
+const newestInInbox = (a: Message, b: Message) => inboxTime(b) - inboxTime(a);
+const soonestBack = (a: Message, b: Message) => (a.snoozedUntil ?? 0) - (b.snoozedUntil ?? 0);
 const isLive = (m: Message) => m.state !== "deleted" && m.state !== "blocked";
 
 /**
@@ -125,7 +151,7 @@ export function inboxMessages(
         (m.state === "inbox" || (showDone && m.state === "done" && !waiting(m, mode))) &&
         (account === "all" || m.account === account),
     )
-    .sort(newestFirst);
+    .sort(newestInInbox);
   return {
     mail: inbox.filter((m) => !waiting(m, mode)),
     screening: inbox.filter((m) => waiting(m, mode) && m.state === "inbox"),
@@ -159,16 +185,32 @@ export function smartCards(mail: Message[], sticky: ReadonlySet<number>): Record
   return cards;
 }
 
-/** Rows (and Focused group rows) under "Today", "Yesterday", … headers. */
-function withPeriods(items: (Message | Extract<ListBlock, { kind: "group" }>)[]): ListBlock[] {
+/** Rows (and Focused group rows) under "Today", "Yesterday", … headers; the Inbox goes by `inboxTime`. */
+function withPeriods(
+  items: (Message | Extract<ListBlock, { kind: "group" }>)[],
+  time: (m: Message) => number = (m) => m.timestamp,
+): ListBlock[] {
   const blocks: ListBlock[] = [];
   let last = "";
   for (const item of items) {
     const newest = "kind" in item ? item.items[0] : item;
-    const period = datePeriod(newest.timestamp);
+    const period = datePeriod(time(newest));
     if (period !== last) blocks.push({ kind: "period", title: period });
     last = period;
     blocks.push("kind" in item ? item : { kind: "row", message: item });
+  }
+  return blocks;
+}
+
+/** Snoozed rows under "Later today", "Tomorrow", … for when they come back. */
+function withReturnPeriods(items: Message[]): ListBlock[] {
+  const blocks: ListBlock[] = [];
+  let last = "";
+  for (const m of items) {
+    const period = futurePeriod(m.snoozedUntil ?? m.timestamp);
+    if (period !== last) blocks.push({ kind: "period", title: period });
+    last = period;
+    blocks.push({ kind: "row", message: m });
   }
   return blocks;
 }
@@ -238,6 +280,7 @@ export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, c
     case "pins":
       return live.filter((m) => m.pinned && !waiting(m, ctx.gatekeeper)).sort(newestFirst);
     case "snoozed":
+      return live.filter((m) => m.state === key).sort(soonestBack);
     case "aside":
       return live.filter((m) => m.state === key).sort(newestFirst);
     case "archive":
@@ -266,8 +309,10 @@ export function buildList(
   const rows = listRows(messages, sticky, ctx);
   if (view.search !== null) {
     if (!view.search.trim()) return rows.model("Search", []);
+    // Narrowed to an account, a search looks in that account only.
+    const inScope = (m: Message) => view.account === "all" || m.account === view.account;
     const hits = rows.of(
-      messages.filter((m) => isLive(m) && matchesQuery(m, view.search!, ctx.hits)).sort(newestFirst),
+      messages.filter((m) => isLive(m) && inScope(m) && matchesQuery(m, view.search!, ctx.hits)).sort(newestFirst),
     );
     return { ...rows.model("Search", hits.map((m) => ({ kind: "row", message: m }))), found: hits.length };
   }
@@ -278,9 +323,13 @@ export function buildList(
     const label = listInfo(view.folder, ctx.folders, ctx.smartFolders)?.label ?? "Folder";
     const account = view.account !== "all" && accounts.find((a) => a.id === view.account)?.label;
     const title = account ? `${label} · ${account}` : label;
-    // Recently Seen keeps the order they were opened in.
+    // Recently Seen keeps the order they were opened in; Snoozed goes by when mail comes back.
     const blocks: ListBlock[] =
-      view.folder === "seen" ? items.map((m) => ({ kind: "row", message: m })) : withPeriods(items);
+      view.folder === "seen"
+        ? items.map((m) => ({ kind: "row", message: m }))
+        : view.folder === "snoozed"
+          ? withReturnPeriods(items)
+          : withPeriods(items);
     return { ...rows.model(title, blocks), recipients: showsRecipients(view.folder, ctx.folders) };
   }
 
@@ -339,10 +388,10 @@ export function buildList(
     const top: ListBlock[] = priority.length
       ? [{ kind: "card", key: "priority", items: priority, total: priority.length }]
       : [];
-    return rows.model(title, [...top, ...gatekeeper, ...withPeriods(items)]);
+    return rows.model(title, [...top, ...gatekeeper, ...withPeriods(items, inboxTime)]);
   }
 
-  return rows.model(title, [...gatekeeper, ...withPeriods(mail)]);
+  return rows.model(title, [...gatekeeper, ...withPeriods(mail, inboxTime)]);
 }
 
 /** A search's `from:`, `has:attachment`, `is:unread` and `date:today`, and the free text left. */

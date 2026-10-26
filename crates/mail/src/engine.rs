@@ -23,6 +23,7 @@ use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::invite::{self, Answer, Invite};
 use crate::oauth::{self, App};
+use crate::unsubscribe::{self, Unsubscribed};
 use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
 
 /// How long a local change waits before it's pushed: longer than the UI's
@@ -1228,6 +1229,54 @@ impl Engine {
                 Graph::new(&token).attachment(&remote, index, &wanted).await
             }
         }
+    }
+
+    /// Unsubscribes from the mailing list a stored message came from, as its
+    /// `List-Unsubscribe` header offers (see `unsubscribe`). The header is
+    /// read from the server, so mail stored before this works too.
+    pub async fn unsubscribe(&self, message_id: i64) -> Result<Unsubscribed> {
+        let at = self
+            .store()
+            .location(message_id)?
+            .ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
+        let account = self.account(at.account_id)?;
+        let (list, post) = match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
+                let parsed = mail_parser::MessageParser::default()
+                    .parse(&raw)
+                    .ok_or_else(|| {
+                        Error::Server("The email on the server is unreadable.".into())
+                    })?;
+                let header = |name: &str| parsed.header_raw(name).map(str::to_owned);
+                (header("List-Unsubscribe"), header("List-Unsubscribe-Post"))
+            }
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let remote = at.remote_id.ok_or(Error::Gone)?;
+                let headers = self
+                    .graph(account.id, &client_id, &tenant)
+                    .await?
+                    .headers(&remote)
+                    .await?;
+                let header = |name: &str| {
+                    headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v.clone())
+                };
+                (header("List-Unsubscribe"), header("List-Unsubscribe-Post"))
+            }
+        };
+        let list = list.ok_or_else(|| {
+            Error::Config("This email doesn't say how to unsubscribe from it.".into())
+        })?;
+        unsubscribe::unsubscribe(unsubscribe::options(&list, post.as_deref())).await
     }
 
     /// The images a stored message's HTML embeds with `cid:` URLs, from its

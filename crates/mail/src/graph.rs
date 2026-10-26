@@ -1407,6 +1407,32 @@ impl Graph {
         ))
     }
 
+    /// A message's internet headers, as name and value.
+    pub async fn headers(&self, id: &str) -> Result<Vec<(String, String)>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Headers {
+            #[serde(default)]
+            internet_message_headers: Vec<Header>,
+        }
+        #[derive(Deserialize)]
+        struct Header {
+            name: String,
+            value: String,
+        }
+        let found: Headers = self
+            .json(self.request(
+                Method::GET,
+                &format!("/me/messages/{}?$select=internetMessageHeaders", path(id)),
+            ))
+            .await?;
+        Ok(found
+            .internet_message_headers
+            .into_iter()
+            .map(|h| (h.name, h.value))
+            .collect())
+    }
+
     /// Deletes a draft for good, as Outlook does once it's sent; where
     /// that isn't offered, into Deleted Items.
     pub async fn delete_draft(&self, id: &str) -> Result<()> {

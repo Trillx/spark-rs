@@ -37,6 +37,7 @@ import type {
   SignaturesView,
   DefaultSignature,
   SyncStatusEvent,
+  Unsubscribed,
   Untrusted,
   UpdatesView,
   UpdateProgress,
@@ -181,8 +182,9 @@ export function searchMessages(query: string): Promise<number[] | null> {
  * Puts a search to every account's server, which stores the mail they find that isn't stored
  * yet. Resolves to how many messages were new, so the caller knows to reload; 0 outside the app.
  */
-export function searchServers(query: string): Promise<number> {
-  if (isTauri()) return invoke("search_servers", { query });
+/** `account` keeps it to one account's server. */
+export function searchServers(query: string, account?: AccountId): Promise<number> {
+  if (isTauri()) return invoke("search_servers", { query, account: account ?? null });
   return Promise.resolve(0);
 }
 
@@ -360,6 +362,21 @@ export function renameFolder(id: number, name: string): Promise<void> {
 export function deleteFolder(id: number): Promise<void> {
   if (isTauri()) return invoke("delete_folder", { id });
   return Promise.reject(DEMO_FOLDERS);
+}
+
+/** Mutes or unmutes a conversation (`Message.conversation`, or the message's id). */
+export function setMuted(conversation: number, muted: boolean): Promise<void> {
+  if (isTauri()) return invoke("set_muted", { conversation, muted });
+  for (const [i, m] of browserMailbox.entries()) {
+    if ((m.conversation ?? m.id) === conversation) browserMailbox[i] = { ...m, muted };
+  }
+  return Promise.resolve();
+}
+
+/** Asks the mailing list a message came from to stop sending. */
+export function unsubscribe(id: number): Promise<Unsubscribed> {
+  if (isTauri()) return invoke("unsubscribe", { id });
+  return Promise.resolve({ kind: "done" });
 }
 
 /** Deletes messages for good on their servers; resolves to how many went. */
@@ -940,6 +957,7 @@ function saveBrowserDraft(draft: OutgoingDraft): number {
 let browserPrefs: Prefs = {
   notify: "people",
   sound: true,
+  snoozeAlert: true,
   badge: "new",
   badgeExcluded: [],
   keepRunning: true,
@@ -954,7 +972,7 @@ let browserPrefs: Prefs = {
 function wakeSnoozed(now = Date.now()) {
   for (const [i, m] of browserMailbox.entries()) {
     if (m.state === "snoozed" && m.snoozedUntil !== undefined && m.snoozedUntil <= now) {
-      browserMailbox[i] = { ...patched(m, { state: "inbox" }), unread: true };
+      browserMailbox[i] = { ...patched(m, { state: "inbox" }), unread: true, returnedAt: m.snoozedUntil };
     }
   }
 }

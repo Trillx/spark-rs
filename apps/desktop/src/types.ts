@@ -109,6 +109,10 @@ export interface Message {
   folder?: number;
   /** Messages of one conversation share it; without one, a message is a conversation of its own. */
   conversation?: number;
+  /** When it came back from Snooze: the Inbox sorts it there, at the top. */
+  returnedAt?: number;
+  /** Its conversation is muted: new mail in it doesn't notify. */
+  muted?: boolean;
 }
 
 /** The Gatekeeper's decision about a sender or a whole domain, for every account. */
@@ -133,6 +137,9 @@ export interface SenderStatus {
 
 /** Where new senders wait: New Senders above the Inbox, in the Inbox asking when opened, or nowhere. */
 export type GatekeeperMode = "beforeInbox" | "insideInbox" | "off";
+
+/** How Unsubscribe went: done by the list's one-click link, an email sent to the list, or a page to finish on. */
+export type Unsubscribed = { kind: "done" } | { kind: "email"; to: string } | { kind: "page"; url: string };
 
 /** What a server folder is for. User folders and labels have none. */
 export type FolderRole = "sent" | "drafts" | "archive" | "trash" | "spam" | "flagged" | "blocked";
@@ -170,6 +177,8 @@ export interface Prefs {
   notify: NotifyFor;
   /** Windows' New Mail sound with each notification. */
   sound: boolean;
+  /** A notification when snoozed mail comes back. */
+  snoozeAlert: boolean;
   badge: BadgeCount;
   /** Accounts the badge leaves out. */
   badgeExcluded: AccountId[];

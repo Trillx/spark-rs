@@ -1,5 +1,6 @@
 import {
   ArrowDownLeft,
+  BellOff,
   Check,
   Circle,
   CircleCheck,
@@ -84,6 +85,8 @@ function MessageRow({
   const done = m.state === "done";
   const deleted = m.state === "deleted";
   const snoozed = m.state === "snoozed" && m.snoozedUntil !== undefined;
+  /** Back from Snooze since it arrived: it shows when it came back, as it sorts. */
+  const returned = m.state === "inbox" && m.returnedAt !== undefined && m.returnedAt > m.timestamp;
   const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
   const to = recipients ? recipientNames(m.to) : null;
   const weight = m.unread ? "font-semibold" : "font-medium";
@@ -133,15 +136,22 @@ function MessageRow({
             <span className={`truncate text-sm leading-5 ${weight}`}>{names ?? m.from}</span>
           )}
           <span
-            data-tip={snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : undefined}
+            data-tip={
+              snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : returned ? "Back from Snooze" : undefined
+            }
             className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${
-              snoozed ? "text-priority" : "text-text-2"
+              snoozed || returned ? "text-priority" : "text-text-2"
             }`}
           >
             {snoozed ? (
               <>
                 <Clock size={12} />
                 {formatLaterShort(m.snoozedUntil!)}
+              </>
+            ) : returned ? (
+              <>
+                <Clock size={12} />
+                {formatListDate(m.returnedAt!)}
               </>
             ) : (
               formatListDate(m.timestamp)
@@ -199,6 +209,7 @@ function MessageRow({
             </span>
           )}
           {m.attachment && <Paperclip size={12} className="shrink-0 rotate-45 text-text-2" aria-label="Has attachment" />}
+          {m.muted && <BellOff size={12} className="shrink-0 text-text-2" aria-label="Muted" />}
         </div>
         <div className="truncate text-[13px] leading-5 text-text-2">{m.snippet || "No content"}</div>
       </div>

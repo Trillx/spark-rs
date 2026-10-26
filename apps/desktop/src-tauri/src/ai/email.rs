@@ -85,6 +85,8 @@ pub mod tests {
             folders: Vec::new(),
             folder: None,
             conversation: None,
+            returned_at: None,
+            muted: false,
         }
     }
 

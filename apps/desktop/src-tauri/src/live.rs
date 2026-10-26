@@ -132,8 +132,10 @@ impl Live {
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(SNOOZE_CHECK).await;
-                if engine.store().wake_snoozed(now_ms()).unwrap_or(0) > 0 {
+                let returned = engine.store().wake_snoozed(now_ms()).unwrap_or_default();
+                if !returned.is_empty() {
                     let _ = app.emit("mailbox-changed", ());
+                    notify::snooze_returned(&app, &engine, &returned);
                 }
             }
         });
@@ -252,16 +254,17 @@ impl Live {
         done
     }
 
-    /// Puts a search to every account's server at once, storing the mail
-    /// they find that isn't stored yet. A server that fails or takes longer
-    /// than `SEARCH_WAIT` is left out. Returns how many messages were new,
-    /// or `None` if a new search cancelled this one.
-    pub async fn search_servers(&self, query: &str) -> Option<usize> {
+    /// Puts a search to every account's server at once (or just `account`'s),
+    /// storing the mail they find that isn't stored yet. A server that fails
+    /// or takes longer than `SEARCH_WAIT` is left out. Returns how many
+    /// messages were new, or `None` if a new search cancelled this one.
+    pub async fn search_servers(&self, query: &str, account: Option<i64>) -> Option<usize> {
         self.search.notify_waiters();
         let cancelled = self.search.notified();
         tokio::pin!(cancelled);
         cancelled.as_mut().enable();
-        let accounts = self.engine.store().accounts().unwrap_or_default();
+        let mut accounts = self.engine.store().accounts().unwrap_or_default();
+        accounts.retain(|a| account.is_none_or(|id| a.id == id));
         let searches = join_all(accounts.iter().map(|account| async move {
             let search = self.engine.search_server(account.id, query);
             match tokio::time::timeout(SEARCH_WAIT, search).await {

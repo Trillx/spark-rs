@@ -41,12 +41,13 @@ pub(crate) struct Threading<'a> {
 }
 
 /// Puts stored message `id` in its conversation, merging the ones it links.
+/// Returns that conversation, and the ones merged into it.
 pub(crate) fn link(
     conn: &Connection,
     id: i64,
     account_id: i64,
     threading: &Threading,
-) -> Result<()> {
+) -> Result<(i64, Vec<i64>)> {
     let mut found = BTreeSet::<i64>::new();
     {
         let mut find = conn.prepare_cached(
@@ -69,13 +70,14 @@ pub(crate) fn link(
         "UPDATE messages SET conversation = ?1 WHERE id = ?2",
         params![target, id],
     )?;
-    for merged in found.into_iter().filter(|&c| c != target) {
+    let merged: Vec<i64> = found.into_iter().filter(|&c| c != target).collect();
+    for &from in &merged {
         conn.execute(
             "UPDATE messages SET conversation = ?1 WHERE account_id = ?2 AND conversation = ?3",
-            params![target, account_id, merged],
+            params![target, account_id, from],
         )?;
     }
-    Ok(())
+    Ok((target, merged))
 }
 
 /// Places mail stored before conversations existed, oldest first.

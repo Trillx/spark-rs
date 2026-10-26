@@ -10,6 +10,7 @@ use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
+use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_store::{
     Account, AccountKind, Category, Change, Contact, Folder, FolderRole, GatekeeperMode,
@@ -70,6 +71,12 @@ pub struct Message {
     /// conversation of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation: Option<i64>,
+    /// When it came back from Snooze: the Inbox puts it there, at the top.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returned_at: Option<i64>,
+    /// Its conversation is muted: new mail in it doesn't notify.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
 }
 
 /// A server folder or label, for the sidebar and folder picker.
@@ -295,6 +302,8 @@ fn from_store(m: spark_store::Message) -> Message {
         folders: m.folders,
         folder: m.folder,
         conversation: Some(m.conversation),
+        returned_at: m.returned_at,
+        muted: m.muted,
     }
 }
 
@@ -413,11 +422,12 @@ pub async fn search_servers(
     app: AppHandle,
     mailbox: State<'_, Mailbox>,
     query: String,
+    account: Option<i64>,
 ) -> Result<usize, String> {
     if !mailbox.live() {
         return Ok(0);
     }
-    match mailbox.live.search_servers(&query).await {
+    match mailbox.live.search_servers(&query, account).await {
         Some(new) => Ok(new),
         None => {
             let _ = app.emit("mailbox-changed", ());
@@ -533,6 +543,62 @@ pub async fn delete_folder(
     let _ = app.emit("folders-changed", ());
     let _ = app.emit("mailbox-changed", ());
     Ok(())
+}
+
+/// Mutes or unmutes a conversation: new mail in it doesn't notify.
+#[tauri::command]
+pub fn set_muted(
+    mailbox: State<'_, Mailbox>,
+    conversation: i64,
+    muted: bool,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        mailbox.demo.set_muted(conversation, muted);
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .set_muted(conversation, muted)
+        .map_err(text)
+}
+
+/// Unsubscribes from the mailing list a message came from. An email the
+/// list asks for goes out from the message's account like any other.
+#[tauri::command]
+pub async fn unsubscribe(mailbox: State<'_, Mailbox>, id: i64) -> Result<Unsubscribed, String> {
+    if !mailbox.live() {
+        return Ok(Unsubscribed::Done);
+    }
+    let result = mailbox.live.engine.unsubscribe(id).await.map_err(text)?;
+    if let Unsubscribed::Email { to, subject, body } = &result {
+        let account = mailbox
+            .live
+            .engine
+            .store()
+            .message(id)
+            .map_err(text)?
+            .ok_or_else(|| "That email is no longer here.".to_owned())?
+            .account_id;
+        let draft = Draft {
+            account,
+            to: to.clone(),
+            subject: subject.clone(),
+            body: body.clone(),
+            send_at: now_ms(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&draft).map_err(text)?;
+        mailbox
+            .live
+            .engine
+            .store()
+            .queue_send(account, &json, draft.send_at, &[])
+            .map_err(text)?;
+        mailbox.live.nudge(account);
+    }
+    Ok(result)
 }
 
 /// Deletes messages for good on their servers. Returns how many went.
@@ -1387,8 +1453,12 @@ mod tests {
             folder: None,
             to: vec!["Me <me@x.com>".into()],
             conversation: 2,
+            returned_at: None,
+            muted: true,
         });
         let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["muted"], true);
+        assert!(json.get("returnedAt").is_none());
         assert_eq!(json["account"], 7);
         assert_eq!(json["from"], "Ana");
         assert_eq!(json["address"], "ana@x.com");

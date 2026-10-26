@@ -3,6 +3,7 @@ import {
   ArrowDownLeft,
   Ban,
   Bell,
+  BellOff,
   Bot,
   Check,
   CircleAlert,
@@ -22,6 +23,7 @@ import {
   List,
   ListChecks,
   MailOpen,
+  MailX,
   PanelLeft,
   Pen,
   Pin,
@@ -29,6 +31,7 @@ import {
   Reply,
   ReplyAll,
   Rows3,
+  Scaling,
   Search,
   Send,
   Settings as SettingsIcon,
@@ -42,6 +45,8 @@ import {
   Trash2,
   UserPlus,
   Zap,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
@@ -92,10 +97,13 @@ import {
   saveDraft,
   saveGatekeeperMode,
   sendMessage,
+  openExternal,
   setBadge,
+  setMuted,
   syncFolders,
   syncNow,
   trustCertificate,
+  unsubscribe,
   updateMessage,
   watchFolders,
 } from "./api";
@@ -112,7 +120,7 @@ import Composer, {
   type Draft,
   type Writing,
 } from "./components/Composer";
-import { CertificateDialog, ConfirmDialog, PromptDialog } from "./components/Dialog";
+import { CertificateDialog, ConfirmDialog, DateTimeDialog, PromptDialog } from "./components/Dialog";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
 import type { RowActions } from "./components/MessageRow";
 import Settings, { type SettingsPage } from "./components/Settings";
@@ -137,11 +145,13 @@ import {
 import { isDraft } from "./lib/drafts";
 import { decidableDomain, domain, forSenders, predict } from "./lib/gatekeeper";
 import {
-  LATER_PRESETS,
   formatFullDate,
+  formatLater,
+  laterPresets,
   laterTime,
   plural,
   presetDetail,
+  presetOf,
   type LaterPreset,
 } from "./lib/format";
 import { loadTheme, saveTheme, type ThemePref } from "./lib/theme";
@@ -149,6 +159,8 @@ import {
   INBOX_MODES,
   badgeCount,
   buildList,
+  loadInboxMode,
+  saveInboxMode,
   sidebarCounts,
   type AccountFilter,
   type InboxMode,
@@ -202,7 +214,8 @@ import {
   type ActionId,
 } from "./lib/shortcuts";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
-import { useSearchHits, useServerSearch } from "./lib/search";
+import { forgetSearch, loadRecentSearches, rememberSearch, useSearchHits, useServerSearch } from "./lib/search";
+import { stepZoom } from "./lib/zoom";
 import type {
   AccountId,
   AccountView,
@@ -276,6 +289,9 @@ const ICONS = {
   download: { Icon: Download, className: "text-primary" },
   error: { Icon: CircleAlert, className: "text-error" },
   spam: { Icon: ShieldAlert, className: "text-error" },
+  mute: { Icon: BellOff, className: "text-text-2" },
+  unsubscribe: { Icon: MailX, className: "text-primary" },
+  zoom: { Icon: ZoomIn, className: "text-primary" },
   agent: { Icon: Bot, className: "text-primary" },
 } satisfies Record<string, ToastIcon>;
 
@@ -302,7 +318,7 @@ export default function App() {
   /** Sent drafts by outbox id until they go out, to reopen one that fails. */
   const outbox = useRef(new Map<number, Draft>());
   const [messages, setMessages] = useState<Message[]>([]);
-  const [view, setView] = useState<ListView>(INITIAL_VIEW);
+  const [view, setView] = useState<ListView>(() => ({ ...INITIAL_VIEW, mode: loadInboxMode("all") }));
   /** Messages read during this visit to the list; they keep their Smart Inbox card until the list changes. */
   const [sticky, setSticky] = useState<ReadonlySet<number>>(new Set());
   /** The list cursor. In split view it follows the open thread. */
@@ -342,6 +358,9 @@ export default function App() {
   /** Where Shift-click and Shift+arrow selections reach from. */
   const pickAnchor = useRef<number | null>(null);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
+  /** Rows being snoozed to a day and time the user picks. */
+  const [snoozePick, setSnoozePick] = useState<number[] | null>(null);
+  const [recentSearches, setRecentSearches] = useState(loadRecentSearches);
   /** A server certificate to ask about, from a sync or send that failed on it. */
   const [certificate, setCertificate] = useState<{ account: AccountId; certificate: Untrusted } | null>(null);
   /** Settings → Notifications → App icon badge. */
@@ -385,7 +404,11 @@ export default function App() {
   const twoColumns = useTwoColumns(container, listWidthUsed);
 
   const hits = useSearchHits([view.search ?? "", ...layout.smartFolders.map((f) => f.query)], messages);
-  const searchingServers = useServerSearch(isDemoMode(accounts) ? null : view.search, reloadMessages);
+  const searchingServers = useServerSearch(
+    isDemoMode(accounts) ? null : view.search,
+    reloadMessages,
+    view.account === "all" ? undefined : view.account,
+  );
   const ctx: ListContext = useMemo(
     () => ({ accounts, folders, smartFolders: layout.smartFolders, seen, hits, gatekeeper: gatekeeperMode }),
     [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode],
@@ -435,7 +458,7 @@ export default function App() {
         loadedAccounts.current = accountSet(loadedAccountList);
         setAccounts(loadedAccountList);
         setMessages(loaded);
-        const first = buildList(loaded, INITIAL_VIEW, new Set()).order[0];
+        const first = buildList(loaded, { ...INITIAL_VIEW, mode: loadInboxMode("all") }, new Set()).order[0];
         if (first !== undefined && twoColumns) openThread(first, loaded);
       },
       (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
@@ -886,10 +909,8 @@ export default function App() {
         setPalette(null);
         setCalendarOpen(false);
         closeSidebar();
-        changeView(
-          { folder: "inbox", sub: null, search: null, account: view.account === m.account ? m.account : "all" },
-          true,
-        );
+        const account = view.account === m.account ? m.account : "all";
+        changeView({ folder: "inbox", mode: loadInboxMode(account), sub: null, search: null, account }, true);
         openThread(id, loaded);
       },
       (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
@@ -924,7 +945,9 @@ export default function App() {
   function selectList(folder: ListKey, account: AccountFilter = "all") {
     setCalendarOpen(false);
     const narrowed = hasAccountRows(folder) ? account : "all";
-    changeView({ folder, account: narrowed, sub: null, search: null });
+    // Each account keeps the Inbox mode it was last shown in.
+    const mode = folder === "inbox" ? loadInboxMode(narrowed) : view.mode;
+    changeView({ folder, account: narrowed, mode, sub: null, search: null });
     closeSidebar();
     const ids = listFolderIds(folder, folders, accountOf(narrowed));
     if (ids.length) void syncFolders(ids).catch(() => {});
@@ -972,6 +995,7 @@ export default function App() {
   }
 
   function saveSmartFolder(name: string, query: string) {
+    setRecentSearches((r) => rememberSearch(r, query));
     const [next, key] = addSmartFolder(layout, name, query);
     setLayout(next);
     selectList(key);
@@ -1007,7 +1031,10 @@ export default function App() {
     if (view.folder === key) selectList("inbox");
   }
 
-  const setMode = (mode: InboxMode) => changeView({ folder: "inbox", mode, sub: null, search: null }, true);
+  function setMode(mode: InboxMode) {
+    saveInboxMode(view.account, mode);
+    changeView({ folder: "inbox", mode, sub: null, search: null }, true);
+  }
 
   function openSearch() {
     if (searching) searchRef.current?.select();
@@ -1032,8 +1059,9 @@ export default function App() {
     } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       moveCursor(e.key === "ArrowDown" ? 1 : -1);
-    } else if (e.key === "Enter" && selectedId !== null) {
-      openListed(selectedId);
+    } else if (e.key === "Enter") {
+      if (view.search) setRecentSearches((r) => rememberSearch(r, view.search!));
+      if (selectedId !== null) openListed(selectedId);
     }
   }
 
@@ -1091,13 +1119,13 @@ export default function App() {
       m.state === "aside"
         ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
         : act(together(m), { state: "aside" }, "Set aside", ICONS.aside),
-    snooze: (m: Message, p: LaterPreset) =>
-      act(
-        together(m),
-        { state: "snoozed", snoozedUntil: laterTime(p) },
-        `Snoozed until ${p.label.toLowerCase()}`,
-        ICONS.snooze,
-      ),
+    snooze: (m: Message, p: LaterPreset) => snoozeUntil([m], laterTime(p), p.label.toLowerCase()),
+    snoozeCustom: (m: Message) => setSnoozePick([m.id]),
+    /** Spark's Discard Snooze: back in the Inbox now. */
+    unsnooze: (m: Message) => act(together(m), { state: "inbox" }, "Snooze discarded", ICONS.inbox),
+    mute,
+    unsubscribe: unsubscribeFrom,
+    searchSender: (m: Message) => searchFor(`from:${m.address}`),
     accept: (m: Message) => decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept),
     acceptAndOpen: (m: Message) => {
       decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept);
@@ -1262,6 +1290,7 @@ export default function App() {
     allPinned: pickedMessages.every(pinnedThread),
     allPriority: pickedMessages.every(priorityThread),
     allAside: pickedMessages.every((m) => m.state === "aside"),
+    allSnoozed: pickedMessages.every((m) => m.state === "snoozed"),
     allSpam: pickedMessages.every(inSpam),
     allDeleted: pickedMessages.every((m) => m.state === "deleted"),
   };
@@ -1325,18 +1354,70 @@ export default function App() {
             ),
       ),
     snooze: (p) => batch((rows) => snoozeRows(rows, p)),
+    snoozeCustom: () => setSnoozePick(pickedRows),
+    unsnooze: () =>
+      batch((rows) =>
+        act(rows.flatMap(together), { state: "inbox" }, `${conversationCount(rows)} back in the Inbox`, ICONS.inbox),
+      ),
     spam: () => batch(spam),
     clear: clearPicked,
   };
 
   function snoozeRows(rows: Message[], p: LaterPreset) {
-    if (rows.length === 1) return actions.snooze(rows[0], p);
-    act(
-      rows.flatMap(together),
-      { state: "snoozed", snoozedUntil: laterTime(p) },
-      `${conversationCount(rows)} snoozed until ${p.label.toLowerCase()}`,
-      ICONS.snooze,
-    );
+    snoozeUntil(rows, laterTime(p), p.label.toLowerCase());
+  }
+
+  /** Snoozes conversations until `at`; `until` says when in the toast ("tomorrow"). */
+  function snoozeUntil(rows: Message[], at: number, until = formatLater(at)) {
+    const what = rows.length === 1 ? "Snoozed" : `${conversationCount(rows)} snoozed`;
+    act(rows.flatMap(together), { state: "snoozed", snoozedUntil: at }, `${what} until ${until}`, ICONS.snooze);
+  }
+
+  /** Mutes a conversation, or unmutes a muted one: new mail in it doesn't notify. */
+  function mute(m: Message) {
+    const conversation = m.conversation ?? m.id;
+    const set = (muted: boolean) => {
+      setMessages((ms) => ms.map((x) => ((x.conversation ?? x.id) === conversation ? { ...x, muted } : x)));
+      setMuted(conversation, muted).catch((error) => {
+        showToast(`Couldn't change that: ${String(error)}`, undefined, ICONS.error);
+        void reloadMessages();
+      });
+    };
+    const muting = !m.muted;
+    set(muting);
+    showToast(muting ? "Conversation muted" : "Conversation unmuted", () => set(!muting), ICONS.mute);
+  }
+
+  /** Asks the mailing list to stop, after asking the user: its one-click link, an email to it, or its page. */
+  function unsubscribeFrom(m: Message) {
+    setConfirm({
+      title: "Unsubscribe",
+      message: `Stop getting emails like this from ${m.from || m.address}? spark-rs asks the mailing list to take you off it.`,
+      confirmLabel: "Unsubscribe",
+      danger: false,
+      run: async () => {
+        const result = await unsubscribe(m.id);
+        if (result.kind === "page") {
+          await openExternal(result.url);
+          showToast("Finish unsubscribing on the list's page", undefined, ICONS.unsubscribe);
+        } else if (result.kind === "email") {
+          showToast(`Unsubscribe request sent to ${result.to}`, undefined, ICONS.unsubscribe);
+        } else {
+          showToast(`Unsubscribed from ${m.address}`, undefined, ICONS.unsubscribe);
+        }
+      },
+    });
+  }
+
+  /** Opens a search for `query`, keeping the thread open; it counts as a recent search. */
+  function searchFor(query: string) {
+    setRecentSearches((r) => rememberSearch(r, query));
+    changeView({ search: query, sub: null }, true);
+  }
+
+  function zoom(step: 1 | -1 | 0) {
+    const level = stepZoom(step);
+    showToast(`Zoom ${Math.round(level * 100)}%`, undefined, ICONS.zoom);
   }
 
   /** A card's or sub-list's rows, each with its conversation. */
@@ -1867,6 +1948,12 @@ export default function App() {
         return gatekeeper.acceptAll(waitingInList());
       case "blockAll":
         return gatekeeper.blockAll(waitingInList());
+      case "zoomIn":
+        return zoom(1);
+      case "zoomOut":
+        return zoom(-1);
+      case "zoomReset":
+        return zoom(0);
     }
     if (pickedRows.length) {
       switch (action) {
@@ -1927,7 +2014,14 @@ export default function App() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.defaultPrevented || palette || settingsPage || isInsideOverlay(e.target)) return;
+      if (e.defaultPrevented) return;
+      // Zoom works everywhere, the composer and dialogs included.
+      const zooming = matchShortcut(e);
+      if (zooming === "zoomIn" || zooming === "zoomOut" || zooming === "zoomReset") {
+        e.preventDefault();
+        return run(zooming);
+      }
+      if (palette || settingsPage || isInsideOverlay(e.target)) return;
       const typing = isTypingTarget(e.target);
       if (isModShortcut(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "z") {
         if (!typing && toast?.undo && !toast.actionLabel) {
@@ -2056,13 +2150,16 @@ export default function App() {
             shortcut: shortcutLabel("done"),
             run: () => actions.done(m),
           },
+          ...(m.state === "snoozed"
+            ? [{ id: "unsnooze", label: "Discard Snooze", keywords: "unsnooze inbox", Icon: Inbox, run: () => actions.unsnooze(m) }]
+            : []),
           {
             id: "snooze-tomorrow",
             label: "Snooze until tomorrow",
             keywords: "later",
             Icon: Clock,
-            detail: presetDetail(LATER_PRESETS[1]),
-            run: () => actions.snooze(m, LATER_PRESETS[1]),
+            detail: presetDetail(presetOf("tomorrow")),
+            run: () => actions.snooze(m, presetOf("tomorrow")),
           },
           {
             id: "snooze",
@@ -2110,6 +2207,24 @@ export default function App() {
             Icon: Trash2,
             shortcut: shortcutLabel("trash"),
             run: () => actions.trash(m),
+          },
+          {
+            id: "mute",
+            label: m.muted ? "Unmute Conversation" : "Mute Conversation",
+            keywords: "silence notifications quiet",
+            Icon: m.muted ? Bell : BellOff,
+            run: () => actions.mute(m),
+          },
+          ...(m.category === "newsletters"
+            ? [{ id: "unsubscribe", label: "Unsubscribe", keywords: "newsletter list stop", Icon: MailX, run: () => actions.unsubscribe(m) }]
+            : []),
+          {
+            id: "search-sender",
+            label: "Search Emails by Sender",
+            detail: m.address,
+            keywords: "from find",
+            Icon: Search,
+            run: () => actions.searchSender(m),
           },
           {
             id: "spam",
@@ -2307,18 +2422,41 @@ export default function App() {
         shortcut: shortcutLabel("sidebar"),
         run: toggleSidebar,
       },
+      { id: "zoom-in", label: "Zoom In", keywords: "bigger larger", Icon: ZoomIn, shortcut: shortcutLabel("zoomIn"), run: () => zoom(1) },
+      { id: "zoom-out", label: "Zoom Out", keywords: "smaller", Icon: ZoomOut, shortcut: shortcutLabel("zoomOut"), run: () => zoom(-1) },
+      { id: "zoom-reset", label: "Actual Size", keywords: "zoom reset", Icon: Scaling, shortcut: shortcutLabel("zoomReset"), run: () => zoom(0) },
     ];
   }
 
   const snoozeTargets = palette?.kind === "snooze" ? palette.targetIds.flatMap((id) => byId.get(id) ?? []) : [];
   const snoozeCommands: Command[] = snoozeTargets.length
-    ? LATER_PRESETS.map((p) => ({
-        id: p.key,
-        label: p.label,
-        Icon: Clock,
-        detail: presetDetail(p),
-        run: () => batch((rows) => snoozeRows(rows, p), snoozeTargets),
-      }))
+    ? [
+        ...(snoozeTargets.every((m) => m.state === "snoozed")
+          ? [
+              {
+                id: "unsnooze",
+                label: "Discard Snooze",
+                Icon: Inbox,
+                run: () =>
+                  batch((rows) => act(rows.flatMap(together), { state: "inbox" }, "Snooze discarded", ICONS.inbox), snoozeTargets),
+              },
+            ]
+          : []),
+        ...laterPresets().map((p) => ({
+          id: p.key,
+          label: p.label,
+          Icon: Clock,
+          detail: presetDetail(p),
+          run: () => batch((rows) => snoozeRows(rows, p), snoozeTargets),
+        })),
+        {
+          id: "custom",
+          label: "Pick date & time…",
+          keywords: "custom date day",
+          Icon: Clock,
+          run: () => setSnoozePick(snoozeTargets.map((m) => m.id)),
+        },
+      ]
     : [];
 
   // ---- layout ----
@@ -2327,6 +2465,7 @@ export default function App() {
   const rows = useLatest<RowActions>({
     open: (id) => {
       clearPicked();
+      if (view.search?.trim()) setRecentSearches((r) => rememberSearch(r, view.search!));
       openListed(id);
     },
     pick: pickRow,
@@ -2467,6 +2606,10 @@ export default function App() {
                 older={older && { loading: loadingOlder, onNearEnd: reachBack }}
                 searchingServers={searchingServers}
                 onEmpty={emptiable(view.folder, view.account).length ? () => emptyList(view.folder, view.account) : undefined}
+                recentSearches={recentSearches}
+                onForgetSearch={(q) => setRecentSearches((r) => forgetSearch(r, q))}
+                searchScope={view.account === "all" ? null : (accounts.find((a) => a.id === view.account)?.label ?? null)}
+                onSearchAllAccounts={() => setView((v) => ({ ...v, account: "all" }))}
               />
               {!twoColumns && pickedRows.length > 0 && <BulkPanel compact selection={selection} actions={bulk} />}
               {twoColumns && (
@@ -2606,6 +2749,18 @@ export default function App() {
             danger={confirm.danger}
             onConfirm={confirm.run}
             onClose={() => setConfirm(null)}
+          />
+        )}
+        {snoozePick && (
+          <DateTimeDialog
+            title="Snooze until"
+            confirmLabel="Snooze"
+            initial={laterTime(presetOf("tomorrow"))}
+            onSubmit={(at) => {
+              const rows = snoozePick.flatMap((id) => byId.get(id) ?? []);
+              batch((targets) => snoozeUntil(targets, at), rows);
+            }}
+            onClose={() => setSnoozePick(null)}
           />
         )}
         {certificate && (

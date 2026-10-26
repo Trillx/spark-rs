@@ -42,7 +42,10 @@ export type ActionId =
   | "acceptDomain"
   | "blockSender"
   | "blockAll"
-  | "blockDomain";
+  | "blockDomain"
+  | "zoomIn"
+  | "zoomOut"
+  | "zoomReset";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -101,6 +104,10 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   blockSender: [{ key: "b", mod: true }],
   blockAll: [{ key: "b", mod: true, shift: true }],
   blockDomain: [{ code: "KeyB", mod: true, alt: true, shift: true }],
+  /** Ctrl+= or Ctrl++ (with Shift, or on the keypad), Ctrl+- and Ctrl+0. */
+  zoomIn: [{ key: "=", mod: true }, { key: "+", mod: true, shift: true }, { key: "+", mod: true }],
+  zoomOut: [{ key: "-", mod: true }],
+  zoomReset: [{ key: "0", mod: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {
