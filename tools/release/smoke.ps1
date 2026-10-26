@@ -4,7 +4,9 @@ $setup = (Get-ChildItem release/*-setup.exe | Select-Object -First 1).FullName
 $dir = Join-Path $env:LOCALAPPDATA 'spark-rs'
 
 function Install-Spark([string[]] $Flags) {
+    Write-Host "Installing with $($Flags -join ' ')"
     $process = Start-Process -FilePath $setup -ArgumentList $Flags -Wait -PassThru
+    Write-Host "Installer exited $($process.ExitCode)"
     if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
 }
 
@@ -29,6 +31,7 @@ $credentials = (& cmdkey /list) -join "`n"
 if ($credentials.Contains('spark-installer-smoke.spark-rs')) { throw 'App credential survived cleanup' }
 if (!$credentials.Contains('spark-installer-smoke-other')) { throw 'Cleanup removed an unrelated credential' }
 & cmdkey /delete:spark-installer-smoke-other
+Write-Host 'Credential cleanup passed'
 
 # A real MCP transport keeps the installed CLI open. Reinstalling in update
 # mode must release that file, including when the agent is waiting on stdin.
@@ -38,6 +41,12 @@ $start.RedirectStandardInput = $true
 $start.RedirectStandardOutput = $true
 $start.RedirectStandardError = $true
 $agent = [Diagnostics.Process]::Start($start)
+Write-Host "Started installed CLI $($agent.Id), sharing the test shell's console"
+$otherDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+New-Item -ItemType Directory $otherDir | Out-Null
+Copy-Item "$dir/spark-cli.exe" "$otherDir/spark-cli.exe"
+$start.FileName = "$otherDir/spark-cli.exe"
+$otherAgent = [Diagnostics.Process]::Start($start)
 try {
     Start-Sleep -Seconds 2
     if ($agent.HasExited) { throw 'MCP process did not stay open for the replacement check' }
@@ -46,7 +55,9 @@ try {
     $sentinel = Join-Path $data 'installer-smoke.txt'
     Set-Content $sentinel 'Keep mail data during updates and ordinary uninstalls'
     Install-Spark -Flags @('/S', '/UPDATE')
+    Write-Host 'Update returned without terminating the parent shell'
     if (!$agent.WaitForExit(10000)) { throw 'Update did not end the installed CLI' }
+    if ($otherAgent.HasExited) { throw 'Update ended a CLI from another folder' }
     if (!(Test-Path $sentinel)) { throw 'Update deleted app data' }
     & "$dir/spark-cli.exe" doctor
     if ($LASTEXITCODE -ne 0) { throw "Updated doctor failed: $LASTEXITCODE" }
@@ -54,7 +65,11 @@ try {
     $uninstall = Start-Process "$dir/uninstall.exe" -ArgumentList '/S' -Wait -PassThru
     if ($uninstall.ExitCode -ne 0) { throw "Uninstall exited $($uninstall.ExitCode)" }
     if (!(Test-Path $sentinel)) { throw 'Ordinary uninstall deleted app data' }
+    Write-Host 'Install, CLI replacement and uninstall checks passed'
 } finally {
     if (!$agent.HasExited) { $agent.Kill() }
     $agent.Dispose()
+    if (!$otherAgent.HasExited) { $otherAgent.Kill(); $otherAgent.WaitForExit() }
+    $otherAgent.Dispose()
+    Remove-Item $otherDir -Recurse -Force
 }

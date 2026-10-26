@@ -5,3 +5,4 @@ node_modules/
 /apps/desktop/src-tauri/binaries
 /build-info.json
 /release
+/tools/release/stop-installed-cli.exe

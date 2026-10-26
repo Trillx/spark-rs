@@ -1,0 +1,36 @@
+# Fast native feedback using installers from an existing build run.
+name: Installer hooks
+on:
+  workflow_dispatch:
+    inputs:
+      installerRun:
+        description: Release workflow run containing the installer artifacts
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  hooks:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: windows-11-arm }
+          - { arch: x64, runner: windows-latest }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-${{ matrix.arch }}
+          path: release
+          run-id: ${{ inputs.installerRun }}
+          github-token: ${{ github.token }}
+      - name: Install the NSIS compiler
+        shell: pwsh
+        run: choco install nsis --yes --no-progress
+      - name: Test the production CLI stop hook
+        shell: pwsh
+        run: ./tools/release/test-hooks.ps1

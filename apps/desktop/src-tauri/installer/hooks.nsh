@@ -1,5 +1,89 @@
-; The hooks run before replacing or removing any installed files. Restart
-; Manager identifies the exact path, so other copies' agents are unaffected.
+; NSIS is a 32-bit process on both architectures. PROCESSENTRY32W is 556
+; bytes there, with the PID at byte 8 and the executable name at byte 36.
+; Terminate the matching image directly: Restart Manager can signal the
+; shared console and stop the terminal or agent that launched spark-cli.
+!macro SparkStopCliFunction prefix
+Function ${prefix}SparkStopCli
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  StrCpy $1 0
+  StrCpy $5 0
+  StrCpy $7 0
+  System::Call 'kernel32::CreateToolhelp32Snapshot(i 2, i 0) p .r0'
+  StrCmp $0 -1 failed
+  System::Alloc 556
+  Pop $1
+  StrCmp $1 0 failed
+  System::Call '*$1(i 556)'
+  System::Call 'kernel32::Process32FirstW(p r0, p r1) i .r2'
+  process_loop:
+    StrCmp $2 0 finished
+    IntOp $3 $1 + 36
+    System::Call '*$3(&w260 .r4)'
+    StrCmp $4 'spark-cli.exe' 0 next_process
+    IntOp $3 $1 + 8
+    System::Call '*$3(i .r4)'
+    System::Call 'kernel32::OpenProcess(i 0x101001, i 0, i r4) p .r5'
+    StrCmp $5 0 next_process
+    System::Call 'kernel32::QueryFullProcessImageNameW(p r5, i 0, w .r6, *i ${NSIS_MAX_STRLEN}) i .r2'
+    StrCmp $2 0 close_process
+    StrCmp $6 '$INSTDIR\spark-cli.exe' 0 close_process
+    System::Call 'kernel32::TerminateProcess(p r5, i 0) i .r2'
+    StrCmp $2 0 failed
+    System::Call 'kernel32::WaitForSingleObject(p r5, i 10000) i .r2'
+    StrCmp $2 0 close_process failed
+  close_process:
+    System::Call 'kernel32::CloseHandle(p r5)'
+    StrCpy $5 0
+  next_process:
+    System::Call 'kernel32::Process32NextW(p r0, p r1) i .r2'
+    Goto process_loop
+  failed:
+    StrCpy $7 1
+  finished:
+    ${If} $5 != 0
+      System::Call 'kernel32::CloseHandle(p r5)'
+    ${EndIf}
+    ${If} $1 != 0
+      System::Free $1
+    ${EndIf}
+    ${If} $0 != -1
+      System::Call 'kernel32::CloseHandle(p r0)'
+    ${EndIf}
+    ${If} $7 = 0
+      ClearErrors
+    ${Else}
+      SetErrors
+    ${EndIf}
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+!macroend
+!insertmacro SparkStopCliFunction ""
+!insertmacro SparkStopCliFunction "un."
+
+!macro SparkStopCli prefix
+  Call ${prefix}SparkStopCli
+  ${If} ${Errors}
+    MessageBox MB_OK|MB_ICONSTOP "Couldn't stop the installed spark-cli. Close agents using spark-rs and try again."
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+!macroend
+
+; The hooks run before replacing or removing any installed files.
 !macro NSIS_HOOK_PREINSTALL
   !if "${ARCH}" == "arm64"
     ${IfNot} ${IsNativeARM64}
@@ -16,11 +100,11 @@
     ${EndIf}
   !endif
   spark_cpu_done:
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\spark-cli.exe" "Agents using spark-rs"
+  !insertmacro SparkStopCli ""
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\spark-cli.exe" "Agents using spark-rs"
+  !insertmacro SparkStopCli "un."
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1
     !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "spark-rs"
