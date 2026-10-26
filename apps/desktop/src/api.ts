@@ -17,6 +17,7 @@ import type {
   Failure,
   FolderRole,
   FolderView,
+  GatekeeperMode,
   InlineImages,
   LocalFile,
   InviteAnswer,
@@ -29,6 +30,9 @@ import type {
   PopupMeeting,
   Prefs,
   SendStatusEvent,
+  SenderChange,
+  SenderDecision,
+  SenderStatus,
   Signature,
   SignaturesView,
   DefaultSignature,
@@ -37,6 +41,7 @@ import type {
   UpdatesView,
   UpdateProgress,
 } from "./types";
+import { covers, domainOf, settled } from "./lib/gatekeeper";
 import { htmlText } from "./lib/signatures";
 
 // Inside the app, data comes from the Rust side. In a plain browser
@@ -477,8 +482,72 @@ export function patched(message: Message, patch: MessagePatch): Message {
   if (patch.unread !== undefined) next.unread = patch.unread;
   if (patch.pinned !== undefined) next.pinned = patch.pinned;
   if (patch.priority !== undefined) next.priority = patch.priority;
-  if (patch.screening !== undefined) next.screening = patch.screening;
   return next;
+}
+
+// ---- Gatekeeper ----
+
+/**
+ * Accepts or blocks senders or whole domains for every account (`null`
+ * makes them new again), moving their mail to match. Resolves to the
+ * changes that undo it. A free mail provider's domain is refused.
+ */
+export function decideSenders(changes: SenderChange[]): Promise<SenderChange[]> {
+  if (isTauri()) return invoke("decide_senders", { changes });
+  const undo: SenderChange[] = [];
+  for (const change of changes) {
+    const isDomain = "domain" in change.screen;
+    const key = isDomain
+      ? `d:${(change.screen as { domain: string }).domain.replace(/^@/, "").toLowerCase()}`
+      : `s:${(change.screen as { sender: string }).sender.toLowerCase()}`;
+    if (isDomain && BROWSER_PUBLIC.has(key.slice(2))) {
+      return Promise.reject(`Anyone can have an address at ${key.slice(2)}, so its senders can only be accepted or blocked one by one.`);
+    }
+    undo.unshift({ screen: change.screen, decision: browserDecisions.get(key) ?? null });
+    if (change.decision) browserDecisions.set(key, change.decision);
+    else browserDecisions.delete(key);
+    browserMailbox.forEach((m, i) => {
+      if (!covers(change.screen, m.address)) return;
+      const status = browserStatus(m.address);
+      const decision = status.sender ?? status.domain;
+      const next = settled(m, decision ?? (browserMode === "off" ? "accepted" : null));
+      browserMailbox[i] = next;
+    });
+  }
+  return Promise.resolve(undo);
+}
+
+export function senderStatus(address: string): Promise<SenderStatus> {
+  if (isTauri()) return invoke("sender_status", { address });
+  return Promise.resolve(browserStatus(address));
+}
+
+export function getGatekeeperMode(): Promise<GatekeeperMode> {
+  if (isTauri()) return invoke("gatekeeper_mode");
+  return Promise.resolve(browserMode);
+}
+
+/** Turning the Gatekeeper off accepts everyone waiting in it. */
+export function setGatekeeperMode(mode: GatekeeperMode): Promise<void> {
+  if (isTauri()) return invoke("set_gatekeeper_mode", { mode });
+  browserMode = mode;
+  if (mode === "off") {
+    browserMailbox.forEach((m, i) => {
+      if (!m.screening) return;
+      browserDecisions.set(`s:${m.address.toLowerCase()}`, "accepted");
+      browserMailbox[i] = { ...m, screening: false };
+    });
+  }
+  return Promise.resolve();
+}
+
+function browserStatus(address: string): SenderStatus {
+  const domain = domainOf(address) ?? "";
+  return {
+    sender: browserDecisions.get(`s:${address.toLowerCase()}`) ?? null,
+    domain: browserDecisions.get(`d:${domain}`) ?? null,
+    publicDomain: BROWSER_PUBLIC.has(domain),
+  };
 }
 
 // ---- sending ----
@@ -771,6 +840,14 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, 
   timestamp: loadedAt - ageMinutes * 60_000,
   folders: demoFolders.filter((f) => (f.members as number[]).includes(m.id)).map((f) => f.id),
 })) as Message[];
+
+/** Gatekeeper decisions in the preview, by `s:<address>` and `d:<domain>`. Senders not waiting were accepted, as after a first sync. */
+const browserDecisions = new Map<string, SenderDecision>(
+  browserMailbox.filter((m) => !m.screening).map((m) => [`s:${m.address.toLowerCase()}`, "accepted"]),
+);
+let browserMode: GatekeeperMode = "beforeInbox";
+/** A few free mail providers, standing in for the store's list. */
+const BROWSER_PUBLIC = new Set(["gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"]);
 
 /** The few demo messages with HTML of their own, like demo::html. */
 const browserHtml = new Map(demo.flatMap((m) => (m.html ? [[m.id, m.html] as const] : [])));

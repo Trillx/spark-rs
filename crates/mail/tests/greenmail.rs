@@ -20,7 +20,8 @@ use spark_mail::engine::{folder_has_older, inbox_has_older};
 use spark_mail::imap::{self, Security, Server};
 use spark_mail::{Engine, OLDER_STEP, Round, Secrets, drafts, smtp};
 use spark_store::{
-    AccountKind, Category, FolderRole, MessageState, OutboxFile, Patch, Store, now_ms,
+    AccountKind, Category, Change, Decision, FolderRole, MessageState, OutboxFile, Patch, Screen,
+    Store, now_ms,
 };
 
 #[derive(Default)]
@@ -1232,15 +1233,12 @@ async fn imap_blocked_mail_moves_to_the_blocked_folder() {
     let offer = find(&engine, "Offer 1");
     assert!(offer.screening);
 
-    // Blocking moves the sender's mail into a new Blocked folder.
-    back_in_time(
-        &engine,
-        offer.id,
-        Patch {
-            state: Some(MessageState::Blocked),
-            ..Default::default()
-        },
-    );
+    // Blocking the sender moves their mail into a new Blocked folder.
+    let block = Change {
+        screen: Screen::Sender("spam@z.net".into()),
+        decision: Some(Decision::Blocked),
+    };
+    engine.store().decide(&[block], now_ms() - 60_000).unwrap();
     assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 2);
     let mut other = imap::login(&imap, &me, "pw").await.unwrap();
     assert_eq!(other.select("Blocked").await.unwrap().exists, 2);
@@ -1284,7 +1282,7 @@ async fn imap_blocked_mail_moves_to_the_blocked_folder() {
     let _ = session.logout().await;
     assert_eq!(other.select("Blocked").await.unwrap().exists, 3);
 
-    // Back to the Inbox from Blocked: moved back on the server.
+    // One email back to the Inbox from Blocked: moved back on the server.
     back_in_time(
         &engine,
         offer.id,
@@ -1380,4 +1378,43 @@ async fn imap_deletes_for_good() {
     assert_eq!(find(&engine, "Back out").state, MessageState::Inbox);
     assert_eq!(find(&engine, "Keep").state, MessageState::Inbox);
     assert_eq!(count(&mut other, "INBOX", "Keep").await, 1);
+}
+
+#[tokio::test]
+async fn imap_people_written_to_elsewhere_skip_the_gatekeeper() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("sent{}@example.com", now_ms());
+    deliver(&smtp, "Ana <ana@x.com>", &me, "Known", false).await;
+    // The user wrote to Dana from their phone: it's in Sent, not in spark-rs.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.create("Sent").await.unwrap();
+    let to_dana = format!(
+        "Message-ID: <to-dana@x.com>\r\nFrom: {me}\r\nTo: Dana <dana@fabrikam.org>\r\nSubject: Hello\r\n\r\nHi Dana\r\n"
+    );
+    other.append("Sent", None, None, to_dana).await.unwrap();
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    let first = Round {
+        fetch: true,
+        list_folders: true,
+        ..Default::default()
+    };
+    engine.run_round(account.id, &first).await.unwrap();
+
+    deliver(&smtp, "Dana <dana@fabrikam.org>", &me, "Re: Hello", false).await;
+    deliver(&smtp, "Eve <eve@fabrikam.org>", &me, "Cold pitch", false).await;
+    let report = engine.run(account.id, true).await.unwrap();
+    assert_eq!(report.new, 2);
+    assert!(!find(&engine, "Re: Hello").screening);
+    assert!(find(&engine, "Cold pitch").screening);
 }

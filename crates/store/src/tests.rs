@@ -328,6 +328,24 @@ fn version_8_databases_index_their_mail_for_search() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+fn decide(store: &mut Store, screen: Screen, decision: Option<Decision>, now: i64) -> Vec<Change> {
+    store.decide(&[Change { screen, decision }], now).unwrap()
+}
+
+fn sender(address: &str) -> Screen {
+    Screen::Sender(address.into())
+}
+
+/// Stores new mail from `from` after the first sync, and returns it.
+fn arrive(store: &mut Store, account: i64, uid: u32, from: &str) -> Message {
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, uid, from), true)
+            .unwrap(),
+    );
+    store.message(id).unwrap().unwrap()
+}
+
 #[test]
 fn new_senders_wait_in_the_gatekeeper_after_the_first_sync() {
     let (mut store, account) = store_with_account();
@@ -357,12 +375,20 @@ fn new_senders_wait_in_the_gatekeeper_after_the_first_sync() {
     assert!(!store.message(again).unwrap().unwrap().screening);
     assert!(store.message(fresh).unwrap().unwrap().screening);
 
-    // Accepting one message accepts the sender.
-    let patch = Patch {
-        screening: Some(false),
-        ..Default::default()
-    };
-    store.update(fresh, &patch, 10).unwrap();
+    // Accepting the sender takes all their mail out of the Gatekeeper.
+    let undo = decide(
+        &mut store,
+        sender("New@x.com"),
+        Some(Decision::Accepted),
+        10,
+    );
+    assert_eq!(
+        undo,
+        [Change {
+            screen: sender("New@x.com"),
+            decision: None
+        }]
+    );
     assert!(!store.message(fresh2).unwrap().unwrap().screening);
     let later = new_id(
         store
@@ -372,11 +398,7 @@ fn new_senders_wait_in_the_gatekeeper_after_the_first_sync() {
     assert!(!store.message(later).unwrap().unwrap().screening);
 
     // Undoing the accept puts the sender back in the Gatekeeper.
-    let undo = Patch {
-        screening: Some(true),
-        ..Default::default()
-    };
-    store.update(fresh, &undo, 11).unwrap();
+    store.decide(&undo, 11).unwrap();
     assert!(store.message(fresh2).unwrap().unwrap().screening);
 
     // The account's own address is never screened.
@@ -393,8 +415,34 @@ fn new_senders_wait_in_the_gatekeeper_after_the_first_sync() {
             .add_incoming(&incoming(account, 8, "s@x.com"), true)
             .unwrap(),
     );
-    store.accept_sender(account, "S@x.com").unwrap();
+    store.accept_sender("S@x.com", 12).unwrap();
     assert!(!store.message(stranger).unwrap().unwrap().screening);
+}
+
+#[test]
+fn decisions_are_for_every_account() {
+    let (mut store, work) = store_with_account();
+    let home = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "me@example.org",
+            name: "Me",
+            label: "Home",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let at_work = arrive(&mut store, work, 1, "ana@x.com").id;
+    let at_home = arrive(&mut store, home, 1, "ana@x.com").id;
+    decide(
+        &mut store,
+        sender("ana@x.com"),
+        Some(Decision::Accepted),
+        10,
+    );
+    assert!(!store.message(at_work).unwrap().unwrap().screening);
+    assert!(!store.message(at_home).unwrap().unwrap().screening);
+    assert!(!arrive(&mut store, home, 2, "ana@x.com").screening);
 }
 
 #[test]
@@ -410,15 +458,16 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
             .add_incoming(&incoming(account, 2, "spam@x.com"), true)
             .unwrap(),
     );
-    let block = Patch {
-        state: Some(MessageState::Blocked),
-        screening: Some(false),
-        ..Default::default()
-    };
-    store.update(a, &block, 10).unwrap();
+    let undo = decide(
+        &mut store,
+        sender("spam@x.com"),
+        Some(Decision::Blocked),
+        10,
+    );
+    let blocked = store.message(b).unwrap().unwrap();
     assert_eq!(
-        store.message(b).unwrap().unwrap().state,
-        MessageState::Blocked
+        (blocked.state, blocked.screening),
+        (MessageState::Blocked, false)
     );
     let c = new_id(
         store
@@ -429,6 +478,7 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
         store.message(c).unwrap().unwrap().state,
         MessageState::Blocked
     );
+
     // Their mail moves to the Blocked folder.
     let pending = store.pending(account, now_ms() + 1, 0).unwrap();
     let mut moving: Vec<(i64, Place)> = pending.iter().map(|p| (p.id, p.place)).collect();
@@ -441,7 +491,22 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
             (c, Place::Blocked)
         ]
     );
-    for p in &pending {
+
+    // Undone in time, none of it leaves the inbox: it waits in the Gatekeeper again.
+    store.decide(&undo, 11).unwrap();
+    for id in [a, c] {
+        let back = store.message(id).unwrap().unwrap();
+        assert_eq!((back.state, back.screening), (MessageState::Inbox, true));
+    }
+    assert!(store.pending(account, now_ms() + 1, 0).unwrap().is_empty());
+
+    decide(
+        &mut store,
+        sender("spam@x.com"),
+        Some(Decision::Blocked),
+        12,
+    );
+    for p in &store.pending(account, now_ms() + 1, 0).unwrap() {
         store
             .mark_pushed(
                 p,
@@ -454,17 +519,18 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
     }
     assert!(store.pending(account, now_ms() + 1, 0).unwrap().is_empty());
 
-    // Clearing out the Blocked list keeps the sender blocked.
+    // Clearing out the Blocked list keeps the sender blocked, and so does
+    // moving one email back to the Inbox.
     let trash = Patch {
         state: Some(MessageState::Deleted),
         ..Default::default()
     };
     store.update(a, &trash, 20).unwrap();
-    let done = Patch {
-        state: Some(MessageState::Done),
+    let inbox = Patch {
+        state: Some(MessageState::Inbox),
         ..Default::default()
     };
-    store.update(b, &done, 21).unwrap();
+    store.update(b, &inbox, 21).unwrap();
     let d = new_id(
         store
             .add_incoming(&incoming(account, 4, "spam@x.com"), true)
@@ -474,20 +540,176 @@ fn blocking_a_sender_blocks_their_mail_now_and_later() {
         store.message(d).unwrap().unwrap().state,
         MessageState::Blocked
     );
-
-    // Moving one back to the Inbox unblocks them.
-    let inbox = Patch {
-        state: Some(MessageState::Inbox),
-        ..Default::default()
-    };
-    store.update(d, &inbox, 22).unwrap();
-    let e = new_id(
-        store
-            .add_incoming(&incoming(account, 5, "spam@x.com"), true)
-            .unwrap(),
+    assert_eq!(
+        store.sender_status("SPAM@x.com").unwrap(),
+        SenderStatus {
+            sender: Some(Decision::Blocked),
+            domain: None,
+            public_domain: false,
+        }
     );
-    let e = store.message(e).unwrap().unwrap();
-    assert_eq!((e.state, e.screening), (MessageState::Inbox, false));
+
+    // Accepting them brings their blocked mail back to the Inbox; trashed mail stays.
+    decide(
+        &mut store,
+        sender("spam@x.com"),
+        Some(Decision::Accepted),
+        30,
+    );
+    let d = store.message(d).unwrap().unwrap();
+    assert_eq!((d.state, d.screening), (MessageState::Inbox, false));
+    assert_eq!(
+        store.message(a).unwrap().unwrap().state,
+        MessageState::Deleted
+    );
+    // What reached the Blocked folder goes back; what never left the inbox stays put.
+    let moving: Vec<(i64, Place)> = store
+        .pending(account, now_ms() + 1, 0)
+        .unwrap()
+        .iter()
+        .map(|p| (p.id, p.place))
+        .collect();
+    assert!(moving.contains(&(c, Place::Inbox)), "{moving:?}");
+    assert!(!moving.iter().any(|(id, _)| *id == d.id));
+}
+
+#[test]
+fn domains_are_decided_as_a_whole_with_senders_as_exceptions() {
+    let (mut store, account) = store_with_account();
+    let ana = arrive(&mut store, account, 1, "ana@spam.biz").id;
+    let bob = arrive(&mut store, account, 2, "bob@spam.biz").id;
+    let elsewhere = arrive(&mut store, account, 3, "ana@other.biz").id;
+    decide(
+        &mut store,
+        sender("bob@spam.biz"),
+        Some(Decision::Accepted),
+        5,
+    );
+
+    let undo = decide(
+        &mut store,
+        Screen::Domain("@Spam.biz".into()),
+        Some(Decision::Blocked),
+        10,
+    );
+    assert_eq!(
+        store.message(ana).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+    assert_eq!(
+        store.message(bob).unwrap().unwrap().state,
+        MessageState::Inbox
+    );
+    assert!(store.message(elsewhere).unwrap().unwrap().screening);
+    let carl = arrive(&mut store, account, 4, "carl@spam.biz").id;
+    assert_eq!(
+        store.message(carl).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+    assert_eq!(
+        store.sender_status("ana@spam.biz").unwrap(),
+        SenderStatus {
+            sender: None,
+            domain: Some(Decision::Blocked),
+            public_domain: false,
+        }
+    );
+
+    // Accepting one sender lets them through the blocked domain.
+    decide(
+        &mut store,
+        sender("ana@spam.biz"),
+        Some(Decision::Accepted),
+        11,
+    );
+    assert_eq!(
+        store.message(ana).unwrap().unwrap().state,
+        MessageState::Inbox
+    );
+    assert_eq!(
+        store.message(carl).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+
+    store.decide(&undo, 12).unwrap();
+    let carl = store.message(carl).unwrap().unwrap();
+    assert_eq!((carl.state, carl.screening), (MessageState::Inbox, true));
+
+    // Free mail providers can't be decided as a whole.
+    let public = store.decide(
+        &[Change {
+            screen: Screen::Domain("gmail.com".into()),
+            decision: Some(Decision::Blocked),
+        }],
+        13,
+    );
+    assert!(public.is_err());
+}
+
+#[test]
+fn colleagues_correspondents_and_big_companies_skip_the_gatekeeper() {
+    let mut store = Store::open_in_memory().unwrap();
+    let account = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: "me@contoso.com",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let screened =
+        |store: &mut Store, uid: u32, from: &str| arrive(store, account, uid, from).screening;
+    assert!(!screened(&mut store, 1, "Boss@Contoso.com"), "a colleague");
+    assert!(
+        !screened(&mut store, 2, "noreply@github.com"),
+        "a well-known company"
+    );
+    assert!(
+        !screened(&mut store, 3, "no-reply@accounts.google.com"),
+        "a well-known company's subdomain"
+    );
+    assert!(screened(&mut store, 4, "someone@fabrikam.com"));
+
+    // Someone the user wrote to from another client, found in Sent.
+    let sent = Incoming {
+        from_address: "me@contoso.com".into(),
+        to: vec!["Dana <Dana@Fabrikam.com>".into()],
+        ..in_folder(account, "Sent Items", 9, 9)
+    };
+    store.add_incoming(&sent, false).unwrap();
+    assert!(!screened(&mut store, 5, "dana@fabrikam.com"));
+    assert!(screened(&mut store, 6, "dan@fabrikam.com"));
+}
+
+#[test]
+fn turning_the_gatekeeper_off_accepts_everyone_waiting() {
+    let (mut store, account) = store_with_account();
+    assert_eq!(
+        store.gatekeeper_mode().unwrap(),
+        GatekeeperMode::BeforeInbox
+    );
+    let waiting = arrive(&mut store, account, 1, "a@x.com").id;
+    store
+        .set_gatekeeper_mode(GatekeeperMode::InsideInbox)
+        .unwrap();
+    assert!(
+        store.message(waiting).unwrap().unwrap().screening,
+        "inside the inbox, still new"
+    );
+
+    store.set_gatekeeper_mode(GatekeeperMode::Off).unwrap();
+    assert_eq!(store.gatekeeper_mode().unwrap(), GatekeeperMode::Off);
+    assert!(!store.message(waiting).unwrap().unwrap().screening);
+    assert!(!arrive(&mut store, account, 2, "b@x.com").screening);
+
+    // Back on, only senders new from then are screened.
+    store
+        .set_gatekeeper_mode(GatekeeperMode::BeforeInbox)
+        .unwrap();
+    assert!(!arrive(&mut store, account, 3, "b@x.com").screening);
+    assert!(arrive(&mut store, account, 4, "c@x.com").screening);
 }
 
 #[test]
@@ -1385,11 +1607,13 @@ fn inbox_mail_first_seen_in_a_folder_still_arrives_as_new() {
             .add_incoming(&incoming(account, 2, "spam@x.com"), false)
             .unwrap(),
     );
-    let blocking = Patch {
-        state: Some(MessageState::Blocked),
-        ..Default::default()
-    };
-    store.update(spam, &blocking, 1_000).unwrap();
+    let _ = spam;
+    decide(
+        &mut store,
+        sender("spam@x.com"),
+        Some(Decision::Blocked),
+        1_000,
+    );
 
     // All Mail syncs before the inbox: a stranger's mail and a blocked sender's.
     let in_all_mail = |uid: u32, message: u32, from: &str| Incoming {
@@ -2138,42 +2362,76 @@ fn version_11_databases_gain_reply_to_and_draft_options_without_losing_mail() {
 }
 
 #[test]
-fn version_12_databases_move_blocked_mail_out_of_the_inbox() {
+fn version_12_databases_move_blocked_mail_out_and_share_decisions() {
     let dir = std::env::temp_dir().join(format!("spark-store-v12-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("v12.sqlite");
     let _ = std::fs::remove_file(&path);
-    let (account, blocked) = {
-        let mut store = Store::open(&path).unwrap();
-        let account = store
-            .add_account(&NewAccount {
-                kind: AccountKind::Imap,
-                email: "me@example.test",
-                name: "Me",
-                label: "Test",
-                config: "{}",
-            })
-            .unwrap()
-            .id;
-        let id = new_id(
-            store
-                .add_incoming(&incoming(account, 1, "spam@x.com"), false)
-                .unwrap(),
-        );
-        // As version 12 left blocked mail: in the server's inbox, nothing to push.
-        store
-            .conn
-            .execute_batch(
-                "UPDATE messages SET state = 'blocked', changed_at = 0;
-                 PRAGMA user_version = 12;",
-            )
-            .unwrap();
-        (account, id)
-    };
+    {
+        let conn = Connection::open(&path).unwrap();
+        for schema in [
+            SCHEMA,
+            SCHEMA_2,
+            SCHEMA_3,
+            SCHEMA_4,
+            drafts::SCHEMA_DRAFTS,
+            conversations::SCHEMA_CONVERSATIONS,
+            SCHEMA_7,
+            calendar::SCHEMA_CALENDAR,
+            search::SCHEMA_SEARCH,
+            signatures::SCHEMA_SIGNATURES,
+            contacts::SCHEMA_CONTACTS,
+            "ALTER TABLE messages ADD COLUMN reply_to_list TEXT NOT NULL DEFAULT '[]';
+             CREATE TABLE draft_options (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                send_later TEXT NOT NULL
+             );",
+        ] {
+            conn.execute_batch(schema).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        // Spam was blocked in one account and accepted in the other; Ana
+        // waits in the first account's Gatekeeper but was accepted in the second.
+        conn.execute_batch(
+            "INSERT INTO accounts (id, kind, email, name, label, color, config, position)
+             VALUES (1, 'imap', 'me@example.test', 'Me', 'One', '#000', '{}', 0),
+                    (2, 'imap', 'me@other.test', 'Me', 'Two', '#000', '{}', 1);
+             INSERT INTO senders (account_id, address, status)
+             VALUES (1, 'spam@x.com', 'blocked'), (2, 'spam@x.com', 'accepted'),
+                    (2, 'Ana@y.com', 'accepted');
+             INSERT INTO messages (id, account_id, from_name, from_address, to_list, cc_list,
+                 subject, snippet, date, text_body, attachments, category, state, unread, pinned,
+                 screening, remote_place, remote_unread, remote_pinned)
+             VALUES (1, 1, 'Spam', 'spam@x.com', '[]', '[]', 'Offer', '', 0, '', '[]', 'people',
+                     'blocked', 0, 0, 0, 'inbox', 0, 0),
+                    (2, 2, 'Spam', 'spam@x.com', '[]', '[]', 'Offer', '', 0, '', '[]', 'people',
+                     'inbox', 0, 0, 0, 'inbox', 0, 0),
+                    (3, 1, 'Ana', 'ana@y.com', '[]', '[]', 'Hi', '', 0, '', '[]', 'people',
+                     'inbox', 1, 0, 1, 'inbox', 1, 0);",
+        )
+        .unwrap();
+    }
     let store = Store::open(&path).unwrap();
-    let pending = store.pending(account, now_ms() + 1, 0).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!((pending[0].id, pending[0].place), (blocked, Place::Blocked));
+    let now = now_ms() + 1;
+    let moving = |account| -> Vec<(i64, Place)> {
+        store
+            .pending(account, now, 0)
+            .unwrap()
+            .iter()
+            .map(|p| (p.id, p.place))
+            .collect()
+    };
+    assert_eq!(moving(1), [(1, Place::Blocked)]);
+    assert_eq!(moving(2), [(2, Place::Blocked)]);
+    assert_eq!(
+        store.message(2).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+    assert!(!store.message(3).unwrap().unwrap().screening);
+    assert_eq!(
+        store.sender_status("spam@x.com").unwrap().sender,
+        Some(Decision::Blocked)
+    );
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 }

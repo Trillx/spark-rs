@@ -19,12 +19,16 @@ mod calendar;
 mod contacts;
 mod conversations;
 mod drafts;
+mod gatekeeper;
 mod search;
 mod signatures;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use contacts::Contact;
 pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
+pub use gatekeeper::{
+    Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
+};
 pub use rusqlite::Error;
 pub use search::{Query, Term};
 pub use signatures::{DefaultSignature, Signature};
@@ -280,7 +284,6 @@ pub struct Patch {
     pub unread: Option<bool>,
     pub pinned: Option<bool>,
     pub priority: Option<bool>,
-    pub screening: Option<bool>,
     /// Files it into this folder of its own account: Filed there, or Done
     /// or Deleted for the Archive or Trash folder. Takes precedence over
     /// `state`.
@@ -454,7 +457,7 @@ CREATE INDEX messages_message_id ON messages(account_id, message_id);
 CREATE INDEX messages_sender ON messages(account_id, from_address);
 CREATE INDEX messages_date ON messages(date DESC);
 
--- Gatekeeper decisions per sender.
+-- Gatekeeper decisions per sender (until version 14, see `gatekeeper`).
 CREATE TABLE senders (
     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     address TEXT NOT NULL COLLATE NOCASE,
@@ -671,6 +674,13 @@ impl Store {
             )?;
             conn.pragma_update(None, "user_version", 13)?;
         }
+        if version < 14 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(gatekeeper::SCHEMA_GATEKEEPER)?;
+            gatekeeper::migrate(&tx, now_ms())?;
+            tx.pragma_update(None, "user_version", 14)?;
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -711,8 +721,6 @@ impl Store {
             ],
         )?;
         let id = self.conn.last_insert_rowid();
-        // You never need to screen yourself.
-        self.set_sender(id, new.email, Some("accepted"))?;
         Ok(self.account(id)?.expect("just inserted"))
     }
 
@@ -777,8 +785,9 @@ impl Store {
     /// recognized by its remote id, its mailbox and UID, or failing those its
     /// Message-ID (it may have left the inbox and come back with a new UID).
     ///
-    /// With `screen_new_senders`, mail from an unknown sender waits in the
-    /// Gatekeeper; without it (the first sync) the sender is accepted.
+    /// With `screen_new_senders`, mail from a new sender waits in the
+    /// Gatekeeper (see `gatekeeper::arrival`); without it (the first sync)
+    /// the sender is accepted.
     pub fn add_incoming(&mut self, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
         let tx = self.conn.transaction()?;
         if let Some(id) = find_stored(&tx, m)? {
@@ -791,7 +800,7 @@ impl Store {
             // First seen by a folder sync (Gmail's All Mail has inbox mail
             // too): it arrives now, as if it were new.
             if folder_only && !dirty {
-                let (state, screening) = arrival(&tx, m, screen_new_senders)?;
+                let (state, screening) = gatekeeper::arrival(&tx, m, screen_new_senders)?;
                 tx.execute(
                     "UPDATE messages SET
                         remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
@@ -832,7 +841,7 @@ impl Store {
             return Ok(Added::Known(id));
         }
 
-        let (state, screening) = arrival(&tx, m, screen_new_senders)?;
+        let (state, screening) = gatekeeper::arrival(&tx, m, screen_new_senders)?;
         let id = insert_message(&tx, m, state, screening, Place::Inbox)?;
         tx.execute(
             "UPDATE messages SET changed_at = ?2 WHERE id = ?1",
@@ -1030,9 +1039,8 @@ impl Store {
 
     // ---- local changes ----
 
-    /// Applies the user's change, including the Gatekeeper's per-sender
-    /// rules: accepting or blocking one message decides for the sender.
-    /// Returns `None` if the message doesn't exist.
+    /// Applies the user's change to one message; decisions about its sender
+    /// are `decide`'s. Returns `None` if the message doesn't exist.
     ///
     /// Filed mail is listed in its home folder from now on, and no longer in
     /// the one it leaves; folder syncs keep it that way until the change is
@@ -1080,9 +1088,6 @@ impl Store {
         if let Some(priority) = patch.priority {
             m.priority = priority;
         }
-        if let Some(screening) = patch.screening {
-            m.screening = screening;
-        }
         // A filed message is where the server has it if that's its home
         // folder, or it has none.
         tx.execute(
@@ -1128,55 +1133,8 @@ impl Store {
             }
         }
 
-        let sender = (m.account_id, m.from_address.as_str());
-        if patch.screening == Some(false) && before.screening {
-            set_sender_in(&tx, sender, Some("accepted"))?;
-            tx.execute(
-                "UPDATE messages SET screening = 0 WHERE account_id = ?1 AND from_address = ?2",
-                params![sender.0, sender.1],
-            )?;
-        } else if patch.screening == Some(true) && !before.screening {
-            set_sender_in(&tx, sender, None)?;
-            tx.execute(
-                "UPDATE messages SET screening = 1
-                 WHERE account_id = ?1 AND from_address = ?2 AND state = 'inbox'",
-                params![sender.0, sender.1],
-            )?;
-        }
-        if m.state == MessageState::Blocked && before.state != MessageState::Blocked {
-            set_sender_in(&tx, sender, Some("blocked"))?;
-            tx.execute(
-                "UPDATE messages SET state = 'blocked', screening = 0,
-                    changed_at = CASE WHEN remote_place = 'blocked' AND remote_unread = unread
-                                           AND remote_pinned = pinned THEN 0 ELSE ?3 END
-                 WHERE account_id = ?1 AND from_address = ?2 AND state = 'inbox'",
-                params![sender.0, sender.1, now],
-            )?;
-        } else if before.state == MessageState::Blocked && m.state == MessageState::Inbox {
-            // Back in the Inbox unblocks the sender. Trash, Done or a folder
-            // only moves the message: the sender stays blocked.
-            set_sender_in(
-                &tx,
-                sender,
-                if m.screening { None } else { Some("accepted") },
-            )?;
-        }
         tx.commit()?;
         self.message(id)
-    }
-
-    /// Accepts a sender without a message, e.g. someone the user wrote to.
-    pub fn accept_sender(&self, account_id: i64, address: &str) -> Result<()> {
-        self.set_sender(account_id, address, Some("accepted"))?;
-        self.conn.execute(
-            "UPDATE messages SET screening = 0 WHERE account_id = ?1 AND from_address = ?2",
-            params![account_id, address],
-        )?;
-        Ok(())
-    }
-
-    fn set_sender(&self, account_id: i64, address: &str, status: Option<&str>) -> Result<()> {
-        set_sender_in(&self.conn, (account_id, address), status)
     }
 
     /// Snoozed messages whose time has come go back to the inbox, unread.
@@ -1777,35 +1735,6 @@ fn refused(why: &str) -> Error {
     )
 }
 
-/// The state and Gatekeeper screening of mail arriving in the inbox, by its
-/// sender. With `screen_new_senders` an unknown sender waits in the
-/// Gatekeeper; without it (an account's first sync) they're accepted.
-fn arrival(
-    conn: &Connection,
-    m: &Incoming,
-    screen_new_senders: bool,
-) -> Result<(MessageState, bool)> {
-    let sender: Option<String> = conn
-        .query_row(
-            "SELECT status FROM senders WHERE account_id = ?1 AND address = ?2",
-            params![m.account_id, m.from_address],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(match sender.as_deref() {
-        Some("blocked") => (MessageState::Blocked, false),
-        Some(_) => (MessageState::Inbox, false),
-        None if screen_new_senders && !m.from_address.is_empty() => (MessageState::Inbox, true),
-        None => {
-            conn.execute(
-                "INSERT OR IGNORE INTO senders (account_id, address, status) VALUES (?1, ?2, 'accepted')",
-                params![m.account_id, m.from_address],
-            )?;
-            (MessageState::Inbox, false)
-        }
-    })
-}
-
 /// `changed_at` for mail arriving in the inbox as `state`: mail from a
 /// blocked sender has to move to the Blocked folder.
 fn arrival_change(state: MessageState) -> i64 {
@@ -1949,25 +1878,6 @@ fn folder_row(r: &Row) -> Result<Folder> {
         sync_state: r.get(7)?,
         synced_at: r.get(8)?,
     })
-}
-
-fn set_sender_in(
-    conn: &Connection,
-    (account_id, address): (i64, &str),
-    status: Option<&str>,
-) -> Result<()> {
-    match status {
-        Some(status) => conn.execute(
-            "INSERT INTO senders (account_id, address, status) VALUES (?1, ?2, ?3)
-             ON CONFLICT (account_id, address) DO UPDATE SET status = excluded.status",
-            params![account_id, address, status],
-        )?,
-        None => conn.execute(
-            "DELETE FROM senders WHERE account_id = ?1 AND address = ?2",
-            params![account_id, address],
-        )?,
-    };
-    Ok(())
 }
 
 pub fn now_ms() -> i64 {

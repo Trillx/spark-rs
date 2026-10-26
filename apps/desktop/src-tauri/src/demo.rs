@@ -13,7 +13,8 @@ use spark_mail::draft::{Draft, OutgoingAttachment};
 use spark_mail::invite::{Answer, Card, Kind, Person};
 use spark_mail::{drafts, parse};
 use spark_store::{
-    AccountKind, Category, Contact, FolderRole, Incoming, MessageState, NewAccount, Patch, Store,
+    AccountKind, Category, Change, Contact, Decision, FolderRole, GatekeeperMode, Incoming,
+    MessageState, NewAccount, Patch, Screen, SenderStatus, Store, domain_of, is_public_domain,
     now_ms,
 };
 
@@ -181,14 +182,34 @@ struct DemoInvite {
     attendees: Vec<Person>,
 }
 
-/// The messages, the drafts, the answers given to demo invitations, and the
-/// people in the demo mail.
+/// The messages, the drafts, the answers given to demo invitations, the
+/// people in the demo mail, and the Gatekeeper's decisions.
 pub struct DemoMailbox(
     Mutex<Vec<Message>>,
     Mutex<DemoDrafts>,
     Mutex<HashMap<i64, Answer>>,
     Mutex<Store>,
+    Mutex<DemoGatekeeper>,
 );
+
+/// Gatekeeper decisions, by lowercased address and domain, and the mode.
+#[derive(Default)]
+struct DemoGatekeeper {
+    senders: HashMap<String, Decision>,
+    domains: HashMap<String, Decision>,
+    mode: GatekeeperMode,
+}
+
+impl DemoGatekeeper {
+    fn status(&self, address: &str) -> SenderStatus {
+        let domain = domain_of(address);
+        SenderStatus {
+            sender: self.senders.get(&address.to_lowercase()).copied(),
+            domain: domain.as_ref().and_then(|d| self.domains.get(d).copied()),
+            public_domain: domain.is_some_and(|d| is_public_domain(&d)),
+        }
+    }
+}
 
 /// Drafts saved in the demo as the composer had them, and drafts being
 /// "sent", by outbox id, until their undo window is over.
@@ -202,12 +223,99 @@ impl DemoMailbox {
     pub fn load() -> Self {
         let messages = demo_messages(now_ms());
         let people = people(&messages);
+        // Senders not waiting in the Gatekeeper were accepted, as after a first sync.
+        let mut gatekeeper = DemoGatekeeper::default();
+        for m in messages.iter().filter(|m| !m.screening) {
+            gatekeeper
+                .senders
+                .insert(m.address.to_lowercase(), Decision::Accepted);
+        }
         Self(
             Mutex::new(messages),
             Mutex::new(DemoDrafts::default()),
             Mutex::default(),
             Mutex::new(people),
+            Mutex::new(gatekeeper),
         )
+    }
+
+    pub fn gatekeeper_mode(&self) -> GatekeeperMode {
+        self.4.lock().unwrap().mode
+    }
+
+    /// As `Store::set_gatekeeper_mode`.
+    pub fn set_gatekeeper_mode(&self, mode: GatekeeperMode) {
+        let mut gatekeeper = self.4.lock().unwrap();
+        gatekeeper.mode = mode;
+        if mode == GatekeeperMode::Off {
+            for m in self.0.lock().unwrap().iter_mut().filter(|m| m.screening) {
+                m.screening = false;
+                gatekeeper
+                    .senders
+                    .insert(m.address.to_lowercase(), Decision::Accepted);
+            }
+        }
+    }
+
+    pub fn sender_status(&self, address: &str) -> SenderStatus {
+        self.4.lock().unwrap().status(address)
+    }
+
+    /// As `Store::decide`, without the senders the store accepts by rule.
+    pub fn decide(&self, changes: &[Change]) -> Result<Vec<Change>, String> {
+        let mut gatekeeper = self.4.lock().unwrap();
+        let mut messages = self.0.lock().unwrap();
+        let mut undo = Vec::new();
+        for change in changes {
+            let (decisions, key) = match &change.screen {
+                Screen::Sender(address) => (&mut gatekeeper.senders, address.trim().to_lowercase()),
+                Screen::Domain(domain) => {
+                    let domain = domain.trim().trim_start_matches('@').to_lowercase();
+                    if is_public_domain(&domain) {
+                        return Err(format!(
+                            "Anyone can have an address at {domain}, so its senders can only be accepted or blocked one by one."
+                        ));
+                    }
+                    (&mut gatekeeper.domains, domain)
+                }
+            };
+            let previous = match change.decision {
+                Some(decision) => decisions.insert(key.clone(), decision),
+                None => decisions.remove(&key),
+            };
+            undo.push(Change {
+                screen: change.screen.clone(),
+                decision: previous,
+            });
+            let affected = |m: &Message| match &change.screen {
+                Screen::Sender(_) => m.address.eq_ignore_ascii_case(&key),
+                Screen::Domain(_) => domain_of(&m.address).as_deref() == Some(key.as_str()),
+            };
+            for m in messages.iter_mut().filter(|m| affected(m)) {
+                let status = gatekeeper.status(&m.address);
+                match status.sender.or(status.domain) {
+                    Some(Decision::Blocked) => {
+                        if m.state == MessageState::Inbox {
+                            m.state = MessageState::Blocked;
+                            m.screening = false;
+                        }
+                    }
+                    decision => {
+                        if m.state == MessageState::Blocked {
+                            m.state = MessageState::Inbox;
+                        }
+                        let new = decision.is_none() && gatekeeper.mode != GatekeeperMode::Off;
+                        if !new {
+                            m.screening = false;
+                        } else if m.state == MessageState::Inbox {
+                            m.screening = true;
+                        }
+                    }
+                }
+            }
+        }
+        undo.reverse();
+        Ok(undo)
     }
 
     /// The people matching `query`, as real accounts suggest them.
@@ -404,7 +512,7 @@ fn is_draft(m: &Message) -> bool {
     m.folders.iter().any(|id| drafts.contains(id))
 }
 
-/// Same rules as `Store::update`, minus the Gatekeeper's per-sender ones.
+/// Same rules as `Store::update`.
 fn apply(message: &mut Message, patch: &Patch, folders: &[FolderView]) -> Result<(), String> {
     let mut state = patch.state;
     let mut home = message.folder;
@@ -445,9 +553,6 @@ fn apply(message: &mut Message, patch: &Patch, folders: &[FolderView]) -> Result
     }
     if let Some(priority) = patch.priority {
         message.priority = priority;
-    }
-    if let Some(screening) = patch.screening {
-        message.screening = screening;
     }
     // Listed in its home folder only, as after a folder sync.
     let home = home.filter(|_| message.state == MessageState::Filed);

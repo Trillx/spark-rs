@@ -12,8 +12,8 @@ use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
 use spark_mail::{Error, Service, Untrusted};
 use spark_store::{
-    Account, AccountKind, Category, Contact, Folder, FolderRole, MessageState, OutboxFile, Patch,
-    now_ms,
+    Account, AccountKind, Category, Change, Contact, Folder, FolderRole, GatekeeperMode,
+    MessageState, OutboxFile, Patch, SenderStatus, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -830,6 +830,66 @@ pub fn update_message(
     updated
         .map(from_store)
         .ok_or_else(|| format!("no message with id {id}"))
+}
+
+/// Accepts or blocks senders or domains for every account (`None` makes
+/// them new again), moving their mail to match. Returns the changes that
+/// undo it.
+#[tauri::command]
+pub fn decide_senders(
+    mailbox: State<'_, Mailbox>,
+    changes: Vec<Change>,
+) -> Result<Vec<Change>, String> {
+    if !mailbox.live() {
+        return mailbox.demo.decide(&changes);
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .decide(&changes, now_ms())
+        .map_err(text)
+}
+
+/// What's been decided about an address and its domain, e.g. for the card
+/// on a blocked sender's email.
+#[tauri::command]
+pub fn sender_status(mailbox: State<'_, Mailbox>, address: String) -> Result<SenderStatus, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.sender_status(&address));
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .sender_status(&address)
+        .map_err(text)
+}
+
+#[tauri::command]
+pub fn gatekeeper_mode(mailbox: State<'_, Mailbox>) -> Result<GatekeeperMode, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.gatekeeper_mode());
+    }
+    mailbox.live.engine.store().gatekeeper_mode().map_err(text)
+}
+
+/// Turning the Gatekeeper off accepts everyone waiting in it.
+#[tauri::command]
+pub fn set_gatekeeper_mode(
+    mailbox: State<'_, Mailbox>,
+    mode: GatekeeperMode,
+) -> Result<(), String> {
+    if !mailbox.live() {
+        mailbox.demo.set_gatekeeper_mode(mode);
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .set_gatekeeper_mode(mode)
+        .map_err(text)
 }
 
 fn prepare_account_add(app: &AppHandle, mailbox: &Mailbox) -> Result<(), String> {

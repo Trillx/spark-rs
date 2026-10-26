@@ -60,6 +60,7 @@ import {
 import {
   cancelSend,
   createFolder,
+  decideSenders,
   deleteFolder,
   deleteForever,
   discardDraft,
@@ -131,6 +132,7 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
+import { forSenders, predict } from "./lib/gatekeeper";
 import {
   LATER_PRESETS,
   formatFullDate,
@@ -207,6 +209,7 @@ import type {
   MessagePatch,
   Prefs,
   SendStatusEvent,
+  SenderChange,
   SyncStatusEvent,
   Untrusted,
 } from "./types";
@@ -708,20 +711,47 @@ export default function App() {
       const change = changes.find((c) => c.id === m.id);
       return change ? patched(m, change.patch) : m;
     });
-    const before = listedIds(model);
-    const remaining = listedIds(buildList(after, view, sticky, ctx));
-    const leaving = changes.map((c) => c.id).filter((id) => before.has(id) && !remaining.has(id));
-    const cursor = { selectedId, openId };
-
-    moveOffMessages(leaving);
+    const putBack = leave(after, changes.map((c) => c.id));
     void updateAll(changes);
     return () => {
       void updateAll(changes.map((c) => ({ id: c.id, patch: c.previous })));
+      putBack();
+    };
+  }
+
+  /** Moves the cursor off what `after` takes out of the list (of `changed`, if given). Returns how to put it back. */
+  function leave(after: Message[], changed?: number[]): () => void {
+    const before = listedIds(model);
+    const remaining = listedIds(buildList(after, view, sticky, ctx));
+    const leaving = (changed ?? [...before]).filter((id) => before.has(id) && !remaining.has(id));
+    const cursor = { selectedId, openId };
+    moveOffMessages(leaving);
+    return () => {
       if (leaving.length) {
         setSelectedId(cursor.selectedId);
         setOpenId(cursor.openId);
       }
     };
+  }
+
+  /**
+   * Accepts or blocks senders or domains for every account, with an undo:
+   * their mail follows, stored mail too, so the list reloads once it's done.
+   */
+  function decide(changes: SenderChange[], text: string, icon?: ToastIcon) {
+    if (!changes.length) return;
+    const after = predict(messages, changes);
+    const putBack = leave(after);
+    setMessages(after);
+    const failed = (error: unknown) => {
+      showToast(`Couldn't change the sender: ${String(error)}`, undefined, ICONS.error);
+      putBack();
+      void reloadMessages();
+    };
+    void decideSenders(changes).then((undo) => {
+      void reloadMessages();
+      showToast(text, () => void decideSenders(undo).then(reloadMessages, failed).finally(putBack), icon);
+    }, failed);
   }
 
   function act(
@@ -1016,8 +1046,8 @@ export default function App() {
         `Snoozed until ${p.label.toLowerCase()}`,
         ICONS.snooze,
       ),
-    accept: (m: Message) => act([m], { screening: false }, "Sender accepted", ICONS.accept),
-    block: (m: Message) => act([m], { state: "blocked" }, "Sender blocked", ICONS.block),
+    accept: (m: Message) => decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept),
+    block: (m: Message) => decide(forSenders([m], "blocked"), "Sender blocked", ICONS.block),
   };
 
   /** Move to Spam, or for mail in Spam, Not Spam: back to the Inbox. Rows stand for their conversations. */
@@ -1258,8 +1288,8 @@ export default function App() {
   const gatekeeper: GatekeeperActions = {
     accept: actions.accept,
     block: actions.block,
-    acceptAll: (items) => act(items, { screening: false }, senders(items, "accepted"), ICONS.accept),
-    blockAll: (items) => act(items, { state: "blocked" }, senders(items, "blocked"), ICONS.block),
+    acceptAll: (items) => decide(forSenders(items, "accepted"), senders(items, "accepted"), ICONS.accept),
+    blockAll: (items) => decide(forSenders(items, "blocked"), senders(items, "blocked"), ICONS.block),
   };
 
   const snoozeMenu = (m: Message) => setPalette({ kind: "snooze", targetIds: [m.id] });

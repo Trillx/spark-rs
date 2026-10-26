@@ -30,6 +30,8 @@ use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
 pub const SETTLE_MS: i64 = 6_000;
 /// A send that failed on the network is retried after this long.
 const SEND_RETRY_MS: i64 = 60_000;
+/// How many new senders a round asks the Sent folder about, at most.
+const SENT_CHECKS: usize = 20;
 
 /// Where passwords and refresh tokens live (the OS credential store in the
 /// apps). An empty value deletes.
@@ -480,6 +482,14 @@ impl Engine {
                         Err(e) => folder_failed(folder, e, &mut report)?,
                     }
                 }
+                let waiting = self.waiting_senders(&report.arrived)?;
+                if !waiting.is_empty()
+                    && let Some(sent) = self.sent_folder(account_id)?
+                    // A failed check leaves them waiting; it doesn't fail the round.
+                    && let Ok(found) = imap::written_to(&mut session, &sent, &waiting).await
+                {
+                    self.accept_senders(&found)?;
+                }
                 let _ = session.logout().await;
             }
             AccountConfig::Microsoft {
@@ -541,9 +551,53 @@ impl Engine {
                         Err(e) => folder_failed(folder, e, &mut report)?,
                     }
                 }
+                let waiting = self.waiting_senders(&report.arrived)?;
+                if !waiting.is_empty()
+                    && let Ok(found) = graph.written_to(&waiting).await
+                {
+                    self.accept_senders(&found)?;
+                }
             }
         }
         Ok(report)
+    }
+
+    /// The senders of new mail still waiting in the Gatekeeper, to ask the
+    /// Sent folder about: the user may have written to them elsewhere
+    /// (Spark reads Sent for the same reason).
+    fn waiting_senders(&self, arrived: &[i64]) -> Result<Vec<String>> {
+        let store = self.store();
+        let mut senders: Vec<String> = Vec::new();
+        for id in arrived {
+            if let Some(m) = store.message(*id)?
+                && m.screening
+                && !senders
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&m.from_address))
+            {
+                senders.push(m.from_address);
+            }
+        }
+        senders.truncate(SENT_CHECKS);
+        Ok(senders)
+    }
+
+    /// The account's Sent folder, as an IMAP mailbox name.
+    fn sent_folder(&self, account_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .store()
+            .folders()?
+            .into_iter()
+            .find(|f| f.account_id == account_id && f.role == Some(FolderRole::Sent))
+            .map(|f| f.remote_id))
+    }
+
+    fn accept_senders(&self, senders: &[String]) -> Result<()> {
+        let store = self.store();
+        for address in senders {
+            store.accept_sender(address, now_ms())?;
+        }
+        Ok(())
     }
 
     /// Puts a search (in the search field's syntax) to the account's server
@@ -957,7 +1011,7 @@ impl Engine {
         let store = self.store();
         for field in [&draft.to, &draft.cc, &draft.bcc] {
             for m in draft::recipients(field).unwrap_or_default() {
-                store.accept_sender(account_id, m.email.as_ref())?;
+                store.accept_sender(m.email.as_ref(), now_ms())?;
             }
         }
         Ok(())

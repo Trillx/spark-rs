@@ -111,6 +111,29 @@ export interface Message {
   conversation?: number;
 }
 
+/** The Gatekeeper's decision about a sender or a whole domain, for every account. */
+export type SenderDecision = "accepted" | "blocked";
+
+/** Who a decision is about: one address, or everyone at a domain. */
+export type Screen = { sender: string } | { domain: string };
+
+/** A decision to make, or (`null`) to forget, making the sender new again. */
+export interface SenderChange {
+  screen: Screen;
+  decision: SenderDecision | null;
+}
+
+/** What's decided about an address and its domain; its own decision wins. */
+export interface SenderStatus {
+  sender: SenderDecision | null;
+  domain: SenderDecision | null;
+  /** A free mail provider's (gmail.com…): it can't be decided as a whole. */
+  publicDomain: boolean;
+}
+
+/** Where new senders wait: New Senders above the Inbox, in the Inbox asking when opened, or nowhere. */
+export type GatekeeperMode = "beforeInbox" | "insideInbox" | "off";
+
 /** What a server folder is for. User folders and labels have none. */
 export type FolderRole = "sent" | "drafts" | "archive" | "trash" | "spam" | "flagged" | "blocked";
 
@@ -187,7 +210,7 @@ export interface AgentSendingEvent {
 
 /** `folder` files the message in that folder of its own account, setting `state` to `filed`. */
 export type MessagePatch = Partial<
-  Pick<Message, "state" | "unread" | "pinned" | "priority" | "screening" | "snoozedUntil" | "folder">
+  Pick<Message, "state" | "unread" | "pinned" | "priority" | "snoozedUntil" | "folder">
 >;
 
 export interface MessageContent {

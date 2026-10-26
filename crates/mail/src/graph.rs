@@ -849,6 +849,28 @@ impl Graph {
         Ok(())
     }
 
+    /// Of `senders`, the ones the user has written to: Sent Items has mail
+    /// to them.
+    pub async fn written_to(&self, senders: &[String]) -> Result<Vec<String>> {
+        let mut found = Vec::new();
+        for address in senders.iter().filter(|a| !a.contains(['"', '\\'])) {
+            let search = format!("\"recipients:{address}\"");
+            let page: Page<Value> = self
+                .json(self.request(
+                    Method::GET,
+                    &format!(
+                        "/me/mailFolders/sentitems/messages?$search={}&$top=1&$select=id",
+                        path(&search)
+                    ),
+                ))
+                .await?;
+            if !page.value.is_empty() {
+                found.push(address.clone());
+            }
+        }
+        Ok(found)
+    }
+
     /// The id of the mailbox's Blocked folder (at the top, as Spark makes
     /// it), made if there isn't one.
     async fn blocked_folder(&self) -> Result<String> {

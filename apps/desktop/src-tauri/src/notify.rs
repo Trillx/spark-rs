@@ -6,7 +6,7 @@
 //! `HKCU\Software\Classes\AppUserModelId\<identifier>`.
 
 use spark_mail::Engine;
-use spark_store::{Category, Message, MessageState};
+use spark_store::{Category, GatekeeperMode, Message, MessageState};
 use tauri::{AppHandle, Manager};
 
 use crate::background;
@@ -47,9 +47,15 @@ pub fn new_mail(app: &AppHandle, engine: &Engine, account_id: i64, ids: &[i64]) 
     }
     let (arrived, account) = {
         let store = engine.store();
+        // Inside the inbox, a new sender's mail is inbox mail like any other.
+        let inside = store.gatekeeper_mode().ok() == Some(GatekeeperMode::InsideInbox);
         let arrived: Vec<Message> = ids
             .iter()
             .filter_map(|&id| store.message(id).ok().flatten())
+            .map(|m| Message {
+                screening: m.screening && !inside,
+                ..m
+            })
             .collect();
         let several = store.accounts().map(|a| a.len() > 1).unwrap_or(false);
         let label = several
@@ -120,7 +126,7 @@ pub fn test_notification(app: AppHandle) -> Result<(), String> {
 }
 
 /// What to show for the mail that arrived in one sync of one account.
-/// Mail from new senders waits in the Gatekeeper without a notification.
+/// Mail waiting in New Senders (`screening`) or blocked shows none.
 pub fn alerts(arrived: &[Message], notify: NotifyFor, account: Option<&str>) -> Vec<Alert> {
     let wanted: Vec<&Message> = arrived
         .iter()

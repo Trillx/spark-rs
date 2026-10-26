@@ -684,6 +684,31 @@ async fn delimiter(session: &mut Session, mailbox: &str) -> Result<Option<String
     Ok(names.iter().find_map(|n| n.delimiter().map(str::to_owned)))
 }
 
+/// Of `senders`, the ones the user has written to: the Sent mailbox has
+/// mail to them. Addresses that can't be searched for are left out.
+pub async fn written_to(
+    session: &mut Session,
+    sent: &str,
+    senders: &[String],
+) -> Result<Vec<String>> {
+    session.examine(sent).await?;
+    let mut found = Vec::new();
+    for address in senders
+        .iter()
+        .filter(|a| a.is_ascii() && !a.contains(['"', '\\']))
+    {
+        let q = quoted(address);
+        if !session
+            .uid_search(format!("OR OR TO {q} CC {q} BCC {q}"))
+            .await?
+            .is_empty()
+        {
+            found.push(address.clone());
+        }
+    }
+    Ok(found)
+}
+
 /// Brings the inbox into the store: new messages, flag changes, and
 /// messages that left the inbox elsewhere.
 pub async fn sync_inbox(
