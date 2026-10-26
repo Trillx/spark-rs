@@ -34,6 +34,10 @@ export interface Draft {
   signatureFor?: AccountId;
   /** A forward's original, below the signature. */
   quote?: string;
+  /** "Remind me" (if nobody replies, with `ifNoReply`). */
+  remind: (Later & { ifNoReply: boolean }) | null;
+  /** The From account's automatic Cc and Bcc as they were added, so another From swaps them. */
+  auto?: { cc: string[]; bcc: string[] };
 }
 
 
@@ -49,6 +53,7 @@ export function emptyDraft(from: AccountId): Draft {
     body: "",
     from,
     sendLater: null,
+    remind: null,
     doneAfter: false,
     attachments: [],
     signature: null,
@@ -92,6 +97,7 @@ export function outgoingDraft(d: Draft, sendAt: number, draftId = d.draftId): Ou
     signature: sentSignature(d) ?? undefined,
     signatureId: sentSignature(d) !== null ? (d.signatureId ?? undefined) : undefined,
     quote: d.quote,
+    remind: d.remind ? { at: d.remind.at, ifNoReply: d.remind.ifNoReply } : undefined,
   };
 }
 
@@ -118,6 +124,7 @@ export function savedDraft(saved: OutgoingDraft): Draft {
     signatureId: saved.signatureId ?? null,
     signatureFor: saved.account,
     quote: saved.quote,
+    remind: saved.remind ? { key: "custom", ...saved.remind } : null,
   };
 }
 

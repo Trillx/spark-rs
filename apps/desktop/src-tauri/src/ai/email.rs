@@ -87,6 +87,7 @@ pub mod tests {
             conversation: None,
             returned_at: None,
             muted: false,
+            reminder: None,
         }
     }
 

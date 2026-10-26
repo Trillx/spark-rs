@@ -61,6 +61,19 @@ pub struct Draft {
     /// A forward's original, below the signature. Plain text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<String>,
+    /// "Remind me", set once it's sent (see `spark_store::NewReminder`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remind: Option<Remind>,
+}
+
+/// Spark's "Remind me" on an email being sent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Remind {
+    /// When it comes back (Unix ms).
+    pub at: i64,
+    /// Only if nobody has replied by then.
+    pub if_no_reply: bool,
 }
 
 /// A Send Later preset, fixed to the time the user chose it.

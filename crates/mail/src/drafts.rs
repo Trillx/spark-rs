@@ -217,6 +217,8 @@ pub fn open(store: &Store, id: i64) -> Result<Option<Draft>> {
         signature: parts.signature,
         signature_id: parts.signature_id,
         quote: parts.quote,
+        // Saved drafts don't keep a reminder; it's chosen when sending.
+        remind: None,
     }))
 }
 

@@ -520,6 +520,7 @@ impl DemoMailbox {
             conversation: None,
             returned_at: None,
             muted: false,
+            reminder: None,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -697,6 +698,7 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             conversation: e.conversation,
             returned_at: None,
             muted: false,
+            reminder: None,
         })
         .collect()
 }

@@ -30,6 +30,8 @@ import type {
   PopupMeeting,
   Prefs,
   PriorityUndo,
+  ReminderView,
+  ScheduledView,
   SendStatusEvent,
   SenderChange,
   SenderDecision,
@@ -363,6 +365,46 @@ export function renameFolder(id: number, name: string): Promise<void> {
 export function deleteFolder(id: number): Promise<void> {
   if (isTauri()) return invoke("delete_folder", { id });
   return Promise.reject(DEMO_FOLDERS);
+}
+
+// ---- scheduled sends and reminders (the desktop app only) ----
+
+export function listScheduled(): Promise<ScheduledView[]> {
+  if (isTauri()) return invoke("list_scheduled");
+  return Promise.resolve([]);
+}
+
+/** Sends a scheduled message at `at` instead, or (null) now. False once it's gone out. */
+export function rescheduleSend(id: number, at: number | null): Promise<boolean> {
+  if (isTauri()) return invoke("reschedule_send", { id, at });
+  return Promise.resolve(false);
+}
+
+/**
+ * Takes a scheduled message out of the queue into Drafts, exactly as it was
+ * queued (with its time, given `keepSchedule`). Resolves to the draft's id;
+ * null once it's gone out.
+ */
+export function unscheduleSend(id: number, keepSchedule: boolean): Promise<number | null> {
+  if (isTauri()) return invoke("unschedule_send", { id, keepSchedule });
+  return Promise.resolve(null);
+}
+
+export function listReminders(): Promise<ReminderView[]> {
+  if (isTauri()) return invoke("list_reminders");
+  return Promise.resolve([]);
+}
+
+/** Moves a reminder to `at`, or (null) removes it. */
+export function setReminder(id: number, at: number | null): Promise<void> {
+  if (isTauri()) return invoke("set_reminder", { id, at });
+  return Promise.resolve();
+}
+
+/** Done on a reminder in the Inbox, or (false) its undo. */
+export function finishReminder(id: number, done: boolean): Promise<void> {
+  if (isTauri()) return invoke("finish_reminder", { id, done });
+  return Promise.resolve();
 }
 
 /** Mutes or unmutes a conversation (`Message.conversation`, or the message's id). */
@@ -1012,6 +1054,10 @@ let browserPrefs: Prefs = {
   meetingPopupGuestsOnly: true,
   meetingPopupSound: true,
   suggestRecipients: true,
+  undoSendSeconds: 5,
+  sendAndDone: false,
+  autoCc: {},
+  autoBcc: {},
 };
 
 /** Snoozed mail whose time has come goes back to the Inbox, unread, as the Rust side does. */

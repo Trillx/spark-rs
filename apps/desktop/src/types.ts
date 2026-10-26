@@ -113,6 +113,30 @@ export interface Message {
   returnedAt?: number;
   /** Its conversation is muted: new mail in it doesn't notify. */
   muted?: boolean;
+  /** A reminder that came due on it (`at`): it's in the Inbox until Done. */
+  reminder?: { id: number; at: number };
+}
+
+/** Mail scheduled with Send Later; `id` is its outbox id. */
+export interface ScheduledView {
+  id: number;
+  account: AccountId;
+  to: string;
+  subject: string;
+  snippet: string;
+  sendAt: number;
+}
+
+/** A "Remind me" on mail you sent: still to come, or `due` and back in the Inbox as `message`. */
+export interface ReminderView {
+  id: number;
+  account: AccountId;
+  to: string;
+  subject: string;
+  remindAt: number;
+  ifNoReply: boolean;
+  due: boolean;
+  message?: number;
 }
 
 /** The Gatekeeper's decision about a sender or a whole domain, for every account. */
@@ -201,6 +225,13 @@ export interface Prefs {
   meetingPopupSound: boolean;
   /** Suggest people from the user's mail while they type in To, Cc and Bcc. */
   suggestRecipients: boolean;
+  /** How long Undo can stop a message after Send, in seconds. */
+  undoSendSeconds: number;
+  /** Replies start with "Mark as Done after sending" on. */
+  sendAndDone: boolean;
+  /** Addresses every new message from an account gets in Cc and Bcc, by account id. */
+  autoCc: Record<string, string>;
+  autoBcc: Record<string, string>;
 }
 
 /** What agents may do in an account; each level includes the ones before. */
@@ -400,6 +431,8 @@ export interface OutgoingDraft {
   signatureId?: number;
   /** A forward's original, below the signature. Plain text. */
   quote?: string;
+  /** "Remind me", set once it's sent. */
+  remind?: { at: number; ifNoReply: boolean };
 }
 
 /** A saved signature. Mirrors `Signature` on the Rust side. */

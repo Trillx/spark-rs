@@ -538,6 +538,7 @@ fn send_email(cx: &mut Context, args: &Value) -> ToolResult {
         signature: signature.as_ref().map(|s| s.html.clone()),
         signature_id: signature.as_ref().map(|s| s.id),
         quote: None,
+        remind: None,
     };
     let json = serde_json::to_string(&queued).expect("drafts serialize");
     let id = cx

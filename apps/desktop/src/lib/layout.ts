@@ -130,8 +130,8 @@ export type SearchHits = ReadonlyMap<string, ReadonlySet<number>>;
 
 const EMPTY_CONTEXT: ListContext = { accounts: [], folders: [], smartFolders: [], seen: [] };
 
-/** Where a message sorts in the Inbox: when it arrived, or when it came back from Snooze if that's later. */
-export const inboxTime = (m: Message) => Math.max(m.timestamp, m.returnedAt ?? 0);
+/** Where a message sorts in the Inbox: when it arrived, or when it came back from Snooze or a reminder if later. */
+export const inboxTime = (m: Message) => Math.max(m.timestamp, m.returnedAt ?? 0, m.reminder?.at ?? 0);
 const newestFirst = (a: Message, b: Message) => b.timestamp - a.timestamp;
 const newestInInbox = (a: Message, b: Message) => inboxTime(b) - inboxTime(a);
 const soonestBack = (a: Message, b: Message) => (a.snoozedUntil ?? 0) - (b.snoozedUntil ?? 0);
@@ -151,7 +151,11 @@ export function inboxMessages(
   const inbox = messages
     .filter(
       (m) =>
-        (m.state === "inbox" || (showDone && m.state === "done" && !waiting(m, mode))) &&
+        // A reminder that came due brings its email to the Inbox, wherever it's kept,
+        // unless it was deleted, blocked or snoozed since.
+        (m.state === "inbox" ||
+          (m.reminder !== undefined && m.state !== "deleted" && m.state !== "blocked" && m.state !== "snoozed") ||
+          (showDone && m.state === "done" && !waiting(m, mode))) &&
         (account === "all" || m.account === account),
     )
     .sort(newestInInbox);
@@ -293,6 +297,10 @@ export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, c
       return messages.filter((m) => m.state === (key === "trash" ? "deleted" : "blocked")).sort(newestFirst);
     case "seen":
       return ctx.seen.flatMap((id) => live.filter((m) => m.id === id));
+    // Not mail: App shows these lists itself.
+    case "scheduled":
+    case "reminders":
+      return [];
   }
   const smartId = smartIdOf(key);
   if (smartId !== undefined) {

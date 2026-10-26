@@ -6,7 +6,7 @@
 //! `HKCU\Software\Classes\AppUserModelId\<identifier>`.
 
 use spark_mail::Engine;
-use spark_store::{Category, GatekeeperMode, Message, MessageState};
+use spark_store::{Category, GatekeeperMode, Message, MessageState, Reminder};
 use tauri::{AppHandle, Manager};
 
 use crate::background;
@@ -100,6 +100,53 @@ pub fn snooze_returned(app: &AppHandle, engine: &Engine, ids: &[i64]) {
         }
         sound = false;
     }
+}
+
+/// Reminders that came due: Spark's reminder, with the subject and who it
+/// went to; a click opens the email it came back as.
+pub fn reminders_due(app: &AppHandle, due: &[Reminder]) {
+    if due.is_empty() || background::in_front(app) {
+        return;
+    }
+    let mut sound = app.state::<PrefsState>().get().sound;
+    for alert in reminder_alerts(due) {
+        if let Err(e) = show(app, &alert, sound) {
+            eprintln!("spark-rs: couldn't show a notification: {e}");
+            return;
+        }
+        sound = false;
+    }
+}
+
+pub fn reminder_alerts(due: &[Reminder]) -> Vec<Alert> {
+    if due.len() > MAX_SEPARATE {
+        return vec![Alert {
+            title: format!("{} reminders", due.len()),
+            lines: vec!["Their emails are back in your Inbox.".into()],
+            attribution: None,
+            message: None,
+        }];
+    }
+    due.iter()
+        .map(|r| Alert {
+            title: if r.if_no_reply {
+                "No reply yet"
+            } else {
+                "Reminder"
+            }
+            .into(),
+            lines: vec![
+                if r.subject.trim().is_empty() {
+                    "(no subject)".to_owned()
+                } else {
+                    r.subject.clone()
+                },
+                format!("To {}", r.to),
+            ],
+            attribution: None,
+            message: r.message,
+        })
+        .collect()
 }
 
 /// Spark's "Snoozed message returned to your Inbox", with sender and subject:
@@ -432,6 +479,7 @@ mod tests {
             conversation: id,
             returned_at: None,
             muted: false,
+            reminder: None,
         }
     }
 
@@ -489,6 +537,25 @@ mod tests {
             },
         ];
         assert!(alerts(&arrived, NotifyFor::All, None).is_empty());
+    }
+
+    #[test]
+    fn due_reminders_say_who_hasnt_replied() {
+        let reminder = Reminder {
+            id: 1,
+            account_id: 1,
+            subject: "Lease".into(),
+            to: "Ana <ana@x.com>".into(),
+            remind_at: 0,
+            if_no_reply: true,
+            due: true,
+            message: Some(9),
+        };
+        let alerts = reminder_alerts(std::slice::from_ref(&reminder));
+        assert_eq!(alerts[0].title, "No reply yet");
+        assert_eq!(alerts[0].lines, ["Lease", "To Ana <ana@x.com>"]);
+        assert_eq!(alerts[0].message, Some(9));
+        assert_eq!(reminder_alerts(&vec![reminder; 5]).len(), 1);
     }
 
     #[test]

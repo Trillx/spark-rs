@@ -95,9 +95,9 @@ export const LATER_PRESETS = [
 
 export type LaterPreset = (typeof LATER_PRESETS)[number];
 
-/** A picked preset, with its time fixed when it was picked. */
+/** A picked preset, with its time fixed when it was picked; "custom" for a picked day and time. */
 export interface Later {
-  key: LaterPreset["key"];
+  key: LaterPreset["key"] | "custom";
   at: number;
 }
 

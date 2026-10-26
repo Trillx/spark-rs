@@ -27,3 +27,12 @@ test("choosing, changing only the time, and clearing a schedule are draft edits"
 test("drafts saved before Send Later metadata open without a schedule", () => {
   assert.equal(savedDraft(outgoingDraft(emptyDraft(1), 0)).sendLater, null);
 });
+
+test("Remind me goes out with the message, as its time and whether to wait for a reply", () => {
+  const remind = { key: "custom" as const, at: 2_000_000_000_000, ifNoReply: true };
+  const draft = { ...emptyDraft(1), to: "ana@example.com", remind };
+  assert.deepEqual(outgoingDraft(draft, 5).remind, { at: remind.at, ifNoReply: true });
+  assert.equal(outgoingDraft(emptyDraft(1), 5).remind, undefined);
+  // Back in the composer from Drafts or the Scheduled list, it's still set.
+  assert.deepEqual(savedDraft(JSON.parse(JSON.stringify(outgoingDraft(draft, 0)))).remind, remind);
+});

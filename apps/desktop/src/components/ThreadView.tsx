@@ -20,6 +20,7 @@ import {
   Reply,
   ReplyAll,
   Search,
+  Send,
   ShieldAlert,
   ShieldCheck,
   Text,
@@ -85,6 +86,8 @@ export interface ThreadActions {
   unsubscribe: (m: Message) => void;
   /** Searches for the sender's mail. */
   searchSender: (m: Message) => void;
+  /** Your sent email as a new one, to send again. */
+  sendAgain: (m: Message) => void;
   summarize: (m: Message, style: SummaryStyle) => void;
   stopSummary: (m: Message) => void;
   deleteSummary: (m: Message) => void;
@@ -589,6 +592,7 @@ function MessageMenuItems({
   const spam = actions.inSpam(m);
   const deleted = m.state === "deleted";
   const senderPriority = actions.senderPriority(m);
+  const yours = isFromYou(m, useAccount(m.account));
   return (
     <>
       <MenuItem label="Reply" detail={shortcutLabel("reply")} icon={<Reply size={15} />} onSelect={() => actions.reply(m)} />
@@ -604,6 +608,7 @@ function MessageMenuItems({
         icon={<Forward size={15} />}
         onSelect={() => actions.forward(m)}
       />
+      {yours && <MenuItem label="Send Again" icon={<Send size={15} />} onSelect={() => actions.sendAgain(m)} />}
       <MenuItem label="Search Emails by Sender" icon={<Search size={15} />} onSelect={() => actions.searchSender(m)} />
       {!single && (
         <MenuItem

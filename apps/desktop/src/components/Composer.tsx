@@ -1,4 +1,5 @@
 import {
+  AlarmClock,
   CalendarClock,
   ChevronsUpDown,
   CircleCheck,
@@ -40,6 +41,7 @@ import { formatBytes, formatLater, laterPresets, pickLater, presetDetail } from 
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import AiMenu, { type AiRequest } from "./AiMenu";
+import { DateTimeDialog } from "./Dialog";
 import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
 import Recipients, { SuggestionList, displayName, useSuggestions, type RecipientsHandle } from "./Recipients";
@@ -126,6 +128,8 @@ export default function Composer({
   const quoteRef = useRef<HTMLTextAreaElement>(null);
   const signatureRef = useRef<SignatureFrameHandle>(null);
   const [dropping, setDropping] = useState(false);
+  /** Picking a day and time for Send Later or Remind me. */
+  const [picking, setPicking] = useState<"sendLater" | "remind" | null>(null);
   // File drops arrive through a listener set up once; it reads these.
   const latest = useRef({ draft, onChange });
   latest.current = { draft, onChange };
@@ -194,6 +198,8 @@ export default function Composer({
   }, []);
 
   function onKeyDown(e: KeyboardEvent) {
+    // The day-and-time dialog sits inside the composer: its keys are its own.
+    if (picking) return;
     const mod = IS_MAC ? e.metaKey : e.ctrlKey;
     const key = e.key.toLowerCase();
     if (mod && e.key === "Enter") {
@@ -531,12 +537,33 @@ export default function Composer({
         </div>
       )}
 
-      {draft.sendLater && (
+      {(draft.sendLater || draft.remind) && (
         <div className="flex shrink-0 flex-wrap gap-1.5 px-3 pb-2">
-          <Chip onClear={() => onChange({ sendLater: null })}>
-            <CalendarClock size={13} /> Send {formatLater(draft.sendLater.at)}
-          </Chip>
+          {draft.sendLater && (
+            <Chip onClear={() => onChange({ sendLater: null })}>
+              <CalendarClock size={13} /> Send {formatLater(draft.sendLater.at)}
+            </Chip>
+          )}
+          {draft.remind && (
+            <Chip onClear={() => onChange({ remind: null })}>
+              <AlarmClock size={13} /> Remind me {formatLater(draft.remind.at)}
+              {draft.remind.ifNoReply && " if no reply"}
+            </Chip>
+          )}
         </div>
+      )}
+      {picking && (
+        <DateTimeDialog
+          title={picking === "sendLater" ? "Send at" : "Remind me at"}
+          confirmLabel={picking === "sendLater" ? "Schedule" : "Remind me"}
+          initial={(picking === "sendLater" ? draft.sendLater?.at : draft.remind?.at) ?? Date.now() + 60 * 60_000}
+          onSubmit={(at) =>
+            picking === "sendLater"
+              ? onChange({ sendLater: { key: "custom", at } })
+              : onChange({ remind: { key: "custom", at, ifNoReply: draft.remind?.ifNoReply ?? true } })
+          }
+          onClose={() => setPicking(null)}
+        />
       )}
 
       <div className="flex h-12 shrink-0 items-center gap-0.5 border-t border-hairline px-2">
@@ -573,7 +600,44 @@ export default function Composer({
               onSelect={() => onChange({ sendLater: pickLater(p) })}
             />
           ))}
+          <MenuItem
+            label="Pick date & time…"
+            checked={draft.sendLater?.key === "custom"}
+            onSelect={() => setPicking("sendLater")}
+          />
           {draft.sendLater && <MenuItem label="Don't schedule" onSelect={() => onChange({ sendLater: null })} />}
+        </Dropdown>
+        <Dropdown
+          direction="up"
+          width="w-64"
+          trigger={({ toggle, open }) => (
+            <IconButton title="Remind me" active={open || draft.remind !== null} onClick={toggle}>
+              <AlarmClock size={17} />
+            </IconButton>
+          )}
+        >
+          <li className="menu-title px-2 py-1 text-[11px]">Remind me</li>
+          {laterPresets().map((p) => (
+            <MenuItem
+              key={p.key}
+              label={p.label}
+              detail={presetDetail(p)}
+              checked={draft.remind?.key === p.key}
+              onSelect={() => onChange({ remind: { ...pickLater(p), ifNoReply: draft.remind?.ifNoReply ?? true } })}
+            />
+          ))}
+          <MenuItem
+            label="Pick date & time…"
+            checked={draft.remind?.key === "custom"}
+            onSelect={() => setPicking("remind")}
+          />
+          <li role="none" className="my-0.5 h-px bg-hairline" />
+          <MenuItem
+            label="Only if nobody replies"
+            checked={draft.remind?.ifNoReply ?? true}
+            onSelect={() => draft.remind && onChange({ remind: { ...draft.remind, ifNoReply: !draft.remind.ifNoReply } })}
+          />
+          {draft.remind && <MenuItem label="Don't remind me" onSelect={() => onChange({ remind: null })} />}
         </Dropdown>
         <IconButton
           title={{ label: "Mark as Done after sending", card: "doneAfter" }}

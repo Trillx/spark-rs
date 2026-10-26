@@ -50,6 +50,13 @@ pub struct Prefs {
     pub sound: bool,
     /// A notification when snoozed mail comes back.
     pub snooze_alert: bool,
+    /// How long Undo can stop a message after Send, in seconds.
+    pub undo_send_seconds: u32,
+    /// Replies start with "Mark as Done after sending" on.
+    pub send_and_done: bool,
+    /// Addresses every new message from an account gets in Cc and Bcc, by account id.
+    pub auto_cc: BTreeMap<i64, String>,
+    pub auto_bcc: BTreeMap<i64, String>,
     pub badge: Badge,
     /// Accounts the badge leaves out, by id.
     pub badge_excluded: Vec<i64>,
@@ -79,6 +86,10 @@ impl Default for Prefs {
             notify: NotifyFor::People,
             sound: true,
             snooze_alert: true,
+            undo_send_seconds: 5,
+            send_and_done: false,
+            auto_cc: BTreeMap::new(),
+            auto_bcc: BTreeMap::new(),
             badge: Badge::New,
             badge_excluded: Vec::new(),
             keep_running: true,

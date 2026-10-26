@@ -1,7 +1,9 @@
 import {
+  AlarmClock,
   Archive,
   ArrowDownLeft,
   Ban,
+  CalendarClock,
   Clock,
   FileText,
   Folder,
@@ -33,7 +35,9 @@ export type SystemList =
   | "spam"
   | "trash"
   | "blocked"
-  | "seen";
+  | "seen"
+  | "scheduled"
+  | "reminders";
 
 /** Any list the message list can show: the Inbox, a shared list, a server folder or a smart folder. */
 export type ListKey = "inbox" | SystemList | `folder:${number}` | `smart:${string}`;
@@ -49,7 +53,12 @@ export const SYSTEM_LISTS: Record<SystemList, { label: string; Icon: LucideIcon;
   trash: { label: "Trash", Icon: Trash2, role: "trash" },
   blocked: { label: "Blocked", Icon: Ban, role: "blocked" },
   seen: { label: "Recently Seen", Icon: History },
+  scheduled: { label: "Scheduled", Icon: CalendarClock },
+  reminders: { label: "Reminders", Icon: AlarmClock },
 };
+
+/** Lists of what's planned rather than mail: Send Later's queue and the reminders. */
+export const isPlannedList = (key: ListKey) => key === "scheduled" || key === "reminders";
 
 /** "All Folders" order in the folder picker. */
 export const SYSTEM_ORDER = Object.keys(SYSTEM_LISTS) as SystemList[];
@@ -210,7 +219,7 @@ export function visit(layout: SidebarLayout, key: ListKey): SidebarLayout {
 
 /** The Inbox and the shared lists can show a row per account; folders belong to one already. */
 export function hasAccountRows(key: ListKey) {
-  return key === "inbox" || (isSystemList(key) && key !== "seen");
+  return key === "inbox" || (isSystemList(key) && key !== "seen" && !isPlannedList(key));
 }
 
 export function toggleExpanded(layout: SidebarLayout, key: ListKey): SidebarLayout {

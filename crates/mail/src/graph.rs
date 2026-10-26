@@ -1168,7 +1168,7 @@ impl Graph {
         draft: &Draft,
         reply_to: Option<&str>,
         files: &[AttachmentData],
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let to = graph_recipients(&draft.to)?;
         let cc = graph_recipients(&draft.cc)?;
         let bcc = graph_recipients(&draft.bcc)?;
@@ -1182,25 +1182,18 @@ impl Graph {
                 "body": body(&bodies),
                 "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
             });
-            if files.is_empty() && bodies.images.is_empty() {
-                self.send(
-                    self.request(Method::POST, "/me/sendMail")
-                        .json(&json!({ "message": message, "saveToSentItems": true })),
-                )
-                .await?;
-                return Ok(());
-            }
-            // Attachments go on a draft, which is then sent.
+            // Sent from a draft, attachments or not, so its Message-ID is
+            // known (for reminders); Graph keeps it when it's sent.
             let created: GraphMessage = self
                 .json(self.request(Method::POST, "/me/messages").json(&message))
                 .await?;
-            return self
-                .attach_and_send(
-                    &format!("/me/messages/{}", path(&created.id)),
-                    files,
-                    &bodies.images,
-                )
-                .await;
+            self.attach_and_send(
+                &format!("/me/messages/{}", path(&created.id)),
+                files,
+                &bodies.images,
+            )
+            .await?;
+            return Ok(created.internet_message_id.as_deref().map(bare_id));
         };
 
         let reply: GraphMessage = self
@@ -1226,7 +1219,8 @@ impl Graph {
         self.send(self.request(Method::PATCH, &draft_path).json(&update))
             .await?;
         self.attach_and_send(&draft_path, files, &bodies.images)
-            .await
+            .await?;
+        Ok(reply.internet_message_id.as_deref().map(bare_id))
     }
 
     /// Adds `files` and the signature's `images` to a draft and sends it.

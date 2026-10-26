@@ -1553,11 +1553,69 @@ function NotificationsPage() {
 
 // ---- Composer ----
 
+const UNDO_SEND_SECONDS = [5, 10, 15, 30, 60];
+
 function ComposerPage() {
   const { prefs, status, change } = usePrefs();
+  const accounts = useAccounts().filter((a) => !a.demo);
   if (!prefs) return <StatusLine status={status} />;
+  const setAuto = (field: "autoCc" | "autoBcc", account: number, value: string) => {
+    const next = { ...prefs[field] };
+    if (value.trim()) next[String(account)] = value.trim();
+    else delete next[String(account)];
+    if ((prefs[field][String(account)] ?? "") !== (next[String(account)] ?? "")) void change({ [field]: next });
+  };
   return (
     <>
+      <Group title="Sending">
+        <Row
+          label="Undo Send"
+          description="How long you have to take a message back after pressing Send."
+          htmlFor="undo-send"
+        >
+          <select
+            id="undo-send"
+            value={prefs.undoSendSeconds}
+            onChange={(e) => void change({ undoSendSeconds: Number(e.target.value) })}
+            className="select select-sm h-8 w-40 rounded-lg border-hairline text-[13px]"
+          >
+            {UNDO_SEND_SECONDS.map((n) => (
+              <option key={n} value={n}>
+                {n} seconds
+              </option>
+            ))}
+          </select>
+        </Row>
+        <Row
+          label="Mark as Done after sending replies"
+          description="Replies start with Send and Done on: the email you answer leaves the Inbox when you send."
+          htmlFor="send-and-done"
+        >
+          <Switch id="send-and-done" on={prefs.sendAndDone} onToggle={() => void change({ sendAndDone: !prefs.sendAndDone })} />
+        </Row>
+      </Group>
+      {accounts.length > 0 && (
+        <Group title="Automatic Cc and Bcc" note="Added to every new message, reply and forward from the account.">
+          {accounts.map((a) => (
+            <Row key={a.id} label={a.label} description={a.email}>
+              <div className="flex flex-col gap-1.5">
+                {(["autoCc", "autoBcc"] as const).map((field) => (
+                  <input
+                    key={`${field}-${prefs[field][String(a.id)] ?? ""}`}
+                    aria-label={`${field === "autoCc" ? "Cc" : "Bcc"} for ${a.label}`}
+                    placeholder={field === "autoCc" ? "Cc" : "Bcc"}
+                    spellCheck={false}
+                    defaultValue={prefs[field][String(a.id)] ?? ""}
+                    onBlur={(e) => setAuto(field, a.id, e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                    className={`${INPUT} h-8 w-56`}
+                  />
+                ))}
+              </div>
+            </Row>
+          ))}
+        </Group>
+      )}
       <Group title="Recipients">
         <Row
           label="Suggest recipients"

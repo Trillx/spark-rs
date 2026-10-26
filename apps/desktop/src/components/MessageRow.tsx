@@ -1,4 +1,5 @@
 import {
+  AlarmClock,
   ArrowDownLeft,
   BellOff,
   Check,
@@ -87,6 +88,8 @@ function MessageRow({
   const snoozed = m.state === "snoozed" && m.snoozedUntil !== undefined;
   /** Back from Snooze since it arrived: it shows when it came back, as it sorts. */
   const returned = m.state === "inbox" && m.returnedAt !== undefined && m.returnedAt > m.timestamp;
+  /** In the Inbox for a reminder that came due. */
+  const reminded = m.reminder !== undefined;
   const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
   const to = recipients ? recipientNames(m.to) : null;
   const weight = m.unread ? "font-semibold" : "font-medium";
@@ -137,13 +140,24 @@ function MessageRow({
           )}
           <span
             data-tip={
-              snoozed ? `Snoozed until ${formatLater(m.snoozedUntil!)}` : returned ? "Back from Snooze" : undefined
+              snoozed
+                ? `Snoozed until ${formatLater(m.snoozedUntil!)}`
+                : reminded
+                  ? "Reminder: Done takes it out of the Inbox"
+                  : returned
+                    ? "Back from Snooze"
+                    : undefined
             }
             className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${
-              snoozed || returned ? "text-priority" : "text-text-2"
+              snoozed || returned || reminded ? "text-priority" : "text-text-2"
             }`}
           >
-            {snoozed ? (
+            {reminded ? (
+              <>
+                <AlarmClock size={12} />
+                {formatListDate(m.reminder!.at)}
+              </>
+            ) : snoozed ? (
               <>
                 <Clock size={12} />
                 {formatLaterShort(m.snoozedUntil!)}

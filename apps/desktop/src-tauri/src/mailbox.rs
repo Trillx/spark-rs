@@ -13,8 +13,8 @@ use spark_mail::invite::{Answer, Card, Invite};
 use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_store::{
-    Account, AccountKind, Category, Change, Contact, Folder, FolderRole, GatekeeperMode,
-    MessageState, OutboxFile, Patch, PriorityUndo, SenderStatus, now_ms,
+    Account, AccountKind, Category, Change, Contact, DueReminder, Folder, FolderRole,
+    GatekeeperMode, MessageState, OutboxFile, Patch, PriorityUndo, SenderStatus, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -77,6 +77,39 @@ pub struct Message {
     /// Its conversation is muted: new mail in it doesn't notify.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
+    /// A reminder that came due on it: it's in the Inbox until Done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<DueReminder>,
+}
+
+/// Mail scheduled with Send Later, for the Scheduled list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledView {
+    /// Its outbox id.
+    pub id: i64,
+    pub account: i64,
+    pub to: String,
+    pub subject: String,
+    pub snippet: String,
+    pub send_at: i64,
+}
+
+/// A reminder, for the Reminders list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderView {
+    pub id: i64,
+    pub account: i64,
+    pub to: String,
+    pub subject: String,
+    pub remind_at: i64,
+    pub if_no_reply: bool,
+    /// It came due and waits in the Inbox.
+    pub due: bool,
+    /// The stored email it came back as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<i64>,
 }
 
 /// A server folder or label, for the sidebar and folder picker.
@@ -304,6 +337,7 @@ fn from_store(m: spark_store::Message) -> Message {
         conversation: Some(m.conversation),
         returned_at: m.returned_at,
         muted: m.muted,
+        reminder: m.reminder,
     }
 }
 
@@ -543,6 +577,129 @@ pub async fn delete_folder(
     let _ = app.emit("folders-changed", ());
     let _ = app.emit("mailbox-changed", ());
     Ok(())
+}
+
+/// Mail scheduled with Send Later, soonest first.
+#[tauri::command]
+pub fn list_scheduled(mailbox: State<'_, Mailbox>) -> Result<Vec<ScheduledView>, String> {
+    if !mailbox.live() {
+        return Ok(Vec::new());
+    }
+    let scheduled = mailbox
+        .live
+        .engine
+        .store()
+        .scheduled_sends()
+        .map_err(text)?;
+    Ok(scheduled
+        .into_iter()
+        .filter_map(|(id, account, json, send_at)| {
+            let draft: Draft = serde_json::from_str(&json).ok()?;
+            Some(ScheduledView {
+                id,
+                account,
+                to: draft.to,
+                subject: draft.subject,
+                snippet: spark_mail::parse::snippet(&draft.body),
+                send_at,
+            })
+        })
+        .collect())
+}
+
+/// Sends a scheduled message at `at` instead, or now. False once it's gone out.
+#[tauri::command]
+pub fn reschedule_send(
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    at: Option<i64>,
+) -> Result<bool, String> {
+    if !mailbox.live() {
+        return Ok(false);
+    }
+    let moved = mailbox
+        .live
+        .engine
+        .store()
+        .reschedule_send(id, at, now_ms())
+        .map_err(text)?;
+    // Sent now: the account's worker sends it on its next round.
+    if moved && at.is_none() {
+        mailbox.live.sync_now();
+    }
+    Ok(moved)
+}
+
+/// Takes a scheduled message out of the queue into Drafts, exactly as it
+/// was queued, to edit (`keep_schedule`: with its time) or to keep. Returns
+/// the draft's id, or `None` once it's gone out.
+#[tauri::command]
+pub fn unschedule_send(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    keep_schedule: bool,
+) -> Result<Option<i64>, String> {
+    if !mailbox.live() {
+        return Ok(None);
+    }
+    let draft = mailbox
+        .live
+        .engine
+        .unschedule(id, keep_schedule)
+        .map_err(text)?;
+    let _ = app.emit("mailbox-changed", ());
+    Ok(draft)
+}
+
+/// Reminders to come, and those waiting in the Inbox.
+#[tauri::command]
+pub fn list_reminders(mailbox: State<'_, Mailbox>) -> Result<Vec<ReminderView>, String> {
+    if !mailbox.live() {
+        return Ok(Vec::new());
+    }
+    let reminders = mailbox.live.engine.store().reminders().map_err(text)?;
+    Ok(reminders
+        .into_iter()
+        .map(|r| ReminderView {
+            id: r.id,
+            account: r.account_id,
+            to: r.to,
+            subject: r.subject,
+            remind_at: r.remind_at,
+            if_no_reply: r.if_no_reply,
+            due: r.due,
+            message: r.message,
+        })
+        .collect())
+}
+
+/// Moves a reminder to `at`, or removes it.
+#[tauri::command]
+pub fn set_reminder(mailbox: State<'_, Mailbox>, id: i64, at: Option<i64>) -> Result<(), String> {
+    if !mailbox.live() {
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .set_reminder(id, at)
+        .map_err(text)
+}
+
+/// Done on a reminder in the Inbox, or its undo.
+#[tauri::command]
+pub fn finish_reminder(mailbox: State<'_, Mailbox>, id: i64, done: bool) -> Result<(), String> {
+    if !mailbox.live() {
+        return Ok(());
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .finish_reminder(id, done)
+        .map_err(text)
 }
 
 /// Mutes or unmutes a conversation: new mail in it doesn't notify.
@@ -1184,6 +1341,17 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
         draft::recipients(field).map_err(text)?;
     }
     draft::check_attachment_size(&draft.attachments).map_err(text)?;
+    // One send per saved draft: another would send it twice.
+    if let Some(saved) = draft.draft_id
+        && mailbox
+            .live
+            .engine
+            .store()
+            .draft_held(saved)
+            .map_err(text)?
+    {
+        return Err("This draft is already on its way.".into());
+    }
     // Copies of local files go into the outbox, so a later send doesn't
     // depend on the originals.
     let json = serde_json::to_string(&draft).map_err(text)?;
@@ -1497,6 +1665,7 @@ mod tests {
             conversation: 2,
             returned_at: None,
             muted: true,
+            reminder: None,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["muted"], true);

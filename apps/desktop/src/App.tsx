@@ -89,6 +89,9 @@ import {
   onSendStatus,
   onSyncStatus,
   openAttachment,
+  finishReminder,
+  listReminders,
+  listScheduled,
   openDraft,
   patched,
   prioritizeSenders,
@@ -96,21 +99,25 @@ import {
   renameFolder,
   saveAllAttachments,
   saveAttachment,
+  rescheduleSend,
   saveDraft,
   saveGatekeeperMode,
   sendMessage,
   openExternal,
   setBadge,
   setMuted,
+  setReminder,
   syncFolders,
   syncNow,
   trustCertificate,
   undoPrioritize,
+  unscheduleSend,
   unsubscribe,
   updateMessage,
   watchFolders,
 } from "./api";
 import BulkPanel, { type BulkActions, type Selection } from "./components/BulkPanel";
+import PlannedList, { type ReminderActions, type ScheduledActions } from "./components/PlannedList";
 import type { AiRequest } from "./components/AiMenu";
 import CalendarScreen from "./components/CalendarScreen";
 import CommandCenter, { type Command } from "./components/CommandCenter";
@@ -134,7 +141,7 @@ import ThreadView, { type ThreadActions } from "./components/ThreadView";
 import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./components/UndoToast";
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
-import { replyRecipients } from "./lib/addresses";
+import { joinAddresses, parseEntry, replyRecipients, splitAddresses } from "./lib/addresses";
 import { badgeIcon } from "./lib/badge";
 import { clearContent, loadContent } from "./lib/content";
 import {
@@ -193,6 +200,7 @@ import {
   folderKey,
   hasAccountRows,
   inSidebar,
+  isPlannedList,
   isSystemList,
   listFolderIds,
   listInfo,
@@ -229,6 +237,8 @@ import type {
   Message,
   MessagePatch,
   Prefs,
+  ReminderView,
+  ScheduledView,
   SendStatusEvent,
   SenderChange,
   SenderDecision,
@@ -250,6 +260,26 @@ interface Confirm {
 
 /** Batch actions on more emails than this ask first, as Spark's do. */
 const HEAVY_BATCH = 100;
+
+/** A day and time to ask for (`DateTimeDialog`), and what to do with it. */
+interface PickTime {
+  title: string;
+  confirmLabel: string;
+  initial: number;
+  run: (at: number) => Promise<void> | void;
+}
+
+type AppPrefs = Pick<Prefs, "badge" | "badgeExcluded" | "undoSendSeconds" | "sendAndDone" | "autoCc" | "autoBcc">;
+
+/** Until the saved settings load: the Rust side's defaults. */
+const DEFAULT_APP_PREFS: AppPrefs = {
+  badge: "new",
+  badgeExcluded: [],
+  undoSendSeconds: 5,
+  sendAndDone: false,
+  autoCc: {},
+  autoBcc: {},
+};
 
 /** What AI does in a composer (by `composerKey`), and its body before AI started. */
 type ComposerWriting = Writing & { composer: number; request: AiRequest; before: string };
@@ -362,16 +392,18 @@ export default function App() {
   /** Where Shift-click and Shift+arrow selections reach from. */
   const pickAnchor = useRef<number | null>(null);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
-  /** Rows being snoozed to a day and time the user picks. */
-  const [snoozePick, setSnoozePick] = useState<number[] | null>(null);
+  /** A day and time being picked: a custom snooze, a new send time, a reminder's. */
+  const [pickTime, setPickTime] = useState<PickTime | null>(null);
+  /** Send Later's queue and the reminders, for their lists and the sidebar. */
+  const [scheduled, setScheduled] = useState<ScheduledView[]>([]);
+  const [reminders, setReminders] = useState<ReminderView[]>([]);
   const [recentSearches, setRecentSearches] = useState(loadRecentSearches);
   /** A server certificate to ask about, from a sync or send that failed on it. */
   const [certificate, setCertificate] = useState<{ account: AccountId; certificate: Untrusted } | null>(null);
-  /** Settings → Notifications → App icon badge. */
-  const [badgePrefs, setBadgePrefs] = useState<Pick<Prefs, "badge" | "badgeExcluded">>({
-    badge: "new",
-    badgeExcluded: [],
-  });
+  /** The settings App acts on: the app icon badge, and how the composer starts and sends. */
+  const [appPrefs, setAppPrefs] = useState<AppPrefs>(DEFAULT_APP_PREFS);
+  /** How long Undo can stop a message after Send. */
+  const undoMs = appPrefs.undoSendSeconds * 1000;
   /** +AI summaries by message id, kept while the app runs. */
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
   const summaryRun = useRef(0);
@@ -434,10 +466,15 @@ export default function App() {
     [messages, discarding],
   );
   const model = useMemo(() => buildList(listed, view, sticky, ctx), [listed, view, sticky, ctx]);
-  const counts = useMemo(
-    () => sidebarCounts(listed, [...layout.favorites, ...layout.folders, ...layout.recents], ctx),
-    [listed, layout, ctx],
-  );
+  const counts = useMemo(() => {
+    const found = sidebarCounts(listed, [...layout.favorites, ...layout.folders, ...layout.recents], ctx);
+    found.lists.scheduled = scheduled.length;
+    found.lists.reminders = reminders.filter((r) => !r.due).length;
+    return found;
+  }, [listed, layout, ctx, scheduled, reminders]);
+  /** Planned items of the account the list is narrowed to. */
+  const inAccount = <T extends { account: AccountId }>(items: T[]) =>
+    view.account === "all" ? items : items.filter((x) => x.account === view.account);
   /** The open list's folders haven't synced yet, so an empty list may only be loading. */
   const loading = listFolderIds(view.folder, folders, accountOf(view.account)).some(
     (id) => !folders.find((f) => f.id === id)?.synced,
@@ -462,8 +499,8 @@ export default function App() {
   const pickedRows = useMemo(() => model.order.filter((id) => picked.has(id)), [model.order, picked]);
   const pickedMessages = pickedRows.flatMap((id) => byId.get(id) ?? []);
   const badge = useMemo(
-    () => (demo ? 0 : badgeCount(listed, badgePrefs.badge, badgePrefs.badgeExcluded, gatekeeperMode)),
-    [demo, listed, badgePrefs, gatekeeperMode],
+    () => (demo ? 0 : badgeCount(listed, appPrefs.badge, appPrefs.badgeExcluded, gatekeeperMode)),
+    [demo, listed, appPrefs, gatekeeperMode],
   );
 
   useEffect(() => {
@@ -485,6 +522,7 @@ export default function App() {
   // Backend events. They call through a ref so the listeners, registered once, see current state.
   const events = useRef({
     reloadMessages,
+    reloadPlanned,
     reloadAccounts,
     reloadFolders,
     syncStatus,
@@ -496,6 +534,7 @@ export default function App() {
   });
   events.current = {
     reloadMessages,
+    reloadPlanned,
     reloadAccounts,
     reloadFolders,
     syncStatus,
@@ -507,7 +546,10 @@ export default function App() {
   };
   useEffect(() => {
     const stops = [
-      onMailboxChanged(() => void events.current.reloadMessages()),
+      onMailboxChanged(() => {
+        void events.current.reloadMessages();
+        events.current.reloadPlanned();
+      }),
       onFoldersChanged(() => void events.current.reloadFolders()),
       onAccountsChanged(() => void events.current.reloadAccounts()),
       onSyncStatus((e) => events.current.syncStatus(e)),
@@ -541,9 +583,11 @@ export default function App() {
       () => {},
     );
     void getPrefs().then(
-      ({ badge, badgeExcluded }) => setBadgePrefs({ badge, badgeExcluded }),
+      ({ badge, badgeExcluded, undoSendSeconds, sendAndDone, autoCc, autoBcc }) =>
+        setAppPrefs({ badge, badgeExcluded, undoSendSeconds, sendAndDone, autoCc, autoBcc }),
       () => {},
     );
+    reloadPlanned();
   }, [settingsPage]);
 
   useEffect(() => {
@@ -599,6 +643,12 @@ export default function App() {
       showToast(`Couldn't update the messages: ${String(failure)}`);
       void reloadMessages();
     }
+  }
+
+  /** Reloads Send Later's queue and the reminders. */
+  function reloadPlanned() {
+    void listScheduled().then(setScheduled, () => {});
+    void listReminders().then(setReminders, () => {});
   }
 
   /** Reloads the list, keeping the cursor and open thread while their messages still exist. */
@@ -712,6 +762,7 @@ export default function App() {
   }
 
   function sendStatus(e: SendStatusEvent) {
+    reloadPlanned();
     const sent = outbox.current.get(e.id);
     outbox.current.delete(e.id);
     // A saved draft it came from is gone now, or back in Drafts if it failed.
@@ -1173,10 +1224,13 @@ export default function App() {
   const inSpam = (m: Message) => m.state === "filed" && m.folder !== undefined && m.folder === spamFolder(m.account)?.id;
 
   const actions = {
+    /** On an email a reminder brought back, Done ends the reminder and leaves the email where it's kept. */
     done: (m: Message) =>
-      m.state === "done"
-        ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
-        : act(together(m), { state: "done" }, "Marked as Done", ICONS.done),
+      own(m).reminder
+        ? finishReminders([own(m)])
+        : m.state === "done"
+          ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
+          : act(together(m), { state: "done" }, "Marked as Done", ICONS.done),
     /** Mail already in Trash is deleted for good, after asking. */
     trash: (m: Message) => {
       if (isDraft(m, folders)) discardListed([m]);
@@ -1205,7 +1259,9 @@ export default function App() {
         ? act(together(m), { state: "inbox" }, "Moved to Inbox", ICONS.inbox)
         : act(together(m), { state: "aside" }, "Set aside", ICONS.aside),
     snooze: (m: Message, p: LaterPreset) => snoozeUntil([m], laterTime(p), p.label.toLowerCase()),
-    snoozeCustom: (m: Message) => setSnoozePick([m.id]),
+    snoozeCustom: (m: Message) => askSnoozeTime([m]),
+    sendAgain,
+    sendDraft: (m: Message) => void sendDraftNow(m),
     /** Spark's Discard Snooze: back in the Inbox now. */
     unsnooze: (m: Message) => act(together(m), { state: "inbox" }, "Snooze discarded", ICONS.inbox),
     mute,
@@ -1439,7 +1495,7 @@ export default function App() {
             ),
       ),
     snooze: (p) => batch((rows) => snoozeRows(rows, p)),
-    snoozeCustom: () => setSnoozePick(pickedRows),
+    snoozeCustom: () => askSnoozeTime(pickedMessages),
     unsnooze: () =>
       batch((rows) =>
         act(rows.flatMap(together), { state: "inbox" }, `${conversationCount(rows)} back in the Inbox`, ICONS.inbox),
@@ -1452,11 +1508,215 @@ export default function App() {
     snoozeUntil(rows, laterTime(p), p.label.toLowerCase());
   }
 
-  /** Snoozes conversations until `at`; `until` says when in the toast ("tomorrow"). */
+  /**
+   * Snoozes conversations until `at`; `until` says when in the toast
+   * ("tomorrow"). An email a reminder brought back has its reminder moved
+   * there instead: it stays where it's kept.
+   */
   function snoozeUntil(rows: Message[], at: number, until = formatLater(at)) {
+    const reminded = rows.filter((m) => own(m).reminder);
+    const mail = rows.filter((m) => !own(m).reminder);
+    const undoReminders = moveReminders(reminded.map(own), at);
+    const undoMail = mail.length
+      ? apply(mail.flatMap(together), () => ({ state: "snoozed", snoozedUntil: at }))
+      : undefined;
     const what = rows.length === 1 ? "Snoozed" : `${conversationCount(rows)} snoozed`;
-    act(rows.flatMap(together), { state: "snoozed", snoozedUntil: at }, `${what} until ${until}`, ICONS.snooze);
+    showToast(
+      `${what} until ${until}`,
+      () => {
+        undoMail?.();
+        undoReminders?.();
+      },
+      ICONS.snooze,
+    );
   }
+
+  /** Asks for a day and time to snooze conversations until. */
+  function askSnoozeTime(rows: Message[]) {
+    setPickTime({
+      title: "Snooze until",
+      confirmLabel: "Snooze",
+      initial: laterTime(presetOf("tomorrow")),
+      run: (at) => batch((targets) => snoozeUntil(targets, at), rows),
+    });
+  }
+
+  /** Done on emails reminders brought back: the reminders end, with Undo. */
+  function finishReminders(emails: Message[]) {
+    const count = emails.filter((m) => m.reminder).length;
+    const undo = endReminders(emails);
+    if (undo) showToast(count === 1 ? "Reminder done" : `${plural(count, "reminder")} done`, undo, ICONS.done);
+  }
+
+  /** Ends the reminders on `emails` (moving the cursor off them as they leave); returns the undo. */
+  function endReminders(emails: Message[]): (() => void) | undefined {
+    const due = new Map(emails.flatMap((m) => (m.reminder ? [[m.id, m.reminder] as const] : [])));
+    if (!due.size) return undefined;
+    const back = leaveFor(messages.map((m) => (due.has(m.id) ? { ...m, reminder: undefined } : m)));
+    const set = (done: boolean) => {
+      setMessages((ms) => ms.map((x) => (due.has(x.id) ? { ...x, reminder: done ? undefined : due.get(x.id) } : x)));
+      Promise.all([...due.values()].map((r) => finishReminder(r.id, done))).then(reloadPlanned, (error) => {
+        showToast(`Couldn't change the reminder: ${String(error)}`, undefined, ICONS.error);
+        void reloadMessages();
+      });
+    };
+    set(true);
+    return () => {
+      set(false);
+      back();
+    };
+  }
+
+  /** Snoozing an email a reminder brought back moves the reminder there instead; returns the undo. */
+  function moveReminders(emails: Message[], at: number): (() => void) | undefined {
+    const due = new Map(emails.flatMap((m) => (m.reminder ? [[m.id, m.reminder] as const] : [])));
+    if (!due.size) return undefined;
+    const back = leaveFor(messages.map((m) => (due.has(m.id) ? { ...m, reminder: undefined } : m)));
+    const move = (to: (r: { id: number; at: number }) => number, removed: boolean) => {
+      setMessages((ms) => ms.map((x) => (due.has(x.id) ? { ...x, reminder: removed ? undefined : due.get(x.id) } : x)));
+      Promise.all([...due.values()].map((r) => setReminder(r.id, to(r)))).then(reloadPlanned, (error) => {
+        showToast(`Couldn't move the reminder: ${String(error)}`, undefined, ICONS.error);
+        void reloadMessages();
+      });
+    };
+    move(() => at, true);
+    return () => {
+      // Back to when it came due: it's in the Inbox again on the next check.
+      move((r) => r.at, false);
+      back();
+    };
+  }
+
+  /** Moves the cursor off emails that leave the open list once the mail is `after`; returns putting it back. */
+  function leaveFor(after: Message[]) {
+    const before = listedIds(model);
+    const remaining = listedIds(buildList(after, view, sticky, ctx));
+    const leaving = [...before].filter((id) => !remaining.has(id));
+    const cursor = { selectedId, openId };
+    moveOffMessages(leaving);
+    return () => {
+      if (!leaving.length) return;
+      setSelectedId(cursor.selectedId);
+      setOpenId(cursor.openId);
+    };
+  }
+
+  /** Your sent email, as a new one to send again: its To and Cc, subject, text and files. */
+  async function sendAgain(m: Message) {
+    const content = await loadContent(m.id).catch(() => null);
+    const people = (list?: string[]) => (list ?? []).filter((r) => r !== "You").join(", ");
+    const cc = people(content?.cc);
+    compose({
+      title: "Send again",
+      to: people(content?.to ?? m.to),
+      cc,
+      showCc: cc !== "",
+      subject: m.subject,
+      body: (content?.text ?? m.body ?? [m.snippet]).join("\n\n"),
+      from: m.account,
+      attachments: (content?.attachments ?? []).map((a, index) => ({
+        kind: "message" as const,
+        message: m.id,
+        index,
+        name: a.name,
+        size: a.size,
+      })),
+    });
+  }
+
+  /** Sends a saved draft from the list, without opening it; Undo opens it in the composer. */
+  async function sendDraftNow(m: Message) {
+    // Open in the composer: what's there is the latest, and sending closes it.
+    const open = composer.current;
+    if (open.draft && (open.draft.draftId === m.id || draftIds.current.get(open.key) === m.id)) return void send();
+    let d: Draft;
+    try {
+      d = savedDraft(await openDraft(m.id));
+    } catch (error) {
+      showToast(`Couldn't open the draft: ${String(error)}`, undefined, ICONS.error);
+      return;
+    }
+    if (![d.to, d.cc, d.bcc].some((field) => field.trim())) {
+      openComposer(d, draftKey(d));
+      showToast("Add at least one recipient");
+      return;
+    }
+    moveOffMessages([m.id]);
+    let id: number;
+    try {
+      id = await sendMessage(outgoingDraft(d, d.sendLater?.at ?? Date.now() + undoMs));
+    } catch (error) {
+      showToast(`Couldn't send: ${String(error)}`, () => openComposer(d), ICONS.error, {
+        actionLabel: "Edit",
+        duration: ERROR_TOAST_MS,
+      });
+      return;
+    }
+    outbox.current.set(id, d);
+    void reloadMessages();
+    reloadPlanned();
+    showToast(d.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, d), ICONS.send, {
+      duration: d.sendLater ? TOAST_MS : undoMs,
+    });
+  }
+
+  // ---- Scheduled and Reminders ----
+
+  const scheduledActions: ScheduledActions = {
+    edit: async (item) => {
+      // Into Drafts exactly as queued, then open there: nothing is lost if editing stops.
+      const id = await unscheduleSend(item.id, true).catch(() => null);
+      reloadPlanned();
+      if (id === null) return showToast("Already sent", undefined, ICONS.send);
+      await reloadMessages();
+      void editDraft({ id });
+    },
+    sendNow: async (item) => {
+      const moved = await rescheduleSend(item.id, null).catch(() => false);
+      showToast(moved ? "Sending now" : "Already sent", undefined, ICONS.send);
+      reloadPlanned();
+    },
+    reschedule: (item) =>
+      setPickTime({
+        title: "Send at",
+        confirmLabel: "Schedule",
+        initial: item.sendAt,
+        run: async (at) => {
+          const moved = await rescheduleSend(item.id, at);
+          showToast(moved ? `Scheduled for ${formatLater(at)}` : "Already sent", undefined, ICONS.send);
+          reloadPlanned();
+        },
+      }),
+    cancel: async (item) => {
+      const id = await unscheduleSend(item.id, false).catch(() => null);
+      reloadPlanned();
+      if (id === null) return showToast("Already sent", undefined, ICONS.send);
+      showToast("Not sent: it's in Drafts", undefined, ICONS.draft);
+      void reloadMessages();
+    },
+  };
+
+  const reminderActions: ReminderActions = {
+    open: (r) => r.message !== undefined && openThread(r.message),
+    change: (r) =>
+      setPickTime({
+        title: "Remind me at",
+        confirmLabel: "Remind me",
+        initial: Math.max(r.remindAt, Date.now() + 60 * 60_000),
+        run: async (at) => {
+          await setReminder(r.id, at);
+          showToast(`Reminder moved to ${formatLater(at)}`, undefined, ICONS.snooze);
+          reloadPlanned();
+          void reloadMessages();
+        },
+      }),
+    remove: async (r) => {
+      await setReminder(r.id, null).catch(() => {});
+      showToast("Reminder removed", undefined, ICONS.snooze);
+      reloadPlanned();
+      void reloadMessages();
+    },
+  };
 
   /** Mutes a conversation, or unmutes a muted one: new mail in it doesn't notify. */
   function mute(m: Message) {
@@ -1507,11 +1767,19 @@ export default function App() {
 
   /** A card's or sub-list's rows, each with its conversation. */
   function doneAll(items: Message[]) {
-    const rows = items.filter((m) => m.state !== "done");
-    act(
-      rows.flatMap(together),
-      { state: "done" },
-      rows.length === 1 ? "Marked as Done" : `${rows.length} emails marked as Done`,
+    // Emails a reminder brought back end their reminders instead; they stay where they're kept.
+    const reminded = items.filter((m) => own(m).reminder).map(own);
+    const rows = items.filter((m) => m.state !== "done" && !own(m).reminder);
+    if (!reminded.length && !rows.length) return;
+    const undoReminders = endReminders(reminded);
+    const undoMail = rows.length ? apply(rows.flatMap(together), () => ({ state: "done" })) : undefined;
+    const count = reminded.length + rows.length;
+    showToast(
+      count === 1 ? "Marked as Done" : `${count} emails marked as Done`,
+      () => {
+        undoMail?.();
+        undoReminders?.();
+      },
       ICONS.done,
     );
   }
@@ -1690,9 +1958,36 @@ export default function App() {
   }
 
   /** From the account the Inbox is narrowed to, else the first. */
+  /** From the account the Inbox is narrowed to, else the first; with the account's automatic Cc and Bcc. */
   function compose(seed: Partial<Draft> = {}) {
-    const from = view.account !== "all" ? view.account : (accounts[0]?.id ?? 0);
-    openComposer({ ...emptyDraft(from), ...seed });
+    const from = seed.from ?? (view.account !== "all" ? view.account : (accounts[0]?.id ?? 0));
+    openComposer(withAutoRecipients({ ...emptyDraft(from), ...seed }, from));
+  }
+
+  /**
+   * The draft from `from`, with that account's automatic Cc and Bcc in place
+   * of the ones the draft got from its account before; what was typed stays.
+   */
+  function withAutoRecipients(d: Draft, from: AccountId): Draft {
+    const address = (entry: string) => parseEntry(entry).address.toLowerCase();
+    const swap = (field: string, before: string[], addresses: Record<string, string>) => {
+      const gone = new Set(before.map(address));
+      const kept = splitAddresses(field).filter((e) => !gone.has(address(e)));
+      const have = new Set(kept.map(address));
+      const added = splitAddresses(addresses[String(from)] ?? "").filter((e) => !have.has(address(e)));
+      return { field: joinAddresses([...kept, ...added]), added };
+    };
+    const cc = swap(d.cc, d.auto?.cc ?? [], appPrefs.autoCc);
+    const bcc = swap(d.bcc, d.auto?.bcc ?? [], appPrefs.autoBcc);
+    return {
+      ...d,
+      from,
+      cc: cc.field,
+      bcc: bcc.field,
+      showCc: d.showCc || cc.field !== "",
+      showBcc: d.showBcc || bcc.field !== "",
+      auto: { cc: cc.added, bcc: bcc.added },
+    };
   }
 
   const replySubject = (m: Message) => (/^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`);
@@ -1707,6 +2002,7 @@ export default function App() {
       subject: replySubject(m),
       from: m.account,
       replyTo: m.id,
+      doneAfter: appPrefs.sendAndDone,
     });
 
   /** A quick-reply chip: a reply your AI provider writes, or without one set up, a stock line. */
@@ -1824,6 +2120,7 @@ export default function App() {
       subject: replySubject(m),
       from: m.account,
       replyTo: m.id,
+      doneAfter: appPrefs.sendAndDone,
     });
   }
 
@@ -1903,7 +2200,7 @@ export default function App() {
     const sent = { ...draft, draftId: await savedDraftId(draft, session) };
     let id: number;
     try {
-      id = await sendMessage(outgoingDraft(sent, sent.sendLater?.at ?? Date.now() + TOAST_MS));
+      id = await sendMessage(outgoingDraft(sent, sent.sendLater?.at ?? Date.now() + undoMs));
     } catch (error) {
       undoDone?.();
       openComposer(sent);
@@ -1912,7 +2209,10 @@ export default function App() {
     }
     outbox.current.set(id, sent);
     if (sent.draftId !== undefined) void reloadMessages();
-    showToast(sent.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, sent, undoDone), ICONS.send);
+    if (sent.sendLater) reloadPlanned();
+    showToast(sent.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, sent, undoDone), ICONS.send, {
+      duration: sent.sendLater ? TOAST_MS : undoMs,
+    });
   }
 
   async function unsend(id: number, sent: Draft, undoDone?: () => void) {
@@ -1925,6 +2225,7 @@ export default function App() {
     undoDone?.();
     openComposer(sent);
     if (sent.draftId !== undefined) void reloadMessages();
+    reloadPlanned();
   }
 
   // ---- +AI Summary ----
@@ -2321,6 +2622,12 @@ export default function App() {
           ...(m.category === "newsletters"
             ? [{ id: "unsubscribe", label: "Unsubscribe", keywords: "newsletter list stop", Icon: MailX, run: () => actions.unsubscribe(m) }]
             : []),
+          ...(fromYou(m) && !isDraft(m, folders)
+            ? [{ id: "send-again", label: "Send Again", keywords: "resend new copy", Icon: Send, run: () => void sendAgain(m) }]
+            : []),
+          ...(isDraft(m, folders)
+            ? [{ id: "send-draft", label: "Send Draft", keywords: "send now", Icon: Send, run: () => void sendDraftNow(m) }]
+            : []),
           {
             id: "search-sender",
             label: "Search Emails by Sender",
@@ -2572,7 +2879,7 @@ export default function App() {
           label: "Pick date & time…",
           keywords: "custom date day",
           Icon: Clock,
-          run: () => setSnoozePick(snoozeTargets.map((m) => m.id)),
+          run: () => askSnoozeTime(snoozeTargets),
         },
       ]
     : [];
@@ -2697,40 +3004,48 @@ export default function App() {
               style={twoColumns ? { width: listWidthUsed } : undefined}
               onPointerDownCapture={() => (scrollPane.current = "list")}
             >
-              <MessageList
-                model={model}
-                view={view}
-                selectedId={selectedId}
-                openId={openId}
-                picked={picked}
-                rows={rows}
-                gatekeeper={gatekeeper}
-                onDoneAll={doneAll}
-                onShowAll={(key) => changeView({ sub: { kind: "card", key } }, true)}
-                onOpenGroup={(key) => changeView({ sub: { kind: "group", key } }, true)}
-                onBack={() => changeView({ sub: null }, true)}
-                onModeChange={setMode}
-                onSearchOpen={openSearch}
-                onSearchChange={(search) => setView((v) => ({ ...v, search }))}
-                onSearchClose={closeSearch}
-                onSearchKeyDown={onSearchKeyDown}
-                onCompose={() => compose()}
-                onToggleDone={toggleDone}
-                onOpenGatekeeper={() => changeView({ sub: { kind: "gatekeeper" } }, true)}
-                searchRef={searchRef}
-                demo={isDemoMode(accounts)}
-                onAddAccounts={() => openSettings("accounts")}
-                loading={loading}
-                onSaveSearch={(query) => setSavingSearch(query)}
-                scrollRef={listScroll}
-                older={older && { loading: loadingOlder, onNearEnd: reachBack }}
-                searchingServers={searchingServers}
-                onEmpty={emptiable(view.folder, view.account).length ? () => emptyList(view.folder, view.account) : undefined}
-                recentSearches={recentSearches}
-                onForgetSearch={(q) => setRecentSearches((r) => forgetSearch(r, q))}
-                searchScope={view.account === "all" ? null : (accounts.find((a) => a.id === view.account)?.label ?? null)}
-                onSearchAllAccounts={() => setView((v) => ({ ...v, account: "all" }))}
-              />
+              {isPlannedList(view.folder) && view.search === null ? (
+                view.folder === "scheduled" ? (
+                  <PlannedList kind="scheduled" items={inAccount(scheduled)} actions={scheduledActions} />
+                ) : (
+                  <PlannedList kind="reminders" items={inAccount(reminders)} actions={reminderActions} />
+                )
+              ) : (
+                <MessageList
+                  model={model}
+                  view={view}
+                  selectedId={selectedId}
+                  openId={openId}
+                  picked={picked}
+                  rows={rows}
+                  gatekeeper={gatekeeper}
+                  onDoneAll={doneAll}
+                  onShowAll={(key) => changeView({ sub: { kind: "card", key } }, true)}
+                  onOpenGroup={(key) => changeView({ sub: { kind: "group", key } }, true)}
+                  onBack={() => changeView({ sub: null }, true)}
+                  onModeChange={setMode}
+                  onSearchOpen={openSearch}
+                  onSearchChange={(search) => setView((v) => ({ ...v, search }))}
+                  onSearchClose={closeSearch}
+                  onSearchKeyDown={onSearchKeyDown}
+                  onCompose={() => compose()}
+                  onToggleDone={toggleDone}
+                  onOpenGatekeeper={() => changeView({ sub: { kind: "gatekeeper" } }, true)}
+                  searchRef={searchRef}
+                  demo={isDemoMode(accounts)}
+                  onAddAccounts={() => openSettings("accounts")}
+                  loading={loading}
+                  onSaveSearch={(query) => setSavingSearch(query)}
+                  scrollRef={listScroll}
+                  older={older && { loading: loadingOlder, onNearEnd: reachBack }}
+                  searchingServers={searchingServers}
+                  onEmpty={emptiable(view.folder, view.account).length ? () => emptyList(view.folder, view.account) : undefined}
+                  recentSearches={recentSearches}
+                  onForgetSearch={(q) => setRecentSearches((r) => forgetSearch(r, q))}
+                  searchScope={view.account === "all" ? null : (accounts.find((a) => a.id === view.account)?.label ?? null)}
+                  onSearchAllAccounts={() => setView((v) => ({ ...v, account: "all" }))}
+                />
+              )}
               {!twoColumns && pickedRows.length > 0 && <BulkPanel compact selection={selection} actions={bulk} />}
               {twoColumns && (
                 <Splitter
@@ -2775,7 +3090,15 @@ export default function App() {
             saved={draftSaved === draftKey(draft)}
             full={composerFull}
             fullStyle={{ left: readerLeft, right: 0 }}
-            onChange={(patch) => setDraft((d) => d && { ...d, ...patch })}
+            onChange={(patch) =>
+              setDraft(
+                (d) =>
+                  d &&
+                  (patch.from !== undefined && patch.from !== d.from
+                    ? withAutoRecipients({ ...d, ...patch }, patch.from)
+                    : { ...d, ...patch }),
+              )
+            }
             onToggleFull={() => setComposerFull((f) => !f)}
             onClose={() => void closeComposer()}
             onDiscard={() => void discardComposer()}
@@ -2875,16 +3198,13 @@ export default function App() {
             onClose={() => setConfirm(null)}
           />
         )}
-        {snoozePick && (
+        {pickTime && (
           <DateTimeDialog
-            title="Snooze until"
-            confirmLabel="Snooze"
-            initial={laterTime(presetOf("tomorrow"))}
-            onSubmit={(at) => {
-              const rows = snoozePick.flatMap((id) => byId.get(id) ?? []);
-              batch((targets) => snoozeUntil(targets, at), rows);
-            }}
-            onClose={() => setSnoozePick(null)}
+            title={pickTime.title}
+            confirmLabel={pickTime.confirmLabel}
+            initial={pickTime.initial}
+            onSubmit={pickTime.run}
+            onClose={() => setPickTime(null)}
           />
         )}
         {certificate && (

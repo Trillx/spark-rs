@@ -128,15 +128,30 @@ impl Live {
             self.start(app, account.id);
         }
         let engine = self.engine.clone();
+        let status = self.status.clone();
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(SNOOZE_CHECK).await;
                 let returned = engine.store().wake_snoozed(now_ms()).unwrap_or_default();
-                if !returned.is_empty() {
+                // Reminders wait for a sync after their time, so a reply is seen first.
+                let synced: HashMap<i64, i64> = status
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(&account, view)| Some((account, view.last_sync?)))
+                    .collect();
+                let reminded = engine
+                    .store()
+                    .wake_reminders(now_ms(), &synced)
+                    .unwrap_or_default();
+                if !returned.is_empty() || !reminded.is_empty() {
                     let _ = app.emit("mailbox-changed", ());
+                }
+                if !returned.is_empty() {
                     notify::snooze_returned(&app, &engine, &returned);
                 }
+                notify::reminders_due(&app, &reminded);
             }
         });
     }

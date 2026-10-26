@@ -2850,3 +2850,167 @@ fn snoozed_mail_from_a_sender_blocked_meanwhile_wakes_into_blocked() {
         MessageState::Inbox
     );
 }
+
+#[test]
+fn reminders_come_back_unless_someone_replied() {
+    let (mut store, account) = store_with_imap_account();
+    let me = "me@fastmail.com";
+    let sent = |uid, subject: &str| Incoming {
+        mailbox: Some("Sent".into()),
+        from_address: me.into(),
+        subject: subject.into(),
+        date: 1_000,
+        ..incoming(account, uid, me)
+    };
+    let quiet = new_id(store.add_incoming(&sent(1, "Quiet"), false).unwrap());
+    let answered = new_id(store.add_incoming(&sent(2, "Answered"), false).unwrap());
+    let reply = Incoming {
+        in_reply_to: Some("<2@example.com>".into()),
+        subject: "Re: Answered".into(),
+        date: 2_000,
+        ..incoming(account, 3, "ana@x.com")
+    };
+    store.add_incoming(&reply, false).unwrap();
+    fn remind<'a>(account: i64, message_id: &'a str, subject: &'a str) -> NewReminder<'a> {
+        NewReminder {
+            account_id: account,
+            message_id: Some(message_id),
+            reply_to: None,
+            subject,
+            to: "Ana <ana@x.com>",
+            sent_at: 1_000,
+            remind_at: 5_000,
+            if_no_reply: true,
+        }
+    }
+    let first = store
+        .add_reminder(&remind(account, "<1@example.com>", "Quiet"))
+        .unwrap();
+    store
+        .add_reminder(&remind(account, "2@example.com", "Answered"))
+        .unwrap();
+    assert_eq!(store.reminders().unwrap().len(), 2);
+
+    let synced = HashMap::from([(account, 5_000)]);
+    assert!(store.wake_reminders(4_999, &synced).unwrap().is_empty());
+    // Not until the account has synced since, so a reply on the server is seen.
+    assert!(
+        store
+            .wake_reminders(5_000, &HashMap::new())
+            .unwrap()
+            .is_empty()
+    );
+    let due = store.wake_reminders(5_000, &synced).unwrap();
+    assert_eq!(due.len(), 1, "the answered one is gone");
+    assert_eq!(
+        (due[0].id, due[0].message, due[0].due),
+        (first, Some(quiet), true)
+    );
+    assert_eq!(store.reminders().unwrap().len(), 1);
+    let m = store.message(quiet).unwrap().unwrap();
+    assert_eq!(m.reminder.map(|r| (r.id, r.at)), Some((first, 5_000)));
+    assert!(store.message(answered).unwrap().unwrap().reminder.is_none());
+
+    // Done takes it out of the Inbox; undo brings it back.
+    store.finish_reminder(first, true).unwrap();
+    assert!(store.message(quiet).unwrap().unwrap().reminder.is_none());
+    store.finish_reminder(first, false).unwrap();
+    assert!(store.message(quiet).unwrap().unwrap().reminder.is_some());
+    // A new time makes it wait again; None removes it.
+    store.set_reminder(first, Some(9_000)).unwrap();
+    assert!(store.message(quiet).unwrap().unwrap().reminder.is_none());
+    assert!(!store.reminder(first).unwrap().unwrap().due);
+    store.set_reminder(first, None).unwrap();
+    assert!(store.reminders().unwrap().is_empty());
+
+    // Sent where the copy isn't stored yet: due anyway after the grace
+    // period, and it finds its email once that's synced.
+    let later = store
+        .add_reminder(&remind(account, "<5@example.com>", "Later"))
+        .unwrap();
+    let due = store
+        .wake_reminders(5_000 + 10 * 60_000, &HashMap::new())
+        .unwrap();
+    assert_eq!((due[0].id, due[0].message), (later, None));
+    let copy = new_id(store.add_incoming(&sent(5, "Later"), false).unwrap());
+    assert!(
+        store
+            .wake_reminders(5_000 + 10 * 60_000, &synced)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.reminder(later).unwrap().unwrap().message, Some(copy));
+    // A reply that turns up after it came due ends it.
+    let reply = Incoming {
+        in_reply_to: Some("<5@example.com>".into()),
+        subject: "Re: Later".into(),
+        date: 3_000,
+        ..incoming(account, 6, "ana@x.com")
+    };
+    store.add_incoming(&reply, false).unwrap();
+    store.wake_reminders(5_000 + 10 * 60_000, &synced).unwrap();
+    assert!(store.reminder(later).unwrap().is_none());
+}
+
+#[test]
+fn trashing_an_email_ends_its_reminder() {
+    let (mut store, account) = store_with_imap_account();
+    let id = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "me@fastmail.com"), false)
+            .unwrap(),
+    );
+    let reminder = store
+        .add_reminder(&NewReminder {
+            account_id: account,
+            message_id: Some("1@example.com"),
+            reply_to: None,
+            subject: "Message 1",
+            to: "ana@x.com",
+            sent_at: 0,
+            remind_at: 10,
+            if_no_reply: false,
+        })
+        .unwrap();
+    store
+        .wake_reminders(10, &HashMap::from([(account, 10)]))
+        .unwrap();
+    assert!(store.message(id).unwrap().unwrap().reminder.is_some());
+    let trash = Patch {
+        state: Some(MessageState::Deleted),
+        ..Default::default()
+    };
+    store.update(id, &trash, 20).unwrap();
+    assert!(store.message(id).unwrap().unwrap().reminder.is_none());
+    assert!(store.reminders().unwrap().iter().all(|r| r.id != reminder));
+}
+
+#[test]
+fn scheduled_sends_can_move_or_come_back_out() {
+    let (mut store, account) = store_with_imap_account();
+    let later = r#"{"account":1,"to":"a@x.com","subject":"Later","body":"","sendAt":9000,"sendLater":{"key":"tomorrow","at":9000},"attachments":[]}"#;
+    let now =
+        r#"{"account":1,"to":"a@x.com","subject":"Now","body":"","sendAt":10,"attachments":[]}"#;
+    let scheduled = store.queue_send(account, later, 9_000, &[]).unwrap();
+    store.queue_send(account, now, 10, &[]).unwrap();
+    let listed = store.scheduled_sends().unwrap();
+    assert_eq!(listed.iter().map(|s| s.0).collect::<Vec<_>>(), [scheduled]);
+
+    assert!(store.reschedule_send(scheduled, Some(20_000), 0).unwrap());
+    let (_, _, draft, send_at) = store.scheduled_sends().unwrap().remove(0);
+    assert_eq!(send_at, 20_000);
+    let draft: serde_json::Value = serde_json::from_str(&draft).unwrap();
+    assert_eq!(draft["sendLater"]["at"], 20_000);
+    assert_eq!(draft["sendAt"], 20_000);
+
+    // Sent now: no longer scheduled, and due.
+    assert!(store.reschedule_send(scheduled, None, 30).unwrap());
+    assert!(store.scheduled_sends().unwrap().is_empty());
+    assert_eq!(store.claim_due_sends(account, 30).unwrap().len(), 2);
+    // Once it's sending it's no longer queued.
+    assert_eq!(store.queued_send(scheduled).unwrap(), None);
+    let again = store.queue_send(account, later, 9_000, &[]).unwrap();
+    let (owner, draft) = store.queued_send(again).unwrap().unwrap();
+    assert_eq!(owner, account);
+    assert!(draft.contains("\"Later\""));
+}

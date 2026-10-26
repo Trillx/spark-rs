@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
 use spark_store::{
-    Account, AccountKind, Folder, FolderRole, Location, NewAccount, Pending, Place, Query, Store,
-    now_ms,
+    Account, AccountKind, Folder, FolderRole, Location, NewAccount, NewReminder, Pending, Place,
+    Query, Store, now_ms,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -984,12 +984,32 @@ impl Engine {
             };
             let mut draft_id = None;
             let result = match result {
-                Ok(()) => {
+                Ok(message_id) => {
                     // The saved draft it came from is done with, here and on the server.
                     if let Some(saved) = saved_draft {
                         self.store().discard_draft(saved)?;
                     }
                     self.store().finish_send(id)?;
+                    if let Ok(draft) = &parsed
+                        && let Some(remind) = &draft.remind
+                    {
+                        let to = [&draft.to, &draft.cc, &draft.bcc]
+                            .into_iter()
+                            .filter(|f| !f.trim().is_empty())
+                            .map(|f| f.trim())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.store().add_reminder(&NewReminder {
+                            account_id,
+                            message_id: message_id.as_deref(),
+                            reply_to: draft.reply_to,
+                            subject: draft.subject.trim(),
+                            to: &to,
+                            sent_at: now_ms(),
+                            remind_at: remind.at,
+                            if_no_reply: remind.if_no_reply,
+                        })?;
+                    }
                     // Delivery is complete even if learning its recipients fails.
                     let _ = self.store().record_sent(&recipients, now_ms());
                     Ok(true)
@@ -1027,7 +1047,36 @@ impl Engine {
         Ok(outcomes)
     }
 
-    async fn send_draft(&self, account_id: i64, outbox_id: i64, draft: &Draft) -> Result<()> {
+    /// Takes a scheduled send out of the queue into Drafts, exactly as it was
+    /// queued, its files too (in one step, so nothing is lost), to edit or to
+    /// keep; `keep_schedule` keeps its Send Later time on the draft. Returns
+    /// the draft, or `None` once it's sending or gone.
+    pub fn unschedule(&self, outbox_id: i64, keep_schedule: bool) -> Result<Option<i64>> {
+        let mut store = self.store();
+        let Some((account_id, json)) = store.queued_send(outbox_id)? else {
+            return Ok(None);
+        };
+        let mut draft: Draft = serde_json::from_str(&json)
+            .map_err(|e| Error::Config(format!("The queued message is unreadable: {e}")))?;
+        if !keep_schedule {
+            draft.send_later = None;
+        }
+        let account = store
+            .account(account_id)?
+            .ok_or_else(|| Error::Config("That account was removed.".into()))?;
+        let files = store.outbox_files(outbox_id)?;
+        let id =
+            drafts::recover_failed_send(&mut store, &account, &draft, &files, now_ms(), outbox_id)?;
+        Ok(Some(id))
+    }
+
+    /// Sends a queued draft. Returns its Message-ID, for reminders.
+    async fn send_draft(
+        &self,
+        account_id: i64,
+        outbox_id: i64,
+        draft: &Draft,
+    ) -> Result<Option<String>> {
         let account = self.account(account_id)?;
         let original = draft
             .reply_to
@@ -1036,7 +1085,7 @@ impl Engine {
             .flatten()
             .or_else(|| drafts::original_from_headers(draft));
         let files = self.outgoing_files(outbox_id, draft).await?;
-        match config(&account)? {
+        let message_id = match config(&account)? {
             AccountConfig::Imap {
                 username,
                 smtp: server,
@@ -1051,7 +1100,9 @@ impl Engine {
                 );
                 let message =
                     draft::build_message(from, draft, original.as_ref().map(|(o, _)| o), &files)?;
+                let message_id = message.headers().get_raw("Message-ID").map(str::to_owned);
                 smtp::send(&server, &username, &self.password(account_id)?, message).await?;
+                message_id
             }
             AccountConfig::Microsoft {
                 client_id, tenant, ..
@@ -1060,9 +1111,9 @@ impl Engine {
                     .access_token(account_id, &App::new(&client_id, &tenant)?)
                     .await?;
                 let remote = original.as_ref().and_then(|(_, remote)| remote.as_deref());
-                Graph::new(&token).send_draft(draft, remote, &files).await?;
+                Graph::new(&token).send_draft(draft, remote, &files).await?
             }
-        }
+        };
         // People you write to skip the Gatekeeper.
         let store = self.store();
         for field in [&draft.to, &draft.cc, &draft.bcc] {
@@ -1070,7 +1121,7 @@ impl Engine {
                 store.accept_sender(m.email.as_ref(), now_ms())?;
             }
         }
-        Ok(())
+        Ok(message_id)
     }
 
     /// Whether the account's calendar can show, as of its last refresh.
@@ -1889,6 +1940,50 @@ mod tests {
             r#"{"limit":300,"complete":true}"#,
             Some(5)
         )));
+    }
+
+    #[test]
+    fn unscheduling_keeps_exactly_what_was_queued_in_drafts() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, Server::new("127.0.0.1", 465));
+        let queued = Draft {
+            account: account.id,
+            to: "ana@x.com".into(),
+            subject: "Lease".into(),
+            body: "As sent".into(),
+            send_at: 9_000,
+            send_later: Some(draft::SendLater {
+                key: "tomorrow".into(),
+                at: 9_000,
+            }),
+            remind: Some(draft::Remind {
+                at: 20_000,
+                if_no_reply: true,
+            }),
+            ..Default::default()
+        };
+        let file = OutboxFile {
+            name: "plan.pdf".into(),
+            mime: "application/pdf".into(),
+            data: b"%PDF".to_vec(),
+        };
+        let json = serde_json::to_string(&queued).unwrap();
+        let outbox = store
+            .queue_send(account.id, &json, 9_000, std::slice::from_ref(&file))
+            .unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+
+        let id = engine.unschedule(outbox, false).unwrap().unwrap();
+        let store = engine.store();
+        assert!(store.scheduled_sends().unwrap().is_empty());
+        assert!(store.is_draft(id).unwrap());
+        let saved: Draft = serde_json::from_str(&store.draft(id).unwrap().unwrap()).unwrap();
+        assert_eq!((saved.body.as_str(), saved.send_later), ("As sent", None));
+        assert_eq!(saved.remind, queued.remind);
+        assert_eq!(store.draft_files(id).unwrap(), [file]);
+        drop(store);
+        // Gone from the queue: there's nothing left to take out.
+        assert_eq!(engine.unschedule(outbox, true).unwrap(), None);
     }
 
     #[test]

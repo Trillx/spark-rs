@@ -21,6 +21,7 @@ mod conversations;
 mod drafts;
 mod gatekeeper;
 mod priority;
+mod reminders;
 mod search;
 mod signatures;
 
@@ -31,6 +32,7 @@ pub use gatekeeper::{
     Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
 };
 pub use priority::PriorityUndo;
+pub use reminders::{NewReminder, Reminder};
 pub use rusqlite::Error;
 pub use search::{Query, Term};
 pub use signatures::{DefaultSignature, Signature};
@@ -257,6 +259,17 @@ pub struct Message {
     pub returned_at: Option<i64>,
     /// Its conversation is muted: new mail in it doesn't notify.
     pub muted: bool,
+    /// A reminder that came due on it: it waits in the Inbox until Done.
+    pub reminder: Option<DueReminder>,
+}
+
+/// A reminder in the Inbox, on the email it came back as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DueReminder {
+    pub id: i64,
+    /// When it came due (Unix ms).
+    pub at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -595,7 +608,9 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      priority, screening, from_name, from_address, subject, snippet, date, attachments, \
      (SELECT group_concat(folder_id) FROM folder_members WHERE message_id = messages.id), \
      CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id), reply_to_list, \
-     returned_at, EXISTS (SELECT 1 FROM muted WHERE muted.conversation = COALESCE(messages.conversation, messages.id))";
+     returned_at, EXISTS (SELECT 1 FROM muted WHERE muted.conversation = COALESCE(messages.conversation, messages.id)), \
+     (SELECT id FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
+     (SELECT remind_at FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1)";
 
 const FOLDER_COLUMNS: &str = "f.id, f.account_id, f.remote_id, p.id, f.name, f.role, f.selectable, \
      f.sync_state, f.synced_at";
@@ -702,6 +717,12 @@ impl Store {
         if version < 16 {
             conn.execute_batch(priority::SCHEMA_PRIORITY)?;
             conn.pragma_update(None, "user_version", 16)?;
+        }
+        if version < 17 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(reminders::SCHEMA_REMINDERS)?;
+            tx.pragma_update(None, "user_version", 17)?;
+            tx.commit()?;
         }
         Ok(Self { conn })
     }
@@ -1156,6 +1177,7 @@ impl Store {
             }
         }
 
+        Self::end_reminders_of(&tx, id)?;
         tx.commit()?;
         self.message(id)
     }
@@ -1645,6 +1667,58 @@ impl Store {
         .collect()
     }
 
+    /// Mail scheduled with Send Later and still queued, soonest first: its
+    /// outbox id, account, draft (JSON) and send time.
+    pub fn scheduled_sends(&self) -> Result<Vec<(i64, i64, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account_id, draft, send_at FROM outbox
+             WHERE status = 'queued' AND json_extract(draft, '$.sendLater') IS NOT NULL
+             ORDER BY send_at",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect()
+    }
+
+    /// Sends a scheduled message at `at` instead, or with `None` now (it's
+    /// no longer scheduled). False once it's sending or gone.
+    pub fn reschedule_send(&self, id: i64, at: Option<i64>, now: i64) -> Result<bool> {
+        let changed = match at {
+            Some(at) => self.conn.execute(
+                "UPDATE outbox SET send_at = ?2,
+                    draft = json_set(draft, '$.sendAt', ?2, '$.sendLater', json_object('key', 'custom', 'at', ?2))
+                 WHERE id = ?1 AND status = 'queued'",
+                params![id, at],
+            )?,
+            None => self.conn.execute(
+                "UPDATE outbox SET send_at = ?2,
+                    draft = json_remove(json_set(draft, '$.sendAt', ?2), '$.sendLater')
+                 WHERE id = ?1 AND status = 'queued'",
+                params![id, now],
+            )?,
+        };
+        Ok(changed == 1)
+    }
+
+    /// A send still waiting in the queue: its account and draft (JSON).
+    pub fn queued_send(&self, id: i64) -> Result<Option<(i64, String)>> {
+        self.conn
+            .query_row(
+                "SELECT account_id, draft FROM outbox WHERE id = ?1 AND status = 'queued'",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Whether a saved draft is already on its way, held by a queued send.
+    pub fn draft_held(&self, draft: i64) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox WHERE draft_message = ?1)",
+            [draft],
+            |r| r.get(0),
+        )
+    }
+
     /// Cancels a queued send; false once sending has started or finished.
     pub fn cancel_send(&self, id: i64) -> Result<bool> {
         Ok(self.conn.execute(
@@ -1984,6 +2058,10 @@ fn message_row(r: &Row) -> Result<Message> {
         conversation: r.get(18)?,
         returned_at: r.get(20)?,
         muted: r.get(21)?,
+        reminder: match (r.get(22)?, r.get(23)?) {
+            (Some(id), Some(at)) => Some(DueReminder { id, at }),
+            _ => None,
+        },
     })
 }
 
