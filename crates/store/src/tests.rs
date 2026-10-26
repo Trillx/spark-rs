@@ -2643,3 +2643,78 @@ fn senders_accepted_later_leave_the_gatekeeper_everywhere() {
         .unwrap();
     assert!(!store.message(waiting).unwrap().unwrap().screening);
 }
+
+#[test]
+fn unsent_drafts_are_not_mail_the_user_wrote() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[RemoteFolder {
+                remote_id: "[Gmail]/Drafts".into(),
+                parent: None,
+                name: "Drafts".into(),
+                role: Some(FolderRole::Drafts),
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    let drafts = folder_id(&store, "[Gmail]/Drafts");
+    let draft = Incoming {
+        from_address: "me@gmail.com".into(),
+        to: vec!["stranger@vendor.org".into()],
+        ..in_folder(account, "[Gmail]/Drafts", 7, 7)
+    };
+    store.add_folder_message(drafts, &draft).unwrap();
+    assert!(arrive(&mut store, account, 8, "stranger@vendor.org").screening);
+}
+
+#[test]
+fn writing_to_someone_from_any_account_lets_their_waiting_mail_through() {
+    let (mut store, gmail) = store_with_account();
+    let waiting = arrive(&mut store, gmail, 1, "dana@fabrikam.org").id;
+    let other = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "me@outlook.com",
+            name: "Me",
+            label: "Other",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    store
+        .replace_folders(
+            other,
+            &[RemoteFolder {
+                remote_id: "Sent".into(),
+                parent: None,
+                name: "Sent".into(),
+                role: Some(FolderRole::Sent),
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    // The other account's Sent folder syncs, with mail to Dana.
+    let sent = Incoming {
+        from_address: "me@outlook.com".into(),
+        to: vec!["Dana <Dana@Fabrikam.org>".into()],
+        ..in_folder(other, "Sent", 2, 2)
+    };
+    store
+        .add_folder_message(folder_id(&store, "Sent"), &sent)
+        .unwrap();
+    assert!(!store.message(waiting).unwrap().unwrap().screening);
+
+    // Someone accepted that way on arrival lets their mail elsewhere through too.
+    let eve = arrive(&mut store, gmail, 3, "eve@fabrikam.org").id;
+    let to_eve = Incoming {
+        from_address: "me@gmail.com".into(),
+        to: vec!["eve@fabrikam.org".into()],
+        mailbox: Some("Sent Mail".into()),
+        ..incoming(gmail, 4, "me@gmail.com")
+    };
+    store.add_incoming(&to_eve, false).unwrap();
+    assert!(!arrive(&mut store, other, 5, "eve@fabrikam.org").screening);
+    assert!(!store.message(eve).unwrap().unwrap().screening);
+}

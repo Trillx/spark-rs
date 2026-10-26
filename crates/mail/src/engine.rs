@@ -111,12 +111,22 @@ pub struct Report {
     pub folder_errors: Vec<String>,
     /// Drafts uploaded to the server, and server copies deleted.
     pub drafts: usize,
+    /// Senders waiting in the Gatekeeper that the Sent folder showed the
+    /// user had written to: they're accepted, so their mail moved.
+    pub accepted: usize,
 }
 
 impl Report {
     /// Whether the message list needs reloading.
     pub fn changed(&self) -> bool {
-        self.new + self.gone + self.older + self.folder_changes + self.drafts + self.headers > 0
+        self.new
+            + self.gone
+            + self.older
+            + self.folder_changes
+            + self.drafts
+            + self.headers
+            + self.accepted
+            > 0
     }
 
     fn drafts_pushed(&mut self, pushed: DraftsReport) {
@@ -497,7 +507,7 @@ impl Engine {
                     // A failed check leaves them to the next round; it doesn't fail this one.
                     && let Ok(found) = imap::written_to(&mut session, &sent, &waiting).await
                 {
-                    self.written_to(account_id, &waiting, &found)?;
+                    report.accepted += self.written_to(account_id, &waiting, &found)?;
                 }
                 let _ = session.logout().await;
             }
@@ -564,17 +574,18 @@ impl Engine {
                 if !waiting.is_empty()
                     && let Ok(found) = graph.written_to(&waiting).await
                 {
-                    self.written_to(account_id, &waiting, &found)?;
+                    report.accepted += self.written_to(account_id, &waiting, &found)?;
                 }
             }
         }
         Ok(report)
     }
 
-    /// Senders waiting in the account's Gatekeeper to ask its Sent folder
-    /// about, on rounds that fetch: the user may have written to them
-    /// elsewhere (Spark reads Sent for the same reason). Those asked lately
-    /// without luck wait, unless they've written again.
+    /// Senders waiting in any account's Gatekeeper to ask this account's
+    /// Sent folder about, on rounds that fetch: the user may have written to
+    /// them elsewhere (Spark reads Sent for the same reason), and a decision
+    /// counts for every account. Those asked here lately without luck wait,
+    /// unless they've written again.
     fn waiting_senders(
         &self,
         account_id: i64,
@@ -591,12 +602,13 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for id in arrived {
             if let Some(m) = store.message(*id)? {
-                asked.remove(&(account_id, m.from_address.to_lowercase()));
+                let address = m.from_address.to_lowercase();
+                asked.retain(|(_, a), _| *a != address);
             }
         }
         let now = now_ms();
         let mut senders: Vec<String> = Vec::new();
-        for address in store.screened_senders(account_id)? {
+        for address in store.screened_senders()? {
             let key = (account_id, address.to_lowercase());
             let lately = asked.get(&key).is_some_and(|at| now - at < SENT_RECHECK_MS);
             if !lately && !senders.iter().any(|s| s.eq_ignore_ascii_case(&address)) {
@@ -610,7 +622,8 @@ impl Engine {
     }
 
     /// The Sent folder had mail to `found` of the `asked`: they're accepted.
-    fn written_to(&self, account_id: i64, asked: &[String], found: &[String]) -> Result<()> {
+    /// Returns how many.
+    fn written_to(&self, account_id: i64, asked: &[String], found: &[String]) -> Result<usize> {
         let now = now_ms();
         {
             let mut not = self
@@ -630,7 +643,7 @@ impl Engine {
         for address in found {
             store.accept_sender(address, now)?;
         }
-        Ok(())
+        Ok(found.len())
     }
 
     /// The account's Sent folder, as an IMAP mailbox name.

@@ -178,7 +178,7 @@ fn unanswered(address: &str) -> bool {
 }
 
 /// A recipient as the store keeps it: `Name <address>` or the bare address.
-fn parse(entry: &str) -> Contact {
+pub(crate) fn parse(entry: &str) -> Contact {
     match entry.rsplit_once('<') {
         Some((name, address)) => Contact {
             name: name.trim().trim_matches('"').trim().to_owned(),

@@ -1424,3 +1424,122 @@ async fn imap_people_written_to_elsewhere_skip_the_gatekeeper() {
     assert!(!find(&engine, "Re: Hello").screening);
     assert!(find(&engine, "Cold pitch").screening);
 }
+
+#[tokio::test]
+async fn imap_blocked_folder_renamed_elsewhere_is_made_again() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("renamed{}@example.com", now_ms());
+    deliver(&smtp, "Spam <spam@z.net>", &me, "Offer 1", false).await;
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store.clone(), Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    engine.run(account.id, true).await.unwrap();
+    let block = Change {
+        screen: Screen::Sender("spam@z.net".into()),
+        decision: Some(Decision::Blocked),
+    };
+    engine.store().decide(&[block], now_ms() - 60_000).unwrap();
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
+
+    // Another client renames Blocked, then more spam arrives.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.rename("Blocked", "Old spam").await.unwrap();
+    deliver(&smtp, "Spam <spam@z.net>", &me, "Offer 2", false).await;
+    engine.run(account.id, true).await.unwrap();
+    let push = || async {
+        let mut state = account_state(&engine, account.id);
+        let pending = engine.store().pending(account.id, now_ms() + 1, 0).unwrap();
+        let mut session = imap::login(&imap, &me, "pw").await.unwrap();
+        let pushed = imap::push(&mut session, &store, &mut state, pending)
+            .await
+            .unwrap();
+        engine
+            .store()
+            .set_sync_state(account.id, &serde_json::to_string(&state).unwrap())
+            .unwrap();
+        pushed
+    };
+    // The move finds the folder gone and waits; the next push makes it again.
+    assert_eq!(push().await, 0);
+    assert_eq!(
+        engine
+            .store()
+            .pending(account.id, now_ms() + 1, 0)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(push().await, 1);
+    assert_eq!(other.select("INBOX").await.unwrap().exists, 0);
+    assert_eq!(other.select("Blocked").await.unwrap().exists, 1);
+    assert_eq!(other.select("Old spam").await.unwrap().exists, 1);
+}
+
+#[tokio::test]
+async fn imap_sent_folders_of_every_account_let_senders_through() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let stamp = now_ms();
+    let (home, work) = (
+        format!("home{stamp}@example.com"),
+        format!("work{stamp}@example.org"),
+    );
+    // The user wrote to Dana from home, on their phone.
+    let mut at_home = imap::login(&imap, &home, "pw").await.unwrap();
+    at_home.create("Sent").await.unwrap();
+    let to_dana = format!(
+        "Message-ID: <to-dana-{stamp}@x.com>\r\nFrom: {home}\r\nTo: dana@fabrikam.org\r\nSubject: Hello\r\n\r\nHi\r\n"
+    );
+    at_home.append("Sent", None, None, to_dana).await.unwrap();
+    let mut at_work = imap::login(&imap, &work, "pw").await.unwrap();
+    at_work.create("Sent").await.unwrap();
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let add = async |email: &str| {
+        engine
+            .add_password_account(
+                AccountKind::Imap,
+                email,
+                "pw",
+                "",
+                imap.clone(),
+                smtp.clone(),
+            )
+            .await
+            .unwrap()
+            .id
+    };
+    let (home_id, work_id) = (add(&home).await, add(&work).await);
+    let round = Round {
+        fetch: true,
+        list_folders: true,
+        ..Default::default()
+    };
+    engine.run_round(home_id, &round).await.unwrap();
+    engine.run_round(work_id, &round).await.unwrap();
+
+    // Dana writes to work, where the Sent folder has nothing for her.
+    deliver(&smtp, "Dana <dana@fabrikam.org>", &work, "Re: Hello", false).await;
+    let report = engine.run(work_id, true).await.unwrap();
+    assert_eq!((report.new, report.accepted), (1, 0));
+    assert!(find(&engine, "Re: Hello").screening);
+
+    // Home's next round finds her in its Sent, and says the list changed.
+    let report = engine.run(home_id, true).await.unwrap();
+    assert_eq!(report.accepted, 1);
+    assert!(report.changed());
+    assert!(!find(&engine, "Re: Hello").screening);
+}

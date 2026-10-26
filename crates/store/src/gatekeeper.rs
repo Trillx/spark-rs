@@ -336,13 +336,14 @@ impl Store {
         Ok(())
     }
 
-    /// Senders waiting in New Senders, with no decision yet.
-    pub fn screened_senders(&self, account_id: i64) -> Result<Vec<String>> {
+    /// Senders waiting in the Gatekeeper, in any account, with no decision
+    /// yet; the latest to write first.
+    pub fn screened_senders(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT from_address FROM messages
-             WHERE account_id = ?1 AND screening = 1 AND state = 'inbox'",
+            "SELECT from_address FROM messages WHERE screening = 1 AND state = 'inbox'
+             GROUP BY from_address ORDER BY MAX(date) DESC",
         )?;
-        stmt.query_map([account_id], |r| r.get(0))?.collect()
+        stmt.query_map([], |r| r.get(0))?.collect()
     }
 }
 
@@ -420,7 +421,8 @@ fn welcome(conn: &Connection, address: &str) -> Result<bool> {
 }
 
 /// Whether the user has written to `address`: it's on mail from one of
-/// their addresses (Sent, or sent from here).
+/// their addresses (Sent, or sent from here), drafts and mail still in the
+/// outbox aside.
 fn wrote_to(conn: &Connection, address: &str) -> Result<bool> {
     let address = address.trim().to_lowercase();
     conn.prepare_cached(
@@ -428,6 +430,10 @@ fn wrote_to(conn: &Connection, address: &str) -> Result<bool> {
              OR EXISTS (
                  SELECT 1 FROM messages m
                  WHERE m.from_address IN (SELECT email FROM accounts)
+                   AND NOT EXISTS (SELECT 1 FROM folder_members fm JOIN folders f ON f.id = fm.folder_id
+                                   WHERE fm.message_id = m.id AND f.role = 'drafts')
+                   AND m.id NOT IN (SELECT message_id FROM draft_uploads)
+                   AND m.id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
                    AND EXISTS (
                        SELECT 1 FROM json_each(m.to_list) j
                        WHERE lower(j.value) = ?1 OR instr(lower(j.value), '<' || ?1 || '>') > 0
@@ -456,7 +462,11 @@ pub(crate) fn arrival(
     Ok(match decided(conn, address)? {
         Some(Decision::Blocked) => (MessageState::Blocked, false),
         Some(Decision::Accepted) => (MessageState::Inbox, false),
-        None if welcome(conn, address)? => (MessageState::Inbox, false),
+        None if welcome(conn, address)? => {
+            // The rules may have changed since their other mail arrived.
+            release(conn, address)?;
+            (MessageState::Inbox, false)
+        }
         None if screen_new_senders && mode(conn)? != GatekeeperMode::Off => {
             (MessageState::Inbox, true)
         }
@@ -466,16 +476,40 @@ pub(crate) fn arrival(
                 [address],
             )?;
             // Accepted for every account, so their mail waiting in another
-            // account's Gatekeeper comes out too. (Through the sender index:
-            // a first sync gets here for most of its senders.)
-            conn.execute(
-                "UPDATE messages SET screening = 0
-                 WHERE account_id IN (SELECT id FROM accounts) AND from_address = ?1 AND screening = 1",
-                [address],
-            )?;
+            // account's Gatekeeper comes out too.
+            release(conn, address)?;
             (MessageState::Inbox, false)
         }
     })
+}
+
+/// Takes an accepted sender's mail out of every account's Gatekeeper. Only
+/// mail waiting there changes: a decision would have moved it already.
+/// (Through the sender index: a first sync gets here for most senders.)
+fn release(conn: &Connection, address: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET screening = 0
+         WHERE account_id IN (SELECT id FROM accounts) AND from_address = ?1 AND screening = 1",
+        [address],
+    )?;
+    Ok(())
+}
+
+/// A Sent folder sync found `m`: if the user sent it, the people it's to
+/// get through the Gatekeeper, as if the user had written to them here.
+pub(crate) fn sent(conn: &Connection, m: &Incoming) -> Result<()> {
+    let own: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE email = ?1 COLLATE NOCASE)",
+        [&m.from_address],
+        |r| r.get(0),
+    )?;
+    if !own {
+        return Ok(());
+    }
+    for entry in m.to.iter().chain(&m.cc).chain(&m.bcc) {
+        release(conn, &crate::contacts::parse(entry).address)?;
+    }
+    Ok(())
 }
 
 /// A new account's colleagues (at its domain, unless anyone can have an

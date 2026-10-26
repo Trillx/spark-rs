@@ -1469,6 +1469,9 @@ impl Store {
             Added::New(id) | Added::Known(id) => id,
         };
         add_member(&tx, folder_id, id, m.uid)?;
+        if role.as_deref() == Some(FolderRole::Sent.as_str()) {
+            gatekeeper::sent(&tx, m)?;
+        }
         tx.commit()?;
         Ok(added)
     }

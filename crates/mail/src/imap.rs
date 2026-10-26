@@ -674,6 +674,16 @@ pub async fn delete_folders(session: &mut Session, mailboxes: &[String]) -> Resu
     Ok(())
 }
 
+/// Whether the server has `mailbox`.
+async fn exists(session: &mut Session, mailbox: &str) -> Result<bool> {
+    let names: Vec<_> = session
+        .list(Some(""), Some(mailbox))
+        .await?
+        .try_collect()
+        .await?;
+    Ok(names.iter().any(|n| n.name() == mailbox))
+}
+
 /// The hierarchy delimiter the server uses at `mailbox`.
 async fn delimiter(session: &mut Session, mailbox: &str) -> Result<Option<String>> {
     let names: Vec<_> = session
@@ -1038,7 +1048,8 @@ async fn fetch_messages(
 /// the move for Done, Delete, blocking, filing into a folder, or back to the
 /// inbox. Returns how many messages were updated. A message the server no
 /// longer has is skipped for good. Records the Blocked folder in `state`
-/// when it's first needed.
+/// when it's first needed, and forgets it if it's gone (renamed or deleted
+/// elsewhere), leaving those moves to the next round.
 pub async fn push(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -1051,7 +1062,6 @@ pub async fn push(
     if pending.iter().any(|p| p.place == Place::Blocked) {
         blocked_folder(session, state).await?;
     }
-    let state = &*state;
     let caps = session.capabilities().await?;
     let server = Capabilities {
         can_move: caps.has_str("MOVE"),
@@ -1060,6 +1070,11 @@ pub async fn push(
     };
     let mut pushed = 0;
     for p in pending {
+        // The Blocked folder went missing below: these wait for the next
+        // round to find or make it again.
+        if p.place == Place::Blocked && state.blocked.is_none() {
+            continue;
+        }
         let Some((mailbox, uid)) = find(session, store, state, &p).await? else {
             lock(store).drop_pending(p.id)?;
             continue;
@@ -1126,6 +1141,14 @@ pub async fn push(
             };
             match done {
                 Ok(()) => true,
+                // Renamed or deleted elsewhere: it's found or made again
+                // next round, and the move waits for it.
+                Err(async_imap::error::Error::No(_))
+                    if p.place == Place::Blocked && !exists(session, &destination).await? =>
+                {
+                    state.blocked = None;
+                    continue;
+                }
                 Err(async_imap::error::Error::No(_)) => {
                     lock(store).drop_pending(p.id)?;
                     continue;
