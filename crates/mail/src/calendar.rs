@@ -411,14 +411,28 @@ pub fn changed_event_body(
             );
             let wall = start["dateTime"].as_str().unwrap_or_default();
             let at = format!("{first}{}", wall.get(10..).unwrap_or_default());
-            // As long on the clock as the event is: 00:00 to 04:00 on the
-            // day the clocks go back stays four hours, not five.
-            let length = if draft.all_day {
-                draft.end - draft.start
+            // The end as many days after the start as the editor has it, at
+            // the user's time if they changed it, else Outlook's, which may
+            // have changed since. On the clock: 00:00 to 04:00 on the day the
+            // clocks go back stays four hours, not five.
+            let ends = if draft.all_day {
+                parse_iso_date(&format!("{at}Z")).map(|t| utc_wall(t + (draft.end - draft.start)))
             } else {
-                clock(draft.end) - clock(draft.start)
+                let days = recurrence::days_between(
+                    &date_in(zone, draft.start, false),
+                    &date_in(zone, draft.end, false),
+                );
+                let time = if draft.end != before.end {
+                    zone.wall_at(draft.end)
+                } else {
+                    end["dateTime"].as_str().unwrap_or_default().to_owned()
+                };
+                Some(format!(
+                    "{}{}",
+                    recurrence::add_days(&first, days),
+                    time.get(10..).unwrap_or_default()
+                ))
             };
-            let ends = parse_iso_date(&format!("{at}Z")).map(|t| utc_wall(t + length));
             start["dateTime"] = json!(at);
             end["dateTime"] = json!(ends.unwrap_or_default());
         }
@@ -2633,6 +2647,13 @@ mod tests {
         let body = changed_event_body(&longer, &before, &details, PACIFIC, true);
         assert_eq!(body["start"]["dateTime"], "2027-02-14T10:00:00");
         assert_eq!(body["end"]["dateTime"], "2027-02-15T11:00:00");
+        // Outlook has it to 12:00 now: its end, untouched here, stays.
+        let outlook = EventDetails {
+            end: details.end + 3_600_000,
+            ..details.clone()
+        };
+        let body = changed_event_body(&longer, &before, &outlook, PACIFIC, true);
+        assert_eq!(body["end"]["dateTime"], "2027-02-15T12:00:00");
 
         // The last weekday, three times from October 30, a rule the editor
         // can't show: November 30's moved to December 1, an hour later, for
