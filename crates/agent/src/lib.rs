@@ -5,7 +5,8 @@
 //! The app writes its port and a secret token to `agent-endpoint.json` in
 //! its local data folder, which only the user can read; every request
 //! carries the token. The file also names the app's executable, so the CLI
-//! can start the app when it isn't running.
+//! can start the app when it isn't running, except while the installer's
+//! `updating` file says an update is replacing it.
 
 use std::future::Future;
 use std::io;
@@ -22,6 +23,9 @@ use tokio::net::{TcpListener, TcpStream};
 /// The desktop app's identifier, which names its data folder.
 pub const IDENTIFIER: &str = "dev.sparkrs.desktop";
 pub const ENDPOINT_FILE: &str = "agent-endpoint.json";
+/// Written next to the endpoint file by the installer while it replaces the
+/// app (`apps/desktop/src-tauri/installer/hooks.nsh`).
+pub const UPDATING_FILE: &str = "updating";
 /// Requests and responses are single lines no longer than this.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 

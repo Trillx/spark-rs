@@ -33,8 +33,9 @@ if (!$credentials.Contains('spark-installer-smoke-other')) { throw 'Cleanup remo
 & cmdkey /delete:spark-installer-smoke-other
 Write-Host 'Credential cleanup passed'
 
-# A real MCP transport keeps the installed CLI open. Reinstalling in update
-# mode must release that file, including when the agent is waiting on stdin.
+# A real MCP transport keeps the installed CLI open. Updates must replace
+# that file without ending the agent's CLI, which carries on from a copy
+# moved aside, also while an earlier update's copy is still running.
 $start = [Diagnostics.ProcessStartInfo]::new("$dir/spark-cli.exe", 'mcp')
 $start.UseShellExecute = $false
 $start.RedirectStandardInput = $true
@@ -56,14 +57,25 @@ try {
     Set-Content $sentinel 'Keep mail data during updates and ordinary uninstalls'
     Install-Spark -Flags @('/S', '/UPDATE')
     Write-Host 'Update returned without terminating the parent shell'
-    if (!$agent.WaitForExit(10000)) { throw 'Update did not end the installed CLI' }
+    Install-Spark -Flags @('/S', '/UPDATE')
+    if ($agent.HasExited) { throw 'Update ended the running CLI' }
+    $agent.StandardInput.WriteLine('{"jsonrpc":"2.0","id":1,"method":"ping"}')
+    $reply = $agent.StandardOutput.ReadLineAsync()
+    if (!$reply.Wait(10000) -or !$reply.Result.Contains('"result"')) { throw 'The running CLI stopped answering' }
+    $aside = @(Get-ChildItem $dir -Filter 'spark-cli.exe.*.old')
+    if ($aside.Count -ne 1) { throw "Expected only the running CLI moved aside, found $($aside.Count)" }
     if ($otherAgent.HasExited) { throw 'Update ended a CLI from another folder' }
+    if (Test-Path (Join-Path $data 'updating')) { throw 'Update left spark-cli waiting for it' }
     if (!(Test-Path $sentinel)) { throw 'Update deleted app data' }
     & "$dir/spark-cli.exe" doctor
     if ($LASTEXITCODE -ne 0) { throw "Updated doctor failed: $LASTEXITCODE" }
     Get-Process spark-desktop -ErrorAction SilentlyContinue | Stop-Process -Force
     $uninstall = Start-Process "$dir/uninstall.exe" -ArgumentList '/S' -Wait -PassThru
     if ($uninstall.ExitCode -ne 0) { throw "Uninstall exited $($uninstall.ExitCode)" }
+    if (!$agent.WaitForExit(10000)) { throw 'Uninstall did not end the CLI moved aside' }
+    if (Get-ChildItem $dir -Filter 'spark-cli.exe.*.old' -ErrorAction SilentlyContinue) {
+        throw 'Uninstall left the CLI moved aside'
+    }
     if (!(Test-Path $sentinel)) { throw 'Ordinary uninstall deleted app data' }
     Write-Host 'Install, CLI replacement and uninstall checks passed'
 } finally {

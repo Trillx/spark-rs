@@ -167,10 +167,11 @@ newest finished build, so documentation changes and unfinished builds don't
 increase it. The last check remains visible offline.
 
 Choose **Update and restart**, confirm, and let the download finish. The
-installer ends agents using that installed spark-cli, replaces the app and
-CLI, and restarts spark-rs. Reconnect your agent if it doesn't reconnect on
-its own. Updates keep your mail, settings and saved passwords. Nothing
-installs until you choose it. Copies built locally can't update themselves.
+installer replaces the app and CLI and restarts spark-rs. Agents already
+using spark-cli stay connected: their requests wait for the new app, and
+they get the new CLI the next time they start it. Updates keep your mail,
+settings and saved passwords. Nothing installs until you choose it. Copies
+built locally can't update themselves.
 
 Uninstalling keeps mail and saved passwords by default. Select **Also delete
 my mail data and saved passwords** in the uninstaller to remove them too.

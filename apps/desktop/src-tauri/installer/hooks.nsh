@@ -33,9 +33,12 @@ Function ${prefix}SparkStopCli
     StrCmp $5 0 next_process
     System::Call 'kernel32::QueryFullProcessImageNameW(p r5, i 0, w .r6, *i ${NSIS_MAX_STRLEN}) i .r2'
     StrCmp $2 0 close_process
-    StrCmp $6 '$INSTDIR\spark-cli.exe' 0 close_process
-    System::Call 'kernel32::TerminateProcess(p r5, i 0) i .r2'
-    StrCmp $2 0 failed
+    ; The prefix also matches copies that updates moved aside.
+    StrLen $3 '$INSTDIR\spark-cli.exe'
+    StrCpy $4 $6 $3
+    StrCmp $4 '$INSTDIR\spark-cli.exe' 0 close_process
+    ; Termination fails if it quit since the snapshot; the wait says so.
+    System::Call 'kernel32::TerminateProcess(p r5, i 0)'
     System::Call 'kernel32::WaitForSingleObject(p r5, i 10000) i .r2'
     StrCmp $2 0 close_process failed
   close_process:
@@ -83,7 +86,54 @@ FunctionEnd
   ${EndIf}
 !macroend
 
-; The hooks run before replacing or removing any installed files.
+; While this file is new, spark-cli waits for the new app instead of
+; starting the old one (UPDATING_FILE in crates/agent/src/lib.rs).
+Var SparkUpdating
+; Where this install moved the installed spark-cli, if it did.
+Var SparkCliAside
+
+; Agents keep spark-cli running for as long as they run, and Windows won't
+; overwrite a running program, but it will rename one: the agents' copy
+; carries on under another name and the new spark-cli takes its place.
+Function SparkBeginUpdate
+  Push $0
+  Delete $SparkUpdating
+  ClearErrors
+  FileOpen $0 $SparkUpdating w
+  ${IfNot} ${Errors}
+    FileClose $0
+  ${EndIf}
+  StrCpy $SparkCliAside ""
+  ; Copies moved aside by earlier updates, once their agents have quit.
+  Delete "$INSTDIR\spark-cli.exe.*.old"
+  ${If} ${FileExists} "$INSTDIR\spark-cli.exe"
+    StrCpy $0 0
+    ${Do}
+      IntOp $0 $0 + 1
+    ${LoopWhile} ${FileExists} "$INSTDIR\spark-cli.exe.$0.old"
+    ClearErrors
+    Rename "$INSTDIR\spark-cli.exe" "$INSTDIR\spark-cli.exe.$0.old"
+    ${IfNot} ${Errors}
+      StrCpy $SparkCliAside "$INSTDIR\spark-cli.exe.$0.old"
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
+  Pop $0
+FunctionEnd
+
+; A failed install leaves the old copy working, with its own spark-cli, and
+; lets agents start it again.
+Function .onInstFailed
+  ${If} $SparkCliAside != ""
+  ${AndIfNot} ${FileExists} "$INSTDIR\spark-cli.exe"
+    Rename $SparkCliAside "$INSTDIR\spark-cli.exe"
+  ${EndIf}
+  ${If} $SparkUpdating != ""
+    Delete $SparkUpdating
+  ${EndIf}
+FunctionEnd
+
+; The PRE hooks run before replacing or removing any installed files.
 !macro NSIS_HOOK_PREINSTALL
   !if "${ARCH}" == "arm64"
     ${IfNot} ${IsNativeARM64}
@@ -100,11 +150,27 @@ FunctionEnd
     ${EndIf}
   !endif
   spark_cpu_done:
-  !insertmacro SparkStopCli ""
+  CreateDirectory "$LOCALAPPDATA\${BUNDLEID}"
+  StrCpy $SparkUpdating "$LOCALAPPDATA\${BUNDLEID}\updating"
+  Call SparkBeginUpdate
+  ; Something kept it from being renamed: end its processes instead.
+  ${If} ${FileExists} "$INSTDIR\spark-cli.exe"
+    !insertmacro SparkStopCli ""
+  ${EndIf}
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  ; Gone now unless an agent still runs it; a later update tries again.
+  ${If} $SparkCliAside != ""
+    Delete $SparkCliAside
+  ${EndIf}
+  Delete $SparkUpdating
+  ClearErrors
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro SparkStopCli "un."
+  Delete "$INSTDIR\spark-cli.exe.*.old"
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1
     !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "spark-rs"

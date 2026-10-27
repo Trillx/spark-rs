@@ -2,19 +2,22 @@
 //! agents such as Claude Code and Codex; `tools`, `call` and `status` do the
 //! same from a shell. Every request goes to the running spark-rs, which
 //! decides what agents may do; when it isn't running, it's started in the
-//! background first.
+//! background first, or awaited while an update installs.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use spark_agent::{CallError, Endpoint, call};
+use spark_agent::{CallError, Endpoint, UPDATING_FILE, call};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// How long spark-rs may take to start.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an update may hold off starting spark-rs. A failed install can
+/// leave its marker behind; an older one is ignored.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Offered when the client doesn't say which MCP version it speaks.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 /// What MCP clients tell the model about these tools.
@@ -63,6 +66,16 @@ async fn reach() -> Result<Endpoint> {
     {
         return Ok(endpoint.clone());
     }
+    // The installer is replacing spark-rs and starts the new one when it's
+    // done. Starting the old one now would hold its files open.
+    while updating(&path.with_file_name(UPDATING_FILE), SystemTime::now()) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Ok(endpoint) = Endpoint::read(&path)
+            && answers(&endpoint).await
+        {
+            return Ok(endpoint);
+        }
+    }
     let exe = match known {
         Some(endpoint) => endpoint.exe,
         None => beside_cli()
@@ -83,6 +96,17 @@ async fn reach() -> Result<Endpoint> {
         START_TIMEOUT.as_secs(),
         exe.display()
     )
+}
+
+/// Whether the installer's `marker` is recent enough to mean it's still
+/// replacing spark-rs at `now`.
+fn updating(marker: &Path, now: SystemTime) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .is_ok_and(|written| {
+            now.duration_since(written)
+                .is_ok_and(|age| age < UPDATE_TIMEOUT)
+        })
 }
 
 async fn answers(endpoint: &Endpoint) -> bool {
@@ -316,6 +340,21 @@ mod tests {
         assert_eq!(reply["result"]["serverInfo"]["name"], "spark-rs");
         assert!(reply["result"]["capabilities"]["tools"].is_object());
         assert_eq!(link.client, "claude-code");
+    }
+
+    #[test]
+    fn only_a_recent_update_marker_holds_off_starting_the_app() {
+        let marker = std::env::temp_dir().join(format!("spark-updating-{}", std::process::id()));
+        assert!(!updating(&marker, SystemTime::now()));
+        std::fs::write(&marker, "").unwrap();
+        let written = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let second = Duration::from_secs(1);
+        assert!(updating(&marker, written));
+        assert!(updating(&marker, written + UPDATE_TIMEOUT - second));
+        // Left by an install that failed, or written by a clock that's ahead.
+        assert!(!updating(&marker, written + UPDATE_TIMEOUT));
+        assert!(!updating(&marker, written - Duration::from_secs(60)));
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[tokio::test]
