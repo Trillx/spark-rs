@@ -690,9 +690,13 @@ function Attendees({
           onChange={(e) => setTyped(e.target.value)}
           onPaste={(e) => {
             const pasted = e.clipboardData.getData("text");
-            if (!/[,;\n]/.test(pasted)) return;
+            if (!/[,;\r\n]/.test(pasted)) return;
             e.preventDefault();
-            const text = typed + pasted;
+            // In place of what's selected, as pasting does; a list a line each is a list too.
+            const input = e.currentTarget;
+            const from = input.selectionStart ?? typed.length;
+            const to = input.selectionEnd ?? typed.length;
+            const text = typed.slice(0, from) + pasted.replace(/\s*[\r\n]+\s*/g, "; ") + typed.slice(to);
             if (!addTyped(text)) setTyped(text);
           }}
           onKeyDown={(e) => {
