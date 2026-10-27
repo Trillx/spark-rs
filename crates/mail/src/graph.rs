@@ -1097,16 +1097,7 @@ impl Graph {
         }
         let repairs = self.complete_all(vec![(&m, &mut whole)]).await;
         let mut store = lock(store);
-        if let Some(listed) = store.content(id)?
-            && let Some(repair) = repairs.first()
-        {
-            if repair.missing.attachments {
-                whole.attachments = listed.attachments;
-            }
-            if repair.missing.invite {
-                whole.invite = listed.invite;
-            }
-        }
+        keep_listed(&store, id, &mut whole, &repairs)?;
         Ok(store.batch(|b| {
             let filled = b.fill_in_body(id, &whole)?;
             if filled {
@@ -1121,9 +1112,12 @@ impl Graph {
     /// delta window as reaching back stores it (newer mail is the delta
     /// query's), and mail in stored folders as their syncs do. Mail in
     /// Deleted Items, Junk Email or Drafts, or in folders not listed, is
-    /// left out, as Spark does. Returns how many were new. Does nothing
-    /// before the first sync. Attachments and invites Graph can't give yet
-    /// are left to the account's rounds, as for syncs (`repair`).
+    /// left out, as Spark does. Hits stored without their bodies get them
+    /// (`Store::fill_in_body`, which keeps what the user changed): Graph
+    /// may have found them by their bodies, which the store can't search
+    /// till it has them. Returns how many were new or filled in. Does
+    /// nothing before the first sync. Attachments and invites Graph can't
+    /// give yet are left to the account's rounds, as for syncs (`repair`).
     pub async fn search_server(
         &self,
         store: &Mutex<Store>,
@@ -1186,10 +1180,15 @@ impl Graph {
         });
         // Where each new one goes: the inbox (`None`) or a stored folder.
         let mut wanted: Vec<(&Listed, Option<&Folder>)> = Vec::new();
+        // Stored ones without their bodies, with their stored ids.
+        let mut bodyless: Vec<(&Listed, i64)> = Vec::new();
         {
             let store = lock(store);
             for m in &listing.value {
                 if store.has_remote_id(account_id, &m.id)? {
+                    if let Some(id) = store.bodyless_remote(account_id, &m.id)? {
+                        bodyless.push((m, id));
+                    }
                     continue;
                 }
                 let parent = m.parent_folder_id.as_deref().unwrap_or_default();
@@ -1204,7 +1203,7 @@ impl Graph {
             }
         }
         let mut full: HashMap<String, GraphMessage> = HashMap::new();
-        if wanted.len() > FETCH_ONE_BY_ONE {
+        if wanted.len() + bodyless.len() > FETCH_ONE_BY_ONE {
             let page: Page<GraphMessage> = self
                 .json(
                     self.request(Method::GET, &format!("{found}&$select={SELECT}"))
@@ -1216,7 +1215,11 @@ impl Graph {
                 Some((m.id.clone(), m))
             }));
         } else {
-            let ids: Vec<&str> = wanted.iter().map(|(m, _)| m.id.as_str()).collect();
+            let ids: Vec<&str> = wanted
+                .iter()
+                .map(|(m, _)| m.id.as_str())
+                .chain(bodyless.iter().map(|(m, _)| m.id.as_str()))
+                .collect();
             full = self.messages_in_full(&ids).await?;
         }
         let mut new = Vec::new();
@@ -1227,13 +1230,27 @@ impl Graph {
                 found.push((to_incoming(account_id, m), folder));
             }
         }
+        let mut whole = Vec::new();
+        for (listed, id) in bodyless {
+            if let Some(m) = full.get(&listed.id) {
+                new.push(m);
+                whole.push((to_incoming(account_id, m), id));
+            }
+        }
         // What Graph can't give yet is listed as it's stored, for the
         // account's rounds to fetch.
-        let incomings = found.iter_mut().map(|(incoming, _)| incoming);
-        let repairs = self
+        let incomings = found
+            .iter_mut()
+            .map(|(incoming, _)| incoming)
+            .chain(whole.iter_mut().map(|(incoming, _)| incoming));
+        let mut repairs = self
             .complete_all(new.into_iter().zip(incomings).collect())
             .await;
-        Ok(lock(store).batch(|b| {
+        let mut store = lock(store);
+        for (incoming, id) in &mut whole {
+            keep_listed(&store, *id, incoming, &repairs)?;
+        }
+        Ok(store.batch(|b| {
             let mut stored = 0;
             for (incoming, folder) in &found {
                 let added = match folder {
@@ -1242,6 +1259,14 @@ impl Graph {
                 };
                 if let Added::New(_) = added {
                     stored += 1;
+                }
+            }
+            for (incoming, id) in &whole {
+                if b.fill_in_body(*id, incoming)? {
+                    stored += 1;
+                } else {
+                    // Filled in meanwhile, with its own repairs listed.
+                    repairs.retain(|r| incoming.remote_id.as_deref() != Some(r.id.as_str()));
                 }
             }
             listed_for_repair(b, account_id, repairs)?;
@@ -2486,6 +2511,27 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         },
         ..Default::default()
     }
+}
+
+/// Of message `id`, stored without its body and now fetched `whole`, what
+/// its listing told of the attachments and invite Graph couldn't give yet
+/// (`repairs`), which it keeps till a round fetches them.
+fn keep_listed(store: &Store, id: i64, whole: &mut Incoming, repairs: &[Repair]) -> Result<()> {
+    let Some(repair) = repairs
+        .iter()
+        .find(|r| whole.remote_id.as_deref() == Some(r.id.as_str()))
+    else {
+        return Ok(());
+    };
+    if let Some(listed) = store.content(id)? {
+        if repair.missing.attachments {
+            whole.attachments = listed.attachments;
+        }
+        if repair.missing.invite {
+            whole.invite = listed.invite;
+        }
+    }
+    Ok(())
 }
 
 /// The kind of invite a meeting message carries, by its type, as JSON with
@@ -4216,6 +4262,69 @@ pub(crate) mod tests {
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    #[tokio::test]
+    async fn a_search_brings_the_bodies_of_mail_stored_without_them() {
+        let (base, seen) = serve(searched).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = searched_store();
+        let state = searchable_state(&base);
+        // i3 came from the background download, and is Done here: its
+        // body, which the search finds it by, isn't stored.
+        let i3 = {
+            let mut s = lock(&store);
+            let head = Incoming {
+                account_id,
+                remote_id: Some("i3".into()),
+                subject: "Quarterly".into(),
+                snippet: "Quarterly".into(),
+                text: "Quarterly".into(),
+                body: Body::Missing,
+                ..Default::default()
+            };
+            let Added::New(id) = s.add_incoming(&head, false).unwrap() else {
+                panic!("stored before");
+            };
+            let done = spark_store::Patch {
+                state: Some(spark_store::MessageState::Done),
+                ..Default::default()
+            };
+            s.update(id, &done, spark_store::now_ms()).unwrap();
+            id
+        };
+        assert!(lock(&store).search("invoice").unwrap().is_empty());
+
+        let query = Query::parse("invoice");
+        let stored = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert_eq!(stored.unwrap(), 3 + 1, "the new ones, and i3");
+        let paths: Vec<String> = seen.take().into_iter().map(|a| a.path).collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with("/me/messages/i3?")),
+            "{paths:?}"
+        );
+        {
+            let s = lock(&store);
+            let content = s.content(i3).unwrap().unwrap();
+            assert!(!content.body_missing);
+            assert_eq!(content.text, "The invoice");
+            let m = s.message(i3).unwrap().unwrap();
+            assert_eq!(
+                (m.state, m.subject.as_str()),
+                (spark_store::MessageState::Done, "Quarterly"),
+                "only its body is filled in"
+            );
+            assert!(s.search("invoice").unwrap().iter().any(|m| m.id == i3));
+        }
+
+        // Asked again, it has it: nothing more to fetch.
+        let again = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert_eq!(again.unwrap(), 0);
+        assert_eq!(seen.take().len(), 3);
     }
 
     #[test]

@@ -357,9 +357,10 @@ impl Live {
     }
 
     /// Puts a search to every account's server at once (or just `account`'s),
-    /// storing the mail they find that isn't stored yet. A server that fails
-    /// or takes longer than `SEARCH_WAIT` is left out. Returns how many
-    /// messages were new, or `None` if a new search cancelled this one.
+    /// storing the mail they find that isn't stored yet, and the bodies of
+    /// what they find stored without them. A server that fails or takes
+    /// longer than `SEARCH_WAIT` is left out. Returns how many messages were
+    /// new or filled in, or `None` if a new search cancelled this one.
     pub async fn search_servers(&self, query: &str, account: Option<i64>) -> Option<usize> {
         self.search.notify_waiters();
         let cancelled = self.search.notified();

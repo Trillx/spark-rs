@@ -1106,6 +1106,39 @@ impl Store {
         Ok(true)
     }
 
+    /// Whether message `id` is stored without its body (`Body::Missing`).
+    pub fn body_missing(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT body_missing FROM messages WHERE id = ?1")?
+            .query_row([id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// The message stored with Graph id `remote_id`, if it's stored without
+    /// its body (`Body::Missing`).
+    pub fn bodyless_remote(&self, account_id: i64, remote_id: &str) -> Result<Option<i64>> {
+        self.conn
+            .prepare_cached(
+                "SELECT id FROM messages
+                 WHERE account_id = ?1 AND remote_id = ?2 AND body_missing != 0",
+            )?
+            .query_row(params![account_id, remote_id], |r| r.get(0))
+            .optional()
+    }
+
+    /// The messages stored at UIDs of an IMAP mailbox without their bodies
+    /// (`Body::Missing`): message id by UID.
+    pub fn bodyless_uids(&self, account_id: i64, mailbox: &str) -> Result<HashMap<u32, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid, id FROM messages WHERE account_id = ?1 AND mailbox = ?2
+                 AND uid IS NOT NULL AND body_missing != 0",
+        )?;
+        stmt.query_map(params![account_id, mailbox], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
     /// UIDs stored for an IMAP mailbox.
     pub fn uids(&self, account_id: i64, mailbox: &str) -> Result<HashSet<u32>> {
         let mut stmt = self.conn.prepare(

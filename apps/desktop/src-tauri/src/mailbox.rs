@@ -548,8 +548,8 @@ pub fn never_suggest_contact(mailbox: State<'_, Mailbox>, address: String) -> Re
 
 /// Puts a search to every account's server and stores the mail they find
 /// that isn't stored yet, for `search_messages` to find; see
-/// `Live::search_servers`. Returns how many messages were new, so the UI
-/// knows to reload. 0 in the demo, and for a search a newer one cancelled,
+/// `Live::search_servers`. Returns how many messages were new or got their
+/// bodies, so the UI knows to reload. 0 in the demo, and for a search a newer one cancelled,
 /// after telling the UI to reload what it stored before it stopped.
 #[tauri::command]
 pub async fn search_servers(

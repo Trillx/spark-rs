@@ -23,7 +23,7 @@
 //! can't fetch (Gmail: "Some messages could not be FETCHed") holds back
 //! only itself, and is asked for again by later syncs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::ops::ControlFlow;
 use std::pin::Pin;
@@ -1478,8 +1478,10 @@ async fn fetch_reply_to(
 /// the inbox sync's) and the archive folder (Gmail: All Mail, in Gmail's
 /// own syntax). The newest `SERVER_HITS` of each that aren't stored yet are
 /// stored, inbox mail as reaching back stores it and archived mail as the
-/// archive folder's sync does. Returns how many were new. A place that
-/// renumbered its UIDs is left to its next sync.
+/// archive folder's sync does. Of each, the newest `SERVER_HITS` hits
+/// stored without their bodies get them (`fill_in_found`). Returns how
+/// many were new or filled in. A place that renumbered its UIDs is left to
+/// its next sync.
 pub async fn search_server(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -1499,20 +1501,34 @@ pub async fn search_server(
         return Ok(0);
     };
     let mut stored = 0;
+    // Mail filled in from the inbox, which the archive needn't fill in too.
+    let mut filled = HashSet::new();
 
     if let Some(floor) = state.floor
         && session.examine(INBOX).await?.uid_validity == state.uid_validity
     {
-        let known = lock(store).uids(account.id, INBOX)?;
-        let hits = newest(uid_search(session, &keys).await?, |uid| {
-            uid < floor && !known.contains(&uid)
-        });
+        let (known, bodyless) = {
+            let store = lock(store);
+            (
+                store.uids(account.id, INBOX)?,
+                store.bodyless_uids(account.id, INBOX)?,
+            )
+        };
+        let found = uid_search(session, &keys).await?;
+        let hits = newest(found.clone(), |uid| uid < floor && !known.contains(&uid));
         for batch in hits.chunks(FETCH_BATCH) {
             stored += fetch_new(session, store, account.id, batch, false)
                 .await?
                 .0
                 .len();
         }
+        let hits: Vec<(u32, i64)> = newest(found, |uid| bodyless.contains_key(&uid))
+            .into_iter()
+            .map(|uid| (uid, bodyless[&uid]))
+            .collect();
+        let ids = fill_in_found(session, store, INBOX, &hits).await?;
+        stored += ids.len();
+        filled.extend(ids);
     }
 
     let archive = match &state.archive {
@@ -1533,9 +1549,22 @@ pub async fn search_server(
         Err(e) => return Err(e.into()),
     }
     let known = lock(store).folder_uids(folder.id)?;
-    let hits = newest(uid_search(session, &keys).await?, |uid| {
-        !known.contains_key(&uid)
-    });
+    let found = uid_search(session, &keys).await?;
+    let bodyless: Vec<(u32, i64)> = {
+        let store = lock(store);
+        let mut bodyless = Vec::new();
+        for uid in newest(found.clone(), |uid| known.contains_key(&uid)) {
+            let id = known[&uid];
+            if !filled.contains(&id) && store.body_missing(id)? {
+                bodyless.push((uid, id));
+            }
+        }
+        bodyless
+    };
+    stored += fill_in_found(session, store, &folder.remote_id, &bodyless)
+        .await?
+        .len();
+    let hits = newest(found, |uid| !known.contains_key(&uid));
     for batch in hits.chunks(FETCH_BATCH) {
         // Mail stored from elsewhere (the inbox, another label) is left as it is.
         let (heads, _) = uid_fetch_each(
@@ -1577,6 +1606,37 @@ pub async fn search_server(
         })?;
     }
     Ok(stored)
+}
+
+/// Downloads the messages at `found` (UID and stored message id) in the
+/// selected `mailbox`, stored without their bodies, and fills them in
+/// (`Store::fill_in_body`, which keeps what the user changed): a search
+/// found them, maybe by their bodies, which the store can't search till it
+/// has them. Returns the ids of those filled in.
+async fn fill_in_found(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    mailbox: &str,
+    found: &[(u32, i64)],
+) -> Result<Vec<i64>> {
+    let mut filled = Vec::new();
+    for batch in found.chunks(FETCH_BATCH) {
+        let uids: Vec<u32> = batch.iter().map(|(uid, _)| *uid).collect();
+        let ids: HashMap<u32, i64> = batch.iter().copied().collect();
+        let (fetched, _) = fetch_messages(session, &uids, mailbox).await?;
+        filled.extend(lock(store).batch(|b| {
+            let mut filled = Vec::new();
+            for m in &fetched {
+                if let Some(&id) = m.uid.and_then(|uid| ids.get(&uid))
+                    && b.fill_in_body(id, m)?
+                {
+                    filled.push(id);
+                }
+            }
+            Ok(filled)
+        })?);
+    }
+    Ok(filled)
 }
 
 /// The newest (highest) `SERVER_HITS` of a search's UIDs that are `wanted`.

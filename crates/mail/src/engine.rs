@@ -1071,8 +1071,9 @@ impl Engine {
 
     /// Puts a search (in the search field's syntax) to the account's server
     /// and stores the mail it finds that isn't stored yet, so the store's
-    /// search has it (see the `search` module). Returns how many messages
-    /// were new. It runs beside the account's rounds, on a connection of
+    /// search has it (see the `search` module), and the bodies of what it
+    /// finds stored without them. Returns how many messages were new or
+    /// filled in. It runs beside the account's rounds, on a connection of
     /// its own; on a Microsoft account, they fetch what Graph couldn't give
     /// of the mail it stores yet, such as its attachments.
     pub async fn search_server(&self, account_id: i64, query: &str) -> Result<usize> {
@@ -3797,8 +3798,13 @@ mod tests {
             let mut status = "OK done";
             if upper.starts_with("LOGIN ") {
                 logins.fetch_add(1, SeqCst);
-            } else if upper.starts_with("SELECT ") {
-                selected = command[7..].trim_matches('"').to_owned();
+            } else if upper.starts_with("SELECT ") || upper.starts_with("EXAMINE ") {
+                selected = command
+                    .split_once(' ')
+                    .unwrap()
+                    .1
+                    .trim_matches('"')
+                    .to_owned();
                 match held.lock().unwrap().get(&selected) {
                     Some((validity, mail)) => reply.extend(
                         format!(
@@ -4222,6 +4228,42 @@ mod tests {
         assert!(engine.fetch_body(id).await.unwrap());
         let content = store.lock().unwrap().content(id).unwrap().unwrap();
         assert_eq!(content.html.as_deref(), Some(HTML));
+    }
+
+    #[tokio::test]
+    async fn an_imap_search_brings_the_bodies_of_mail_stored_without_them() {
+        // Found by what's only in its body, which isn't stored.
+        let raw = b"From: ana@example.com\r\nSubject: Files\r\nMessage-ID: <z@example.com>\r\n\
+                    Content-Type: text/plain\r\n\r\nThe zebra crossing plans.\r\n"
+            .to_vec();
+        let imap = ImapStandIn::start(7, vec![(42, raw.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        store
+            .set_sync_state(account.id, r#"{"uidValidity":7,"floor":40}"#)
+            .unwrap();
+        let id = store_head(&mut store, account.id, 42, &raw);
+        let read = spark_store::Patch {
+            unread: Some(false),
+            ..Default::default()
+        };
+        store.update(id, &read, now_ms()).unwrap();
+        assert!(store.search("zebra").unwrap().is_empty());
+        let store = Arc::new(Mutex::new(store));
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+
+        assert_eq!(engine.search_server(account.id, "zebra").await.unwrap(), 1);
+        {
+            let s = store.lock().unwrap();
+            let content = s.content(id).unwrap().unwrap();
+            assert!(!content.body_missing);
+            assert_eq!(content.text.trim(), "The zebra crossing plans.");
+            let m = s.message(id).unwrap().unwrap();
+            assert!(!m.unread, "what the user changed stays");
+            assert_eq!(s.search("zebra").unwrap()[0].id, id);
+        }
+        // Asked again, it has it.
+        assert_eq!(engine.search_server(account.id, "zebra").await.unwrap(), 0);
     }
 
     #[tokio::test]
