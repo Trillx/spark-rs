@@ -15,6 +15,7 @@ import {
   withAllDay,
   withDays,
   withEnd,
+  withFirstDay,
   withStart,
   type NewEventDefaults,
 } from "../lib/eventDraft";
@@ -245,7 +246,7 @@ export default function EventEditor({
                 <DateField
                   label="Start date"
                   day={days.first}
-                  onPick={(first) => setDraft((d) => withDays(d, first, first + (days.last - days.first)))}
+                  onPick={(first) => setDraft((d) => withFirstDay(d, first))}
                 />
               ) : (
                 <>

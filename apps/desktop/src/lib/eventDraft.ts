@@ -147,6 +147,12 @@ export function allDayDays(d: EventDraft) {
   return { first, last: Math.max(first, fromUtcDate(d.end - DAY)) };
 }
 
+/** An all-day draft starting on `first` (a local midnight), as many days long as it was. */
+export function withFirstDay(d: EventDraft, first: number): EventDraft {
+  const start = toUtcDate(first);
+  return { ...d, start, end: d.end + (start - d.start) };
+}
+
 /** The draft with its all-day days set (local midnights). */
 export function withDays(d: EventDraft, first: number, last: number): EventDraft {
   const start = toUtcDate(first);

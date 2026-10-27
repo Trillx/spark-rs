@@ -294,16 +294,26 @@ pub fn changed_event_body(
         body.insert("subject".into(), json!(draft.title.trim()));
     }
     if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
-        let (start, end) = if shift {
-            (
-                details.start + (draft.start - before.start),
-                details.end + (draft.end - before.end),
-            )
-        } else {
-            (draft.start, draft.end)
+        // The series' own first time moves by as much as this occurrence's
+        // did on the clock (days and hours), so its own length stays and a
+        // DST change between them doesn't move it an hour.
+        let moved = |series: i64, was: i64, now: i64| {
+            if !shift {
+                zone.time(now, draft.all_day)
+            } else if draft.all_day {
+                zone.time(series + (now - was), true)
+            } else {
+                // Clock times, counted as if they were UTC's.
+                let clock = |t: i64| parse_iso_date(&format!("{}Z", (zone.wall)(t))).unwrap_or(t);
+                let at = clock(series) + (clock(now) - clock(was));
+                json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
+            }
         };
-        body.insert("start".into(), zone.time(start, draft.all_day));
-        body.insert("end".into(), zone.time(end, draft.all_day));
+        body.insert(
+            "start".into(),
+            moved(details.start, before.start, draft.start),
+        );
+        body.insert("end".into(), moved(details.end, before.end, draft.end));
         body.insert("isAllDay".into(), json!(draft.all_day));
     }
     if draft.location.trim() != before.location.as_deref().unwrap_or_default() {
@@ -361,9 +371,11 @@ pub fn changed_event_body(
 
 /// `html`, an event's description, with `notes` in place of what comes
 /// before the Teams meeting Outlook put in it (found by its rule of
-/// underscores or its `-::~:~::~` marker): everything from the top-level
-/// element holding that on stays as it is. `None` if there's no meeting in
-/// it.
+/// underscores or its `-::~:~::~` marker). The meeting is the outermost
+/// element around that with nothing to read before it in it; it, and all
+/// after it, stays as it is, and the notes are what comes before it in the
+/// element around it (Outlook's `WordSection1`, or the body). `None` if
+/// there's no meeting in it.
 fn with_notes(html: &str, notes: &str) -> Option<String> {
     const VOID: &[&str] = &[
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
@@ -381,34 +393,37 @@ fn with_notes(html: &str, notes: &str) -> Option<String> {
     if marker < body {
         return None;
     }
-    // The element at the top of the body that the meeting starts in.
-    let mut depth = 0usize;
-    let mut top = marker;
+    // The elements open where the meeting starts, outermost first: where
+    // each starts, and where its content does.
+    let mut open: Vec<(usize, usize)> = Vec::new();
     let mut at = body;
-    while let Some(open) = lower[at..marker].find('<').map(|i| at + i) {
-        let Some(close) = lower[open..].find('>').map(|i| open + i) else {
+    while let Some(start) = lower[at..marker].find('<').map(|i| at + i) {
+        let Some(end) = lower[start..].find('>').map(|i| start + i + 1) else {
             break;
         };
-        let tag = &lower[open + 1..close];
+        let tag = &lower[start + 1..end - 1];
         let name: String = tag
             .trim_start_matches('/')
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric())
             .collect();
         if tag.starts_with('/') {
-            depth = depth.saturating_sub(1);
+            open.pop();
         } else if !tag.starts_with('!') && !tag.ends_with('/') && !VOID.contains(&name.as_str()) {
-            if depth == 0 {
-                top = open;
-            }
-            depth += 1;
+            open.push((start, end));
         }
-        at = close + 1;
+        at = end;
         if at >= marker {
             break;
         }
     }
-    let cut = if depth > 0 { top } else { marker };
+    let (cut, from) = match open
+        .iter()
+        .position(|&(_, content)| !has_text(&html[content..marker]))
+    {
+        Some(i) => (open[i].0, if i == 0 { body } else { open[i - 1].1 }),
+        None => (marker, open.last().map_or(body, |&(_, content)| content)),
+    };
     let escape = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -426,7 +441,26 @@ fn with_notes(html: &str, notes: &str) -> Option<String> {
     } else {
         "<div><br></div>"
     };
-    Some(format!("{}{lines}{gap}{}", &html[..body], &html[cut..]))
+    Some(format!("{}{lines}{gap}{}", &html[..from], &html[cut..]))
+}
+
+/// Whether HTML has something to read in it, not only tags and spaces.
+fn has_text(html: &str) -> bool {
+    let mut inside = false;
+    let mut text = String::new();
+    for c in html.chars() {
+        match c {
+            '<' => inside = true,
+            '>' => inside = false,
+            c if !inside => text.push(c),
+            _ => {}
+        }
+    }
+    !text
+        .replace("&nbsp;", " ")
+        .replace('\u{a0}', " ")
+        .trim()
+        .is_empty()
 }
 
 fn attendee(p: &Person) -> serde_json::Value {
@@ -1156,6 +1190,77 @@ mod tests {
             body["end"]["dateTime"],
             pacific(series_start + 7_200_000).as_str()
         );
+    }
+
+    #[test]
+    fn notes_wrapped_with_the_meeting_are_replaced_not_kept() {
+        let meeting = format!(
+            "<div style=\"width:100%\"><span>{}</span><div>Microsoft Teams meeting</div></div>",
+            "_".repeat(80)
+        );
+        let html = format!(
+            "<html><body lang=EN-US><div class=WordSection1><p class=MsoNormal>Old agenda</p>\
+             <p class=MsoNormal>&nbsp;</p>{meeting}</div></body></html>"
+        );
+        assert_eq!(
+            with_notes(&html, "New agenda").unwrap(),
+            format!(
+                "<html><body lang=EN-US><div class=WordSection1><div>New agenda</div><div><br></div>{meeting}</div></body></html>"
+            )
+        );
+        assert_eq!(
+            with_notes(&html, "").unwrap(),
+            format!("<html><body lang=EN-US><div class=WordSection1>{meeting}</div></body></html>"),
+            "a note cleared is gone"
+        );
+        assert_eq!(
+            with_notes("<html><body><p>Just notes</p></body></html>", "x"),
+            None
+        );
+    }
+
+    /// New York's clock: four hours behind UTC until November 1, 2026 at 2:00, then five.
+    fn eastern(ms: i64) -> String {
+        let change = parse_iso_date("2026-11-01T06:00:00Z").unwrap();
+        utc_wall(ms - if ms < change { 4 } else { 5 } * 3_600_000)
+    }
+
+    #[test]
+    fn every_occurrence_keeps_its_clock_time_across_a_dst_change() {
+        const EASTERN: Zone<'static> = Zone {
+            name: "Eastern Standard Time",
+            wall: eastern,
+        };
+        // Weekly 9:00 to 10:00 from October 5; the November 2 one, after the
+        // clocks went back, is moved to October 26 at 9:00, for all of them.
+        let series_start = parse_iso_date("2026-10-05T13:00:00Z").unwrap();
+        let details = EventDetails {
+            start: series_start,
+            end: series_start + 3_600_000,
+            ..Default::default()
+        };
+        let occurrence = parse_iso_date("2026-11-02T14:00:00Z").unwrap();
+        let before = Event {
+            title: "Planning".into(),
+            start: occurrence,
+            end: occurrence + 3_600_000,
+            response: Response::Organizer,
+            series: Some("series".into()),
+            ..Default::default()
+        };
+        let to = parse_iso_date("2026-10-26T13:00:00Z").unwrap();
+        let draft = EventDraft {
+            title: "Planning".into(),
+            start: to,
+            end: to + 3_600_000,
+            ..Default::default()
+        };
+        let body = changed_event_body(&draft, &before, &details, EASTERN, true);
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-09-28T09:00:00", "timeZone": "Eastern Standard Time" })
+        );
+        assert_eq!(body["end"]["dateTime"], "2026-09-28T10:00:00");
     }
 
     #[tokio::test]

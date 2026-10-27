@@ -275,3 +275,18 @@ test("moves keep clock times across a DST change and past midnight", async () =>
     else process.env.TZ = zone;
   }
 });
+
+test("an all-day event's new first day keeps its length across a DST change", async () => {
+  const { withFirstDay, allDayDays } = await import("./eventDraft.ts");
+  const zone = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const local = (m: number, d: number) => new Date(2026, m, d).getTime();
+    const d = { ...newDraft(1, toUtcDate(local(9, 27)), true, defaults), end: toUtcDate(local(9, 28)) + DAY };
+    const moved = withFirstDay(d, local(10, 1));
+    assert.deepEqual(allDayDays(moved), { first: local(10, 1), last: local(10, 2) });
+  } finally {
+    if (zone === undefined) delete process.env.TZ;
+    else process.env.TZ = zone;
+  }
+});
