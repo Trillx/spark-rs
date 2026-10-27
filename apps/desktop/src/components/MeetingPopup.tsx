@@ -116,10 +116,15 @@ function Card({
             {copied ? <Check /> : <Link2 />}
           </Tool>
         )}
+        {m.callLink && m.joined && (
+          <Tool label="Open meeting" onClick={() => act({ action: "join", id: m.id })}>
+            <ArrowUpRight />
+          </Tool>
+        )}
         <Tool label="Snooze for a minute" onClick={() => act({ action: "snooze", id: m.id })}>
           <Clock />
         </Tool>
-        {m.callLink && (
+        {m.callLink && !m.joined && (
           <button
             className="btn btn-primary btn-sm ml-1.5 h-7 min-h-7 gap-1 rounded-lg px-3 text-[13px] font-medium"
             title={m.callLink}

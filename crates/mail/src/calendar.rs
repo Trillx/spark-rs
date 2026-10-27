@@ -1,7 +1,8 @@
 //! The Microsoft 365 calendar through Graph: the user's calendars, their
 //! events over a stretch of time (each occurrence of a recurring event on its
-//! own, as Graph's calendar view expands them), and answering an invitation
-//! there, which also tells the organizer.
+//! own, as Graph's calendar view expands them) with the reminder Outlook set
+//! for each, and answering an invitation there, which also tells the
+//! organizer.
 //!
 //! Times are asked for in UTC. All-day events keep their days as written,
 //! read as UTC midnights, like all-day invites.
@@ -22,7 +23,7 @@ const EVENT_PAGE: usize = 250;
 
 const EVENT_SELECT: &str = "id,subject,start,end,isAllDay,location,onlineMeeting,onlineMeetingUrl,\
      organizer,attendees,responseStatus,responseRequested,isCancelled,isOrganizer,showAs,sensitivity,\
-     type,body,webLink";
+     type,body,webLink,isReminderOn,reminderMinutesBeforeStart";
 
 /// The user's answer to an event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +80,11 @@ pub struct Event {
     pub repeats: bool,
     pub show_as: ShowAs,
     pub private: bool,
+    /// Outlook reminds the user this many minutes before the start (0: as
+    /// it starts); `None` for no reminder. For an all-day event it counts
+    /// back from the midnight its day starts, on the user's clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<i64>,
 }
 
 impl Event {
@@ -103,6 +109,7 @@ struct GraphCalendar {
     color: Option<String>,
     #[serde(default)]
     is_default_calendar: bool,
+    owner: Option<GraphAddress>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -128,6 +135,8 @@ struct GraphEvent {
     kind: Option<String>,
     body: Option<GraphBody>,
     web_link: Option<String>,
+    is_reminder_on: bool,
+    reminder_minutes_before_start: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,19 +191,29 @@ struct GraphBody {
 }
 
 impl Graph {
-    /// The user's calendars, as Outlook lists them.
-    pub async fn calendars(&self) -> Result<Vec<RemoteCalendar>> {
+    /// The user's calendars, as Outlook lists them; `me` is the account's
+    /// address, which owns the user's own calendars.
+    pub async fn calendars(&self, me: &str) -> Result<Vec<RemoteCalendar>> {
         let mut next = Some(
-            "/me/calendars?$top=250&$select=id,name,hexColor,color,isDefaultCalendar".to_owned(),
+            "/me/calendars?$top=250&$select=id,name,hexColor,color,isDefaultCalendar,owner"
+                .to_owned(),
         );
         let mut calendars = Vec::new();
         while let Some(url) = next.take() {
             let page: Page<GraphCalendar> = self.json(self.request(Method::GET, &url)).await?;
-            calendars.extend(page.value.into_iter().map(|c| RemoteCalendar {
-                color: calendar_color(c.hex_color.as_deref(), c.color.as_deref()),
-                remote_id: c.id,
-                name: c.name,
-                is_default: c.is_default_calendar,
+            calendars.extend(page.value.into_iter().map(|c| {
+                RemoteCalendar {
+                    color: calendar_color(c.hex_color.as_deref(), c.color.as_deref()),
+                    // The main calendar is always the user's, whichever of their
+                    // addresses Outlook gives as its owner.
+                    own: c.is_default_calendar
+                        || c.owner
+                            .and_then(|o| o.address)
+                            .is_some_and(|a| a.trim().eq_ignore_ascii_case(me)),
+                    remote_id: c.id,
+                    name: c.name,
+                    is_default: c.is_default_calendar,
+                }
             }));
             next = page.next_link;
         }
@@ -330,6 +349,11 @@ fn to_event(e: GraphEvent) -> Option<Event> {
             _ => ShowAs::Unknown,
         },
         private: matches!(e.sensitivity.as_deref(), Some("private" | "confidential")),
+        reminder: e
+            .is_reminder_on
+            .then_some(e.reminder_minutes_before_start)
+            .flatten()
+            .filter(|m| *m >= 0),
     })
 }
 
@@ -422,7 +446,9 @@ mod tests {
             "sensitivity": "normal",
             "type": "occurrence",
             "body": { "contentType": "text", "content": "Agenda in the doc.\n\n________________________________________________________________________________\nMicrosoft Teams meeting" },
-            "webLink": "https://outlook.office365.com/owa/?itemid=AAMk1"
+            "webLink": "https://outlook.office365.com/owa/?itemid=AAMk1",
+            "isReminderOn": true,
+            "reminderMinutesBeforeStart": 15
         }))
         .unwrap();
         assert_eq!(event.title, "Q4 planning");
@@ -436,6 +462,7 @@ mod tests {
         assert_eq!(event.response, Response::Tentative);
         assert_eq!(event.show_as, ShowAs::Tentative);
         assert!(event.repeats && !event.private && event.response_requested);
+        assert_eq!(event.reminder, Some(15));
         let people: Vec<_> = event
             .attendees
             .iter()
@@ -458,7 +485,9 @@ mod tests {
             "start": { "dateTime": "2026-10-24T07:00:00.0000000", "timeZone": "UTC" },
             "end": { "dateTime": "2026-10-26T07:00:00.0000000", "timeZone": "UTC" },
             "isAllDay": true,
-            "isOrganizer": true
+            "isOrganizer": true,
+            "isReminderOn": false,
+            "reminderMinutesBeforeStart": 1080
         }))
         .unwrap();
         assert!(event.all_day);
@@ -466,6 +495,7 @@ mod tests {
         assert_eq!(event.end, parse_iso_date("2026-10-26T00:00:00Z").unwrap());
         assert_eq!(event.response, Response::Organizer);
         assert_eq!(event.call_link, None);
+        assert_eq!(event.reminder, None, "no reminder unless it's on");
         assert!(graph_event(json!({ "id": "x", "subject": "No times" })).is_none());
     }
 
@@ -481,7 +511,12 @@ mod tests {
             };
             Some(match path {
                 p if p.starts_with("/me/calendars?") => json!({ "value": [
-                    { "id": "c1", "name": "Calendar", "hexColor": "", "color": "lightBlue", "isDefaultCalendar": true }
+                    { "id": "c1", "name": "Calendar", "hexColor": "", "color": "lightBlue", "isDefaultCalendar": true,
+                      "owner": { "name": "Me", "address": "alias@contoso.com" } },
+                    { "id": "c2", "name": "Projects", "isDefaultCalendar": false,
+                      "owner": { "name": "Me", "address": "Me@Contoso.com" } },
+                    { "id": "c3", "name": "Sam Okafor", "isDefaultCalendar": false,
+                      "owner": { "name": "Sam Okafor", "address": "sam@contoso.com" } }
                 ] }),
                 p if p.starts_with(
                     "/me/calendars/c1/calendarView?startDateTime=2026-10-26T00:00:00Z&endDateTime=2026-11-02T00:00:00Z&",
@@ -493,10 +528,12 @@ mod tests {
         }
         let (base, seen) = crate::graph::tests::stand_in(reply).await;
         let graph = Graph::with_base(&base, "token");
-        let calendars = graph.calendars().await.unwrap();
-        assert_eq!(calendars.len(), 1);
+        let calendars = graph.calendars("me@contoso.com").await.unwrap();
+        assert_eq!(calendars.len(), 3);
         assert_eq!(calendars[0].color.as_deref(), Some("#4f9ff0"));
         assert!(calendars[0].is_default);
+        let own: Vec<_> = calendars.iter().map(|c| c.own).collect();
+        assert_eq!(own, [true, true, false], "not Sam's, shared with me");
 
         let start = parse_iso_date("2026-10-26T00:00:00Z").unwrap();
         let events = graph.events("c1", start, start + 7 * DAY_MS).await.unwrap();

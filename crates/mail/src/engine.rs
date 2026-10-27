@@ -1158,7 +1158,7 @@ impl Engine {
         let end = end.min(start + CALENDAR_STRETCH_MS);
         let result = async {
             let graph = self.graph(account_id, &client_id, &tenant).await?;
-            let listed = graph.calendars().await?;
+            let listed = graph.calendars(&account.email).await?;
             self.store().replace_calendars(account_id, &listed)?;
             let calendars = self.store().calendars()?;
             for c in calendars.iter().filter(|c| c.account_id == account_id) {

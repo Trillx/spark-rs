@@ -1016,6 +1016,7 @@ fn calendar(remote_id: &str, name: &str) -> RemoteCalendar {
         name: name.into(),
         color: None,
         is_default: false,
+        own: true,
     }
 }
 
@@ -1042,15 +1043,19 @@ fn calendars_keep_their_ids_and_go_with_their_events() {
         before.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
         ["Calendar", "Birthdays"]
     );
+    assert!(before.iter().all(|c| c.own));
     store
         .replace_events(before[1].id, 0, 100, &[event("x", 10, 20)])
         .unwrap();
 
-    store
-        .replace_calendars(account, &[calendar("a", "Work")])
-        .unwrap();
+    let shared = RemoteCalendar {
+        own: false,
+        ..calendar("a", "Work")
+    };
+    store.replace_calendars(account, &[shared]).unwrap();
     let after = store.calendars().unwrap();
     assert_eq!(after.len(), 1);
+    assert!(!after[0].own, "a refresh says whose it is");
     assert_eq!(
         (after[0].id, after[0].name.as_str()),
         (before[0].id, "Work")

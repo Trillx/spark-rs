@@ -56,6 +56,8 @@ function demoEvents(now: number): CalendarEvent[] {
       repeats: spec.repeats ?? false,
       showAs: spec.showAs ?? (response === "tentative" ? "tentative" : "busy"),
       private: spec.private ?? false,
+      // Outlook's default reminder, unless the event sets its own.
+      reminder: "reminder" in spec ? spec.reminder : allDay ? undefined : 15,
     });
   };
   /** `day` days from today at `hh:mm` local time, lasting `minutes`. */
@@ -102,7 +104,12 @@ function demoEvents(now: number): CalendarEvent[] {
     attendees: [ME_WORK],
     response: "tentative",
   });
-  add(3, ...at(0, "12:30", 60), false, { title: "Lunch with Ana", location: "Café Luna", response: "organizer" });
+  add(3, ...at(0, "12:30", 60), false, {
+    title: "Lunch with Ana",
+    location: "Café Luna",
+    response: "organizer",
+    reminder: 30,
+  });
   add(1, ...at(0, "14:00", 120), false, { title: "Focus time", response: "organizer", showAs: "busy", private: true });
 
   // Tomorrow: the invitation from the demo mailbox, and a 1:1 that was canceled.

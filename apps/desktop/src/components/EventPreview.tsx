@@ -1,8 +1,8 @@
-import { CircleHelp, Check, ExternalLink, Lock, MapPin, Repeat, Users, Video, X, type LucideIcon } from "lucide-react";
+import { Bell, CircleHelp, Check, ExternalLink, Lock, MapPin, Repeat, Users, Video, X, type LucideIcon } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { openExternal } from "../api";
 import { useAccount } from "../lib/accounts";
-import { eventDate, eventTime } from "../lib/calendar";
+import { alertText, eventDate, eventTime } from "../lib/calendar";
 import type { CalendarEvent, CalendarInfo, InviteAnswer, InvitePerson } from "../types";
 import { Description, People, callService } from "./InviteCard";
 
@@ -19,8 +19,8 @@ const ATTENDING: { answer: InviteAnswer; label: string; Icon: LucideIcon; tone: 
 
 /**
  * An event's details, beside it (or centred, in Day view): its calendar,
- * title and time, the call to join, place, repeats, your answer, who's
- * invited, and the notes. Closes on Esc or a click elsewhere.
+ * title and time, the call to join, place, repeats, its alert, your answer,
+ * who's invited, and the notes. Closes on Esc or a click elsewhere.
  */
 export default function EventPreview({
   event: e,
@@ -182,6 +182,11 @@ export default function EventPreview({
             {e.repeats && (
               <Row Icon={Repeat}>
                 <span>Repeats</span>
+              </Row>
+            )}
+            {e.reminder !== undefined && (
+              <Row Icon={Bell}>
+                <span>{alertText(e)}</span>
               </Row>
             )}
             {e.private && (

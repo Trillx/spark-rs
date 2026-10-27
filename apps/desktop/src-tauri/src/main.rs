@@ -3,6 +3,7 @@
 
 mod agents;
 mod ai;
+mod alerts;
 mod background;
 mod calendar;
 mod chime;
@@ -39,7 +40,8 @@ fn main() {
             let config_dir = app.path().app_config_dir()?;
             app.manage(prefs::PrefsState::load(config_dir.clone()));
             app.manage(meetings::Meetings::default());
-            app.manage(ai::AiState::new(config_dir, ai::Keys::platform()));
+            app.manage(alerts::Alerts::default());
+            app.manage(ai::AiState::new(config_dir.clone(), ai::Keys::platform()));
             notify::register(app.handle());
             let live = live::Live::open(&app.path().app_local_data_dir()?)?;
             live.start_all(app.handle());
@@ -52,6 +54,7 @@ fn main() {
             }
             background::setup(app)?;
             meetings::start(app.handle());
+            alerts::start(app.handle(), &config_dir);
             app.manage(updates::Updates::default());
             updates::start(app.handle());
             Ok(())

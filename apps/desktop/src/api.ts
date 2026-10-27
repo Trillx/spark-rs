@@ -283,6 +283,7 @@ export function meetingPopupMeetings(): Promise<PopupMeeting[]> {
         name,
         address: `${name.split(" ")[0].toLowerCase()}@acme.example`,
       })),
+      joined: false,
     },
   ]);
 }
@@ -291,7 +292,7 @@ export type PopupAct =
   | { action: "join" | "snooze" | "dismiss" | "openCalendar"; id: number }
   | { action: "dismissAll" | "openSettings" };
 
-/** Join also opens the call. */
+/** Join opens the call; the card stays, with Open meeting in place of Join. */
 export function meetingPopupAct(act: PopupAct): Promise<void> {
   if (isTauri()) return invoke("meeting_popup_act", { act });
   return Promise.resolve();
@@ -872,8 +873,9 @@ export const onAgentSending = (handler: (event: AgentSendingEvent) => void) => o
 /** A new-mail notification was clicked: show this message. */
 export const onOpenMessage = (handler: (id: number) => void) => on("open-message", handler);
 
-/** The meeting pop-up's calendar button: show the calendar on the day of this time (Unix ms). */
-export const onOpenCalendar = (handler: (at: number) => void) => on("open-calendar", handler);
+/** A calendar alert, or the meeting pop-up's calendar button: show the calendar on the day of `at` (Unix ms), with `event` open. */
+export const onOpenCalendar = (handler: (focus: { at: number; event?: number }) => void) =>
+  on("open-calendar", handler);
 
 /** The meeting pop-up's settings button: open this Settings page. */
 export const onOpenSettings = (handler: (page: "notifications") => void) => on("open-settings", handler);
@@ -1050,7 +1052,9 @@ let browserPrefs: Prefs = {
   badgeExcluded: [],
   keepRunning: true,
   openAtLogin: false,
+  eventAlerts: true,
   meetingPopup: true,
+  meetingPopupMinutes: 1,
   meetingPopupGuestsOnly: true,
   meetingPopupSound: true,
   suggestRecipients: true,

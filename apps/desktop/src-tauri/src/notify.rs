@@ -1,5 +1,6 @@
 //! New-mail notifications: Windows toasts with the New Mail sound. Clicking
 //! one brings the window forward and opens the message (`open-message`).
+//! Calendar alerts (`alerts.rs`) show here too, with buttons.
 //!
 //! An app without an installer has to introduce itself to Windows before its
 //! toasts show: `register` writes its name and icon under
@@ -7,7 +8,7 @@
 
 use spark_mail::Engine;
 use spark_store::{Category, GatekeeperMode, Message, MessageState, Reminder};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::background;
 use crate::prefs::{NotifyFor, PrefsState};
@@ -340,7 +341,7 @@ fn toast_xml(alert: &Alert, sound: bool) -> String {
 
 /// Escapes text for XML, dropping the control characters XML can't carry
 /// (they turn up in subjects).
-fn escape(text: &str) -> String {
+pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -357,12 +358,40 @@ fn escape(text: &str) -> String {
     out
 }
 
+/// A click on a toast or one of its buttons.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Click {
+    /// The button's arguments; empty for the toast itself.
+    pub button: String,
+    /// The item picked in the toast's drop-down, by id.
+    pub choice: Option<String>,
+}
+
 fn show(app: &AppHandle, alert: &Alert, sound: bool) -> Result<(), String> {
+    let message = alert.message;
+    let clicked = app.clone();
+    show_xml(app, &toast_xml(alert, sound), None, move |_| {
+        background::show(&clicked);
+        if let Some(id) = message {
+            let _ = clicked.emit("open-message", id);
+        }
+    })
+}
+
+/// Shows a toast written in Windows' XML schema; `on_click` runs for a
+/// click on it or on one of its foreground buttons. `expires` (Unix ms)
+/// takes it out of the notification center then.
+pub fn show_xml(
+    app: &AppHandle,
+    xml: &str,
+    expires: Option<i64>,
+    on_click: impl Fn(Click) + Send + 'static,
+) -> Result<(), String> {
     #[cfg(windows)]
-    return toast::show(app, &toast_xml(alert, sound), alert.message);
+    return toast::show(app, xml, expires, on_click);
     #[cfg(not(windows))]
     {
-        let _ = (app, toast_xml(alert, sound));
+        let _ = (app, xml, expires, on_click);
         Err("Notifications are only available on Windows for now.".into())
     }
 }
@@ -372,15 +401,15 @@ mod toast {
     use std::fs;
     use std::sync::Mutex;
 
-    use tauri::{AppHandle, Emitter, Manager};
+    use tauri::{AppHandle, Manager};
     use windows::Data::Xml::Dom::XmlDocument;
-    use windows::Foundation::TypedEventHandler;
+    use windows::Foundation::{DateTime, IReference, PropertyValue, TypedEventHandler};
     use windows::UI::Notifications::{
-        NotificationSetting, ToastNotification, ToastNotificationManager,
+        NotificationSetting, ToastActivatedEventArgs, ToastNotification, ToastNotificationManager,
     };
-    use windows::core::HSTRING;
+    use windows::core::{HSTRING, IInspectable, Interface};
 
-    use crate::background;
+    use super::Click;
 
     const ICON: &[u8] = include_bytes!("../icons/128x128@2x.png");
 
@@ -411,7 +440,15 @@ mod toast {
             .map_err(|e| format!("couldn't register with Windows: {e}"))
     }
 
-    pub fn show(app: &AppHandle, xml: &str, message: Option<i64>) -> Result<(), String> {
+    /// 100 ns ticks between 1601-01-01 (Windows' epoch) and 1970-01-01.
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+    pub fn show(
+        app: &AppHandle,
+        xml: &str,
+        expires: Option<i64>,
+        on_click: impl Fn(Click) + Send + 'static,
+    ) -> Result<(), String> {
         let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
             &app.config().identifier,
         ))
@@ -430,15 +467,24 @@ mod toast {
         doc.LoadXml(&HSTRING::from(xml))
             .map_err(|e| e.to_string())?;
         let toast = ToastNotification::CreateToastNotification(&doc).map_err(|e| e.to_string())?;
-        let clicked = app.clone();
+        if let Some(at) = expires {
+            let time = DateTime {
+                UniversalTime: at * 10_000 + UNIX_EPOCH_TICKS,
+            };
+            let expiry = PropertyValue::CreateDateTime(time)
+                .and_then(|v| v.cast::<IReference<DateTime>>())
+                .map_err(|e| e.to_string())?;
+            toast
+                .SetExpirationTime(&expiry)
+                .map_err(|e| e.to_string())?;
+        }
         toast
-            .Activated(&TypedEventHandler::new(move |_, _| {
-                background::show(&clicked);
-                if let Some(id) = message {
-                    let _ = clicked.emit("open-message", id);
-                }
-                Ok(())
-            }))
+            .Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
+                move |_, args| {
+                    on_click(click(args.as_ref()));
+                    Ok(())
+                },
+            ))
             .map_err(|e| e.to_string())?;
         notifier.Show(&toast).map_err(|e| e.to_string())?;
 
@@ -448,6 +494,24 @@ mod toast {
         }
         shown.push(toast);
         Ok(())
+    }
+
+    /// The button and drop-down choice behind an activation.
+    fn click(args: Option<&IInspectable>) -> Click {
+        let Some(args) = args.and_then(|a| a.cast::<ToastActivatedEventArgs>().ok()) else {
+            return Click::default();
+        };
+        let button = args
+            .Arguments()
+            .map(|a| a.to_string_lossy())
+            .unwrap_or_default();
+        let choice = args.UserInput().ok().and_then(|input| {
+            let first = input.First().ok()?;
+            let pair = first.Current().ok()?;
+            let value = pair.Value().ok()?.cast::<IReference<HSTRING>>().ok()?;
+            Some(value.Value().ok()?.to_string_lossy())
+        });
+        Click { button, choice }
     }
 }
 

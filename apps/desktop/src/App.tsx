@@ -411,8 +411,8 @@ export default function App() {
   const [gatekeeperMode, setGatekeeperMode] = useState<GatekeeperMode>("beforeInbox");
   /** The calendar shows in place of the list and the reader. */
   const [calendarOpen, setCalendarOpen] = useState(false);
-  /** A day the calendar was asked to show, by the meeting pop-up. */
-  const [calendarFocus, setCalendarFocus] = useState<{ at: number } | undefined>();
+  /** A day and event the calendar was asked to show, by a calendar alert or the meeting pop-up. */
+  const [calendarFocus, setCalendarFocus] = useState<{ at: number; event?: number } | undefined>();
   const lastSettingsPage = useRef<SettingsPage>("accounts");
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
   /** Settings → Appearance → Minimize old emails. */
@@ -557,7 +557,7 @@ export default function App() {
       onOpenMessage((id) => events.current.openFromNotification(id)),
       onAgentActivity((e) => showToast(e.text, undefined, ICONS.agent)),
       onAgentSending((e) => events.current.agentSending(e)),
-      onOpenCalendar((at) => events.current.openCalendarAt(at)),
+      onOpenCalendar((focus) => events.current.openCalendarAt(focus)),
       onOpenSettings((page) => events.current.openSettings(page)),
     ];
     return () => stops.forEach((stop) => stop());
@@ -2261,11 +2261,11 @@ export default function App() {
     setSummary(m.id, () => undefined);
   }
 
-  /** The meeting pop-up's calendar button. */
-  function openCalendarAt(at: number) {
+  /** A calendar alert, or the meeting pop-up's calendar button: the day, and the event there. */
+  function openCalendarAt(focus: { at: number; event?: number }) {
     setSettingsPage(null);
     setPalette(null);
-    setCalendarFocus({ at });
+    setCalendarFocus({ ...focus });
     setCalendarOpen(true);
     closeSidebar();
   }

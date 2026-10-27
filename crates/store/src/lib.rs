@@ -724,6 +724,12 @@ impl Store {
             tx.pragma_update(None, "user_version", 17)?;
             tx.commit()?;
         }
+        if version < 18 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(calendar::SCHEMA_CALENDAR_OWN)?;
+            tx.pragma_update(None, "user_version", 18)?;
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 

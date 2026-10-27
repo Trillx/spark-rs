@@ -166,6 +166,7 @@ export function WeekGrid({ days, events, calendars, now, selected, onOpen, onPic
                     ...(single && !isOff(e) && e.response !== "none" ? {} : eventStyle(e, color, isPast(e, now), false)),
                     ...(!single && !isOff(e) && e.response !== "none" ? { background: tint(color, 30) } : {}),
                   }}
+                  data-event={e.id}
                   onClick={(ev) => onOpen(e, ev.currentTarget.getBoundingClientRect())}
                 >
                   {single && !isOff(e) && e.response !== "none" && (
@@ -272,7 +273,8 @@ function DayColumn({
               width: `calc(${(span / columns) * 100}% - 4px)`,
               ...eventStyle(e, color, isPast(e, now)),
             }}
-            onClick={(ev) => onOpen(e, ev.currentTarget.getBoundingClientRect())}
+            data-event={e.id}
+                  onClick={(ev) => onOpen(e, ev.currentTarget.getBoundingClientRect())}
           >
             {height >= 38 ? (
               <span className="block px-1.5 py-0.5">
@@ -369,7 +371,8 @@ export function MonthGrid({ days, month, events, calendars, now, selected, onOpe
                       selected === e.id ? "ring-2 ring-primary" : plain ? "hover:bg-base-content/5" : ""
                     } ${isPast(e, now) && plain ? "opacity-60" : ""}`}
                     style={plain ? undefined : bar && !isOff(e) ? { background: tint(color, 30) } : eventStyle(e, color, isPast(e, now), false)}
-                    onClick={(ev) => onOpen(e, ev.currentTarget.getBoundingClientRect())}
+                    data-event={e.id}
+                  onClick={(ev) => onOpen(e, ev.currentTarget.getBoundingClientRect())}
                   >
                     {plain && <span className="size-1.5 shrink-0 rounded-full" style={{ background: color }} />}
                     <span className="min-w-0 flex-1 truncate font-medium">{e.title || "No Title"}</span>

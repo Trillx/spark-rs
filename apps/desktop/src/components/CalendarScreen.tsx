@@ -80,8 +80,8 @@ export default function CalendarScreen({
   onClose,
 }: {
   demo: boolean;
-  /** A time whose day to show; a new object shows it again. */
-  focus?: { at: number };
+  /** A time whose day to show, and an event there to open; a new object shows it again. */
+  focus?: { at: number; event?: number };
   onClose: () => void;
 }) {
   const source = demo ? DEMO : LIVE;
@@ -177,24 +177,30 @@ export default function CalendarScreen({
     return () => observer.disconnect();
   }, []);
 
+  /** The event a calendar alert or the meeting pop-up asked for, opened once it's drawn. */
+  const wanted = useRef<number | undefined>(undefined);
   useEffect(() => {
     if (!focus) return;
     setAnchor(startOfDay(focus.at));
     setPreview(null);
+    wanted.current = focus.event;
   }, [focus]);
 
   const changeKind = (next: CalendarKind) => {
     setKind(next);
     saveKind(next);
     setPreview(null);
+    wanted.current = undefined;
   };
   const go = (n: number) => {
     setAnchor((a) => stepAnchor(kind, a, n));
     setPreview(null);
+    wanted.current = undefined;
   };
   const goToday = () => {
     setAnchor(startOfDay(Date.now()));
     setPreview(null);
+    wanted.current = undefined;
   };
   const pickDay = (day: number) => {
     setAnchor(day);
@@ -246,6 +252,16 @@ export default function CalendarScreen({
     [events, hidden, calendars],
   );
   const open = preview ? events.find((e) => e.id === preview.id) : undefined;
+
+  useEffect(() => {
+    const id = wanted.current;
+    if (id === undefined || !shown.some((e) => e.id === id)) return;
+    const block = box.current?.querySelector<HTMLElement>(`[data-event="${id}"]`);
+    if (!block) return;
+    wanted.current = undefined;
+    block.scrollIntoView({ block: "nearest" });
+    setPreview({ id, anchor: block.getBoundingClientRect() });
+  }, [shown, focus]);
 
   const answer = (e: CalendarEvent, chosen: InviteAnswer) => {
     const before = e.response;

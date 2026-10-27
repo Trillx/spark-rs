@@ -1336,6 +1336,13 @@ const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
   { key: "off", label: "Off" },
 ];
 
+/** When the meeting pop-up shows, as Spark offers it. */
+const POPUP_CHOICES: { key: string; label: string }[] = [
+  { key: "off", label: "Off" },
+  { key: "0", label: "When meeting starts" },
+  ...[1, 2, 3, 5, 10, 15].map((m) => ({ key: String(m), label: `${m} minute${m === 1 ? "" : "s"} before` })),
+];
+
 const NOTIFY_CHOICES: { key: NotifyFor; label: string; detail: string }[] = [
   { key: "people", label: "Smart", detail: "Only mail from people" },
   { key: "all", label: "All", detail: "Every new email" },
@@ -1482,17 +1489,40 @@ function NotificationsPage() {
           })}
       </Group>
 
-      <Group title="Meetings">
+      <Group title="Calendar">
         <Row
-          label="Meeting pop-up"
-          description="A card over your other windows a minute before each meeting, with the time left and a button to join the call."
+          label="Event alerts"
+          description="A notification at each event's alert time, as set in Outlook, with Snooze. Clicking it opens the event."
+          htmlFor="event-alerts"
+        >
+          <Switch id="event-alerts" on={prefs.eventAlerts} onToggle={() => void change({ eventAlerts: !prefs.eventAlerts })} />
+        </Row>
+      </Group>
+
+      <Group title="Meeting pop-up">
+        <Row
+          label="Show meeting pop-up"
+          description="A card over your other windows before each meeting, with the time left and a button to join the call."
           htmlFor="meeting-popup"
         >
-          <Switch
+          <select
             id="meeting-popup"
-            on={prefs.meetingPopup}
-            onToggle={() => void change({ meetingPopup: !prefs.meetingPopup })}
-          />
+            value={prefs.meetingPopup ? String(prefs.meetingPopupMinutes) : "off"}
+            onChange={(e) =>
+              void change(
+                e.target.value === "off"
+                  ? { meetingPopup: false }
+                  : { meetingPopup: true, meetingPopupMinutes: Number(e.target.value) },
+              )
+            }
+            className="select select-sm h-8 w-44 rounded-lg border-hairline text-[13px]"
+          >
+            {POPUP_CHOICES.map((c) => (
+              <option key={c.key} value={c.key}>
+                {c.label}
+              </option>
+            ))}
+          </select>
         </Row>
         <Row
           label="Only meetings with others"

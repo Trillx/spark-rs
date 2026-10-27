@@ -63,8 +63,8 @@ Created in [T3 Code](https://t3.codes).
   in the composer, through Anthropic, OpenAI, or an OpenAI-compatible server
   such as Ollama on your own computer.
 - **Calendar.** Microsoft 365 calendars by day, week or month, invitations you
-  answer from the email, and a pop-up a minute before meetings on your main
-  calendar, with Join for Teams, Zoom and Meet calls.
+  answer from the email, event alerts with Snooze, and a pop-up before
+  meetings, with Join for Teams, Zoom and Meet calls.
 - **Search.** A full-text index on your computer answers as you type, and the
   servers are searched too, for mail that isn't downloaded yet.
 - **Agents.** Claude Code, Codex and other MCP clients can read, triage or
@@ -279,16 +279,26 @@ Microsoft 365 accounts added before the calendar arrived signed in without
 the calendar permission: add `Calendars.ReadWrite` to the app registration
 (see above), then choose Sign in on the calendar screen.
 
-A minute before each meeting, a pop-up shows at the top of the screen, over
-your other windows, with a soft chime: who's in it, the time to go (then the time left), and
-Join, which opens the call. Its other buttons open the day in the calendar,
+At each event's alert time (the reminder Outlook has for it), a Windows
+notification says what starts and when, such as "Starts in 15 minutes at
+10:00 AM". Snooze puts it off for 5, 10 or 30 minutes, and clicking it opens
+the event in the calendar. An alert missed while spark-rs was closed or the
+computer was asleep isn't shown late. Settings → Notifications → Calendar →
+Event alerts turns them off.
+
+A minute before each meeting, unless you pick another time, a pop-up shows at
+the top of the screen, over your other windows, with a soft chime: who's in it, the time to go (then the time left), and
+Join, which opens the call. Its other buttons open the meeting in the calendar,
 copy the call link, snooze it for a minute and dismiss it; drag it to move it.
-It stays until the meeting ends unless you join or dismiss it. Only your main
-Microsoft 365 calendar pops up, without declined, canceled or all-day events,
-and by default without events that have no one else and no call link, like
-focus time. To catch meetings added since you last looked, spark-rs reads the
-next two hours of your calendar every five minutes. Settings → Notifications
-→ Meetings turns the pop-up or its chime off and shows a sample.
+It stays until the meeting ends unless you dismiss it; once you've joined,
+Join turns into a button that opens the call again. Your own Microsoft 365
+calendars pop up and alert, not the ones others share with you, and the pop-up
+leaves out declined, canceled and all-day events, and by default events that
+have no one else and no call link, like focus time. To catch meetings added
+since you last looked, spark-rs reads the next two hours of your calendar every
+five minutes, and the next two weeks every hour. Settings → Notifications →
+Meeting pop-up sets when it shows (as the meeting starts, or 1, 2, 3, 5, 10 or
+15 minutes before) or turns it off, turns its chime off and shows a sample.
 
 ## Notifications and the tray
 

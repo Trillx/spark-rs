@@ -35,6 +35,14 @@ CREATE TABLE events (
 CREATE INDEX events_start ON events(start);
 ";
 
+/// Version 18: which calendars are the user's own, so other people's shared
+/// with them don't pop up or alert. Until the next refresh says, the main
+/// calendar is.
+pub(crate) const SCHEMA_CALENDAR_OWN: &str = "
+ALTER TABLE calendars ADD COLUMN own INTEGER NOT NULL DEFAULT 0;
+UPDATE calendars SET own = is_default;
+";
+
 /// A calendar as a backend listed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteCalendar {
@@ -43,6 +51,8 @@ pub struct RemoteCalendar {
     /// Hex, e.g. "#0ea5e9"; `None` takes the account's color.
     pub color: Option<String>,
     pub is_default: bool,
+    /// The user's own, not someone else's shared with them.
+    pub own: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +63,8 @@ pub struct Calendar {
     pub name: String,
     pub color: Option<String>,
     pub is_default: bool,
+    /// The user's own, not someone else's shared with them.
+    pub own: bool,
 }
 
 /// An event (one occurrence of a recurring one) as a backend fetched it.
@@ -99,18 +111,20 @@ impl Store {
         let tx = self.conn.transaction()?;
         for (position, c) in listed.iter().enumerate() {
             tx.execute(
-                "INSERT INTO calendars (account_id, remote_id, name, color, is_default, position)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO calendars (account_id, remote_id, name, color, is_default, position, own)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (account_id, remote_id) DO UPDATE SET
                     name = excluded.name, color = excluded.color,
-                    is_default = excluded.is_default, position = excluded.position",
+                    is_default = excluded.is_default, position = excluded.position,
+                    own = excluded.own",
                 params![
                     account_id,
                     c.remote_id,
                     c.name,
                     c.color,
                     c.is_default,
-                    position as i64
+                    position as i64,
+                    c.own
                 ],
             )?;
         }
@@ -131,7 +145,7 @@ impl Store {
     pub fn calendars(&self) -> Result<Vec<Calendar>> {
         self.conn
             .prepare(
-                "SELECT c.id, c.account_id, c.remote_id, c.name, c.color, c.is_default
+                "SELECT c.id, c.account_id, c.remote_id, c.name, c.color, c.is_default, c.own
                  FROM calendars c JOIN accounts a ON a.id = c.account_id
                  ORDER BY a.position, c.position",
             )?
@@ -143,6 +157,7 @@ impl Store {
                     name: r.get(3)?,
                     color: r.get(4)?,
                     is_default: r.get(5)?,
+                    own: r.get(6)?,
                 })
             })?
             .collect()

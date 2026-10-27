@@ -1,8 +1,10 @@
 //! The meeting pop-up, Spark's Meeting Pop-Up: a card over every other
-//! window from a minute before a meeting until it ends, with the time left,
+//! window from shortly before a meeting (as it starts, or 1 to 15 minutes
+//! before, as Settings say) until it ends, with the time left,
 //! who's in it, and Join, Copy link, Snooze and Dismiss, and a chime
-//! (`chime.rs`) as each meeting appears. A timer here picks the meetings from
-//! the stored calendars, and keeps the next couple of hours fresh from the
+//! (`chime.rs`) as each meeting appears. Joining leaves the card up without
+//! its Join button, as Spark does. A timer here picks the meetings from the
+//! stored calendars, and keeps the next couple of hours fresh from the
 //! servers whether or not the calendar screen is open. The window
 //! (`src/popup.tsx`) only draws them.
 //!
@@ -25,6 +27,7 @@ use tauri::{
 };
 use tokio::sync::Notify;
 
+use crate::alerts::OpenCalendar;
 use crate::background;
 use crate::chime;
 use crate::mailbox::{Mailbox, open_external, text};
@@ -32,10 +35,9 @@ use crate::prefs::PrefsState;
 
 pub const LABEL: &str = "meeting-popup";
 
-/// Pops up this long before a meeting starts.
-const LEAD_MS: i64 = 60_000;
+const MINUTE_MS: i64 = 60_000;
 /// Snooze brings it back after this long, as in Spark.
-const SNOOZE_MS: i64 = 60_000;
+const SNOOZE_MS: i64 = MINUTE_MS;
 /// Events this long or longer (a conference, a trip) don't pop up.
 const LONGEST_MS: i64 = 24 * 60 * 60_000;
 const CHECK_EVERY: Duration = Duration::from_secs(5);
@@ -64,6 +66,8 @@ pub struct Meeting {
     call_link: Option<String>,
     /// Who's in it besides the user, the organizer first.
     people: Vec<Person>,
+    /// The user joined from the pop-up: the card stays, without Join.
+    joined: bool,
 }
 
 #[derive(Default)]
@@ -83,6 +87,9 @@ struct PopupState {
     dismissed: HashMap<(i64, i64), i64>,
     /// Snoozed meetings by event id, until when.
     snoozed: HashMap<i64, i64>,
+    /// Meetings joined from the pop-up by event id and start, kept until
+    /// they end.
+    joined: HashMap<(i64, i64), i64>,
     /// The sample from Settings, until it's dismissed.
     preview: Option<Meeting>,
     /// What the window shows.
@@ -97,6 +104,15 @@ impl Meetings {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PopupState> {
         self.state.lock().unwrap()
+    }
+
+    /// Marks meeting `id` joined until it ends.
+    fn join(&self, id: i64) {
+        let mut state = self.lock();
+        if let Some(m) = state.showing.iter().find(|m| m.id == id) {
+            let (key, end) = ((m.id, m.start), m.end);
+            state.joined.insert(key, end);
+        }
     }
 
     fn dismiss(&self, id: i64) {
@@ -138,9 +154,10 @@ pub fn start(app: &AppHandle) {
 }
 
 /// Reads the coming hours from the servers, so meetings added or moved
-/// since the calendar screen was last open pop up too.
+/// since the calendar screen was last open pop up, and alert, too.
 async fn refresh(app: &AppHandle) {
-    if !app.state::<PrefsState>().get().meeting_popup {
+    let prefs = app.state::<PrefsState>().get();
+    if !prefs.meeting_popup && !prefs.event_alerts {
         return;
     }
     let mailbox = app.state::<Mailbox>();
@@ -166,6 +183,7 @@ fn check(app: &AppHandle) {
         stored_meetings(
             &app.state::<Mailbox>(),
             now,
+            lead(prefs.meeting_popup_minutes),
             prefs.meeting_popup_guests_only,
         )
     } else {
@@ -175,7 +193,8 @@ fn check(app: &AppHandle) {
         let mut state = meetings.lock();
         state.dismissed.retain(|_, end| *end > now);
         state.snoozed.retain(|_, until| *until > now);
-        let showing: Vec<Meeting> = state
+        state.joined.retain(|_, end| *end > now);
+        let mut showing: Vec<Meeting> = state
             .preview
             .iter()
             .cloned()
@@ -184,6 +203,9 @@ fn check(app: &AppHandle) {
                     && !state.snoozed.contains_key(&m.id)
             }))
             .collect();
+        for m in &mut showing {
+            m.joined = state.joined.contains_key(&(m.id, m.start));
+        }
         let arrived = arrived(&state.showing, &showing);
         state.showing = showing.clone();
         (showing, arrived)
@@ -250,9 +272,20 @@ fn open(app: &AppHandle, cards: usize) {
     }
 }
 
-/// The meetings due at `now` in each account's main calendar, earliest
-/// first. Other calendars (shared ones, holidays) never pop up.
-fn stored_meetings(mailbox: &Mailbox, now: i64, guests_only: bool) -> Vec<Meeting> {
+/// How long before a meeting it pops up, from Settings' minutes, which
+/// can only be Spark's choices.
+fn lead(minutes: u32) -> i64 {
+    let minutes = [0, 1, 2, 3, 5, 10, 15]
+        .into_iter()
+        .rfind(|&m| m <= minutes)
+        .unwrap_or(1);
+    i64::from(minutes) * MINUTE_MS
+}
+
+/// The meetings due at `now`, popping up `lead` before they start, in the
+/// user's own calendars of every account, earliest first; a meeting in
+/// two of them shows once. Calendars shared by others never pop up.
+fn stored_meetings(mailbox: &Mailbox, now: i64, lead: i64, guests_only: bool) -> Vec<Meeting> {
     if !mailbox.live() {
         return Vec::new();
     }
@@ -260,20 +293,16 @@ fn stored_meetings(mailbox: &Mailbox, now: i64, guests_only: bool) -> Vec<Meetin
     let (Ok(accounts), Ok(calendars), Ok(events)) = (
         store.accounts(),
         store.calendars(),
-        store.events_between(now, now + LEAD_MS + 1),
+        store.events_between(now, now + lead + 1),
     ) else {
         return Vec::new();
     };
     events
         .into_iter()
-        .filter(|e| {
-            calendars
-                .iter()
-                .any(|c| c.id == e.calendar_id && c.is_default)
-        })
+        .filter(|e| calendars.iter().any(|c| c.id == e.calendar_id && c.own))
         .filter_map(|stored| {
             let event = Event::from_json(&stored.data);
-            if !due(&event, now, guests_only) {
+            if !due(&event, now, lead, guests_only) {
                 return None;
             }
             let me = accounts
@@ -282,19 +311,31 @@ fn stored_meetings(mailbox: &Mailbox, now: i64, guests_only: bool) -> Vec<Meetin
                 .map_or("", |a| a.email.as_str());
             Some(meeting(stored.id, event, me))
         })
-        .collect()
+        .fold(Vec::new(), |mut kept: Vec<Meeting>, m| {
+            if !kept.iter().any(|k| same(k, &m)) {
+                kept.push(m);
+            }
+            kept
+        })
+}
+
+/// Whether two stored events are one meeting, e.g. in two accounts'
+/// calendars.
+fn same(a: &Meeting, b: &Meeting) -> bool {
+    (a.start, a.end, &a.call_link) == (b.start, b.end, &b.call_link)
+        && a.title.trim().eq_ignore_ascii_case(b.title.trim())
 }
 
 /// Whether `e` pops up at `now`, before dismissing and snoozing: a timed
-/// meeting the user hasn't declined, from a minute before it starts until
-/// it ends. `guests_only` leaves out events with no one else and no call,
+/// meeting the user hasn't declined, from `lead` before it starts until it
+/// ends. `guests_only` leaves out events with no one else and no call,
 /// like focus time.
-fn due(e: &Event, now: i64, guests_only: bool) -> bool {
+fn due(e: &Event, now: i64, lead: i64, guests_only: bool) -> bool {
     !e.all_day
         && !e.canceled
         && e.response != Response::Declined
         && e.end - e.start < LONGEST_MS
-        && e.start - LEAD_MS <= now
+        && e.start - lead <= now
         && now < e.end
         && (!guests_only || !e.attendees.is_empty() || e.call_link.is_some())
 }
@@ -318,6 +359,7 @@ fn meeting(id: i64, event: Event, me: &str) -> Meeting {
         end: event.end,
         call_link: event.call_link,
         people,
+        joined: false,
     }
 }
 
@@ -328,7 +370,7 @@ fn sample(now: i64) -> Meeting {
         address: address.into(),
         answer: Some(Answer::Accepted),
     };
-    let start = now + LEAD_MS;
+    let start = now + MINUTE_MS;
     Meeting {
         id: -1,
         title: "Design review: Inbox v3".into(),
@@ -342,6 +384,7 @@ fn sample(now: i64) -> Meeting {
             person("Kai Tanaka", "kai@acme.example"),
             person("Alex Moreno", "alex@moreno-design.example"),
         ],
+        joined: false,
     }
 }
 
@@ -349,7 +392,7 @@ fn sample(now: i64) -> Meeting {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum Act {
-    /// Opens the call and puts the meeting away.
+    /// Opens the call; the card stays, without Join.
     Join {
         id: i64,
     },
@@ -360,7 +403,7 @@ pub enum Act {
         id: i64,
     },
     DismissAll,
-    /// Brings the main window forward on the meeting's day in the calendar.
+    /// Brings the main window forward on the meeting in the calendar.
     OpenCalendar {
         id: i64,
     },
@@ -387,13 +430,16 @@ pub fn meeting_popup_act(
             {
                 open_external(link)?;
             }
-            meetings.dismiss(id);
+            meetings.join(id);
         }
+        // Snoozing a joined meeting forgets it was joined, as in Spark.
         Act::Snooze { id } => {
             if id < 0 {
                 meetings.dismiss(id);
             } else {
-                meetings.lock().snoozed.insert(id, now_ms() + SNOOZE_MS);
+                let mut state = meetings.lock();
+                state.snoozed.insert(id, now_ms() + SNOOZE_MS);
+                state.joined.retain(|(joined, _), _| *joined != id);
             }
         }
         Act::Dismiss { id } => meetings.dismiss(id),
@@ -406,7 +452,8 @@ pub fn meeting_popup_act(
         Act::OpenCalendar { id } => {
             let start = find(id).map_or_else(now_ms, |m| m.start);
             background::show(&app);
-            app.emit_to("main", "open-calendar", start).map_err(text)?;
+            app.emit_to("main", "open-calendar", OpenCalendar::event(id, start))
+                .map_err(text)?;
             return Ok(());
         }
         Act::OpenSettings => {
@@ -493,10 +540,25 @@ mod tests {
     #[test]
     fn pops_up_a_minute_before_until_the_end() {
         let e = standup();
-        assert!(!due(&e, 98 * MIN, true));
-        assert!(due(&e, 99 * MIN, true));
-        assert!(due(&e, 114 * MIN, true));
-        assert!(!due(&e, 115 * MIN, true));
+        assert!(!due(&e, 98 * MIN, MIN, true));
+        assert!(due(&e, 99 * MIN, MIN, true));
+        assert!(due(&e, 114 * MIN, MIN, true));
+        assert!(!due(&e, 115 * MIN, MIN, true));
+    }
+
+    #[test]
+    fn pops_up_as_long_before_as_settings_say() {
+        let e = standup();
+        assert!(!due(&e, 89 * MIN, 10 * MIN, true));
+        assert!(due(&e, 90 * MIN, 10 * MIN, true));
+        assert!(!due(&e, 99 * MIN, 0, true), "when it starts");
+        assert!(due(&e, 100 * MIN, 0, true));
+        assert_eq!(lead(0), 0);
+        assert_eq!(lead(5), 5 * MIN);
+        assert_eq!(lead(15), 15 * MIN);
+        // Only Spark's choices: anything else rounds down to one.
+        assert_eq!(lead(4), 3 * MIN);
+        assert_eq!(lead(60), 15 * MIN);
     }
 
     #[test]
@@ -519,13 +581,13 @@ mod tests {
             ..standup()
         };
         for e in [declined, canceled, all_day, trip] {
-            assert!(!due(&e, now, false), "{e:?}");
+            assert!(!due(&e, now, MIN, false), "{e:?}");
         }
         let unanswered = Event {
             response: Response::None,
             ..standup()
         };
-        assert!(due(&unanswered, now, true));
+        assert!(due(&unanswered, now, MIN, true));
     }
 
     #[test]
@@ -539,18 +601,18 @@ mod tests {
             response: Response::Organizer,
             ..standup()
         };
-        assert!(!due(&focus, now, true));
-        assert!(due(&focus, now, false));
+        assert!(!due(&focus, now, MIN, true));
+        assert!(due(&focus, now, MIN, false));
         let solo_call = Event {
             call_link: Some("https://zoom.us/j/1".into()),
             ..focus.clone()
         };
-        assert!(due(&solo_call, now, true));
+        assert!(due(&solo_call, now, MIN, true));
         let with_guest = Event {
             attendees: vec![person("Kai Tanaka", "kai@acme.example")],
             ..focus
         };
-        assert!(due(&with_guest, now, true));
+        assert!(due(&with_guest, now, MIN, true));
     }
 
     #[test]
@@ -605,8 +667,30 @@ mod tests {
                 "end": 115 * MIN,
                 "callLink": "https://teams.microsoft.com/l/meetup-join/x",
                 "people": [{ "name": "Sam Okafor", "address": "sam@acme.example" }],
+                "joined": false,
             })
         );
+    }
+
+    #[test]
+    fn one_meeting_in_two_calendars_shows_once() {
+        let a = meeting(7, standup(), "me@acme.example");
+        let b = Meeting {
+            id: 9,
+            title: "standup ".into(),
+            ..a.clone()
+        };
+        assert!(same(&a, &b));
+        let later = Meeting {
+            start: a.start + MIN,
+            ..b.clone()
+        };
+        assert!(!same(&a, &later));
+        let other_call = Meeting {
+            call_link: None,
+            ..b
+        };
+        assert!(!same(&a, &other_call));
     }
 
     #[test]

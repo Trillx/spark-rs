@@ -1,6 +1,6 @@
 //! Settings → Notifications: which new mail shows a notification, its sound,
-//! the app icon badge, the meeting pop-up, and running in the background. Saved as `prefs.json`
-//! in the app's config directory.
+//! the app icon badge, calendar alerts, the meeting pop-up, and running in
+//! the background. Saved as `prefs.json` in the app's config directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::agents::Access;
+use crate::alerts::Alerts;
 use crate::background;
 use crate::meetings::Meetings;
 
@@ -65,8 +66,14 @@ pub struct Prefs {
     pub keep_running: bool,
     /// Starts in the background when the user signs in to Windows.
     pub open_at_login: bool,
-    /// The meeting pop-up (`meetings.rs`) a minute before each meeting.
+    /// A notification at each event's alert time (`alerts.rs`), Spark's
+    /// Allow notifications for calendars.
+    pub event_alerts: bool,
+    /// The meeting pop-up (`meetings.rs`) before each meeting.
     pub meeting_popup: bool,
+    /// How many minutes before a meeting the pop-up shows: 0 (as it
+    /// starts), 1, 2, 3, 5, 10 or 15, as Spark offers.
+    pub meeting_popup_minutes: u32,
     /// Leaves events with no one else and no call out of the pop-up.
     pub meeting_popup_guests_only: bool,
     /// A chime as a meeting appears in the pop-up.
@@ -94,7 +101,9 @@ impl Default for Prefs {
             badge_excluded: Vec::new(),
             keep_running: true,
             open_at_login: false,
+            event_alerts: true,
             meeting_popup: true,
+            meeting_popup_minutes: 1,
             meeting_popup_guests_only: true,
             meeting_popup_sound: true,
             suggest_recipients: true,
@@ -244,10 +253,15 @@ pub fn get_prefs(state: State<'_, PrefsState>) -> Prefs {
 pub fn save_prefs(
     state: State<'_, PrefsState>,
     meetings: State<'_, Meetings>,
+    alerts: State<'_, Alerts>,
     prefs: Prefs,
 ) -> Result<Prefs, String> {
-    if prefs.open_at_login != state.get().open_at_login {
+    let before = state.get();
+    if prefs.open_at_login != before.open_at_login {
         background::set_open_at_login(prefs.open_at_login)?;
+    }
+    if prefs.event_alerts && !before.event_alerts {
+        alerts.turned_on();
     }
     let saved = state.update(|current| {
         *current = Prefs {
@@ -257,6 +271,7 @@ pub fn save_prefs(
         }
     });
     meetings.changed();
+    alerts.changed();
     saved
 }
 
@@ -285,6 +300,8 @@ mod tests {
         assert!(
             prefs.meeting_popup && prefs.meeting_popup_guests_only && prefs.meeting_popup_sound
         );
+        assert!(prefs.event_alerts);
+        assert_eq!(prefs.meeting_popup_minutes, 1, "a minute before, as Spark");
     }
 
     #[test]

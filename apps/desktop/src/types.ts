@@ -217,8 +217,12 @@ export interface Prefs {
   keepRunning: boolean;
   /** Start in the background when the user signs in to Windows. */
   openAtLogin: boolean;
-  /** The meeting pop-up a minute before each meeting. */
+  /** A notification at each event's alert time. */
+  eventAlerts: boolean;
+  /** The meeting pop-up before each meeting. */
   meetingPopup: boolean;
+  /** How many minutes before a meeting the pop-up shows: 0 (as it starts), 1, 2, 3, 5, 10 or 15. */
+  meetingPopupMinutes: number;
   /** Leave events with no one else and no call out of the pop-up. */
   meetingPopupGuestsOnly: boolean;
   /** A chime as a meeting appears in the pop-up. */
@@ -365,6 +369,11 @@ export interface CalendarEvent {
   repeats: boolean;
   showAs: "free" | "tentative" | "busy" | "oof" | "workingElsewhere" | "unknown";
   private: boolean;
+  /**
+   * Outlook reminds the user this many minutes before the start (0: as it starts); absent for no reminder.
+   * All-day events count back from the midnight their day starts.
+   */
+  reminder?: number;
 }
 
 /** A meeting in the pop-up (src-tauri/src/meetings.rs). */
@@ -378,6 +387,8 @@ export interface PopupMeeting {
   callLink?: string;
   /** Who's in it besides the user, the organizer first. */
   people: InvitePerson[];
+  /** Joined from the pop-up: the card stays, with Open meeting instead of Join. */
+  joined: boolean;
 }
 
 /** The images an email's HTML embeds (`cid:` URLs): data URLs by Content-ID, lowercase without angle brackets. */

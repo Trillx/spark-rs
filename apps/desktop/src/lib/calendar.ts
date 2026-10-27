@@ -267,6 +267,21 @@ export function eventTime(e: CalendarEvent) {
   return `${dayFormat.format(e.start)}, ${timeFormat.format(e.start)} – ${dayFormat.format(e.end)}, ${timeFormat.format(e.end)}`;
 }
 
+/**
+ * The event's alert, as Spark words it: "Alert 15m before", "Alert 1h 30m before", "Alert 1d before",
+ * "Alert at the event time" (or "event day", all day).
+ */
+export function alertText(e: CalendarEvent) {
+  const m = e.reminder;
+  if (m === undefined) return undefined;
+  if (m === 0) return `Alert at the ${e.allDay ? "event day" : "event time"}`;
+  const days = Math.floor(m / (24 * 60));
+  const hours = Math.floor((m % (24 * 60)) / 60);
+  const minutes = m % 60;
+  const parts = days && !hours && !minutes ? [`${days}d`] : [hours + days * 24 ? `${hours + days * 24}h` : "", minutes ? `${minutes}m` : ""];
+  return `Alert ${parts.filter(Boolean).join(" ")} before`;
+}
+
 /** "Fri, Oct 24" for the day an event starts. */
 export function eventDate(e: CalendarEvent) {
   return e.allDay ? utcDayFormat.format(e.start) : dayFormat.format(e.start);
