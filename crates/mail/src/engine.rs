@@ -5,6 +5,7 @@
 //! parallel.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use lettre::message::Mailbox;
@@ -13,7 +14,7 @@ use spark_store::{
     Account, AccountKind, Folder, FolderRole, Location, NewAccount, NewReminder, Pending, Place,
     Query, Store, now_ms,
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::attachment::{self, AttachmentData, InlineImage};
 use crate::cache::{AttachmentCache, Flight};
@@ -79,6 +80,9 @@ pub enum AccountConfig {
 pub struct Round {
     /// Fetch new inbox mail.
     pub fetch: bool,
+    /// With `fetch`, also fetch what Microsoft mail was stored without
+    /// (`Graph::repair`).
+    pub repair: bool,
     /// Refresh the account's folder list.
     pub list_folders: bool,
     /// Stored folders (of any account; others are skipped) to sync.
@@ -88,6 +92,15 @@ pub struct Round {
     /// Stored folders (of any account; others are skipped) to reach
     /// `OLDER_STEP` messages further back in, and so sync.
     pub older_folders: Vec<i64>,
+}
+
+/// How `Engine::watch_inbox` ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Watch {
+    /// It can't watch this account: Microsoft, or a server without IDLE.
+    Unwatched,
+    /// It was told to start over, e.g. after the computer slept.
+    Restart,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -450,13 +463,14 @@ impl Engine {
     }
 
     /// One round for an account: push changes older than the undo window,
-    /// and with `fetch`, bring in new mail. Opens no connection when there
-    /// is nothing to do.
+    /// and with `fetch`, bring in new mail and what mail stored earlier came
+    /// without. Opens no connection when there is nothing to do.
     pub async fn run(&self, account_id: i64, fetch: bool) -> Result<Report> {
         self.run_round(
             account_id,
             &Round {
                 fetch,
+                repair: fetch,
                 ..Default::default()
             },
         )
@@ -635,9 +649,11 @@ impl Engine {
                 {
                     report.accepted += self.written_to(account_id, &waiting, &found)?;
                 }
-                // Last, and on rounds that fetch: ones that only push come
-                // with every change the user makes.
-                if round.fetch {
+                // Last, and only on rounds that ask for it (the app's
+                // sweeps). Rounds that only push come with every change the
+                // user makes, and inbox checks every half minute; up to a
+                // minute of repairs would hold up what they're for.
+                if round.fetch && round.repair {
                     report.repaired = graph.repair(&self.store, account_id, now_ms()).await;
                 }
             }
@@ -719,6 +735,49 @@ impl Engine {
             .into_iter()
             .find(|f| f.account_id == account_id && f.role == Some(FolderRole::Sent))
             .map(|f| f.remote_id))
+    }
+
+    /// Watches an IMAP account's inbox with IDLE, on a connection of its
+    /// own, calling `changed` whenever the server reports a change there.
+    /// Sets `watching` as the IDLE starts; the caller clears it once this
+    /// returns. Returns `Unwatched` at once
+    /// for Microsoft accounts and servers without IDLE, `Restart` once
+    /// `restart` is notified, and otherwise runs until the connection fails.
+    /// It only reads, so it doesn't take the account's turn.
+    pub async fn watch_inbox(
+        &self,
+        account_id: i64,
+        restart: &Notify,
+        watching: &AtomicBool,
+        changed: impl Fn(),
+    ) -> Result<Watch> {
+        let account = self.account(account_id)?;
+        let AccountConfig::Imap {
+            username,
+            imap: server,
+            ..
+        } = config(&account)?
+        else {
+            return Ok(Watch::Unwatched);
+        };
+        let password = self.password(account_id)?;
+        let mut session = imap::login(&server, &username, &password).await?;
+        if !imap::can_idle(&mut session).await? {
+            let _ = session.logout().await;
+            return Ok(Watch::Unwatched);
+        }
+        imap::examine_inbox(&mut session).await?;
+        watching.store(true, Ordering::Relaxed);
+        loop {
+            session = match imap::idle(session, restart.notified()).await? {
+                imap::Idle::Changed(session) => {
+                    changed();
+                    session
+                }
+                imap::Idle::Quiet(session) => session,
+                imap::Idle::Stopped => return Ok(Watch::Restart),
+            };
+        }
     }
 
     /// Puts a search (in the search field's syntax) to the account's server
@@ -3329,6 +3388,54 @@ mod tests {
         let report = engine.run(account_id, true).await.unwrap();
         assert_eq!((report.new, report.repaired), (0, 5));
         assert!(report.changed());
+        assert_eq!(files(&engine), whole(1..=5, &[]));
+        assert!(repair_list(&engine, account_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_checks_leave_repairs_to_the_sweep() {
+        let down = Arc::new(AtomicBool::new(true));
+        let unavailable = down.clone();
+        let failing = move |_: &str| {
+            let down = unavailable.load(SeqCst);
+            down.then(|| Answer::status(503).with_retry_after(0))
+        };
+        let (base, seen) = graph::tests::serve(inbox(failing)).await;
+        let (engine, account_id) = microsoft_engine(base);
+        engine
+            .store()
+            .set_sync_state(account_id, AT_DELTA1)
+            .unwrap();
+        engine.run(account_id, true).await.unwrap();
+        assert_eq!(repair_list(&engine, account_id).len(), 4);
+        down.store(false, SeqCst);
+        seen.take();
+
+        // An inbox check stores new mail whole, and leaves the list be.
+        let check = Round {
+            fetch: true,
+            ..Default::default()
+        };
+        let report = engine.run_round(account_id, &check).await.unwrap();
+        assert_eq!((report.new, report.repaired), (1, 0));
+        let listings: Vec<String> = seen
+            .take()
+            .into_iter()
+            .map(|a| a.path.split('?').next().unwrap().to_owned())
+            .filter(|path| path.ends_with("/attachments"))
+            .collect();
+        assert_eq!(listings, ["/me/messages/n5/attachments"]);
+        assert_eq!(files(&engine), whole(1..=5, &[1, 2, 3, 4]));
+        assert_eq!(repair_list(&engine, account_id).len(), 4);
+
+        // The sweep fetches what's missing.
+        let sweep = Round {
+            fetch: true,
+            repair: true,
+            ..Default::default()
+        };
+        let report = engine.run_round(account_id, &sweep).await.unwrap();
+        assert_eq!((report.new, report.repaired), (0, 4));
         assert_eq!(files(&engine), whole(1..=5, &[]));
         assert!(repair_list(&engine, account_id).is_empty());
     }

@@ -892,6 +892,16 @@ export default function App() {
     void watchFolders(watched ? watched.split(",").map(Number) : []).catch(() => {});
   }, [watched]);
 
+  // As in Spark, the window coming to the front fetches the open list.
+  // The backend checks the inboxes.
+  const open = listFolderIds(view.folder, folders, accountOf(view.account)).join(",");
+  useEffect(() => {
+    if (!open) return;
+    const fetchOpen = () => void syncFolders(open.split(",").map(Number)).catch(() => {});
+    window.addEventListener("focus", fetchOpen);
+    return () => window.removeEventListener("focus", fetchOpen);
+  }, [open]);
+
   useEffect(() => {
     if (settingsPage !== null) return;
     void getAiSettings().then(

@@ -1,9 +1,12 @@
 //! Real accounts: the mail engine and one background worker per account.
 //!
 //! A worker loops: send what's due, push local changes once they're past the
-//! undo window, and fetch new mail every couple of minutes or when asked,
-//! syncing the folders the UI watches along with it. Older mail is reached
-//! back for when the UI asks. The folder list is refreshed now and then.
+//! undo window, and fetch new mail on Spark's schedule. IMAP inboxes are
+//! watched with IDLE, so new mail comes in as it arrives; other inboxes are
+//! checked every 30 seconds, and when the window comes to the front. Every
+//! five minutes a sweep also syncs the folders the UI watches, lists the
+//! folders again and fetches what Microsoft mail was stored without. Older
+//! mail is reached back for when the UI asks.
 //! Searches go to every account's server at once, beside the workers. It
 //! tells the UI through events (`mailbox-changed`, `folders-changed`,
 //! `accounts-changed`, `sync-status`, `send-status`), and the user through
@@ -18,7 +21,7 @@ use std::time::{Duration, Instant};
 use futures_util::future::join_all;
 use serde::Serialize;
 use spark_mail::engine::{folder_has_older, inbox_has_older};
-use spark_mail::{Engine, Error, Round, Untrusted};
+use spark_mail::{Engine, Error, Round, Untrusted, Watch};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
@@ -29,10 +32,19 @@ use crate::notify;
 use crate::secrets::MailSecrets;
 
 const TICK: Duration = Duration::from_secs(2);
-const FETCH_EVERY: Duration = Duration::from_secs(120);
+/// How often an inbox IDLE doesn't watch is checked, as in Spark.
+const INBOX_EVERY: Duration = Duration::from_secs(30);
+/// How often the sweep runs, as in Spark: the inbox (watched or not), the
+/// folders the UI watches, and the folder list.
+const SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const SNOOZE_CHECK: Duration = Duration::from_secs(15);
-const LIST_FOLDERS_EVERY: Duration = Duration::from_secs(15 * 60);
+/// A wait this much longer than `TICK` means the computer slept.
+const SLEPT: Duration = Duration::from_secs(60);
+/// How long after IDLE fails it's tried again, doubling up to
+/// `IDLE_RETRY_MAX`. A server out of connections waits the most.
+const IDLE_RETRY: Duration = Duration::from_secs(30);
+const IDLE_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 /// How long a search waits for a server, as in Spark.
 const SEARCH_WAIT: Duration = Duration::from_secs(60);
 
@@ -49,15 +61,50 @@ pub struct Live {
 }
 
 struct Worker {
-    wake: Arc<Notify>,
-    asks: Arc<Asks>,
+    shared: Arc<Shared>,
     task: JoinHandle<()>,
+    /// Keeps IDLE on the inbox (`watch`).
+    watch: JoinHandle<()>,
+}
+
+impl Worker {
+    fn abort(&self) {
+        self.task.abort();
+        self.watch.abort();
+    }
+}
+
+/// What a worker shares with its inbox's IDLE (`watch`) and the UI.
+#[derive(Default)]
+struct Shared {
+    /// Ends the worker's wait for its next round.
+    wake: Notify,
+    asks: Asks,
+    watcher: Watcher,
+}
+
+/// How the inbox's IDLE is doing.
+#[derive(Default)]
+struct Watcher {
+    /// IDLE is on the inbox, so the worker checks it only with the sweep.
+    watching: AtomicBool,
+    /// A round found the server out of connections: IDLE gives its one up
+    /// for `IDLE_RETRY_MAX`.
+    give_way: AtomicBool,
+    /// Tells IDLE to connect again, e.g. after the computer slept.
+    restart: Notify,
 }
 
 /// What the user asked a worker for, between rounds.
 #[derive(Default)]
 struct Asks {
+    /// A sweep, shown as syncing: the user asked, or the account was added.
     fetch: AtomicBool,
+    /// The inbox, quietly: IDLE saw it change.
+    inbox: AtomicBool,
+    /// The inbox, quietly, unless it was checked within `INBOX_EVERY`:
+    /// the window came to the front.
+    focus: AtomicBool,
     list_folders: AtomicBool,
     /// Folders to sync on the next round, whatever the timer says.
     folders: Mutex<HashSet<i64>>,
@@ -162,10 +209,12 @@ impl Live {
     /// Starts the account's worker; its first round fetches and lists the
     /// folders at once.
     pub fn start(&self, app: &AppHandle, account_id: i64) {
-        let wake = Arc::new(Notify::new());
-        let asks = Arc::new(Asks {
-            fetch: AtomicBool::new(true),
-            list_folders: AtomicBool::new(true),
+        let shared = Arc::new(Shared {
+            asks: Asks {
+                fetch: AtomicBool::new(true),
+                list_folders: AtomicBool::new(true),
+                ..Default::default()
+            },
             ..Default::default()
         });
         let task = tauri::async_runtime::spawn(work(
@@ -174,22 +223,26 @@ impl Live {
             self.status.clone(),
             self.watched.clone(),
             account_id,
-            wake.clone(),
-            asks.clone(),
+            shared.clone(),
         ));
-        let old = self
-            .workers
-            .lock()
-            .unwrap()
-            .insert(account_id, Worker { wake, asks, task });
+        let watch =
+            tauri::async_runtime::spawn(watch(self.engine.clone(), account_id, shared.clone()));
+        let old = self.workers.lock().unwrap().insert(
+            account_id,
+            Worker {
+                shared,
+                task,
+                watch,
+            },
+        );
         if let Some(old) = old {
-            old.task.abort();
+            old.abort();
         }
     }
 
     pub fn stop(&self, account_id: i64) {
         if let Some(worker) = self.workers.lock().unwrap().remove(&account_id) {
-            worker.task.abort();
+            worker.abort();
         }
         self.status.lock().unwrap().remove(&account_id);
     }
@@ -198,17 +251,34 @@ impl Live {
     /// account now.
     pub fn sync_now(&self) {
         for worker in self.workers.lock().unwrap().values() {
-            worker.asks.fetch.store(true, Ordering::Relaxed);
-            worker.asks.list_folders.store(true, Ordering::Relaxed);
-            worker.wake.notify_one();
+            worker.shared.asks.fetch.store(true, Ordering::Relaxed);
+            worker
+                .shared
+                .asks
+                .list_folders
+                .store(true, Ordering::Relaxed);
+            worker.shared.wake.notify_one();
+        }
+    }
+
+    /// The window came to the front: checks every inbox not checked
+    /// within `INBOX_EVERY`, as Spark does.
+    pub fn focused(&self) {
+        for worker in self.workers.lock().unwrap().values() {
+            worker.shared.asks.focus.store(true, Ordering::Relaxed);
+            worker.shared.wake.notify_one();
         }
     }
 
     /// Lists every account's folders again now.
     pub fn refresh_folders(&self) {
         for worker in self.workers.lock().unwrap().values() {
-            worker.asks.list_folders.store(true, Ordering::Relaxed);
-            worker.wake.notify_one();
+            worker
+                .shared
+                .asks
+                .list_folders
+                .store(true, Ordering::Relaxed);
+            worker.shared.wake.notify_one();
         }
     }
 
@@ -231,8 +301,8 @@ impl Live {
         }
         // Each engine round skips other accounts' folders.
         for worker in self.workers.lock().unwrap().values() {
-            worker.asks.folders.lock().unwrap().extend(&ids);
-            worker.wake.notify_one();
+            worker.shared.asks.folders.lock().unwrap().extend(&ids);
+            worker.shared.wake.notify_one();
         }
     }
 
@@ -259,14 +329,18 @@ impl Live {
                 continue;
             };
             if accounts.contains(&account_id) {
-                worker.asks.older_inbox.store(true, Ordering::Relaxed);
+                worker
+                    .shared
+                    .asks
+                    .older_inbox
+                    .store(true, Ordering::Relaxed);
             }
             if let Some(ids) = owned.get(&account_id) {
-                worker.asks.older_folders.lock().unwrap().extend(ids);
+                worker.shared.asks.older_folders.lock().unwrap().extend(ids);
             }
             let (tx, rx) = oneshot::channel();
-            worker.asks.older_waiters.lock().unwrap().push(tx);
-            worker.wake.notify_one();
+            worker.shared.asks.older_waiters.lock().unwrap().push(tx);
+            worker.shared.wake.notify_one();
             done.push(rx);
         }
         done
@@ -306,7 +380,7 @@ impl Live {
     /// Wakes the account's worker, e.g. for a send that's already due.
     pub fn nudge(&self, account_id: i64) {
         if let Some(worker) = self.workers.lock().unwrap().get(&account_id) {
-            worker.wake.notify_one();
+            worker.shared.wake.notify_one();
         }
     }
 
@@ -342,9 +416,13 @@ async fn work(
     status: Arc<Mutex<HashMap<i64, SyncView>>>,
     watched: Arc<Mutex<HashSet<i64>>>,
     account_id: i64,
-    wake: Arc<Notify>,
-    asks: Arc<Asks>,
+    shared: Arc<Shared>,
 ) {
+    let Shared {
+        wake,
+        asks,
+        watcher,
+    } = &*shared;
     let set_status = |view: SyncView| {
         status.lock().unwrap().insert(account_id, view.clone());
         let _ = app.emit(
@@ -356,9 +434,10 @@ async fn work(
         );
     };
     let mut last_fetch: Option<Instant> = None;
-    let mut last_list: Option<Instant> = None;
+    let mut last_sweep: Option<Instant> = None;
     let mut last_sync: Option<i64> = None;
     let mut retry_at: Option<Instant> = None;
+    let mut slept = false;
     loop {
         if !matches!(engine.store().account(account_id), Ok(Some(_))) {
             break;
@@ -395,11 +474,25 @@ async fn work(
         // Waiters first: their asks are in by then.
         let waiters = std::mem::take(&mut *asks.older_waiters.lock().unwrap());
         let requested = asks.fetch.swap(false, Ordering::Relaxed);
+        let inbox_asked = asks.inbox.swap(false, Ordering::Relaxed);
+        let focused = asks.focus.swap(false, Ordering::Relaxed);
         let list_asked = asks.list_folders.swap(false, Ordering::Relaxed);
         let mut folders: HashSet<i64> = std::mem::take(&mut *asks.folders.lock().unwrap());
         let older_inbox = asks.older_inbox.swap(false, Ordering::Relaxed);
         let older_folders = std::mem::take(&mut *asks.older_folders.lock().unwrap());
+        let due = due(
+            last_fetch.map(|at| at.elapsed()),
+            last_sweep.map(|at| at.elapsed()),
+            watcher.watching.load(Ordering::Relaxed),
+            focused,
+        );
+        let woke = std::mem::take(&mut slept);
+        let sweep = requested || woke || due.sweep;
+        let fetch = sweep || inbox_asked || due.inbox;
         let asked = requested
+            || woke
+            || inbox_asked
+            || (focused && due.inbox)
             || list_asked
             || !folders.is_empty()
             || older_inbox
@@ -407,11 +500,13 @@ async fn work(
             || !waiters.is_empty();
         let waiting = retry_at.is_some_and(|at| Instant::now() < at);
         if asked || !waiting {
-            let fetch = requested || last_fetch.is_none_or(|at| at.elapsed() >= FETCH_EVERY);
-            let list_folders = list_asked
-                || (fetch && last_list.is_none_or(|at| at.elapsed() >= LIST_FOLDERS_EVERY));
-            if fetch {
+            let list_folders = list_asked || sweep;
+            if sweep {
                 folders.extend(watched.lock().unwrap().iter());
+            }
+            // Checks on the schedule don't spin the sync button; ones the
+            // user asked for and the first do.
+            if fetch && (requested || last_sync.is_none()) {
                 set_status(SyncView {
                     status: SyncStatus::Syncing,
                     last_sync,
@@ -420,6 +515,7 @@ async fn work(
             }
             let round = Round {
                 fetch,
+                repair: sweep,
                 list_folders,
                 folders: folders.into_iter().collect(),
                 older_inbox,
@@ -432,8 +528,8 @@ async fn work(
             match engine.run_round(account_id, &round).await {
                 Ok(report) => {
                     retry_at = None;
-                    if list_folders {
-                        last_list = Some(Instant::now());
+                    if sweep {
+                        last_sweep = Some(Instant::now());
                     }
                     if fetch {
                         last_fetch = Some(Instant::now());
@@ -460,6 +556,11 @@ async fn work(
                 Err(e) => {
                     retry_at = Some(Instant::now() + RETRY_AFTER);
                     last_fetch = Some(Instant::now());
+                    // IDLE's connection may be the one too many.
+                    if e.is_connection_limit() && watcher.watching.load(Ordering::Relaxed) {
+                        watcher.give_way.store(true, Ordering::Relaxed);
+                        watcher.restart.notify_one();
+                    }
                     set_status(SyncView {
                         status: SyncStatus::Error,
                         message: Some(describe(&e)),
@@ -482,9 +583,81 @@ async fn work(
             }
         }
 
+        let waited_from = now_ms();
         tokio::select! {
             _ = wake.notified() => {}
             _ = tokio::time::sleep(TICK) => {}
+        }
+        // Waking from sleep: IDLE's connection is gone, and mail came in.
+        if now_ms() - waited_from > (TICK + SLEPT).as_millis() as i64 {
+            slept = true;
+            watcher.restart.notify_one();
+        }
+    }
+}
+
+/// What a worker's schedule has due.
+#[derive(Debug, PartialEq, Eq)]
+struct Due {
+    inbox: bool,
+    sweep: bool,
+}
+
+/// From how long ago the inbox was last fetched and the last sweep ran
+/// (`None`: not yet), whether IDLE watches the inbox, and whether the window
+/// just came to the front.
+fn due(
+    since_inbox: Option<Duration>,
+    since_sweep: Option<Duration>,
+    watching: bool,
+    focused: bool,
+) -> Due {
+    let past = |since: Option<Duration>, every| since.is_none_or(|since| since >= every);
+    let sweep = past(since_sweep, SWEEP_EVERY);
+    // IDLE tells when the inbox changes, so then only the sweep checks it.
+    let every = if watching { SWEEP_EVERY } else { INBOX_EVERY };
+    let inbox = sweep || past(since_inbox, every) || (focused && past(since_inbox, INBOX_EVERY));
+    Due { inbox, sweep }
+}
+
+/// Keeps IDLE on the account's inbox, so the worker fetches new mail as it
+/// arrives. Ends for accounts it can't watch; the worker checks their inbox
+/// every `INBOX_EVERY` instead, as it does while IDLE is down.
+async fn watch(engine: Arc<Engine>, account_id: i64, shared: Arc<Shared>) {
+    let Shared {
+        wake,
+        asks,
+        watcher,
+    } = &*shared;
+    let mut retry = IDLE_RETRY;
+    loop {
+        let started = Instant::now();
+        let watched = engine
+            .watch_inbox(account_id, &watcher.restart, &watcher.watching, || {
+                asks.inbox.store(true, Ordering::Relaxed);
+                wake.notify_one();
+            })
+            .await;
+        watcher.watching.store(false, Ordering::Relaxed);
+        // One that ran a while didn't fail the way the last one did.
+        if started.elapsed() >= SWEEP_EVERY {
+            retry = IDLE_RETRY;
+        }
+        let wait = match watched {
+            Ok(Watch::Unwatched) => return,
+            Ok(Watch::Restart) if watcher.give_way.swap(false, Ordering::Relaxed) => IDLE_RETRY_MAX,
+            Ok(Watch::Restart) => continue,
+            Err(e) if e.is_connection_limit() => IDLE_RETRY_MAX,
+            Err(e) => {
+                eprintln!("spark-rs: watching the inbox of account {account_id}: {e}");
+                let wait = retry;
+                retry = (retry * 2).min(IDLE_RETRY_MAX);
+                wait
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = watcher.restart.notified() => {}
         }
     }
 }
@@ -509,5 +682,85 @@ fn describe(e: &Error) -> String {
     match e {
         Error::Network { .. } => format!("Offline or the server isn't answering. {e}"),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secs(n: u64) -> Option<Duration> {
+        Some(Duration::from_secs(n))
+    }
+
+    #[test]
+    fn the_first_round_sweeps() {
+        let due = due(None, None, false, false);
+        assert!(due.inbox && due.sweep);
+    }
+
+    #[test]
+    fn an_unwatched_inbox_is_checked_every_30_seconds() {
+        assert_eq!(
+            due(secs(29), secs(29), false, false),
+            Due {
+                inbox: false,
+                sweep: false
+            }
+        );
+        assert_eq!(
+            due(secs(30), secs(30), false, false),
+            Due {
+                inbox: true,
+                sweep: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_watched_inbox_waits_for_the_sweep() {
+        assert_eq!(
+            due(secs(299), secs(299), true, false),
+            Due {
+                inbox: false,
+                sweep: false
+            }
+        );
+        assert_eq!(
+            due(secs(300), secs(300), true, false),
+            Due {
+                inbox: true,
+                sweep: true
+            }
+        );
+    }
+
+    #[test]
+    fn the_sweep_runs_every_five_minutes() {
+        assert_eq!(
+            due(secs(10), secs(300), false, false),
+            Due {
+                inbox: true,
+                sweep: true
+            }
+        );
+    }
+
+    #[test]
+    fn coming_to_the_front_checks_an_inbox_not_checked_just_now() {
+        assert_eq!(
+            due(secs(29), secs(29), true, true),
+            Due {
+                inbox: false,
+                sweep: false
+            }
+        );
+        assert_eq!(
+            due(secs(30), secs(30), true, true),
+            Due {
+                inbox: true,
+                sweep: false
+            }
+        );
     }
 }

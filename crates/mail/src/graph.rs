@@ -77,8 +77,9 @@ const REPAIR_REQUEST_TIME: Duration = Duration::from_secs(25);
 /// was stored, and after `REPAIR_TRIES` failed tries of its own, is given
 /// up on (`Graph::repair`).
 pub const REPAIR_FOR_MS: i64 = 7 * DAY_MS;
-/// See `REPAIR_FOR_MS`. Rounds come at least half a minute apart, so a
-/// computer that was off for a week still tries a while before giving up.
+/// See `REPAIR_FOR_MS`. Repairs come with the app's sweeps, five minutes
+/// apart, so a computer that was off for a week still tries for most of an
+/// hour before giving up.
 pub const REPAIR_TRIES: u32 = 10;
 /// Well-known folders: their role, or `None` for ones left out of the list.
 /// Folders inside the inbox are listed at the top.

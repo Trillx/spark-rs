@@ -32,11 +32,12 @@ use std::sync::MutexGuard;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{
     AttributeValue, MailboxDatum, MessageSection, NameAttribute, Outcome, Response, SectionPath,
     Status,
 };
-use async_imap::types::{Fetch, Flag};
+use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
 use async_imap::{Client, Session as ImapSession};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -1050,6 +1051,96 @@ pub async fn older_inbox(
     }
     state.complete = !more;
     Ok(stored)
+}
+
+/// How long one IDLE waits before it's renewed: under the 29 minutes
+/// RFC 2177 allows, as Spark does.
+pub const IDLE_RENEW: Duration = Duration::from_secs(28 * 60);
+
+/// How an IDLE ended.
+pub enum Idle {
+    /// The server reported a change: new mail, an expunge or a flag.
+    Changed(Session),
+    /// `IDLE_RENEW` passed quietly.
+    Quiet(Session),
+    /// `stop` resolved; the connection was dropped.
+    Stopped,
+}
+
+/// Whether the server takes IDLE.
+pub async fn can_idle(session: &mut Session) -> Result<bool> {
+    Ok(session.capabilities().await?.has_str("IDLE"))
+}
+
+/// Opens the inbox read-only for `idle`.
+pub async fn examine_inbox(session: &mut Session) -> Result<()> {
+    timeout(NETWORK_TIMEOUT, session.examine(INBOX))
+        .await
+        .map_err(|_| Error::Server("The mail server didn't open the inbox.".into()))??;
+    // What came before is in the inbox as it's opened.
+    while session.unsolicited_responses.try_recv().is_ok() {}
+    Ok(())
+}
+
+/// Waits in IDLE on the selected mailbox until the server reports a
+/// change, `IDLE_RENEW` passes or `stop` resolves, then ends the IDLE. A
+/// connection the server closes is an error.
+pub async fn idle(session: Session, stop: impl Future<Output = ()>) -> Result<Idle> {
+    let quiet = || Error::Server("The mail server stopped answering.".into());
+    // Changes reported while the last IDLE ended or this one began (mail
+    // that came in between) arrive here, not in the wait.
+    let between = session.unsolicited_responses.clone();
+    let mut handle = session.idle();
+    timeout(NETWORK_TIMEOUT, handle.init())
+        .await
+        .map_err(|_| quiet())??;
+    let mut changed_between = false;
+    while let Ok(response) = between.try_recv() {
+        changed_between |= reports_change(&response);
+    }
+    let changed = changed_between || {
+        // Held through the wait: dropping it would interrupt it.
+        let (wait, _interrupt) = handle.wait_with_timeout(IDLE_RENEW);
+        let response = tokio::select! {
+            response = wait => response?,
+            () = stop => return Ok(Idle::Stopped),
+        };
+        match response {
+            IdleResponse::NewData(_) => true,
+            IdleResponse::Timeout => false,
+            // Not interrupted, so the connection ended.
+            IdleResponse::ManualInterrupt => {
+                return Err(Error::Server(
+                    "The mail server closed the connection.".into(),
+                ));
+            }
+        }
+    };
+    let session = timeout(NETWORK_TIMEOUT, handle.done())
+        .await
+        .map_err(|_| quiet())??;
+    Ok(if changed {
+        Idle::Changed(session)
+    } else {
+        Idle::Quiet(session)
+    })
+}
+
+/// Whether a response the server sent unasked tells of mail that came,
+/// went or changed flags.
+fn reports_change(response: &UnsolicitedResponse) -> bool {
+    match response {
+        UnsolicitedResponse::Exists(_)
+        | UnsolicitedResponse::Expunge(_)
+        | UnsolicitedResponse::Recent(_) => true,
+        UnsolicitedResponse::Other(data) => {
+            matches!(
+                data.parsed(),
+                Response::Fetch(..) | Response::Vanished { .. }
+            )
+        }
+        UnsolicitedResponse::Status { .. } => false,
+    }
 }
 
 /// The lowest UID in the selected mailbox, `exists` messages long: its

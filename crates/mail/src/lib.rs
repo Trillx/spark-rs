@@ -25,7 +25,7 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-pub use engine::{AccountConfig, CalendarStatus, Engine, Round, Secrets};
+pub use engine::{AccountConfig, CalendarStatus, Engine, Round, Secrets, Watch};
 
 /// How many messages further back the inbox or a folder reaches each time
 /// the user scrolls to the end of its list, as in Spark.
@@ -85,6 +85,26 @@ impl Error {
             host: host.to_owned(),
             detail: detail.to_string(),
         }
+    }
+
+    /// The server turned a connection away for having too many open, as in
+    /// Gmail's "Too many simultaneous connections".
+    pub fn is_connection_limit(&self) -> bool {
+        let text = match self {
+            Self::Auth(text) | Self::Server(text) => text,
+            Self::Network { detail, .. } => detail,
+            _ => return false,
+        }
+        .to_lowercase();
+        [
+            "too many simultaneous connections",
+            "too many connections",
+            "maximum number of connections",
+            "connection limit",
+            "[limit]",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
     }
 }
 

@@ -99,12 +99,18 @@ pub fn in_front(app: &AppHandle) -> bool {
 /// Any spark-rs window gaining or losing focus (the meeting pop-up too)
 /// tells the main window, whose Home Screen counts time away from all of
 /// them, as Spark does; coming back to any of them takes down the Email
-/// Focus reminder.
+/// Focus reminder. The main window coming to the front also checks the
+/// inboxes, as in Spark.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if let WindowEvent::Focused(focused) = event {
-        let _ = window.app_handle().emit_to("main", "window-focus", *focused);
+        let _ = window
+            .app_handle()
+            .emit_to("main", "window-focus", *focused);
         if *focused {
             notify::withdraw_focus_reminder(window.app_handle());
+            if window.label() == "main" {
+                window.state::<Mailbox>().live.focused();
+            }
         }
         return;
     }

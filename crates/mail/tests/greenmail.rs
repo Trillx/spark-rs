@@ -9,7 +9,9 @@
 //!     tools/cross/run.sh cargo test -p spark-mail --test greenmail
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_imap::types::Flag;
 use futures_util::TryStreamExt;
@@ -18,7 +20,7 @@ use lettre::message::{Attachment, MultiPart, SinglePart};
 use spark_mail::draft::{Draft, OutgoingAttachment};
 use spark_mail::engine::{folder_has_older, inbox_has_older};
 use spark_mail::imap::{self, Security, Server};
-use spark_mail::{Engine, OLDER_STEP, Round, Secrets, drafts, smtp};
+use spark_mail::{Engine, OLDER_STEP, Round, Secrets, Watch, drafts, smtp};
 use spark_store::{
     AccountKind, Category, Change, Decision, FolderRole, MessageState, OutboxFile, Patch, Screen,
     Store, now_ms,
@@ -1794,4 +1796,83 @@ async fn imap_sent_search_needs_the_exact_address() {
         .await
         .unwrap();
     assert_eq!(found, ["JoAnn@vendor.org"]);
+}
+
+/// Long enough for GreenMail to tell about new mail.
+const IDLE_WAIT: Duration = Duration::from_secs(20);
+
+#[tokio::test]
+async fn imap_idle_reports_new_mail() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("idle{}@example.com", now_ms());
+    deliver(&smtp, "Ana Ruiz <ana@x.com>", &me, "First", false).await;
+    let mut session = imap::login(&imap, &me, "pw").await.unwrap();
+    assert!(imap::can_idle(&mut session).await.unwrap());
+    imap::examine_inbox(&mut session).await.unwrap();
+
+    // Mail that arrives during the IDLE.
+    let (idled, ()) = tokio::join!(
+        tokio::time::timeout(IDLE_WAIT, imap::idle(session, std::future::pending())),
+        async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            deliver(&smtp, "Bob <bob@y.org>", &me, "Second", false).await;
+        },
+    );
+    let Ok(Ok(imap::Idle::Changed(session))) = idled else {
+        panic!("IDLE didn't report the new mail");
+    };
+    // What the server said about it as the IDLE ended.
+    while session.unsolicited_responses.try_recv().is_ok() {}
+
+    // Mail that arrives between two IDLEs.
+    deliver(&smtp, "Bob <bob@y.org>", &me, "Third", false).await;
+    let idled = tokio::time::timeout(IDLE_WAIT, imap::idle(session, std::future::pending())).await;
+    let Ok(Ok(imap::Idle::Changed(session))) = idled else {
+        panic!("IDLE missed mail that came before it began");
+    };
+
+    let stopped = tokio::time::timeout(IDLE_WAIT, imap::idle(session, async {})).await;
+    assert!(matches!(stopped, Ok(Ok(imap::Idle::Stopped))));
+}
+
+#[tokio::test]
+async fn imap_engine_watches_the_inbox() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("watch{}@example.com", now_ms());
+    deliver(&smtp, "Ana Ruiz <ana@x.com>", &me, "First", false).await;
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap, smtp.clone())
+        .await
+        .unwrap();
+
+    let restart = tokio::sync::Notify::new();
+    let watching = AtomicBool::new(false);
+    let seen = tokio::sync::Notify::new();
+    let watch = engine.watch_inbox(account.id, &restart, &watching, || seen.notify_one());
+    let (watched, ()) = tokio::join!(tokio::time::timeout(2 * IDLE_WAIT, watch), async {
+        while !watching.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        deliver(&smtp, "Bob <bob@y.org>", &me, "Second", false).await;
+        tokio::time::timeout(IDLE_WAIT, seen.notified())
+            .await
+            .expect("the watch didn't see the new mail");
+        restart.notify_one();
+    });
+    assert_eq!(
+        watched.expect("the watch didn't stop").unwrap(),
+        Watch::Restart
+    );
 }
