@@ -17,9 +17,9 @@ use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_mail::{signature, trackers};
 use spark_store::{
-    Account, AccountKind, Category, Change, Contact, DraftFile, DueReminder, Folder, FolderRole,
-    GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo, QueuedDraft, SavedFile,
-    SenderStatus, Store, now_ms,
+    Account, AccountKind, Category, Change, Contact, DraftFile, DraftSend, DueReminder, Folder,
+    FolderRole, GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo, QueuedDraft,
+    SavedFile, SenderStatus, Store, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -1554,32 +1554,63 @@ pub async fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i
     Ok(id)
 }
 
-/// Queues a real account's draft. Copies of its files from this computer go
-/// into the outbox, so a later send doesn't depend on the originals; they're
-/// read before the store is locked.
+/// Queues a real account's draft, its files read from this computer.
 fn queue_live(engine: &spark_mail::Engine, draft: &Draft) -> Result<i64, String> {
+    queue_reading(engine, draft, |path| std::fs::read(path))
+}
+
+/// Why a send from a saved draft didn't queue.
+const ON_ITS_WAY: &str = "This draft is already on its way.";
+const SENT_OR_DELETED: &str = "This draft was already sent or deleted.";
+
+/// Queues a real account's draft. Copies of its files from this computer
+/// (`read_file`) go into the outbox, so a later send doesn't depend on the
+/// originals; they're read before the store is locked.
+fn queue_reading(
+    engine: &spark_mail::Engine,
+    draft: &Draft,
+    read_file: impl Fn(&str) -> io::Result<Vec<u8>>,
+) -> Result<i64, String> {
     let json = serde_json::to_string(draft).map_err(text)?;
-    let read: Vec<io::Result<Vec<u8>>> = attached(draft)
-        .iter()
-        .map(|f| std::fs::read(f.path))
-        .collect();
+    // One send per saved draft: another, or one after it's sent, would send
+    // it twice. Reserved before its files are read, it's still the same
+    // draft once they are, not one given its id meanwhile.
+    let reserved = match draft.draft_id {
+        Some(saved) => {
+            let found = engine.store().reserve_draft_send(saved).map_err(text)?;
+            match found {
+                DraftSend::Reserved(reserved) => Some(reserved),
+                DraftSend::Held => return Err(ON_ITS_WAY.into()),
+                DraftSend::Gone => return Err(SENT_OR_DELETED.into()),
+            }
+        }
+        None => None,
+    };
+    let read: Vec<io::Result<Vec<u8>>> =
+        attached(draft).iter().map(|f| read_file(f.path)).collect();
     let mut store = engine.store();
-    let queued = outbox_files(draft, read, &store)?;
-    let Some(saved) = draft.draft_id else {
+    let queued = outbox_files(draft, read, &store);
+    let Some(reserved) = reserved else {
         return store
-            .queue_send(draft.account, &json, draft.send_at, &queued)
+            .queue_send(draft.account, &json, draft.send_at, &queued?)
             .map_err(text);
     };
-    // The saved draft it came from waits with it, out of the lists. One
-    // send per saved draft: another, or one after it's sent, would send it
-    // twice.
+    let queued = match queued {
+        Ok(queued) => queued,
+        Err(e) => {
+            // Not sent: it can be sent again, or discarded.
+            store.release_draft_send(reserved).map_err(text)?;
+            return Err(e);
+        }
+    };
+    // The saved draft it came from waits with it, out of the lists.
     match store
-        .queue_draft_send(saved, draft.account, &json, draft.send_at, &queued)
+        .queue_draft_send(reserved, draft.account, &json, draft.send_at, &queued)
         .map_err(text)?
     {
         QueuedDraft::Queued(id) => Ok(id),
-        QueuedDraft::Held => Err("This draft is already on its way.".into()),
-        QueuedDraft::Gone => Err("This draft was already sent or deleted.".into()),
+        QueuedDraft::Held => Err(ON_ITS_WAY.into()),
+        QueuedDraft::Gone => Err(SENT_OR_DELETED.into()),
     }
 }
 
@@ -2032,13 +2063,19 @@ pub fn discard_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<(), String>
         mailbox.demo.discard_draft(id);
         return Ok(());
     }
-    mailbox
-        .live
-        .engine
-        .store()
-        .discard_draft(id)
-        .map_err(text)?;
+    discard_live(&mailbox.live.engine, id)?;
     SAVED_FILES.forget(id);
+    Ok(())
+}
+
+/// Deletes a real account's draft, but not while a send has it reserved,
+/// reading its files: deleted, a new draft could get its id meanwhile.
+fn discard_live(engine: &spark_mail::Engine, id: i64) -> Result<(), String> {
+    let mut store = engine.store();
+    if store.draft_reserved(id).map_err(text)? {
+        return Err("This draft is being sent.".into());
+    }
+    store.discard_draft(id).map_err(text)?;
     Ok(())
 }
 
@@ -2076,7 +2113,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use spark_store::NewAccount;
+    use spark_store::{DraftCopy, NewAccount};
 
     #[test]
     fn script_file_and_attack_links_never_open() {
@@ -2561,6 +2598,188 @@ mod tests {
             second,
             Err("This draft was already sent or deleted.".into())
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A saved draft with a file attached, for sending.
+    fn saved_with_file(engine: &spark_mail::Engine, account: &Account, path: &Path) -> Draft {
+        write_file(path, b"the plan", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            attachments: vec![file_attachment(path, 8)],
+            ..Default::default()
+        };
+        let id = save_live(engine, &SavedFiles::default(), &draft, read_local).unwrap();
+        draft.draft_id = Some(id);
+        draft
+    }
+
+    #[test]
+    fn a_second_send_while_the_first_reads_its_files_is_refused() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("double-send");
+        let draft = saved_with_file(&engine, &account, &dir.join("plan.txt"));
+        let id = draft.draft_id.unwrap();
+        // Send, clicked twice: the second comes while the first reads.
+        let second = Cell::new(None);
+        let first = queue_reading(&engine, &draft, |path| {
+            second.set(Some(queue_live(&engine, &draft)));
+            std::fs::read(path)
+        });
+        assert_eq!(
+            second.take(),
+            Some(Err("This draft is already on its way.".into()))
+        );
+        let first = first.unwrap();
+        let mut store = engine.store();
+        assert!(store.draft_held(id).unwrap());
+        let queued = store.claim_due_sends(account.id, i64::MAX).unwrap();
+        assert_eq!(
+            queued.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first]
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_draft_isnt_discarded_while_its_send_reads_its_files() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("discard-mid-send");
+        let draft = saved_with_file(&engine, &account, &dir.join("plan.txt"));
+        let id = draft.draft_id.unwrap();
+        // Gone meanwhile, a new draft could get its id.
+        let discarded = Cell::new(None);
+        let queued = queue_reading(&engine, &draft, |path| {
+            discarded.set(Some(discard_live(&engine, id)));
+            std::fs::read(path)
+        });
+        assert_eq!(
+            discarded.take(),
+            Some(Err("This draft is being sent.".into()))
+        );
+        let queued = queued.unwrap();
+        let store = engine.store();
+        assert!(store.draft_held(id).unwrap());
+        assert_eq!(bytes(&store.outbox_files(queued).unwrap()), [b"the plan"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_send_whose_draft_went_and_gave_its_id_to_a_new_one_queues_nothing() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("id-reused");
+        let draft = saved_with_file(&engine, &account, &dir.join("plan.txt"));
+        let id = draft.draft_id.unwrap();
+        // While the send reads its files, the draft is deleted on the server
+        // and the next sync forgets it; a new draft gets its id.
+        let new = Draft {
+            account: account.id,
+            to: "bo@example.test".into(),
+            body: "Something else".into(),
+            ..Default::default()
+        };
+        let replaced = Cell::new(None);
+        let sent = queue_reading(&engine, &draft, |path| {
+            assert_eq!(engine.store().remove_messages(&[id]).unwrap(), 1);
+            let saved = save_live(&engine, &SavedFiles::default(), &new, read_local);
+            replaced.set(Some(saved.unwrap()));
+            std::fs::read(path)
+        });
+        assert_eq!(replaced.take(), Some(id), "the id wasn't given again");
+        assert_eq!(sent, Err("This draft was already sent or deleted.".into()));
+        let mut store = engine.store();
+        assert!(
+            store
+                .claim_due_sends(account.id, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        // The new draft stays as it was saved, listed.
+        assert!(!store.draft_held(id).unwrap());
+        let saved: Draft = serde_json::from_str(&store.draft(id).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            (saved.to.as_str(), saved.body.as_str()),
+            ("bo@example.test", "Something else")
+        );
+        assert_eq!(store.messages().unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_draft_uploaded_before_its_account_had_a_drafts_folder_can_be_sent() {
+        let (engine, _) = engine();
+        // A Microsoft 365 account whose first folder listing failed.
+        let account = engine
+            .store()
+            .add_account(&NewAccount {
+                kind: AccountKind::Microsoft,
+                email: "me@contoso.test",
+                name: "Me",
+                label: "Work",
+                config: "{}",
+            })
+            .unwrap();
+        let mut draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            body: "The plan".into(),
+            ..Default::default()
+        };
+        let id = save_live(&engine, &SavedFiles::default(), &draft, read_local).unwrap();
+        draft.draft_id = Some(id);
+        {
+            // Uploaded, with no Drafts folder to list it in.
+            let mut store = engine.store();
+            let upload = store.draft_uploads(account.id, i64::MAX).unwrap().remove(0);
+            let copy = DraftCopy {
+                remote_id: Some("AAMkADraft1".into()),
+                ..Default::default()
+            };
+            store.draft_uploaded(&upload, &copy, &[]).unwrap();
+            assert!(!store.is_draft(id).unwrap());
+        }
+        let queued = queue_live(&engine, &draft).unwrap();
+        let store = engine.store();
+        assert!(store.draft_held(id).unwrap());
+        assert_eq!(
+            store.queued_send(queued).unwrap().map(|(a, _)| a),
+            Some(account.id)
+        );
+    }
+
+    #[test]
+    fn a_send_whose_files_cant_be_read_leaves_the_draft_free() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("unreadable");
+        let path = dir.join("plan.txt");
+        write_file(&path, b"the plan", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            ..Default::default()
+        };
+        let id = save_live(&engine, &SavedFiles::default(), &draft, read_local).unwrap();
+        draft.draft_id = Some(id);
+        // Attached since it was saved, and unreadable: nothing saved stands in.
+        draft.attachments = vec![file_attachment(&path, 8)];
+        let unreadable = |_: &str| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        let failed = queue_reading(&engine, &draft, unreadable);
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.starts_with("Couldn't read plan.txt")),
+            "{failed:?}"
+        );
+        assert!(!engine.store().draft_held(id).unwrap());
+        // It can be sent once the file reads, and discarded after an undo.
+        let queued = queue_live(&engine, &draft).unwrap();
+        assert!(engine.store().cancel_send(queued).unwrap());
+        discard_live(&engine, id).unwrap();
+        assert!(engine.store().messages().unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

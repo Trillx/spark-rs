@@ -4,6 +4,8 @@
 //! had there. Server copies that were replaced, discarded or sent wait in
 //! `draft_removals` to be deleted. Both survive restarts and being offline.
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
@@ -41,6 +43,18 @@ CREATE TABLE draft_removals (
 
 ALTER TABLE messages ADD COLUMN bcc_list TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE outbox ADD COLUMN draft_message INTEGER REFERENCES messages(id) ON DELETE SET NULL;
+";
+
+/// Drafts reserved for a send from the composer (`Store::reserve_draft_send`).
+/// Temporary, made each time the store opens like `changes::WATCH_MESSAGES`,
+/// so a reservation lasts this opening of the store at most. One ends with
+/// its draft's row, however that's deleted: a new draft given the same id
+/// isn't reserved.
+pub(crate) const WATCH_SENDS: &str = "
+CREATE TEMP TABLE draft_sends (draft INTEGER PRIMARY KEY, token INTEGER NOT NULL);
+CREATE TEMP TRIGGER draft_send_ended AFTER DELETE ON main.messages BEGIN
+    DELETE FROM draft_sends WHERE draft = OLD.id;
+END;
 ";
 
 /// What the composer saved, for the draft's message row.
@@ -129,6 +143,29 @@ pub struct DraftUpload {
     pub attachments: Vec<Attachment>,
 }
 
+/// A saved draft reserved for one send from the composer while its files
+/// are read (`Store::reserve_draft_send`): `Store::queue_draft_send` queues
+/// it, or `Store::release_draft_send` gives it up.
+#[must_use = "a reserved draft is queued or released"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct DraftReservation {
+    draft: i64,
+    /// This reservation's own: one made since for a new draft given the
+    /// same id has another.
+    token: i64,
+}
+
+/// What `Store::reserve_draft_send` found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DraftSend {
+    /// Reserved for this send.
+    Reserved(DraftReservation),
+    /// Another send has it already: queued with it, or reading its files.
+    Held,
+    /// It's gone: sent or deleted.
+    Gone,
+}
+
 /// What `Store::queue_draft_send` did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueuedDraft {
@@ -136,7 +173,7 @@ pub enum QueuedDraft {
     Queued(i64),
     /// Another queued send holds the draft already.
     Held,
-    /// It's no longer a draft: sent or deleted.
+    /// It went while it was reserved: sent or deleted.
     Gone,
 }
 
@@ -253,7 +290,8 @@ impl Store {
 
     /// A queued send came from this draft: it isn't listed while it waits,
     /// and goes once it's sent (`discard_draft`). A send from the composer
-    /// queues and holds in one step (`queue_draft_send`).
+    /// reserves the draft, then queues and holds in one step
+    /// (`queue_draft_send`).
     pub fn hold_draft_for_send(&self, outbox_id: i64, draft: i64) -> Result<()> {
         hold_in(&self.conn, outbox_id, draft)
     }
@@ -263,30 +301,67 @@ impl Store {
         held_in(&self.conn, draft)
     }
 
-    /// Queues a send made from saved draft `draft` (as `queue_send`) and
-    /// holds the draft with it (`hold_draft_for_send`), in one step. Nothing
-    /// is queued if another send holds the draft already, or if it's no
-    /// longer a draft: sent or deleted meanwhile, when queuing it would send
-    /// it again.
+    /// Whether a send has a saved draft reserved (`reserve_draft_send`),
+    /// reading its files.
+    pub fn draft_reserved(&self, draft: i64) -> Result<bool> {
+        reserved_in(&self.conn, draft)
+    }
+
+    /// Reserves saved draft `draft` for a send from the composer, before its
+    /// files are read without the store. One send per draft: no other can
+    /// reserve it until this one is queued (`queue_draft_send`) or given up
+    /// (`release_draft_send`). Saves still go, as the send carries its own
+    /// copy; deleting the draft ends the reservation (`WATCH_SENDS`), and
+    /// the send queues nothing. Any row with the id will do: a draft
+    /// uploaded before its account listed a Drafts folder is in none
+    /// (`is_draft`), but is still the composer's.
+    pub fn reserve_draft_send(&self, draft: i64) -> Result<DraftSend> {
+        if held_in(&self.conn, draft)? || reserved_in(&self.conn, draft)? {
+            return Ok(DraftSend::Held);
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE id = ?1)",
+            [draft],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(DraftSend::Gone);
+        }
+        // Unique in this run, so no other opening of the store has it either.
+        static LAST: AtomicI64 = AtomicI64::new(0);
+        let token = LAST.fetch_add(1, Ordering::Relaxed) + 1;
+        self.conn.execute(
+            "INSERT INTO draft_sends (draft, token) VALUES (?1, ?2)",
+            params![draft, token],
+        )?;
+        Ok(DraftSend::Reserved(DraftReservation { draft, token }))
+    }
+
+    /// Queues the send `reserved` is for (as `queue_send`) and holds its
+    /// draft with it (`hold_draft_for_send`), in one step, ending the
+    /// reservation. Nothing is queued if the draft went meanwhile, sent or
+    /// deleted, when its id may be a new draft's. Failing, it gives up the
+    /// reservation, so the draft can be sent again.
     pub fn queue_draft_send(
         &mut self,
-        draft: i64,
+        reserved: DraftReservation,
         account_id: i64,
         json: &str,
         send_at: i64,
         files: &[OutboxFile],
     ) -> Result<QueuedDraft> {
-        let tx = self.conn.transaction()?;
-        if held_in(&tx, draft)? {
-            return Ok(QueuedDraft::Held);
+        let queued = queue_reserved(&mut self.conn, &reserved, account_id, json, send_at, files);
+        if queued.is_err() {
+            release_in(&self.conn, &reserved)?;
         }
-        if !is_draft_in(&tx, draft)? {
-            return Ok(QueuedDraft::Gone);
-        }
-        let id = queue_send_in(&tx, account_id, json, send_at, files)?;
-        hold_in(&tx, id, draft)?;
-        tx.commit()?;
-        Ok(QueuedDraft::Queued(id))
+        queued
+    }
+
+    /// Gives up the send `reserved` is for, unqueued: the draft can be sent
+    /// or discarded again.
+    pub fn release_draft_send(&self, reserved: DraftReservation) -> Result<()> {
+        release_in(&self.conn, &reserved)?;
+        Ok(())
     }
 
     /// The account's drafts saved before `settled_before` (so quick saves
@@ -658,6 +733,46 @@ fn hold_in(conn: &Connection, outbox_id: i64, draft: i64) -> Result<()> {
         params![outbox_id, draft],
     )?;
     Ok(())
+}
+
+fn reserved_in(conn: &Connection, draft: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM draft_sends WHERE draft = ?1)",
+        [draft],
+        |r| r.get(0),
+    )
+}
+
+/// Ends a reservation. False if it had ended already, with its draft's row.
+fn release_in(conn: &Connection, reserved: &DraftReservation) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM draft_sends WHERE draft = ?1 AND token = ?2",
+        params![reserved.draft, reserved.token],
+    )? == 1)
+}
+
+/// `Store::queue_draft_send`'s transaction.
+fn queue_reserved(
+    conn: &mut Connection,
+    reserved: &DraftReservation,
+    account_id: i64,
+    json: &str,
+    send_at: i64,
+    files: &[OutboxFile],
+) -> Result<QueuedDraft> {
+    let tx = conn.transaction()?;
+    if !release_in(&tx, reserved)? {
+        return Ok(QueuedDraft::Gone);
+    }
+    let queued = if held_in(&tx, reserved.draft)? {
+        QueuedDraft::Held
+    } else {
+        let id = queue_send_in(&tx, account_id, json, send_at, files)?;
+        hold_in(&tx, id, reserved.draft)?;
+        QueuedDraft::Queued(id)
+    };
+    tx.commit()?;
+    Ok(queued)
 }
 
 fn is_draft_in(conn: &Connection, id: i64) -> Result<bool> {

@@ -33,7 +33,8 @@ pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use changes::{Changes, Mark};
 pub use contacts::Contact;
 pub use drafts::{
-    DraftCopy, DraftFile, DraftRemoval, DraftSave, DraftUpload, QueuedDraft, SavedFile,
+    DraftCopy, DraftFile, DraftRemoval, DraftReservation, DraftSave, DraftSend, DraftUpload,
+    QueuedDraft, SavedFile,
 };
 pub use gatekeeper::{
     Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
@@ -829,6 +830,7 @@ impl Store {
         }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
         conn.execute_batch(&changes::WATCH_MESSAGES)?;
+        conn.execute_batch(drafts::WATCH_SENDS)?;
         Ok(Self {
             conn,
             people: RefCell::default(),

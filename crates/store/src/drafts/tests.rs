@@ -471,6 +471,14 @@ fn drafts_being_sent_are_hidden_and_not_uploaded() {
     assert!(store.messages().unwrap().is_empty());
 }
 
+/// Reserves draft `id` for a send.
+fn reserve(store: &Store, id: i64) -> DraftReservation {
+    match store.reserve_draft_send(id).unwrap() {
+        DraftSend::Reserved(reserved) => reserved,
+        other => panic!("not reserved: {other:?}"),
+    }
+}
+
 #[test]
 fn a_draft_queues_once_and_never_after_its_gone() {
     let (mut store, account_id, _) = store_with_drafts();
@@ -482,8 +490,11 @@ fn a_draft_queues_once_and_never_after_its_gone() {
     let files = std::slice::from_ref(&file);
     let queued = |store: &mut Store| store.claim_due_sends(account_id, i64::MAX).unwrap();
     let id = save(&mut store, account_id, None, "v1", 1_000);
+    let reserved = reserve(&store, id);
+    // Another send while this one reads its files.
+    assert_eq!(store.reserve_draft_send(id), Ok(DraftSend::Held));
     let QueuedDraft::Queued(outbox) = store
-        .queue_draft_send(id, account_id, "{}", 9_000, files)
+        .queue_draft_send(reserved, account_id, "{}", 9_000, files)
         .unwrap()
     else {
         panic!("not queued");
@@ -491,34 +502,126 @@ fn a_draft_queues_once_and_never_after_its_gone() {
     assert!(store.draft_held(id).unwrap());
     assert!(store.messages().unwrap().is_empty());
     assert_eq!(store.outbox_files(outbox).unwrap(), files);
-    assert_eq!(
-        store.queue_draft_send(id, account_id, "{}", 9_000, files),
-        Ok(QueuedDraft::Held)
-    );
+    assert_eq!(store.reserve_draft_send(id), Ok(DraftSend::Held));
     assert_eq!(queued(&mut store).len(), 1);
 
     // Sent, as `send_due` finishes it: the draft goes, then the send. One
     // queued from it meanwhile would send it again.
     assert!(store.discard_draft(id).unwrap());
-    assert_eq!(
-        store.queue_draft_send(id, account_id, "{}", 0, files),
-        Ok(QueuedDraft::Gone)
-    );
+    assert_eq!(store.reserve_draft_send(id), Ok(DraftSend::Gone));
     store.finish_send(outbox).unwrap();
-    assert_eq!(
-        store.queue_draft_send(id, account_id, "{}", 0, files),
-        Ok(QueuedDraft::Gone)
-    );
+    assert_eq!(store.reserve_draft_send(id), Ok(DraftSend::Gone));
     assert!(queued(&mut store).is_empty());
 
     // Discarded: nothing to send.
     let id = save(&mut store, account_id, None, "v2", 2_000);
     assert!(store.discard_draft(id).unwrap());
+    assert_eq!(store.reserve_draft_send(id), Ok(DraftSend::Gone));
+    assert!(queued(&mut store).is_empty());
+}
+
+#[test]
+fn a_reserved_draft_stays_until_its_send_is_queued_or_given_up() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let id = save(&mut store, account_id, None, "v1", 1_000);
+    let reserved = reserve(&store, id);
+    assert!(store.draft_reserved(id).unwrap());
+    // Saves still go: the send carries its own copy.
+    assert_eq!(save(&mut store, account_id, Some(id), "v2", 2_000), id);
+    assert!(store.draft_reserved(id).unwrap());
+
+    // Given up (a file couldn't be read): it can be sent again.
+    store.release_draft_send(reserved).unwrap();
+    assert!(!store.draft_reserved(id).unwrap());
+    let reserved = reserve(&store, id);
+    // A queue that fails gives it up too: here, for an account that's gone.
+    assert!(
+        store
+            .queue_draft_send(reserved, account_id + 1, "{}", 0, &[])
+            .is_err()
+    );
+    assert!(!store.draft_reserved(id).unwrap());
+    assert!(
+        store
+            .claim_due_sends(account_id, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Discarded here meanwhile: the send queues nothing.
+    let reserved = reserve(&store, id);
+    assert!(store.discard_draft(id).unwrap());
+    assert!(!store.draft_reserved(id).unwrap());
     assert_eq!(
-        store.queue_draft_send(id, account_id, "{}", 0, files),
+        store.queue_draft_send(reserved, account_id, "{}", 0, &[]),
         Ok(QueuedDraft::Gone)
     );
-    assert!(queued(&mut store).is_empty());
+    assert!(
+        store
+            .claim_due_sends(account_id, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_reservation_ends_with_its_drafts_row() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let id = save(&mut store, account_id, None, "v1", 1_000);
+    let stale = reserve(&store, id);
+    // While the send reads its files, the draft is deleted on the server and
+    // the next sync forgets it; a new draft gets its id.
+    assert_eq!(store.remove_messages(&[id]).unwrap(), 1);
+    assert_eq!(save(&mut store, account_id, None, "v2", 2_000), id);
+    let fresh = reserve(&store, id);
+    // The old send doesn't take the new draft.
+    assert_eq!(
+        store.queue_draft_send(stale, account_id, "{}", 0, &[]),
+        Ok(QueuedDraft::Gone)
+    );
+    assert!(!store.draft_held(id).unwrap());
+    assert!(
+        store
+            .claim_due_sends(account_id, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    // Its own send does.
+    assert!(matches!(
+        store.queue_draft_send(fresh, account_id, "{}", 0, &[]),
+        Ok(QueuedDraft::Queued(_))
+    ));
+    assert!(store.draft_held(id).unwrap());
+}
+
+#[test]
+fn a_draft_uploaded_before_its_account_had_a_drafts_folder_can_be_sent() {
+    // A Microsoft 365 account whose first folder listing failed.
+    let mut store = Store::open_in_memory().unwrap();
+    let account = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: "me@contoso.com",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap();
+    let id = save(&mut store, account.id, None, "v1", 1_000);
+    let upload = upload_of(&store, account.id);
+    let copy = DraftCopy {
+        remote_id: Some("AAMkADraft1".into()),
+        ..Default::default()
+    };
+    store.draft_uploaded(&upload, &copy, &[]).unwrap();
+    // In no Drafts folder, and not waiting to upload.
+    assert!(!store.is_draft(id).unwrap());
+    let reserved = reserve(&store, id);
+    assert!(matches!(
+        store.queue_draft_send(reserved, account.id, "{}", 0, &[]),
+        Ok(QueuedDraft::Queued(_))
+    ));
+    assert!(store.draft_held(id).unwrap());
 }
 
 #[test]
