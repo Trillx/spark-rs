@@ -558,12 +558,19 @@ export function onFileDrag(handler: (e: FileDrag) => void): () => void {
   return () => void stop.then((unlisten) => unlisten());
 }
 
-/** Opens a conversation in a window of its own, or brings its window forward. */
-export function openThreadWindow(id: number, title: string): Promise<void> {
-  if (isTauri()) return invoke("open_thread_window", { id, title });
-  window.open(`${window.location.pathname}?thread=${id}`, `thread-${id}`, "width=880,height=780");
+/**
+ * Opens a conversation in a window of its own, or brings its window forward; with `then`, a
+ * summary style, the window summarizes it too.
+ */
+export function openThreadWindow(id: number, title: string, then?: string): Promise<void> {
+  if (isTauri()) return invoke("open_thread_window", { id, title, then: then ?? null });
+  const asked = then ? `&then=${encodeURIComponent(then)}` : "";
+  window.open(`${window.location.pathname}?thread=${id}${asked}`, `thread-${id}`, "width=880,height=780");
   return Promise.resolve();
 }
+
+/** For a conversation's own window, already open: it's asked to summarize, in that style. */
+export const onThreadThen = (handler: (style: string) => void) => on("thread-then", handler);
 
 /** A command that changes mail: once it has, the app's other windows read the changes too. */
 function mutate<T>(command: string, args: Record<string, unknown>): Promise<T> {

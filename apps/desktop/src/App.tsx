@@ -108,6 +108,7 @@ import {
   openThreadWindow,
   closeWindow,
   onSearchInMain,
+  onThreadThen,
   onWindowClose,
   searchInMain,
   openDraft,
@@ -283,7 +284,7 @@ import {
   type ActionId,
 } from "./lib/shortcuts";
 import { setLinkHandlers } from "./lib/links";
-import { THREAD_WINDOW, loadPopOut, savePopOut } from "./lib/threadWindow";
+import { THREAD_THEN, THREAD_WINDOW, loadPopOut, savePopOut, summaryStyle } from "./lib/threadWindow";
 import { messageMarkdown, type MarkdownHeader } from "./lib/markdown";
 import { printEmails } from "./lib/print";
 import { parseMailto } from "./lib/mailto";
@@ -871,7 +872,12 @@ export default function App() {
           const own = loaded.find((x) => x.id === THREAD_WINDOW);
           threadOpened.current = own !== undefined;
           setThreadLoaded(true);
-          if (own) openThread(own.id, loaded);
+          if (own) {
+            openThread(own.id, loaded);
+            // Opened to summarize it, too.
+            const style = summaryStyle(THREAD_THEN);
+            if (style) summarize(own, style);
+          }
         } else if (first !== undefined && twoColumns && !home) {
           openThread(first, loaded);
         }
@@ -894,6 +900,7 @@ export default function App() {
     openSettings,
     otherWindowEdited,
     searchFromWindow,
+    summarizeOpen,
   });
   events.current = {
     reloadMessages,
@@ -908,6 +915,7 @@ export default function App() {
     openSettings,
     otherWindowEdited,
     searchFromWindow,
+    summarizeOpen,
   };
   useEffect(() => {
     const stops = [
@@ -920,6 +928,8 @@ export default function App() {
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
       onMailEdited(() => events.current.otherWindowEdited()),
+      // A conversation's own window, asked to summarize it.
+      ...(THREAD_WINDOW !== null ? [onThreadThen((style) => events.current.summarizeOpen(style))] : []),
       // What clicks on notifications and the meeting pop-up ask for is the main window's.
       ...(THREAD_WINDOW === null
         ? [
@@ -1603,11 +1613,29 @@ export default function App() {
     else openThread(id, list);
   }
 
-  /** Spark's "Open Thread in a new Window": the conversation leaves the reader for a window of its own. */
-  function popOut(m: Message) {
-    void openThreadWindow(m.id, m.subject || "No subject").then(() => {
+  /**
+   * Spark's "Open Thread in a new Window": the conversation leaves the reader for a window of its
+   * own; with `then`, the window summarizes it in that style.
+   */
+  function popOut(m: Message, then?: SummaryStyle) {
+    void openThreadWindow(m.id, m.subject || "No subject", then).then(() => {
       if (openId === m.id) setOpenId(null);
     }, fileError);
+  }
+
+  /** Summarizes a conversation where it's read: its own window, if it opens in one, else the reader. */
+  function summarizeConversation(m: Message, style: SummaryStyle) {
+    if (openId !== m.id) {
+      if (alwaysPopOut && !twoColumns && THREAD_WINDOW === null && !isDraft(m, folders)) return popOut(m, style);
+      openThread(m.id);
+    }
+    summarize(m, style);
+  }
+
+  /** In a conversation's own window: summarize what it shows. */
+  function summarizeOpen(style: string) {
+    const s = summaryStyle(style);
+    if (s && openMessage) summarize(openMessage, s);
   }
 
   /** The cursor moved: split view shows the message there, but a draft only opens when asked. */
@@ -3289,8 +3317,7 @@ export default function App() {
       case "summarize":
       case "summarizeDetailed":
       case "summarizeActions":
-        if (openId !== m.id) openThread(m.id);
-        return summarize(m, SUMMARY_ACTIONS[action]);
+        return summarizeConversation(m, SUMMARY_ACTIONS[action]);
     }
   }
 
@@ -3636,10 +3663,7 @@ export default function App() {
             keywords: "ai summarize summary",
             Icon,
             shortcut: shortcutLabel(action),
-            run: () => {
-              if (openId !== m.id) openThread(m.id);
-              summarize(m, SUMMARY_ACTIONS[action]);
-            },
+            run: () => summarizeConversation(m, SUMMARY_ACTIONS[action]),
           })),
         ]
       : [];
