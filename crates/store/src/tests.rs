@@ -1562,6 +1562,34 @@ fn mail_stored_without_its_body_gets_it_once_and_keeps_the_users_changes() {
 }
 
 #[test]
+fn microsoft_inbox_mail_is_counted_by_when_it_came() {
+    let (mut store, account) = store_with_account();
+    for uid in 1..=3 {
+        let graph = Incoming {
+            mailbox: None,
+            uid: None,
+            remote_id: Some(format!("AAMk-{uid}")),
+            ..incoming(account, uid, "a@x.com")
+        };
+        store.add_incoming(&graph, false).unwrap();
+    }
+    // Not IMAP mail, nor what's left the inbox.
+    store
+        .add_incoming(&incoming(account, 4, "a@x.com"), false)
+        .unwrap();
+    store.observe_gone_remote(account, "AAMk-1").unwrap();
+    // Dated 1,001 to 1,004 (`incoming`).
+    assert_eq!(store.inbox_count(account, i64::MIN, 1_003).unwrap(), 1);
+    assert_eq!(store.inbox_count(account, i64::MIN, i64::MAX).unwrap(), 2);
+    assert_eq!(
+        store.inbox_count(account + 1, i64::MIN, i64::MAX).unwrap(),
+        0
+    );
+    let ids = store.inbox_remote_ids(account, i64::MIN, i64::MAX).unwrap();
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
 fn a_body_downloaded_late_fills_in_no_other_email_given_its_id() {
     // IMAP: the newest message, stored without its body, is opened, and
     // deleted for good while its body downloads. The background download

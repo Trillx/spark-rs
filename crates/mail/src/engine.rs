@@ -241,8 +241,13 @@ const BACKFILL_STEP_TIME: Duration = Duration::from_secs(45);
 
 /// How often a pass goes over the Microsoft inbox mail stored from before
 /// the delta query's window (`graph::Graph::reconcile_inbox`), besides once
-/// after the app starts.
+/// after the app starts: every hour for up to `RECONCILE_STEP` messages,
+/// and an hour longer for each `RECONCILE_STEP` more, up to
+/// `RECONCILE_LONGEST` (`reconcile_every`). A pass takes a request per
+/// 1,000 of them, so it's about 240 a day up to 60,000.
 const RECONCILE_EVERY: Duration = Duration::from_secs(60 * 60);
+const RECONCILE_STEP: usize = 10_000;
+const RECONCILE_LONGEST: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// When an account's next background download step may start (`Engine::backfill`).
 #[derive(Default)]
@@ -251,8 +256,9 @@ struct Pace {
     /// Steps that failed in a row.
     failures: u32,
     /// When the account's last pass over older inbox mail ended
-    /// (`graph::Graph::reconcile_inbox`): none since the app started.
-    reconciled: Option<Instant>,
+    /// (`graph::Graph::reconcile_inbox`), and how long after it the next is
+    /// due (`reconcile_every`): none since the app started.
+    reconciled: Option<(Instant, Duration)>,
     /// What the account's rounds have tried to push (`Engine::work_waits`).
     tried: Tried,
 }
@@ -274,8 +280,17 @@ impl Pace {
     /// Whether a new pass over older inbox mail is due.
     fn reconcile_due(&self) -> bool {
         self.reconciled
-            .is_none_or(|ended| ended.elapsed() >= RECONCILE_EVERY)
+            .is_none_or(|(ended, every)| ended.elapsed() >= every)
     }
+}
+
+/// How long after a pass over `older` messages the next is due
+/// (`RECONCILE_EVERY`).
+fn reconcile_every(older: usize) -> Duration {
+    let hours = older.div_ceil(RECONCILE_STEP).max(1);
+    RECONCILE_EVERY
+        .saturating_mul(u32::try_from(hours).unwrap_or(u32::MAX))
+        .min(RECONCILE_LONGEST)
 }
 
 pub struct Engine {
@@ -815,8 +830,8 @@ impl Engine {
     /// Whether the account's background download has anything left to do:
     /// its first sync is done, and its inbox isn't covered back to
     /// `BACKFILL_DAYS` yet nor complete, or (Microsoft) a pass over the
-    /// older mail it has is under way or due: every `RECONCILE_EVERY`, and
-    /// once after the app starts.
+    /// older mail it has is under way or due: once after the app starts,
+    /// then every hour or more, the more of it there is (`reconcile_every`).
     pub fn backfill_left(&self, account_id: i64) -> bool {
         let reconcile = self
             .paces_lock()
@@ -911,8 +926,8 @@ impl Engine {
         let wait = match &stepped {
             Ok((_, ended)) => {
                 pace.failures = 0;
-                if *ended {
-                    pace.reconciled = Some(Instant::now());
+                if let Some(older) = *ended {
+                    pace.reconciled = Some((Instant::now(), reconcile_every(older)));
                 }
                 BACKFILL_PAUSE
             }
@@ -927,9 +942,13 @@ impl Engine {
         Ok(stepped?.0)
     }
 
-    /// `backfill`'s step: what it did, and whether a pass over older mail
-    /// ended. `reconcile`: a new pass may start.
-    async fn backfill_step(&self, account_id: i64, reconcile: bool) -> Result<(Report, bool)> {
+    /// `backfill`'s step: what it did, and if a pass over older mail ended,
+    /// how many messages it goes over. `reconcile`: a new pass may start.
+    async fn backfill_step(
+        &self,
+        account_id: i64,
+        reconcile: bool,
+    ) -> Result<(Report, Option<usize>)> {
         let account = self.account(account_id)?;
         let since = backfill_since(now_ms());
         match config(&account)? {
@@ -954,7 +973,7 @@ impl Engine {
                     older: older?,
                     ..Default::default()
                 };
-                Ok((report, false))
+                Ok((report, None))
             }
             AccountConfig::Microsoft {
                 client_id, tenant, ..
@@ -978,7 +997,7 @@ impl Engine {
                         older: older?,
                         ..Default::default()
                     };
-                    return Ok((report, false));
+                    return Ok((report, None));
                 }
                 let reconciled = graph
                     .reconcile_inbox(&self.store, account_id, &mut state)
@@ -989,7 +1008,14 @@ impl Engine {
                     reconciled: reconciled.changed,
                     ..Default::default()
                 };
-                Ok((report, reconciled.done))
+                let older = match (reconciled.done, state.since) {
+                    (true, Some(since)) => {
+                        Some(self.store().inbox_count(account_id, i64::MIN, since)?)
+                    }
+                    (true, None) => Some(0),
+                    (false, _) => None,
+                };
+                Ok((report, older))
             }
         }
     }
@@ -4819,6 +4845,19 @@ mod tests {
         delivery.abort();
     }
 
+    #[test]
+    fn a_pass_over_more_older_mail_comes_less_often() {
+        let hours = |older| reconcile_every(older).as_secs() / 3600;
+        assert_eq!(hours(0), 1);
+        assert_eq!(hours(10_000), 1);
+        assert_eq!(hours(10_001), 2);
+        assert_eq!(hours(25_000), 3);
+        assert_eq!(hours(50_000), 5);
+        assert_eq!(hours(50_001), 6);
+        assert_eq!(hours(1_000_000), 6);
+        assert_eq!(hours(usize::MAX), 6);
+    }
+
     #[tokio::test]
     async fn older_microsoft_mail_is_gone_over_after_start_and_hourly() {
         fn empty(_: &str) -> Option<serde_json::Value> {
@@ -4852,7 +4891,8 @@ mod tests {
         unpaused();
         assert!(!engine.backfill_due(account_id), "the pass is over");
 
-        // A pass under way goes on; a new one starts every hour.
+        // A pass under way goes on; a new one starts every hour, with
+        // nothing older stored.
         synced(Some(graph::Reconcile {
             before: now - 100 * 86_400_000,
             until: now - 400 * 86_400_000,
@@ -4860,8 +4900,10 @@ mod tests {
         assert!(engine.backfill_due(account_id));
         synced(None);
         assert!(!engine.backfill_due(account_id));
+        let reconciled = engine.paces_lock()[&account_id].reconciled;
+        assert_eq!(reconciled.map(|(_, every)| every), Some(RECONCILE_EVERY));
         engine.paces_lock().get_mut(&account_id).unwrap().reconciled =
-            Some(Instant::now() - RECONCILE_EVERY);
+            Some((Instant::now() - RECONCILE_EVERY, RECONCILE_EVERY));
         assert!(engine.backfill_due(account_id));
 
         // Not while Microsoft asks the account to wait.

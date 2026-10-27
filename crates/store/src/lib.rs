@@ -1133,6 +1133,19 @@ impl Store {
         inbox_remote_ids_in(&self.conn, account_id, from, to)
     }
 
+    /// How many `inbox_remote_ids` there are.
+    pub fn inbox_count(&self, account_id: i64, from: i64, to: i64) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM messages
+                 WHERE date >= ?2 AND date < ?3 AND account_id = ?1 AND remote_place = 'inbox'
+                   AND remote_id IS NOT NULL",
+            )?
+            .query_row(params![account_id, from, to], |r| r.get(0))?;
+        Ok(usize::try_from(count).unwrap_or_default())
+    }
+
     /// Whether message `id` is stored without its body (`Body::Missing`).
     pub fn body_missing(&self, id: i64) -> Result<bool> {
         body_missing_in(&self.conn, id)
