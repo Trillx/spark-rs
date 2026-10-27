@@ -87,7 +87,14 @@ interface Source {
   refresh: (start: number, end: number) => Promise<void>;
   answer: (id: number, answer: InviteAnswer) => Promise<void>;
   /** Makes or changes an event, then reads [start, end) of its calendar again. */
-  save: (id: number | null, draft: EventDraft, scope: EventScope, start: number, end: number) => Promise<void>;
+  save: (
+    id: number | null,
+    draft: EventDraft,
+    before: EventDraft | null,
+    scope: EventScope,
+    start: number,
+    end: number,
+  ) => Promise<void>;
   remove: (id: number, scope: EventScope, start: number, end: number) => Promise<void>;
 }
 
@@ -104,7 +111,7 @@ const DEMO: Source = {
   events: (start, end) => Promise.resolve(demoListEvents(start, end)),
   refresh: () => Promise.resolve(),
   answer: demoAnswer,
-  save: (id, draft, scope) => demoSaveEvent(id, draft, scope),
+  save: (id, draft, _before, scope) => demoSaveEvent(id, draft, scope),
   remove: (id, scope) => demoDeleteEvent(id, scope),
 };
 
@@ -449,7 +456,7 @@ export default function CalendarScreen({
     setFailed(null);
     setEvents((all) => all.map((x) => (x.id === e.id ? { ...x, start: to.start, end, allDay: to.allDay } : x)));
     try {
-      if (!(await saveDraft(e, draft))) await load();
+      if (!(await saveDraft(e, draft, draftOf(e)))) await load();
     } catch (error) {
       setFailed(`Couldn't move "${e.title || "No Title"}": ${String(error)}`);
       await load();
@@ -552,7 +559,8 @@ export default function CalendarScreen({
   };
 
   /** Saves the editor's draft; a repeating event asks which occurrences first. False to go on editing. */
-  const saveDraft = async (event: CalendarEvent | undefined, draft: EventDraft) => {
+  /** `before` is the event as the editor opened it: only what changed from it is saved. */
+  const saveDraft = async (event: CalendarEvent | undefined, draft: EventDraft, before: EventDraft | null) => {
     let scope: EventScope = "one";
     if (event?.repeats) {
       const choice = await ask({
@@ -567,7 +575,7 @@ export default function CalendarScreen({
       if (choice !== "one" && choice !== "all") return false;
       scope = choice;
     }
-    await source.save(event?.id ?? null, draft, scope, start - DAY_MS, end + DAY_MS);
+    await source.save(event?.id ?? null, draft, before, scope, start - DAY_MS, end + DAY_MS);
     await load();
     return true;
   };
@@ -796,7 +804,7 @@ export default function CalendarScreen({
           modal={editor.modal}
           defaults={editor.defaults}
           unsaved={editor.unsaved}
-          onSave={(draft) => saveDraft(editor.event, draft)}
+          onSave={(draft) => saveDraft(editor.event, draft, editor.event ? editor.initial : null)}
           onClose={() => setEditor(null)}
         />
       )}

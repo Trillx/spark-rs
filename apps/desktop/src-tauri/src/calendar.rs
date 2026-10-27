@@ -157,14 +157,16 @@ pub async fn answer_event(
 }
 
 /// Makes an event (no `id`), or changes the user's stored event `id`
-/// (`scope`: that occurrence or the whole series), then reads its account's
-/// calendar for [start, end) (what the screen shows) again. Resolves once
-/// the server has it; Outlook mails the people invited.
+/// (`scope`: that occurrence or the whole series; `before`: as the editor
+/// opened it, so only what the user changed is sent), then reads its
+/// account's calendar for [start, end) (what the screen shows) again.
+/// Resolves once the server has it; Outlook mails the people invited.
 #[tauri::command]
 pub async fn save_event(
     mailbox: State<'_, Mailbox>,
     id: Option<i64>,
     draft: EventDraft,
+    before: Option<EventDraft>,
     scope: Option<Scope>,
     start: i64,
     end: i64,
@@ -191,7 +193,7 @@ pub async fn save_event(
     };
     match id {
         Some(id) => engine
-            .update_event(id, &draft, scope.unwrap_or_default(), zone)
+            .update_event(id, &draft, before.as_ref(), scope.unwrap_or_default(), zone)
             .await
             .map_err(text)?,
         None => engine.create_event(&draft, zone).await.map_err(text)?,

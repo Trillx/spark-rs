@@ -1469,19 +1469,24 @@ impl Engine {
 
     /// Changes the user's stored event `event_id` to say what `draft` says:
     /// that occurrence, or with `Scope::All` every occurrence of its series,
-    /// which move by as much as this one did. Outlook sends the people
-    /// invited the update.
+    /// which move by as much as this one did. Only what changed from
+    /// `before`, the event as the editor opened it (else as stored), is
+    /// sent, so what changed in Outlook meanwhile stays. Outlook sends the
+    /// people invited the update.
     pub async fn update_event(
         &self,
         event_id: i64,
         draft: &EventDraft,
+        before: Option<&EventDraft>,
         scope: Scope,
         zone: Zone<'_>,
     ) -> Result<()> {
         let (target, event, graph) = self.event_target(event_id, scope).await?;
         let details = graph.event_details(&target).await?;
         let series = scope == Scope::All && event.series.as_deref() == Some(target.as_str());
-        let body = calendar::changed_event_body(draft, &event, &details, zone, series);
+        let stored = EventDraft::of(&event, draft.calendar);
+        let before = before.unwrap_or(&stored);
+        let body = calendar::changed_event_body(draft, before, &details, zone, series);
         if body.as_object().is_some_and(|b| b.is_empty()) {
             return Ok(());
         }

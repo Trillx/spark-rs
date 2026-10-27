@@ -275,11 +275,18 @@ export function answerEvent(id: number, answer: InviteAnswer): Promise<void> {
 
 /**
  * Makes an event (`id` null) or changes the user's event `id` (`scope`: that occurrence or the whole
- * series), then reads its calendar for [start, end) again. Resolves once the server has it; Outlook
- * mails the people invited.
+ * series; `before`: as the editor opened it, so only what the user changed is sent), then reads its
+ * calendar for [start, end) again. Resolves once the server has it; Outlook mails the people invited.
  */
-export function saveEvent(id: number | null, draft: EventDraft, scope: EventScope, start: number, end: number): Promise<void> {
-  if (isTauri()) return invoke("save_event", { id, draft, scope, start, end });
+export function saveEvent(
+  id: number | null,
+  draft: EventDraft,
+  before: EventDraft | null,
+  scope: EventScope,
+  start: number,
+  end: number,
+): Promise<void> {
+  if (isTauri()) return invoke("save_event", { id, draft, before, scope, start, end });
   return Promise.resolve();
 }
 

@@ -243,6 +243,25 @@ pub struct EventDraft {
     pub teams: bool,
 }
 
+impl EventDraft {
+    /// Stored event `e` as the editor would open it, in calendar `calendar`.
+    pub fn of(e: &Event, calendar: i64) -> Self {
+        Self {
+            calendar,
+            title: e.title.clone(),
+            start: e.start,
+            end: e.end,
+            all_day: e.all_day,
+            location: e.location.clone().unwrap_or_default(),
+            notes: e.notes.clone().unwrap_or_default(),
+            attendees: e.attendees.clone(),
+            reminder: e.reminder,
+            show_as: e.show_as,
+            teams: e.online_meeting,
+        }
+    }
+}
+
 /// The Graph fields of a new event saying what `draft` says.
 pub fn new_event_body(draft: &EventDraft, zone: Zone) -> serde_json::Value {
     let mut body = serde_json::Map::new();
@@ -275,22 +294,24 @@ pub fn new_event_body(draft: &EventDraft, zone: Zone) -> serde_json::Value {
     body.into()
 }
 
-/// The Graph fields to change for event `before` to say what `draft` says:
-/// only those that differ, so the rest stays as Outlook has it. `details`
-/// are the event's as Graph has them now (`Graph::event_details`): its
-/// rooms, and the Teams meeting Outlook put after its notes, stay. With
-/// `shift`, `details`' times (the series' first occurrence, for every
-/// occurrence) move by as much as the draft's moved from `before`'s, start
-/// and end each.
+/// The Graph fields to change for an event the editor opened as `before`
+/// to say what `draft` says: only what the user changed, so the rest stays
+/// as Outlook has it now, even if it changed meanwhile. `details` are the
+/// event's as Graph has them now (`Graph::event_details`): the people
+/// invited there, rooms and each one's required or optional, have the
+/// user's additions and removals applied, and the Teams meeting Outlook put
+/// after its notes stays. With `shift`, `details`' times (the series' first
+/// occurrence, for every occurrence) move by as much as the draft's moved
+/// from `before`'s, start and end each.
 pub fn changed_event_body(
     draft: &EventDraft,
-    before: &Event,
+    before: &EventDraft,
     details: &EventDetails,
     zone: Zone,
     shift: bool,
 ) -> serde_json::Value {
     let mut body = serde_json::Map::new();
-    if draft.title.trim() != before.title {
+    if draft.title.trim() != before.title.trim() {
         body.insert("subject".into(), json!(draft.title.trim()));
     }
     if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
@@ -316,13 +337,13 @@ pub fn changed_event_body(
         body.insert("end".into(), moved(details.end, before.end, draft.end));
         body.insert("isAllDay".into(), json!(draft.all_day));
     }
-    if draft.location.trim() != before.location.as_deref().unwrap_or_default() {
+    if draft.location.trim() != before.location.trim() {
         body.insert(
             "location".into(),
             json!({ "displayName": draft.location.trim() }),
         );
     }
-    if draft.notes.trim() != before.notes.as_deref().unwrap_or_default() {
+    if draft.notes.trim() != before.notes.trim() {
         // A Teams meeting's joining details stay as Outlook wrote them:
         // without them, Outlook turns the meeting off.
         let content = match with_notes(&details.body, draft.notes.trim()) {
@@ -335,7 +356,8 @@ pub fn changed_event_body(
     let wanted: Vec<String> = draft.attendees.iter().map(key).collect();
     let had: Vec<String> = before.attendees.iter().map(key).collect();
     if wanted != had {
-        // Rooms, and the people kept, stay as they are (required or optional).
+        // Those the user took off go, those they added come; everyone else
+        // stays as they are now (rooms, required or optional).
         let address = |a: &serde_json::Value| {
             a["emailAddress"]["address"]
                 .as_str()
@@ -346,11 +368,15 @@ pub fn changed_event_body(
         let mut attendees: Vec<serde_json::Value> = details
             .attendees
             .iter()
-            .filter(|a| a["type"] == "resource" || wanted.contains(&address(a)))
+            .filter(|a| {
+                a["type"] == "resource"
+                    || !had.contains(&address(a))
+                    || wanted.contains(&address(a))
+            })
             .cloned()
             .collect();
         for p in &draft.attendees {
-            if !attendees.iter().any(|a| address(a) == key(p)) {
+            if !had.contains(&key(p)) && !attendees.iter().any(|a| address(a) == key(p)) {
                 attendees.push(attendee(p));
             }
         }
@@ -362,7 +388,7 @@ pub fn changed_event_body(
     if draft.show_as != before.show_as {
         body.insert("showAs".into(), json!(show_as(draft.show_as)));
     }
-    if draft.teams && !before.online_meeting {
+    if draft.teams && !before.teams {
         body.insert("isOnlineMeeting".into(), json!(true));
         body.insert("onlineMeetingProvider".into(), json!("teamsForBusiness"));
     }
@@ -1085,7 +1111,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            changed_event_body(&unchanged, &before, &details, PACIFIC, false),
+            changed_event_body(
+                &unchanged,
+                &EventDraft::of(&before, 0),
+                &details,
+                PACIFIC,
+                false
+            ),
             json!({})
         );
 
@@ -1101,7 +1133,13 @@ mod tests {
             reminder: None,
             ..unchanged.clone()
         };
-        let body = changed_event_body(&draft, &before, &details, PACIFIC, false);
+        let body = changed_event_body(
+            &draft,
+            &EventDraft::of(&before, 0),
+            &details,
+            PACIFIC,
+            false,
+        );
         let keys: Vec<&str> = body
             .as_object()
             .unwrap()
@@ -1156,7 +1194,7 @@ mod tests {
             body: "<html><body><p>Old</p></body></html>".into(),
             ..details.clone()
         };
-        let body = changed_event_body(&draft, &before, &plain, PACIFIC, false);
+        let body = changed_event_body(&draft, &EventDraft::of(&before, 0), &plain, PACIFIC, false);
         assert_eq!(
             body["body"],
             json!({ "contentType": "text", "content": "New agenda" })
@@ -1169,7 +1207,7 @@ mod tests {
             end: series_start + 900_000,
             ..details.clone()
         };
-        let body = changed_event_body(&draft, &before, &series, PACIFIC, true);
+        let body = changed_event_body(&draft, &EventDraft::of(&before, 0), &series, PACIFIC, true);
         assert_eq!(
             body["start"]["dateTime"],
             pacific(series_start + 3_600_000).as_str()
@@ -1185,10 +1223,73 @@ mod tests {
             end: series_start + 3_600_000,
             ..series.clone()
         };
-        let body = changed_event_body(&draft, &before, &long_series, PACIFIC, true);
+        let body = changed_event_body(
+            &draft,
+            &EventDraft::of(&before, 0),
+            &long_series,
+            PACIFIC,
+            true,
+        );
         assert_eq!(
             body["end"]["dateTime"],
             pacific(series_start + 7_200_000).as_str()
+        );
+    }
+
+    #[test]
+    fn changes_made_in_outlook_meanwhile_stay() {
+        // The editor opened with Sam and Kai; Kai was taken off in Outlook
+        // since, and a room added. The user adds Alex and renames it.
+        let start = parse_iso_date("2026-10-27T16:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Sync".into(),
+            start,
+            end: start + 1_800_000,
+            location: "Room 1".into(),
+            attendees: vec![
+                person("Sam", "sam@contoso.com"),
+                person("Kai", "kai@contoso.com"),
+            ],
+            ..Default::default()
+        };
+        let details = EventDetails {
+            start,
+            end: start + 1_800_000,
+            attendees: vec![
+                json!({ "type": "required", "emailAddress": { "address": "sam@contoso.com" } }),
+                json!({ "type": "resource", "emailAddress": { "address": "room4@contoso.com" } }),
+            ],
+            ..Default::default()
+        };
+        let renamed = EventDraft {
+            title: "Weekly sync".into(),
+            ..before.clone()
+        };
+        let body = changed_event_body(&renamed, &before, &details, PACIFIC, false);
+        assert_eq!(
+            body,
+            json!({ "subject": "Weekly sync" }),
+            "nothing else is sent back"
+        );
+        let more = EventDraft {
+            attendees: vec![
+                person("Sam", "sam@contoso.com"),
+                person("Kai", "kai@contoso.com"),
+                person("Alex", "alex@contoso.com"),
+            ],
+            ..before.clone()
+        };
+        let body = changed_event_body(&more, &before, &details, PACIFIC, false);
+        let invited: Vec<&str> = body["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["emailAddress"]["address"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            invited,
+            ["sam@contoso.com", "room4@contoso.com", "alex@contoso.com"],
+            "Kai stays off"
         );
     }
 
@@ -1255,7 +1356,7 @@ mod tests {
             end: to + 3_600_000,
             ..Default::default()
         };
-        let body = changed_event_body(&draft, &before, &details, EASTERN, true);
+        let body = changed_event_body(&draft, &EventDraft::of(&before, 0), &details, EASTERN, true);
         assert_eq!(
             body["start"],
             json!({ "dateTime": "2026-09-28T09:00:00", "timeZone": "Eastern Standard Time" })

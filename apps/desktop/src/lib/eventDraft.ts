@@ -112,9 +112,10 @@ export function withStart(d: EventDraft, start: number): EventDraft {
  */
 export function withEnd(d: EventDraft, end: number): EventDraft {
   if (d.allDay) return { ...d, end: Math.max(end, d.start + DAY) };
-  let next = end;
-  while (next <= d.start) next += DAY;
-  return { ...d, end: next };
+  // A day later on the clock, across a DST change too.
+  const next = new Date(end);
+  while (next.getTime() <= d.start) next.setDate(next.getDate() + 1);
+  return { ...d, end: next.getTime() };
 }
 
 /**

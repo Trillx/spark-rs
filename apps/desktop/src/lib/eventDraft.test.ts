@@ -298,3 +298,19 @@ test("an all-day event's new first day keeps its length across a DST change", as
     else process.env.TZ = zone;
   }
 });
+
+test("an end after midnight is the next day on the clock, across a DST change too", () => {
+  const zone = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    // March 8, 2026 starts summer time at 2:00.
+    const day = new Date(2026, 2, 7).getTime();
+    const d = newDraft(1, atMinutes(day, 21 * 60), false, defaults);
+    const end = withEnd(d, atMinutes(day, 3 * 60)).end;
+    assert.equal(new Date(end).getDate(), 8);
+    assert.equal(new Date(end).getHours(), 3);
+  } finally {
+    if (zone === undefined) delete process.env.TZ;
+    else process.env.TZ = zone;
+  }
+});

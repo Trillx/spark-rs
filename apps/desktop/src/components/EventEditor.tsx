@@ -114,12 +114,16 @@ export default function EventEditor({
 
   useEffect(() => {
     const asked = () => document.querySelector("[aria-modal]") !== null;
-    const onPointer = (e: PointerEvent) => {
-      if (asked() || ref.current?.contains(e.target as Node)) return;
-      // A time still being typed counts: it's taken in first, then the change is looked at.
+    // What's still being typed (a time, someone to invite) counts: it's taken in first, then
+    // whether anything changed is looked at.
+    const closeSoon = () => {
       const typing = document.activeElement;
       if (typing instanceof HTMLElement && ref.current?.contains(typing)) typing.blur();
       window.setTimeout(() => latestClose.current());
+    };
+    const onPointer = (e: PointerEvent) => {
+      if (asked() || ref.current?.contains(e.target as Node)) return;
+      closeSoon();
     };
     // Capture, so Esc closes the editor and not the calendar; a list or picker open in it closes first.
     const onKey = (e: KeyboardEvent) => {
@@ -127,7 +131,7 @@ export default function EventEditor({
       if (ref.current?.querySelector("[role='listbox'], [role='dialog']")) return;
       e.stopPropagation();
       e.preventDefault();
-      latestClose.current();
+      closeSoon();
     };
     window.addEventListener("pointerdown", onPointer, true);
     window.addEventListener("keydown", onKey, true);
