@@ -83,10 +83,12 @@ pub fn snooze_returned(app: &AppHandle, engine: &Engine, ids: &[i64]) {
     if !prefs.snooze_alert || background::in_front(app) {
         return;
     }
+    // Not the ones that woke into Blocked: their sender was blocked meanwhile.
     let returned: Vec<Message> = {
         let store = engine.store();
         ids.iter()
             .filter_map(|&id| store.message(id).ok().flatten())
+            .filter(|m| m.state == MessageState::Inbox)
             .collect()
     };
     // One sound for all of them, as for new mail.

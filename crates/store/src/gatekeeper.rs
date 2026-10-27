@@ -347,6 +347,14 @@ impl Store {
     }
 }
 
+/// SQL: whether the decision about a `messages` row's sender (theirs, else
+/// their domain's) is to block them.
+pub(crate) const SENDER_BLOCKED: &str = "COALESCE(
+    (SELECT status FROM gatekeeper_senders g WHERE g.address = messages.from_address),
+    (SELECT status FROM gatekeeper_domains d
+     WHERE d.domain = substr(messages.from_address, instr(messages.from_address, '@') + 1))
+) = 'blocked'";
+
 fn mode(conn: &Connection) -> Result<GatekeeperMode> {
     let value: Option<String> = conn
         .query_row(
@@ -420,20 +428,19 @@ fn welcome(conn: &Connection, address: &str) -> Result<bool> {
     wrote_to(conn, address)
 }
 
-/// Whether the user has written to `address`: it's on mail from one of
-/// their addresses (Sent, or sent from here), drafts and mail still in the
-/// outbox aside.
+/// Whether the user has written to `address`: it's on mail of theirs in a
+/// Sent folder, or on mail sent from here. Other mail claiming to be from
+/// them proves nothing (anyone can write that From), and drafts weren't sent.
 fn wrote_to(conn: &Connection, address: &str) -> Result<bool> {
     let address = address.trim().to_lowercase();
     conn.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM sent_to WHERE lower(address) = ?1)
              OR EXISTS (
-                 SELECT 1 FROM messages m
-                 WHERE m.from_address IN (SELECT email FROM accounts)
-                   AND NOT EXISTS (SELECT 1 FROM folder_members fm JOIN folders f ON f.id = fm.folder_id
-                                   WHERE fm.message_id = m.id AND f.role = 'drafts')
-                   AND m.id NOT IN (SELECT message_id FROM draft_uploads)
-                   AND m.id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
+                 SELECT 1 FROM folders f
+                 JOIN folder_members fm ON fm.folder_id = f.id
+                 JOIN messages m ON m.id = fm.message_id
+                 WHERE f.role = 'sent'
+                   AND m.from_address IN (SELECT email FROM accounts)
                    AND EXISTS (
                        SELECT 1 FROM json_each(m.to_list) j
                        WHERE lower(j.value) = ?1 OR instr(lower(j.value), '<' || ?1 || '>') > 0
@@ -495,19 +502,26 @@ fn release(conn: &Connection, address: &str) -> Result<()> {
     Ok(())
 }
 
-/// A Sent folder sync found `m`: if the user sent it, the people it's to
-/// get through the Gatekeeper, as if the user had written to them here.
-pub(crate) fn sent(conn: &Connection, m: &Incoming) -> Result<()> {
-    let own: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM accounts WHERE email = ?1 COLLATE NOCASE)",
-        [&m.from_address],
-        |r| r.get(0),
-    )?;
-    if !own {
+/// A Sent folder sync found stored message `id`: if the user sent it, the
+/// people it's to get through the Gatekeeper, as if the user had written to
+/// them here. (Read from the store: a sync passes only the location of mail
+/// it has already.)
+pub(crate) fn sent(conn: &Connection, id: i64) -> Result<()> {
+    let recipients: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT to_list, cc_list, bcc_list FROM messages
+             WHERE id = ?1 AND from_address IN (SELECT email FROM accounts)",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((to, cc, bcc)) = recipients else {
         return Ok(());
-    }
-    for entry in m.to.iter().chain(&m.cc).chain(&m.bcc) {
-        release(conn, &crate::contacts::parse(entry).address)?;
+    };
+    for list in [to, cc, bcc] {
+        for entry in crate::from_json(&list) {
+            release(conn, &crate::contacts::parse(&entry).address)?;
+        }
     }
     Ok(())
 }

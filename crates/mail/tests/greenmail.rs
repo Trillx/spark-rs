@@ -1543,3 +1543,46 @@ async fn imap_sent_folders_of_every_account_let_senders_through() {
     assert!(report.changed());
     assert!(!find(&engine, "Re: Hello").screening);
 }
+
+#[tokio::test]
+async fn imap_accepted_mail_comes_back_from_a_renamed_blocked_folder() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("unrenamed{}@example.com", now_ms());
+    deliver(&smtp, "Spam <spam@z.net>", &me, "Offer", false).await;
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    engine.run(account.id, true).await.unwrap();
+    let decide = |decision| {
+        let change = Change {
+            screen: Screen::Sender("spam@z.net".into()),
+            decision: Some(decision),
+        };
+        engine.store().decide(&[change], now_ms() - 60_000).unwrap();
+    };
+    decide(Decision::Blocked);
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
+
+    // Another client renames Blocked; then the user accepts the sender here.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.rename("Blocked", "Old spam").await.unwrap();
+    decide(Decision::Accepted);
+    assert_eq!(engine.run(account.id, false).await.unwrap().pushed, 1);
+    assert_eq!(other.select("INBOX").await.unwrap().exists, 1);
+    assert_eq!(other.select("Old spam").await.unwrap().exists, 0);
+    assert!(
+        engine
+            .store()
+            .pending(account.id, now_ms() + 1, 0)
+            .unwrap()
+            .is_empty()
+    );
+}

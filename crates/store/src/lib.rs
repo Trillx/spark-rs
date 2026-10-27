@@ -1161,14 +1161,19 @@ impl Store {
     }
 
     /// Snoozed messages whose time has come go back to the inbox, unread,
-    /// at the top (`returned_at`). Returns their ids.
+    /// at the top (`returned_at`), or to Blocked if their sender was blocked
+    /// meanwhile. Returns their ids.
     pub fn wake_snoozed(&self, now: i64) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "UPDATE messages SET state = 'inbox', returned_at = snoozed_until, snoozed_until = NULL,
-                unread = 1, changed_at = CASE WHEN remote_unread = 1 THEN changed_at ELSE ?1 END
+        let blocked = gatekeeper::SENDER_BLOCKED;
+        let mut stmt = self.conn.prepare(&format!(
+            "UPDATE messages SET
+                state = CASE WHEN {blocked} THEN 'blocked' ELSE 'inbox' END,
+                returned_at = CASE WHEN {blocked} THEN NULL ELSE snoozed_until END,
+                snoozed_until = NULL, unread = 1,
+                changed_at = CASE WHEN remote_unread = 1 AND NOT {blocked} THEN changed_at ELSE ?1 END
              WHERE state = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1
-             RETURNING id",
-        )?;
+             RETURNING id"
+        ))?;
         stmt.query_map([now], |r| r.get(0))?.collect()
     }
 
@@ -1470,7 +1475,7 @@ impl Store {
         };
         add_member(&tx, folder_id, id, m.uid)?;
         if role.as_deref() == Some(FolderRole::Sent.as_str()) {
-            gatekeeper::sent(&tx, m)?;
+            gatekeeper::sent(&tx, id)?;
         }
         tx.commit()?;
         Ok(added)

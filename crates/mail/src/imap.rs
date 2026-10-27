@@ -1364,9 +1364,48 @@ async fn locate(
                 }
             }
         }
-        return Ok(None);
+        return out_of_blocked(session, state, p).await;
     };
-    search(session, &mailbox, p).await
+    match search(session, &mailbox, p).await? {
+        Some(found) => Ok(Some(found)),
+        None => out_of_blocked(session, state, p).await,
+    }
+}
+
+/// Mail the server had in the Blocked folder, which another client renamed
+/// or deleted since: by Message-ID in any other folder but Archive and
+/// Trash (where it would have gone some other way).
+async fn out_of_blocked(
+    session: &mut Session,
+    state: &SyncState,
+    p: &Pending,
+) -> Result<Option<(String, u32)>> {
+    if p.remote_place != Place::Blocked || p.message_id.is_none() {
+        return Ok(None);
+    }
+    let names: Vec<_> = session
+        .list(Some(""), Some("*"))
+        .await?
+        .try_collect()
+        .await?;
+    let skip = [
+        state.archive.as_deref(),
+        state.trash.as_deref(),
+        state.blocked.as_deref(),
+        p.mailbox.as_deref(),
+    ];
+    let mailboxes: Vec<String> = names
+        .iter()
+        .filter(|n| !n.attributes().contains(&NameAttribute::NoSelect))
+        .map(|n| n.name().to_owned())
+        .filter(|n| !skip.contains(&Some(n.as_str())))
+        .collect();
+    for mailbox in mailboxes {
+        if let Some(found) = search(session, &mailbox, p).await? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a stored UID belongs to the mailbox generation selected now.

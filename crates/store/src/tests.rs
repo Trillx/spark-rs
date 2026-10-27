@@ -673,14 +673,37 @@ fn colleagues_correspondents_and_big_companies_skip_the_gatekeeper() {
     assert!(screened(&mut store, 4, "someone@fabrikam.com"));
 
     // Someone the user wrote to from another client, found in Sent.
+    store
+        .replace_folders(
+            account,
+            &[RemoteFolder {
+                remote_id: "Sent Items".into(),
+                parent: None,
+                name: "Sent Items".into(),
+                role: Some(FolderRole::Sent),
+                selectable: true,
+            }],
+        )
+        .unwrap();
     let sent = Incoming {
         from_address: "me@contoso.com".into(),
         to: vec!["Dana <Dana@Fabrikam.com>".into()],
         ..in_folder(account, "Sent Items", 9, 9)
     };
-    store.add_incoming(&sent, false).unwrap();
+    store
+        .add_folder_message(folder_id(&store, "Sent Items"), &sent)
+        .unwrap();
     assert!(!screened(&mut store, 5, "dana@fabrikam.com"));
     assert!(screened(&mut store, 6, "dan@fabrikam.com"));
+
+    // Mail in the inbox that claims to be from the user proves nothing.
+    let forged = Incoming {
+        from_address: "me@contoso.com".into(),
+        to: vec!["stranger@vendor.org".into()],
+        ..incoming(account, 10, "me@contoso.com")
+    };
+    store.add_incoming(&forged, true).unwrap();
+    assert!(screened(&mut store, 11, "stranger@vendor.org"));
 }
 
 #[test]
@@ -2706,15 +2729,124 @@ fn writing_to_someone_from_any_account_lets_their_waiting_mail_through() {
         .unwrap();
     assert!(!store.message(waiting).unwrap().unwrap().screening);
 
-    // Someone accepted that way on arrival lets their mail elsewhere through too.
+    // Someone accepted that way on arrival lets their mail elsewhere through
+    // too: here someone written to from spark-rs, before they were accepted.
     let eve = arrive(&mut store, gmail, 3, "eve@fabrikam.org").id;
-    let to_eve = Incoming {
-        from_address: "me@gmail.com".into(),
-        to: vec!["eve@fabrikam.org".into()],
-        mailbox: Some("Sent Mail".into()),
-        ..incoming(gmail, 4, "me@gmail.com")
-    };
-    store.add_incoming(&to_eve, false).unwrap();
+    store
+        .record_sent(
+            &[Contact {
+                name: "Eve".into(),
+                address: "eve@fabrikam.org".into(),
+            }],
+            4,
+        )
+        .unwrap();
     assert!(!arrive(&mut store, other, 5, "eve@fabrikam.org").screening);
     assert!(!store.message(eve).unwrap().unwrap().screening);
+
+    // Sent mail already stored from another folder releases its recipients
+    // when the Sent sync finds it (a sync passes only its location then).
+    let fay = arrive(&mut store, gmail, 6, "fay@fabrikam.org").id;
+    store
+        .replace_folders(
+            gmail,
+            &[RemoteFolder {
+                remote_id: "[Gmail]/All Mail".into(),
+                parent: None,
+                name: "All Mail".into(),
+                role: Some(FolderRole::Archive),
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    let to_fay = Incoming {
+        from_address: "me@gmail.com".into(),
+        to: vec!["fay@fabrikam.org".into()],
+        ..in_folder(gmail, "[Gmail]/All Mail", 7, 7)
+    };
+    store
+        .add_folder_message(folder_id(&store, "[Gmail]/All Mail"), &to_fay)
+        .unwrap();
+    assert!(
+        store.message(fay).unwrap().unwrap().screening,
+        "All Mail isn't Sent"
+    );
+    store
+        .replace_folders(
+            gmail,
+            &[
+                RemoteFolder {
+                    remote_id: "[Gmail]/All Mail".into(),
+                    parent: None,
+                    name: "All Mail".into(),
+                    role: Some(FolderRole::Archive),
+                    selectable: true,
+                },
+                RemoteFolder {
+                    remote_id: "[Gmail]/Sent Mail".into(),
+                    parent: None,
+                    name: "Sent Mail".into(),
+                    role: Some(FolderRole::Sent),
+                    selectable: true,
+                },
+            ],
+        )
+        .unwrap();
+    let located = Incoming {
+        account_id: gmail,
+        mailbox: Some("[Gmail]/Sent Mail".into()),
+        uid: Some(8),
+        message_id: to_fay.message_id.clone(),
+        ..Default::default()
+    };
+    store
+        .add_folder_message(folder_id(&store, "[Gmail]/Sent Mail"), &located)
+        .unwrap();
+    assert!(!store.message(fay).unwrap().unwrap().screening);
+}
+
+#[test]
+fn snoozed_mail_from_a_sender_blocked_meanwhile_wakes_into_blocked() {
+    let (mut store, account) = store_with_account();
+    let snoozed = new_id(
+        store
+            .add_incoming(&incoming(account, 1, "spam@x.com"), false)
+            .unwrap(),
+    );
+    let later = Patch {
+        state: Some(MessageState::Snoozed),
+        snoozed_until: Some(100),
+        ..Default::default()
+    };
+    store.update(snoozed, &later, 1).unwrap();
+    decide(&mut store, sender("spam@x.com"), Some(Decision::Blocked), 2);
+    assert_eq!(
+        store.message(snoozed).unwrap().unwrap().state,
+        MessageState::Snoozed
+    );
+    store.wake_snoozed(101).unwrap();
+    assert_eq!(
+        store.message(snoozed).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+    let pending = store.pending(account, now_ms() + 1, 0).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.id == snoozed && p.place == Place::Blocked),
+        "{pending:?}"
+    );
+
+    // Another sender's wakes into the Inbox as before.
+    let ana = new_id(
+        store
+            .add_incoming(&incoming(account, 2, "ana@y.com"), false)
+            .unwrap(),
+    );
+    store.update(ana, &later, 3).unwrap();
+    store.wake_snoozed(101).unwrap();
+    assert_eq!(
+        store.message(ana).unwrap().unwrap().state,
+        MessageState::Inbox
+    );
 }
