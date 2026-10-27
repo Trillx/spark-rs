@@ -1475,6 +1475,7 @@ impl Engine {
                 .map(attachment::cid_refs)
                 .unwrap_or_default(),
             key: format!("{message_id}-{key}"),
+            draft: store.is_draft(message_id)?,
         })
     }
 
@@ -1520,9 +1521,9 @@ impl Engine {
     }
 
     /// The images an email embeds, read on a blocking thread, if they're
-    /// kept.
+    /// kept. A draft's never are.
     async fn kept_images(&self, email: &EmailFiles) -> Result<Option<Vec<InlineImage>>> {
-        let Some(files) = self.files.clone() else {
+        let Some(files) = self.files.clone().filter(|_| !email.draft) else {
             return Ok(None);
         };
         let (account, key, cids) = (email.at.account_id, email.key.clone(), email.images.clone());
@@ -1605,7 +1606,7 @@ impl Engine {
     /// Keeps what was downloaded of an email, on a blocking thread, unless
     /// its account went meanwhile; then makes room. `files` are its
     /// attachments by index, `images` those its HTML embeds if they were
-    /// fetched. Hands them back.
+    /// fetched (not kept for a draft). Hands them back.
     async fn keep(
         &self,
         email: &EmailFiles,
@@ -1617,6 +1618,7 @@ impl Engine {
         };
         let store = self.store.clone();
         let (account, key, cids) = (email.at.account_id, email.key.clone(), email.images.clone());
+        let draft = email.draft;
         blocking(move || {
             {
                 let _held = cache.lock();
@@ -1634,6 +1636,7 @@ impl Engine {
                 }
                 if let Some(images) = &images
                     && !cids.is_empty()
+                    && !draft
                 {
                     cache.put_images(account, &key, &cids, images);
                 }
@@ -1718,7 +1721,8 @@ impl Engine {
     }
 
     /// The images a stored message's HTML embeds with `cid:` URLs: the ones
-    /// kept here, else from its server (and kept). Empty, without asking the
+    /// kept here, else from its server (and kept). A draft's always come from
+    /// its server, as they can change there. Empty, without asking the
     /// server, when it embeds none.
     pub async fn inline_images(&self, message_id: i64) -> Result<Vec<InlineImage>> {
         let email = self.email_files(message_id)?;
@@ -1987,6 +1991,9 @@ struct EmailFiles {
     /// Its name in the cache: its id and `files_key`, as a stored id can be
     /// another email's once the first is gone.
     key: String,
+    /// It's a draft, which can change on the server keeping its id and
+    /// Content-IDs: its images aren't kept, but come from there each time.
+    draft: bool,
 }
 
 /// The UIDVALIDITY a stored IMAP message's UID was given under: its
@@ -2048,7 +2055,7 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(text: &str) -> T {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
@@ -3009,5 +3016,64 @@ mod tests {
         assert_eq!(engine.inline_images(id).await.unwrap(), images);
         assert!(asked_for().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_drafts_images_come_from_the_server_each_time() {
+        // The draft's logo on the server: edited elsewhere, it changes
+        // under the same message and Content-ID.
+        static LOGO: AtomicU8 = AtomicU8::new(1);
+        fn draft_d1(path: &str) -> Option<serde_json::Value> {
+            use serde_json::json;
+            Some(match path.strip_prefix("/me/messages/d1/attachments")? {
+                p if p.starts_with('?') => json!({ "value": [
+                    { "id": "logo", "contentType": "image/png", "size": 10, "isInline": true },
+                ] }),
+                "/logo" => json!({ "contentType": "image/png", "contentId": "<logo>",
+                    "contentBytes": STANDARD.encode([0x89, b'P', b'N', b'G', LOGO.load(SeqCst)]) }),
+                _ => return None,
+            })
+        }
+        let (base, _) = graph::tests::stand_in(draft_d1).await;
+        let dir = files_dir("graph-draft");
+        let (engine, m1) = graph_engine(base, &dir);
+        let draft = {
+            let mut store = engine.store();
+            let account = store.message(m1).unwrap().unwrap().account_id;
+            store
+                .replace_folders(
+                    account,
+                    &[RemoteFolder {
+                        remote_id: "drafts".into(),
+                        parent: None,
+                        name: "Drafts".into(),
+                        role: Some(FolderRole::Drafts),
+                        selectable: true,
+                    }],
+                )
+                .unwrap();
+            let folder = store.folders().unwrap()[0].id;
+            let incoming = Incoming {
+                account_id: account,
+                remote_id: Some("d1".into()),
+                message_id: Some("d1@contoso.com".into()),
+                from_address: "me@contoso.com".into(),
+                date: 1,
+                html: Some("<img src=\"cid:logo\">".into()),
+                ..Default::default()
+            };
+            let (Added::New(id) | Added::Known(id)) =
+                store.add_folder_message(folder, &incoming).unwrap();
+            assert!(store.is_draft(id).unwrap());
+            id
+        };
+        let logo = |images: Vec<InlineImage>| images[0].bytes[4];
+
+        assert_eq!(logo(engine.inline_images(draft).await.unwrap()), 1);
+        LOGO.store(2, SeqCst);
+        assert_eq!(logo(engine.inline_images(draft).await.unwrap()), 2);
+        // Nor are they kept for after a restart.
+        assert_eq!(kept_files(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

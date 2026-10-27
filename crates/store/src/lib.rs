@@ -32,7 +32,9 @@ mod templates;
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use changes::{Changes, Mark};
 pub use contacts::Contact;
-pub use drafts::{DraftCopy, DraftFile, DraftRemoval, DraftSave, DraftUpload, SavedFile};
+pub use drafts::{
+    DraftCopy, DraftFile, DraftRemoval, DraftSave, DraftUpload, QueuedDraft, SavedFile,
+};
 pub use gatekeeper::{
     Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
 };
@@ -1678,18 +1680,7 @@ impl Store {
         files: &[OutboxFile],
     ) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO outbox (account_id, draft, send_at) VALUES (?1, ?2, ?3)",
-            params![account_id, draft, send_at],
-        )?;
-        let id = tx.last_insert_rowid();
-        for (position, f) in files.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO outbox_files (outbox_id, position, name, mime, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, position as i64, f.name, f.mime, f.data],
-            )?;
-        }
+        let id = queue_send_in(&tx, account_id, draft, send_at, files)?;
         tx.commit()?;
         Ok(id)
     }
@@ -1750,15 +1741,6 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
-    }
-
-    /// Whether a saved draft is already on its way, held by a queued send.
-    pub fn draft_held(&self, draft: i64) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM outbox WHERE draft_message = ?1)",
-            [draft],
-            |r| r.get(0),
-        )
     }
 
     /// Cancels a queued send; false once sending has started or finished.
@@ -2192,6 +2174,29 @@ fn insert_message(
         }
     }
     priority::arrived(conn, id)?;
+    Ok(id)
+}
+
+/// `Store::queue_send`, in a transaction the caller commits.
+fn queue_send_in(
+    conn: &Connection,
+    account_id: i64,
+    draft: &str,
+    send_at: i64,
+    files: &[OutboxFile],
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO outbox (account_id, draft, send_at) VALUES (?1, ?2, ?3)",
+        params![account_id, draft, send_at],
+    )?;
+    let id = conn.last_insert_rowid();
+    for (position, f) in files.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO outbox_files (outbox_id, position, name, mime, data)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, position as i64, f.name, f.mime, f.data],
+        )?;
+    }
     Ok(id)
 }
 

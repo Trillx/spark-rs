@@ -472,6 +472,56 @@ fn drafts_being_sent_are_hidden_and_not_uploaded() {
 }
 
 #[test]
+fn a_draft_queues_once_and_never_after_its_gone() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let file = OutboxFile {
+        name: "plan.pdf".into(),
+        mime: "application/pdf".into(),
+        data: b"the plan".to_vec(),
+    };
+    let files = std::slice::from_ref(&file);
+    let queued = |store: &mut Store| store.claim_due_sends(account_id, i64::MAX).unwrap();
+    let id = save(&mut store, account_id, None, "v1", 1_000);
+    let QueuedDraft::Queued(outbox) = store
+        .queue_draft_send(id, account_id, "{}", 9_000, files)
+        .unwrap()
+    else {
+        panic!("not queued");
+    };
+    assert!(store.draft_held(id).unwrap());
+    assert!(store.messages().unwrap().is_empty());
+    assert_eq!(store.outbox_files(outbox).unwrap(), files);
+    assert_eq!(
+        store.queue_draft_send(id, account_id, "{}", 9_000, files),
+        Ok(QueuedDraft::Held)
+    );
+    assert_eq!(queued(&mut store).len(), 1);
+
+    // Sent, as `send_due` finishes it: the draft goes, then the send. One
+    // queued from it meanwhile would send it again.
+    assert!(store.discard_draft(id).unwrap());
+    assert_eq!(
+        store.queue_draft_send(id, account_id, "{}", 0, files),
+        Ok(QueuedDraft::Gone)
+    );
+    store.finish_send(outbox).unwrap();
+    assert_eq!(
+        store.queue_draft_send(id, account_id, "{}", 0, files),
+        Ok(QueuedDraft::Gone)
+    );
+    assert!(queued(&mut store).is_empty());
+
+    // Discarded: nothing to send.
+    let id = save(&mut store, account_id, None, "v2", 2_000);
+    assert!(store.discard_draft(id).unwrap());
+    assert_eq!(
+        store.queue_draft_send(id, account_id, "{}", 0, files),
+        Ok(QueuedDraft::Gone)
+    );
+    assert!(queued(&mut store).is_empty());
+}
+
+#[test]
 fn a_draft_moved_to_another_account_starts_over() {
     let (mut store, account_id, _) = store_with_drafts();
     let other = store

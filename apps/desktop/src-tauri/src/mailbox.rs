@@ -18,8 +18,8 @@ use spark_mail::{Error, Service, Untrusted};
 use spark_mail::{signature, trackers};
 use spark_store::{
     Account, AccountKind, Category, Change, Contact, DraftFile, DueReminder, Folder, FolderRole,
-    GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo, SavedFile, SenderStatus,
-    Store, now_ms,
+    GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo, QueuedDraft, SavedFile,
+    SenderStatus, Store, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -1564,21 +1564,23 @@ fn queue_live(engine: &spark_mail::Engine, draft: &Draft) -> Result<i64, String>
         .map(|f| std::fs::read(f.path))
         .collect();
     let mut store = engine.store();
-    // One send per saved draft: another would send it twice.
-    if let Some(saved) = draft.draft_id
-        && store.draft_held(saved).map_err(text)?
-    {
-        return Err("This draft is already on its way.".into());
-    }
     let queued = outbox_files(draft, read, &store)?;
-    let id = store
-        .queue_send(draft.account, &json, draft.send_at, &queued)
-        .map_err(text)?;
-    // The saved draft it came from waits with it, out of the lists.
-    if let Some(saved) = draft.draft_id {
-        store.hold_draft_for_send(id, saved).map_err(text)?;
+    let Some(saved) = draft.draft_id else {
+        return store
+            .queue_send(draft.account, &json, draft.send_at, &queued)
+            .map_err(text);
+    };
+    // The saved draft it came from waits with it, out of the lists. One
+    // send per saved draft: another, or one after it's sent, would send it
+    // twice.
+    match store
+        .queue_draft_send(saved, draft.account, &json, draft.send_at, &queued)
+        .map_err(text)?
+    {
+        QueuedDraft::Queued(id) => Ok(id),
+        QueuedDraft::Held => Err("This draft is already on its way.".into()),
+        QueuedDraft::Gone => Err("This draft was already sent or deleted.".into()),
     }
-    Ok(id)
 }
 
 /// A saved signature going out becomes its address's most recent.
@@ -2518,6 +2520,47 @@ mod tests {
         assert_eq!(store.outbox_files(queued[0]).unwrap(), expected);
         assert_eq!(store.draft_files(id).unwrap(), expected);
         drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_send_that_waited_while_its_draft_went_out_queues_nothing() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("sent-meanwhile");
+        let path = dir.join("plan.txt");
+        write_file(&path, b"the plan", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            attachments: vec![file_attachment(&path, 8)],
+            ..Default::default()
+        };
+        let id = save_live(&engine, &SavedFiles::default(), &draft, read_local).unwrap();
+        draft.draft_id = Some(id);
+        // Two sends start; one queues it while the other is still reading
+        // its files, and it goes out (as `send_due` finishes a send: the
+        // draft goes, then the send).
+        let first = queue_live(&engine, &draft).unwrap();
+        {
+            let mut store = engine.store();
+            assert_eq!(
+                store.claim_due_sends(account.id, i64::MAX).unwrap().len(),
+                1
+            );
+            assert!(store.discard_draft(id).unwrap());
+            store.finish_send(first).unwrap();
+        }
+        // The other gets the store after that.
+        let second = queue_live(&engine, &draft);
+        let queued = engine
+            .store()
+            .claim_due_sends(account.id, i64::MAX)
+            .unwrap();
+        assert!(queued.is_empty(), "sent again: {second:?}");
+        assert_eq!(
+            second,
+            Err("This draft was already sent or deleted.".into())
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

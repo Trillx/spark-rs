@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
     Attachment, Category, Incoming, MessageState, OutboxFile, Place, Result, Store,
-    attachments_from_json, insert_message, json,
+    attachments_from_json, insert_message, json, queue_send_in,
 };
 
 /// Version 5: the draft queue; Bcc of stored mail (drafts keep theirs); and
@@ -129,6 +129,17 @@ pub struct DraftUpload {
     pub attachments: Vec<Attachment>,
 }
 
+/// What `Store::queue_draft_send` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedDraft {
+    /// Queued with this outbox id, the draft held with it.
+    Queued(i64),
+    /// Another queued send holds the draft already.
+    Held,
+    /// It's no longer a draft: sent or deleted.
+    Gone,
+}
+
 /// A server copy of a draft to delete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftRemoval {
@@ -241,13 +252,41 @@ impl Store {
     }
 
     /// A queued send came from this draft: it isn't listed while it waits,
-    /// and goes once it's sent (`discard_draft`).
+    /// and goes once it's sent (`discard_draft`). A send from the composer
+    /// queues and holds in one step (`queue_draft_send`).
     pub fn hold_draft_for_send(&self, outbox_id: i64, draft: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE outbox SET draft_message = ?2 WHERE id = ?1",
-            params![outbox_id, draft],
-        )?;
-        Ok(())
+        hold_in(&self.conn, outbox_id, draft)
+    }
+
+    /// Whether a saved draft is already on its way, held by a queued send.
+    pub fn draft_held(&self, draft: i64) -> Result<bool> {
+        held_in(&self.conn, draft)
+    }
+
+    /// Queues a send made from saved draft `draft` (as `queue_send`) and
+    /// holds the draft with it (`hold_draft_for_send`), in one step. Nothing
+    /// is queued if another send holds the draft already, or if it's no
+    /// longer a draft: sent or deleted meanwhile, when queuing it would send
+    /// it again.
+    pub fn queue_draft_send(
+        &mut self,
+        draft: i64,
+        account_id: i64,
+        json: &str,
+        send_at: i64,
+        files: &[OutboxFile],
+    ) -> Result<QueuedDraft> {
+        let tx = self.conn.transaction()?;
+        if held_in(&tx, draft)? {
+            return Ok(QueuedDraft::Held);
+        }
+        if !is_draft_in(&tx, draft)? {
+            return Ok(QueuedDraft::Gone);
+        }
+        let id = queue_send_in(&tx, account_id, json, send_at, files)?;
+        hold_in(&tx, id, draft)?;
+        tx.commit()?;
+        Ok(QueuedDraft::Queued(id))
     }
 
     /// The account's drafts saved before `settled_before` (so quick saves
@@ -603,6 +642,22 @@ fn saved_rows(conn: &Connection, id: i64) -> Result<Vec<(i64, SavedFile)>> {
         ))
     })?
     .collect()
+}
+
+fn held_in(conn: &Connection, draft: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM outbox WHERE draft_message = ?1)",
+        [draft],
+        |r| r.get(0),
+    )
+}
+
+fn hold_in(conn: &Connection, outbox_id: i64, draft: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE outbox SET draft_message = ?2 WHERE id = ?1",
+        params![outbox_id, draft],
+    )?;
+    Ok(())
 }
 
 fn is_draft_in(conn: &Connection, id: i64) -> Result<bool> {
