@@ -1085,7 +1085,7 @@ export default function App() {
       const { draft: open, key } = composer.current;
       if (open && !closed.has(key)) {
         if (!asked && key !== session) return false;
-        if (!(await track(latestCloseComposer.current()))) return false;
+        if (!(await track(latestCloseComposer.current(true)))) return false;
         closed.add(key);
       }
       const results = await Promise.allSettled([...inFlight.current]);
@@ -3190,9 +3190,12 @@ export default function App() {
     });
   }
 
-  /** Closing keeps the draft in Drafts; one emptied out is deleted there. */
-  /** Closes the composer, keeping its draft in Drafts. False if saving it failed (`draftError` offers it back). */
-  async function closeComposer(): Promise<boolean> {
+  /**
+   * Closes the composer, keeping its draft in Drafts (one emptied out is deleted there). False if
+   * saving it failed: `draftError` offers it back, and with `keep` it's back in the composer too,
+   * as a conversation's own window keeps it in view, and so does quitting.
+   */
+  async function closeComposer(keep = THREAD_WINDOW !== null): Promise<boolean> {
     if (!draft) return true;
     stopWriting();
     const closed = draft;
@@ -3212,8 +3215,8 @@ export default function App() {
       await storeDraft(closed, session);
     } catch (error) {
       draftError(error, closed);
-      // A conversation's own window keeps it in view, so it can't close on it (and lose it).
-      if (THREAD_WINDOW !== null) openComposer(closed);
+      // Back as it was, saving to the copy it saved before, if any.
+      if (keep) openComposer({ ...closed, draftId: draftIds.current.get(session) ?? closed.draftId });
       return false;
     }
     showToast("Draft saved", undefined, ICONS.draft);
