@@ -194,7 +194,7 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
-import { stuckNotice } from "./lib/outbox";
+import { draftLeft, goneNotice, stuckNotice } from "./lib/outbox";
 import {
   activate as activateHome,
   clearAll as clearHomeFeed,
@@ -323,6 +323,7 @@ import type {
   Message,
   MessagePatch,
   Prefs,
+  QueuedChange,
   ReminderView,
   ScheduledView,
   SendStatusEvent,
@@ -2646,11 +2647,21 @@ export default function App() {
     }
   }
 
-  /** Takes a queued send into Drafts exactly as queued, then opens it there: nothing is lost if editing stops. */
+  /** Says what became of a queued send a change found gone, unless the notice of its failure does. */
+  function sayGone(change: QueuedChange) {
+    const notice = goneNotice(change);
+    if (notice !== undefined) showToast(notice, undefined, ICONS.send);
+  }
+
+  /**
+   * Takes a queued send into Drafts exactly as queued, then opens it there: nothing is lost if editing stops. One the
+   * server refused for good meanwhile is in Drafts too, and opens there.
+   */
   async function editQueued(outboxId: number) {
-    const id = await changeQueued(() => unscheduleSend(outboxId, true));
-    if (id === undefined) return;
-    if (id === null) return showToast("Already sent", undefined, ICONS.send);
+    const change = await changeQueued(() => unscheduleSend(outboxId, true));
+    if (change === undefined) return;
+    const id = draftLeft(change);
+    if (id === undefined) return sayGone(change);
     await reloadMessages();
     void editDraft({ id });
   }
@@ -2658,8 +2669,9 @@ export default function App() {
   const scheduledActions: ScheduledActions = {
     edit: (item) => editQueued(item.id),
     sendNow: async (item) => {
-      const moved = await changeQueued(() => rescheduleSend(item.id, null));
-      if (moved !== undefined) showToast(moved ? "Sending now" : "Already sent", undefined, ICONS.send);
+      const change = await changeQueued(() => rescheduleSend(item.id, null));
+      if (change?.status === "moved") showToast("Sending now", undefined, ICONS.send);
+      else if (change !== undefined) sayGone(change);
     },
     reschedule: (item) =>
       setPickTime({
@@ -2667,15 +2679,15 @@ export default function App() {
         confirmLabel: "Schedule",
         initial: item.sendAt,
         run: async (at) => {
-          const moved = await changeQueued(() => rescheduleSend(item.id, at));
-          if (moved === undefined) return;
-          showToast(moved ? `Scheduled for ${formatLater(at)}` : "Already sent", undefined, ICONS.send);
+          const change = await changeQueued(() => rescheduleSend(item.id, at));
+          if (change?.status === "moved") showToast(`Scheduled for ${formatLater(at)}`, undefined, ICONS.send);
+          else if (change !== undefined) sayGone(change);
         },
       }),
     cancel: async (item) => {
-      const id = await changeQueued(() => unscheduleSend(item.id, false));
-      if (id === undefined) return;
-      if (id === null) return showToast("Already sent", undefined, ICONS.send);
+      const change = await changeQueued(() => unscheduleSend(item.id, false));
+      if (change === undefined) return;
+      if (change.status !== "takenBack") return sayGone(change);
       showToast("Not sent: it's in Drafts", undefined, ICONS.draft);
       void reloadMessages();
     },

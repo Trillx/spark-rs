@@ -37,6 +37,7 @@ import type {
   PopupMeeting,
   Prefs,
   PriorityUndo,
+  QueuedChange,
   ReminderView,
   ScheduledView,
   SendStatusEvent,
@@ -413,20 +414,22 @@ export function listScheduled(): Promise<ScheduledView[]> {
   return Promise.resolve([]);
 }
 
-/** Sends a scheduled message at `at` instead, or (null) now. False once it's gone out. */
-export function rescheduleSend(id: number, at: number | null): Promise<boolean> {
+/**
+ * Sends a scheduled message at `at` instead, or (null) now. Resolves to "moved", or what became of it once it's gone.
+ */
+export function rescheduleSend(id: number, at: number | null): Promise<QueuedChange> {
   if (isTauri()) return mutate("reschedule_send", { id, at });
-  return Promise.resolve(false);
+  return Promise.resolve({ status: "gone" });
 }
 
 /**
  * Takes a scheduled message out of the queue into Drafts, exactly as it was
- * queued (with its time, given `keepSchedule`). Resolves to the draft's id;
- * null once it's gone out.
+ * queued (with its time, given `keepSchedule`). Resolves to the draft
+ * ("takenBack"), or what became of it once it's gone.
  */
-export function unscheduleSend(id: number, keepSchedule: boolean): Promise<number | null> {
+export function unscheduleSend(id: number, keepSchedule: boolean): Promise<QueuedChange> {
   if (isTauri()) return mutate("unschedule_send", { id, keepSchedule });
-  return Promise.resolve(null);
+  return Promise.resolve({ status: "gone" });
 }
 
 export function listReminders(): Promise<ReminderView[]> {

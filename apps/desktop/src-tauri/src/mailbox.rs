@@ -14,7 +14,7 @@ use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
 use spark_mail::unsubscribe::Unsubscribed;
-use spark_mail::{Error, Service, Untrusted};
+use spark_mail::{Error, QueuedChange, Service, Untrusted};
 use spark_mail::{signature, trackers};
 use spark_store::{
     Account, AccountKind, AutoLabel, Category, Change, Contact, DraftFile, DraftSend, DueReminder,
@@ -721,19 +721,20 @@ pub fn list_scheduled(mailbox: State<'_, Mailbox>) -> Result<Vec<ScheduledView>,
 }
 
 /// Sends a scheduled message at `at` instead, or now, once a try of it under
-/// way is over. False once it's gone out.
+/// way is over. Says what became of it instead once it's gone: sent, or
+/// back in Drafts having failed.
 #[tauri::command]
 pub async fn reschedule_send(
     mailbox: State<'_, Mailbox>,
     id: i64,
     at: Option<i64>,
-) -> Result<bool, String> {
+) -> Result<QueuedChange, String> {
     if !mailbox.live() {
-        return Ok(false);
+        return Ok(QueuedChange::Gone);
     }
     let moved = mailbox.live.engine.reschedule(id, at).await.map_err(text)?;
     // Sent now: the account's worker sends it on its next round.
-    if moved && at.is_none() {
+    if moved == QueuedChange::Moved && at.is_none() {
         mailbox.live.sync_now();
     }
     Ok(moved)
@@ -741,17 +742,17 @@ pub async fn reschedule_send(
 
 /// Takes a queued message out of the queue into Drafts, exactly as it was
 /// queued, to edit (`keep_schedule`: with its time) or to keep, once a try
-/// of it under way is over. Returns the draft's id, or `None` once it's
-/// gone out.
+/// of it under way is over. Says what became of it instead once it's gone:
+/// sent, or back in Drafts having failed.
 #[tauri::command]
 pub async fn unschedule_send(
     app: AppHandle,
     mailbox: State<'_, Mailbox>,
     id: i64,
     keep_schedule: bool,
-) -> Result<Option<i64>, String> {
+) -> Result<QueuedChange, String> {
     if !mailbox.live() {
-        return Ok(None);
+        return Ok(QueuedChange::Gone);
     }
     let draft = mailbox
         .live

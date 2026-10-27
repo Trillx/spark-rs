@@ -27,7 +27,9 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-pub use engine::{AccountConfig, CalendarStatus, CutShort, Engine, OwnDraft, Round, Secrets, Watch};
+pub use engine::{
+    AccountConfig, CalendarStatus, CutShort, Engine, OwnDraft, QueuedChange, Round, Secrets, Watch,
+};
 
 /// How many messages further back the inbox or a folder reaches each time
 /// the user scrolls to the end of its list, as in Spark.

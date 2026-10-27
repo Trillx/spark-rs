@@ -49,6 +49,9 @@ const SEND_TELL_AFTER_MS: i64 = 10 * 60_000;
 /// under way to end (`Engine::between_tries`): a try's every request has a
 /// time limit, and those of a big forward add up.
 const SEND_WAIT: Duration = Duration::from_secs(5 * 60);
+/// How long how a try ended a queued send is kept, for a change asked of
+/// it meanwhile, or from a list not updated yet (`Engine::send_end`).
+const SEND_END_KEPT: Duration = Duration::from_secs(10 * 60);
 /// How many waiting senders a round asks the Sent folder about, at most.
 const SENT_CHECKS: usize = 20;
 /// A waiting sender the Sent folder didn't have is asked about again after
@@ -250,6 +253,31 @@ pub struct WaitingSend {
     pub sending: bool,
 }
 
+/// What came of a change asked of a queued send (`Engine::unschedule`,
+/// `Engine::reschedule`), once a try of it under way was over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum QueuedChange {
+    /// Taken out of the queue into Drafts, as `draft_id`.
+    TakenBack { draft_id: i64 },
+    /// Still queued, to go at its new time.
+    Moved,
+    /// It went first.
+    Sent,
+    /// The server refused it for good first: it's back in Drafts as
+    /// `draft_id`, unless it couldn't be read.
+    Failed {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        draft_id: Option<i64>,
+    },
+    /// It's no longer queued: taken back already.
+    Gone,
+}
+
 /// A send claimed for a try (`Store::claim_send`). Once the try is over,
 /// whoever waits to change the send hears so (`Engine::between_tries`).
 /// A try cut off part way, as when the account's worker stops, puts the
@@ -394,6 +422,9 @@ pub struct Engine {
     failing_sends: Mutex<HashMap<i64, FailingSend>>,
     /// A try of a queued send ended (`Trying`).
     send_tried: Notify,
+    /// Queued sends a try ended lately, by outbox id: sent, or back in
+    /// Drafts (`send_end`).
+    send_ends: Mutex<HashMap<i64, (QueuedChange, Instant)>>,
 }
 
 impl Engine {
@@ -412,6 +443,7 @@ impl Engine {
             bodies: Mutex::new(HashMap::new()),
             failing_sends: Mutex::new(HashMap::new()),
             send_tried: Notify::new(),
+            send_ends: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1917,7 +1949,11 @@ impl Engine {
                 if let Some(saved) = saved_draft {
                     self.store().discard_draft(saved)?;
                 }
-                self.store().finish_send(id)?;
+                {
+                    let store = self.store();
+                    store.finish_send(id)?;
+                    self.send_ended(id, QueuedChange::Sent);
+                }
                 if let Ok(draft) = &parsed
                     && let Some(remind) = &draft.remind
                 {
@@ -1955,14 +1991,21 @@ impl Engine {
                         .account(account_id)?
                         .ok_or_else(|| Error::Config("That account was removed.".into()))?;
                     let files = store.outbox_files(id)?;
-                    draft_id = Some(drafts::recover_failed_send(
+                    let recovered = drafts::recover_failed_send(
                         &mut store,
                         &account,
                         &draft,
                         &files,
                         now_ms(),
                         id,
-                    )?);
+                    )?;
+                    self.send_ended(
+                        id,
+                        QueuedChange::Failed {
+                            draft_id: Some(recovered),
+                        },
+                    );
+                    draft_id = Some(recovered);
                 }
                 Err(e)
             }
@@ -2019,6 +2062,28 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// A try ended queued send `id` (`QueuedChange::Sent` or `Failed`). Told
+    /// with the store held, as the try settles it there, so a change asked
+    /// of it doesn't find it gone without knowing how (`send_end`).
+    fn send_ended(&self, id: i64, end: QueuedChange) {
+        let mut ends = self
+            .send_ends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ends.retain(|_, (_, at)| at.elapsed() < SEND_END_KEPT);
+        ends.insert(id, (end, Instant::now()));
+    }
+
+    /// What became of send `id`, no longer queued: how a try ended it
+    /// lately, else it was taken back.
+    fn send_end(&self, id: i64) -> QueuedChange {
+        self.send_ends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&id)
+            .map_or(QueuedChange::Gone, |(end, _)| *end)
+    }
+
     /// The sends the Scheduled list shows, soonest first: those scheduled
     /// with Send Later, and those failing on the network (`send_due_each`),
     /// so one that can't go yet can be found, changed or taken back.
@@ -2049,51 +2114,42 @@ impl Engine {
     /// Takes a queued send out of the queue into Drafts, exactly as it was
     /// queued, its files too (in one step, so nothing is lost), to edit or to
     /// keep; `keep_schedule` keeps its Send Later time on the draft. A try of
-    /// it under way is waited out (`between_tries`). Returns the draft, or
-    /// `None` once it's gone: sent, or back in Drafts having failed.
-    pub async fn unschedule(&self, outbox_id: i64, keep_schedule: bool) -> Result<Option<i64>> {
-        let id = self
-            .between_tries(outbox_id, |store| {
-                let Some((account_id, json)) = store.queued_send(outbox_id)? else {
-                    return Ok(None);
-                };
-                let mut draft: Draft = serde_json::from_str(&json)
-                    .map_err(|e| Error::Config(format!("The queued message is unreadable: {e}")))?;
-                if !keep_schedule {
-                    draft.send_later = None;
-                }
-                let account = store
-                    .account(account_id)?
-                    .ok_or_else(|| Error::Config("That account was removed.".into()))?;
-                let files = store.outbox_files(outbox_id)?;
-                let id = drafts::recover_failed_send(
-                    store,
-                    &account,
-                    &draft,
-                    &files,
-                    now_ms(),
-                    outbox_id,
-                )?;
-                Ok(Some(id))
-            })
-            .await?;
-        if id.is_some() {
+    /// it under way is waited out (`between_tries`). Returns the draft
+    /// (`TakenBack`), or what became of the send once it's gone: sent, or
+    /// back in Drafts having failed.
+    pub async fn unschedule(&self, outbox_id: i64, keep_schedule: bool) -> Result<QueuedChange> {
+        self.between_tries(outbox_id, |store| {
+            let Some((account_id, json)) = store.queued_send(outbox_id)? else {
+                return Ok(self.send_end(outbox_id));
+            };
+            let mut draft: Draft = serde_json::from_str(&json)
+                .map_err(|e| Error::Config(format!("The queued message is unreadable: {e}")))?;
+            if !keep_schedule {
+                draft.send_later = None;
+            }
+            let account = store
+                .account(account_id)?
+                .ok_or_else(|| Error::Config("That account was removed.".into()))?;
+            let files = store.outbox_files(outbox_id)?;
+            let id =
+                drafts::recover_failed_send(store, &account, &draft, &files, now_ms(), outbox_id)?;
             self.failing_sends_lock().remove(&outbox_id);
-        }
-        Ok(id)
+            Ok(QueuedChange::TakenBack { draft_id: id })
+        })
+        .await
     }
 
     /// Sends a queued send at `at` instead, or with `None` now (it's no
     /// longer scheduled), once a try of it under way is over
-    /// (`between_tries`). False once it's gone. Moved, it counts its
-    /// failures afresh.
-    pub async fn reschedule(&self, outbox_id: i64, at: Option<i64>) -> Result<bool> {
+    /// (`between_tries`). Returns `Moved`, or what became of the send once
+    /// it's gone. Moved, it counts its failures afresh.
+    pub async fn reschedule(&self, outbox_id: i64, at: Option<i64>) -> Result<QueuedChange> {
         self.between_tries(outbox_id, |store| {
-            let moved = store.reschedule_send(outbox_id, at, now_ms())?;
-            if moved {
-                self.failing_sends_lock().remove(&outbox_id);
+            if !store.reschedule_send(outbox_id, at, now_ms())? {
+                return Ok(self.send_end(outbox_id));
             }
-            Ok(moved)
+            self.failing_sends_lock().remove(&outbox_id);
+            Ok(QueuedChange::Moved)
         })
         .await
     }
@@ -3597,10 +3653,28 @@ mod tests {
 
     /// One SMTP delivery, rejecting its recipients or accepting its DATA.
     async fn smtp_delivery(code: u16) -> (Server, tokio::task::JoinHandle<()>) {
+        smtp_delivery_after(code, None).await
+    }
+
+    /// `smtp_delivery`, held before it begins until `release` is told: a
+    /// try under way while the test says so.
+    async fn smtp_delivery_held(code: u16) -> (Server, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let release = Arc::new(Notify::new());
+        let (server, task) = smtp_delivery_after(code, Some(release.clone())).await;
+        (server, release, task)
+    }
+
+    async fn smtp_delivery_after(
+        code: u16,
+        release: Option<Arc<Notify>>,
+    ) -> (Server, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
+            if let Some(release) = release {
+                release.notified().await;
+            }
             smtp_session(socket, code).await;
         });
         (
@@ -4062,7 +4136,11 @@ mod tests {
             .unwrap();
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
 
-        let id = engine.unschedule(outbox, false).await.unwrap().unwrap();
+        let QueuedChange::TakenBack { draft_id: id } =
+            engine.unschedule(outbox, false).await.unwrap()
+        else {
+            panic!("taken back");
+        };
         {
             let store = engine.store();
             assert!(store.outbox_sends().unwrap().is_empty());
@@ -4072,8 +4150,15 @@ mod tests {
             assert_eq!(saved.remind, queued.remind);
             assert_eq!(store.draft_files(id).unwrap(), [file]);
         }
-        // Gone from the queue: there's nothing left to take out.
-        assert_eq!(engine.unschedule(outbox, true).await.unwrap(), None);
+        // Gone from the queue: there's nothing left to take out or move.
+        assert_eq!(
+            engine.unschedule(outbox, true).await.unwrap(),
+            QueuedChange::Gone
+        );
+        assert_eq!(
+            engine.reschedule(outbox, None).await.unwrap(),
+            QueuedChange::Gone
+        );
     }
 
     #[test]
@@ -5404,7 +5489,10 @@ mod tests {
 
         // The second, waiting its turn, comes out at once.
         let taken = engine.unschedule(second, true).await.unwrap();
-        assert!(taken.is_some(), "still queued, not being sent");
+        assert!(
+            matches!(taken, QueuedChange::TakenBack { .. }),
+            "still queued, not being sent"
+        );
         // The first comes out once its try is over, not as "Already sent".
         let editing = tokio::spawn({
             let engine = engine.clone();
@@ -5419,7 +5507,10 @@ mod tests {
             "{outcomes:?}"
         );
         let taken = editing.await.unwrap().unwrap();
-        assert!(taken.is_some(), "taken back after its try failed");
+        assert!(
+            matches!(taken, QueuedChange::TakenBack { .. }),
+            "taken back after its try failed"
+        );
         let store = engine.store();
         assert!(store.due_sends(account, i64::MAX).unwrap().is_empty());
         let drafts: Vec<String> = store
@@ -5468,8 +5559,70 @@ mod tests {
             .expect("told the try is over")
             .unwrap()
             .unwrap();
-        assert!(taken.is_some(), "back in the queue, and taken from it");
+        assert!(
+            matches!(taken, QueuedChange::TakenBack { .. }),
+            "back in the queue, and taken from it"
+        );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_change_waiting_out_a_try_hears_how_it_ended() {
+        // Refused for good, then sent.
+        for code in [550, 250] {
+            let (smtp, release, delivery) = smtp_delivery_held(code).await;
+            let mut store = Store::open_in_memory().unwrap();
+            let account = test_account(&mut store, smtp).id;
+            let (outbox, _) = queue_to_ana(&mut store, account, "Plans", 0);
+            let engine = Arc::new(Engine::new(
+                Arc::new(Mutex::new(store)),
+                Arc::new(TestSecrets),
+            ));
+            let sending = tokio::spawn({
+                let engine = engine.clone();
+                async move { engine.send_due(account).await }
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !engine.store().is_sending(outbox).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("it's tried");
+
+            // Edit and Send now, asked while it's tried, wait for the try.
+            let editing = tokio::spawn({
+                let engine = engine.clone();
+                async move { engine.unschedule(outbox, true).await }
+            });
+            let moving = tokio::spawn({
+                let engine = engine.clone();
+                async move { engine.reschedule(outbox, None).await }
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!editing.is_finished() && !moving.is_finished());
+            release.notify_one();
+            let outcomes = sending.await.unwrap().unwrap();
+            let ended = if code == 250 {
+                QueuedChange::Sent
+            } else {
+                let recovered = outcomes[0].draft_id;
+                assert!(recovered.is_some(), "back in Drafts");
+                QueuedChange::Failed {
+                    draft_id: recovered,
+                }
+            };
+            // Each hears how it ended, as Don't send does from a list not
+            // updated yet.
+            assert_eq!(editing.await.unwrap().unwrap(), ended, "{code}");
+            assert_eq!(moving.await.unwrap().unwrap(), ended, "{code}");
+            assert_eq!(
+                engine.unschedule(outbox, false).await.unwrap(),
+                ended,
+                "{code}"
+            );
+            delivery.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -5581,18 +5734,22 @@ mod tests {
         );
 
         // Moved, it's listed by its new time, and counts its tries afresh.
-        assert!(
+        assert_eq!(
             engine
                 .reschedule(failing, Some(i64::MAX / 4))
                 .await
-                .unwrap()
+                .unwrap(),
+            QueuedChange::Moved
         );
         assert_eq!(
             listed(&engine),
             [(failing, false, false), (later, false, false)]
         );
         assert!(!engine.failing_sends_lock().contains_key(&failing));
-        assert!(engine.unschedule(failing, true).await.unwrap().is_some());
+        assert!(matches!(
+            engine.unschedule(failing, true).await.unwrap(),
+            QueuedChange::TakenBack { .. }
+        ));
         assert_eq!(listed(&engine), [(later, false, false)]);
     }
 

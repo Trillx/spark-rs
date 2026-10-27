@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ScheduledView } from "../types";
-import { stuckNotice } from "./outbox.ts";
+import { draftLeft, goneNotice, stuckNotice } from "./outbox.ts";
 
 const send = (id: number, subject: string, failed?: string): ScheduledView => ({
   id,
@@ -31,4 +31,19 @@ test("One send that couldn't go yet is named, with why", () => {
 test("Several that couldn't go yet are told of together", () => {
   const items = [send(1, "Fwd: Files", offline), send(2, "Later"), send(3, "Re: Lunch", offline)];
   assert.equal(stuckNotice(items, { id: 3, message: offline }), "2 emails couldn't be sent yet. They'll keep trying.");
+});
+
+test("A change that found its send refused for good opens it in Drafts, and says nothing over the failure", () => {
+  assert.equal(draftLeft({ status: "failed", draftId: 7 }), 7);
+  assert.equal(goneNotice({ status: "failed", draftId: 7 }), undefined);
+  assert.equal(draftLeft({ status: "failed" }), undefined);
+  assert.equal(goneNotice({ status: "failed" }), undefined);
+  assert.equal(draftLeft({ status: "takenBack", draftId: 8 }), 8);
+});
+
+test("Only a send that went is already sent", () => {
+  assert.equal(goneNotice({ status: "sent" }), "Already sent");
+  assert.equal(draftLeft({ status: "sent" }), undefined);
+  assert.equal(goneNotice({ status: "gone" }), "It's no longer waiting to be sent");
+  assert.equal(goneNotice({ status: "moved" }), undefined);
 });

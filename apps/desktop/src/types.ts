@@ -175,6 +175,16 @@ export interface ScheduledView {
   sending?: boolean;
 }
 
+/** What came of a change asked of a queued send, once a try of it under way was over. */
+export type QueuedChange =
+  | { status: "takenBack"; draftId: number }
+  | { status: "moved" }
+  | { status: "sent" }
+  /** The server refused it for good first: it's back in Drafts (as `draftId`, unless it couldn't be read). */
+  | { status: "failed"; draftId?: number }
+  /** It's no longer queued: taken back already. */
+  | { status: "gone" };
+
 /** A "Remind me" on mail you sent: still to come, or `due` and back in the Inbox as `message`. */
 export interface ReminderView {
   id: number;
