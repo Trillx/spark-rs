@@ -598,7 +598,7 @@ pub fn series_from(
         Some((ms, zone.wall_at(ms)))
     };
     let (start, end) = match (master_time("start"), master_time("end")) {
-        (Some((from, wall)), Some((to, _))) if !draft.all_day && !before.all_day => {
+        (Some((_, wall)), Some((_, to_wall))) if !draft.all_day && !before.all_day => {
             let start = if draft.start != before.start {
                 zone.wall_at(draft.start)
             } else {
@@ -611,8 +611,14 @@ pub fn series_from(
             let end = if draft.end != before.end {
                 zone.wall_at(draft.end)
             } else {
-                parse_iso_date(&format!("{start}Z"))
-                    .map_or_else(|| zone.wall_at(draft.end), |t| utc_wall(t + (to - from)))
+                // As long as the series is on its own clock (Sunday 0:00 to
+                // 4:00), not in hours that passed (five, the night clocks
+                // went back).
+                let clock = |w: &str| parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
+                match (clock(&start), clock(&wall), clock(&to_wall)) {
+                    (Some(t), Some(from), Some(to)) => utc_wall(t + (to - from)),
+                    _ => zone.wall_at(draft.end),
+                }
             };
             (
                 json!({ "dateTime": start, "timeZone": zone.name }),
@@ -2129,6 +2135,37 @@ mod tests {
         let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
         assert_eq!(body["start"]["dateTime"], "2026-11-10T00:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-13T00:00:00");
+    }
+
+    #[test]
+    fn all_future_keeps_an_overnight_series_hours_across_dst() {
+        const EASTERN: Zone<'static> = Zone {
+            name: "Eastern Standard Time",
+            wall: eastern,
+            shift: 0,
+        };
+        // Sundays 0:00 to 4:00 in New York, first on November 1, 2026, the
+        // night clocks go back: five hours pass.
+        let master = json!({
+            "subject": "Maintenance",
+            "start": { "dateTime": "2026-11-01T04:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-11-01T09:00:00.0000000", "timeZone": "UTC" }
+        });
+        let start = parse_iso_date("2026-11-08T05:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Maintenance".into(),
+            start,
+            end: start + 4 * 3_600_000,
+            notes: "Old".into(),
+            ..Default::default()
+        };
+        let renoted = EventDraft {
+            notes: "New".into(),
+            ..before.clone()
+        };
+        let body = series_from(&master, &renoted, &before, EASTERN, json!(null));
+        assert_eq!(body["start"]["dateTime"], "2026-11-08T00:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-08T04:00:00");
     }
 
     #[test]

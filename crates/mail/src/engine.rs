@@ -1756,8 +1756,10 @@ impl Engine {
         );
         // Read from Outlook's own range, so a rule the editor doesn't know
         // counts too.
-        let ends_kept =
-            rule.is_none_or(|r| Repeat::from_graph(&old).is_some_and(|w| w.ends == r.ends));
+        // Its end is the user's only if they changed it from the one the
+        // editor opened with; else it's Outlook's, which may have changed.
+        let opened = before.repeat.clone().or_else(|| Repeat::from_graph(&old));
+        let ends_kept = rule.is_none_or(|r| opened.as_ref().is_some_and(|w| w.ends == r.ends));
         if ends_kept && old["range"]["type"] == "numbered" {
             let times = old["range"]["numberOfOccurrences"]
                 .as_i64()
