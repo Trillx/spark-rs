@@ -103,7 +103,7 @@ pub fn cid_refs(html: &str) -> Vec<String> {
 }
 
 /// `%xx` escapes decoded, as in a `cid:` URL; anything else is kept.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

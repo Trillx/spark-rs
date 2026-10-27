@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { draftKey, emptyDraft, outgoingDraft, savedDraft } from "./composeDraft.ts";
+import { draftHasContent, draftKey, emptyDraft, outgoingDraft, savedDraft } from "./composeDraft.ts";
 
 test("Send Later survives saving and reopening without queueing delivery", () => {
   const sendLater = { key: "tomorrow" as const, at: 2_000_000_000_000 };
@@ -22,6 +22,16 @@ test("choosing, changing only the time, and clearing a schedule are draft edits"
   const cleared = { ...scheduled, sendLater: null };
   assert.notEqual(draftKey(scheduled), draftKey(cleared));
   assert.equal(savedDraft(outgoingDraft(cleared, 0)).sendLater, null);
+});
+
+test("the rich body goes out and comes back with its text; a picture alone is content", () => {
+  const draft = { ...emptyDraft(1), body: "Hi Bo", bodyHtml: "<div>Hi <b>Bo</b></div>" };
+  const saved = outgoingDraft(draft, 0);
+  assert.equal(saved.bodyHtml, "<div>Hi <b>Bo</b></div>");
+  assert.equal(savedDraft(saved).bodyHtml, draft.bodyHtml);
+  assert.notEqual(draftKey(draft), draftKey({ ...draft, bodyHtml: "<div>Hi Bo</div>" }), "formatting is an edit");
+  assert.equal(draftHasContent({ ...emptyDraft(1), bodyHtml: "<div><br></div>" }), false);
+  assert.equal(draftHasContent({ ...emptyDraft(1), bodyHtml: '<div><img src="data:image/png;base64,x"></div>' }), true);
 });
 
 test("drafts saved before Send Later metadata open without a schedule", () => {

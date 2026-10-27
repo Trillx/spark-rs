@@ -133,6 +133,7 @@ fn main() {
             mailbox::inline_images,
             mailbox::pick_files,
             mailbox::describe_files,
+            mailbox::read_image,
             ai::get_ai_settings,
             ai::save_ai_settings,
             ai::test_ai_connection,

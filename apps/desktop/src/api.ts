@@ -511,7 +511,12 @@ export function describeFiles(paths: string[]): Promise<LocalFile[]> {
   return Promise.resolve([]);
 }
 
-export type FileDrag = { type: "over" } | { type: "leave" } | { type: "drop"; paths: string[] };
+/** Where in the window (CSS px) files are dragged to. */
+export type DragPoint = { x: number; y: number };
+export type FileDrag =
+  | { type: "over"; at: DragPoint }
+  | { type: "leave" }
+  | { type: "drop"; paths: string[]; at: DragPoint };
 
 /**
  * Files dragged over or dropped on the window. The desktop shell handles file
@@ -521,11 +526,19 @@ export type FileDrag = { type: "over" } | { type: "leave" } | { type: "drop"; pa
 export function onFileDrag(handler: (e: FileDrag) => void): () => void {
   if (!isTauri()) return () => {};
   const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
-    if (payload.type === "drop") handler({ type: "drop", paths: payload.paths });
-    else if (payload.type === "leave") handler({ type: "leave" });
-    else handler({ type: "over" });
+    if (payload.type === "leave") return handler({ type: "leave" });
+    // The shell gives physical pixels.
+    const at = { x: payload.position.x / devicePixelRatio, y: payload.position.y / devicePixelRatio };
+    if (payload.type === "drop") handler({ type: "drop", paths: payload.paths, at });
+    else handler({ type: "over", at });
   });
   return () => void stop.then((unlisten) => unlisten());
+}
+
+/** A picture file dropped on the composer's body, as a data URL. */
+export function readImage(path: string): Promise<string> {
+  if (isTauri()) return invoke("read_image", { path });
+  return Promise.reject("Run the desktop app to add pictures from files.");
 }
 
 export function updateMessage(id: number, patch: MessagePatch): Promise<Message> {

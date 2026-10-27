@@ -528,6 +528,8 @@ fn send_email(cx: &mut Context, args: &Value) -> ToolResult {
         bcc: String::new(),
         subject: subject.clone(),
         body,
+        // Agents write plain text.
+        body_html: None,
         reply_to: original.map(|m| m.id),
         send_at,
         send_later: None,

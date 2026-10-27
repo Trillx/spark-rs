@@ -23,7 +23,7 @@ use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::engine::Engine;
 use crate::graph::Graph;
 use crate::imap::{self, Session, SyncState};
-use crate::signature::{self, SIGNATURE_SECTION};
+use crate::signature::{self, BODY_SECTION, SIGNATURE_SECTION};
 use crate::{Error, Result, parse};
 
 /// What a round did with the account's drafts.
@@ -191,6 +191,7 @@ pub fn open(store: &Store, id: i64) -> Result<Option<Draft>> {
         bcc: field(&content.bcc),
         subject: m.subject,
         body: parts.body,
+        body_html: parts.body_html,
         reply_to,
         send_at: 0,
         send_later: store
@@ -229,6 +230,8 @@ const FORWARDED: &str = "---------- Forwarded message ----------";
 #[derive(Debug, Default, PartialEq)]
 struct StoredParts {
     body: String,
+    /// The body's formatting, when the draft has HTML.
+    body_html: Option<String>,
     signature: Option<String>,
     signature_id: Option<i64>,
     /// A forward's original, below the signature.
@@ -237,8 +240,20 @@ struct StoredParts {
 
 /// Splits a stored draft's text around the signature its HTML has, if any.
 /// One whose text matches a saved signature comes back as that signature,
-/// with its own images rather than the message's.
+/// with its own images rather than the message's. The body keeps its
+/// formatting: its section of the HTML, or all of a draft written elsewhere
+/// that has neither a signature nor a forward here.
 fn stored_parts(store: &Store, text: &str, html: Option<&str>) -> Result<StoredParts> {
+    // What the HTML version adds after a body (`Parts::html`) isn't typed.
+    let body_html = html
+        .and_then(|h| signature::section(h, BODY_SECTION))
+        .map(|body| {
+            let body = body.trim();
+            body.strip_suffix("<br><br>")
+                .unwrap_or(body)
+                .trim_end()
+                .to_owned()
+        });
     let whole = || match text.find(FORWARDED) {
         Some(at) if at == 0 || text[..at].ends_with('\n') => StoredParts {
             body: text[..at].trim_end().to_owned(),
@@ -246,12 +261,20 @@ fn stored_parts(store: &Store, text: &str, html: Option<&str>) -> Result<StoredP
             ..Default::default()
         },
         _ => StoredParts {
-            body: text.to_owned(),
+            body: text.trim_end().to_owned(),
             ..Default::default()
         },
     };
     let Some(found) = html.and_then(|h| signature::section(h, SIGNATURE_SECTION)) else {
-        return Ok(whole());
+        let mut parts = whole();
+        parts.body_html = match body_html {
+            Some(body) => Some(body),
+            None if parts.quote.is_none() => html
+                .map(signature::sanitize)
+                .filter(|h| !signature::text(h).is_empty() || h.contains("<img")),
+            None => None,
+        };
+        return Ok(parts);
     };
     let found_text = signature::text(found);
     let squeeze = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
@@ -268,6 +291,7 @@ fn stored_parts(store: &Store, text: &str, html: Option<&str>) -> Result<StoredP
     };
     Ok(StoredParts {
         body: body.to_owned(),
+        body_html,
         signature_id: saved.as_ref().map(|s| s.id),
         signature: Some(saved.map_or_else(|| found.trim().to_owned(), |s| s.html)),
         quote: (!quote.is_empty()).then(|| quote.to_owned()),
@@ -1046,6 +1070,47 @@ mod tests {
             }]
         );
         assert!(open(&store, id + 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn rich_text_comes_back_from_the_stored_copy() {
+        let store = Store::open_in_memory().unwrap();
+        let rich = Draft {
+            account: 1,
+            to: "bo@x.com".into(),
+            subject: "Plan".into(),
+            body: "Hi Bo".into(),
+            body_html: Some("<div>Hi <b>Bo</b></div>".into()),
+            ..Default::default()
+        };
+        let from: Mailbox = "me@x.com".parse().unwrap();
+        let raw = mime(from.clone(), &rich, "d1@x.com", None, &[]).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let text = parsed.body_text(0).unwrap().replace("\r\n", "\n");
+        let parts = stored_parts(&store, &text, parsed.body_html(0).as_deref()).unwrap();
+        assert_eq!(
+            (parts.body.as_str(), parts.body_html.as_deref()),
+            ("Hi Bo", Some("<div>Hi <b>Bo</b></div>"))
+        );
+        // With a signature, the body is still its own section.
+        let signed = Draft {
+            signature: Some("<div>Me</div>".into()),
+            ..rich.clone()
+        };
+        let raw = mime(from, &signed, "d2@x.com", None, &[]).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let text = parsed.body_text(0).unwrap().replace("\r\n", "\n");
+        let parts = stored_parts(&store, &text, parsed.body_html(0).as_deref()).unwrap();
+        assert_eq!(parts.body_html.as_deref(), Some("<div>Hi <b>Bo</b></div>"));
+        assert_eq!(parts.signature.as_deref(), Some("<div>Me</div>"));
+        // One written elsewhere keeps all its formatting, cleaned.
+        let elsewhere = stored_parts(
+            &store,
+            "Hello",
+            Some(r#"<html><head><style>p{}</style></head><body><p onclick="x()"><i>Hello</i></p></body></html>"#),
+        )
+        .unwrap();
+        assert_eq!(elsewhere.body_html.as_deref(), Some("<p><i>Hello</i></p>"));
     }
 
     #[test]

@@ -1231,7 +1231,8 @@ impl Graph {
         Ok(reply.internet_message_id.as_deref().map(bare_id))
     }
 
-    /// Adds `files` and the signature's `images` to a draft and sends it.
+    /// Adds `files` and the body's and signature's `images` to a draft and
+    /// sends it.
     /// If that fails, the draft is deleted so it doesn't linger in Drafts.
     async fn attach_and_send(
         &self,
@@ -1260,35 +1261,51 @@ impl Graph {
         result
     }
 
-    /// An image the HTML shows by its `cid:`. Signature images are small
-    /// enough to go in one request.
+    /// An image the HTML shows by its `cid:`.
     async fn attach_inline(&self, draft_path: &str, image: &InlineImage) -> Result<()> {
         let extension = image.mime.rsplit('/').next().unwrap_or("png");
-        self.send(
-            self.request(Method::POST, &format!("{draft_path}/attachments"))
-                .json(&json!({
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": format!("image.{extension}"),
-                    "contentType": image.mime,
-                    "contentBytes": STANDARD.encode(&image.bytes),
-                    "isInline": true,
-                    "contentId": image.cid,
-                })),
+        let name = format!("image.{extension}");
+        self.upload(
+            draft_path,
+            &name,
+            &image.mime,
+            &image.bytes,
+            Some(&image.cid),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn attach(&self, draft_path: &str, f: &AttachmentData) -> Result<()> {
-        if f.bytes.len() < INLINE_ATTACHMENT_MAX {
+        self.upload(draft_path, &f.name, &f.mime, &f.bytes, None)
+            .await
+    }
+
+    /// Attaches a file, in one request if it's small, else in an upload
+    /// session; with `cid`, as an image the HTML shows.
+    async fn upload(
+        &self,
+        draft_path: &str,
+        name: &str,
+        mime: &str,
+        bytes: &[u8],
+        cid: Option<&str>,
+    ) -> Result<()> {
+        let inline = |mut item: Value| {
+            if let Some(cid) = cid {
+                item["isInline"] = Value::Bool(true);
+                item["contentId"] = Value::String(cid.to_owned());
+            }
+            item
+        };
+        if bytes.len() < INLINE_ATTACHMENT_MAX {
             self.send(
                 self.request(Method::POST, &format!("{draft_path}/attachments"))
-                    .json(&json!({
+                    .json(&inline(json!({
                         "@odata.type": "#microsoft.graph.fileAttachment",
-                        "name": f.name,
-                        "contentType": f.mime,
-                        "contentBytes": STANDARD.encode(&f.bytes),
-                    })),
+                        "name": name,
+                        "contentType": mime,
+                        "contentBytes": STANDARD.encode(bytes),
+                    }))),
             )
             .await?;
             return Ok(());
@@ -1305,17 +1322,17 @@ impl Graph {
                     &format!("{draft_path}/attachments/createUploadSession"),
                 )
                 .json(&json!({
-                    "AttachmentItem": {
+                    "AttachmentItem": inline(json!({
                         "attachmentType": "file",
-                        "name": f.name,
-                        "size": f.bytes.len(),
-                        "contentType": f.mime,
-                    }
+                        "name": name,
+                        "size": bytes.len(),
+                        "contentType": mime,
+                    }))
                 })),
             )
             .await?;
-        let total = f.bytes.len();
-        for (i, chunk) in f.bytes.chunks(UPLOAD_CHUNK).enumerate() {
+        let total = bytes.len();
+        for (i, chunk) in bytes.chunks(UPLOAD_CHUNK).enumerate() {
             let start = i * UPLOAD_CHUNK;
             let end = start + chunk.len() - 1;
             // The upload URL carries its own authorization.
@@ -1328,8 +1345,7 @@ impl Graph {
                 .map_err(|e| Error::network(HOST, e))?;
             if !response.status().is_success() {
                 return Err(Error::Server(format!(
-                    "Microsoft didn't accept {} ({}).",
-                    f.name,
+                    "Microsoft didn't accept {name} ({}).",
                     response.status()
                 )));
             }
@@ -1374,7 +1390,7 @@ fn move_destination<'a>(p: &'a Pending, blocked: Option<&'a str>) -> Option<&'a 
 impl Graph {
     /// Saves a draft: `update` (a draft's id) changed in place, or a new
     /// one in Drafts with `files` attached. Returns its id and Message-ID.
-    /// A draft that's gone is made anew, and so is one whose signature has
+    /// A draft that's gone is made anew, and so is one with embedded
     /// images: they're attached with the draft.
     pub async fn save_draft(
         &self,
@@ -1499,7 +1515,8 @@ impl Graph {
 /// Messages deleted per page when emptying a folder.
 const EMPTY_PAGE: usize = 100;
 
-/// A message body as Graph takes it: HTML with a signature, else text.
+/// A message body as Graph takes it: HTML with rich text or a signature,
+/// else text.
 fn body(bodies: &Bodies) -> Value {
     match &bodies.html {
         Some(html) => json!({ "contentType": "HTML", "content": html }),

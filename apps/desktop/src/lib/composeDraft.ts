@@ -9,7 +9,10 @@ export interface Draft {
   showCc: boolean;
   showBcc: boolean;
   subject: string;
+  /** The body's text (what AI and the checks read). */
   body: string;
+  /** The body as the rich editor has it; absent while it's only `body`'s text (a draft from before). */
+  bodyHtml?: string;
   from: AccountId;
   sendLater: Later | null;
   doneAfter: boolean;
@@ -62,9 +65,13 @@ export function emptyDraft(from: AccountId): Draft {
   };
 }
 
-/** A signature alone isn't content: a new message with just one is empty. */
+/** A signature alone isn't content: a new message with just one is empty. A picture in the body is. */
 export function draftHasContent(d: Draft) {
-  return [d.to, d.cc, d.bcc, d.subject, d.body, d.quote ?? ""].some((s) => s.trim()) || d.attachments.length > 0;
+  return (
+    [d.to, d.cc, d.bcc, d.subject, d.body, d.quote ?? ""].some((s) => s.trim()) ||
+    /<img\b/i.test(d.bodyHtml ?? "") ||
+    d.attachments.length > 0
+  );
 }
 
 /** The signature the draft goes out with, if any. */
@@ -74,7 +81,19 @@ function sentSignature(d: Draft) {
 
 /** What a saved draft keeps, to tell whether there's anything new to save. */
 export function draftKey(d: Draft) {
-  return JSON.stringify([d.from, d.to, d.cc, d.bcc, d.subject, d.body, d.attachments, sentSignature(d), d.quote, d.sendLater]);
+  return JSON.stringify([
+    d.from,
+    d.to,
+    d.cc,
+    d.bcc,
+    d.subject,
+    d.body,
+    d.bodyHtml,
+    d.attachments,
+    sentSignature(d),
+    d.quote,
+    d.sendLater,
+  ]);
 }
 
 /** The draft as the backend takes it, to save or to send at `sendAt`. */
@@ -86,6 +105,7 @@ export function outgoingDraft(d: Draft, sendAt: number, draftId = d.draftId): Ou
     bcc: d.bcc,
     subject: d.subject,
     body: d.body,
+    bodyHtml: d.bodyHtml,
     // A forward isn't a reply; it only carries replyTo for "Mark as Done after sending".
     replyTo: d.forward ? undefined : d.replyTo,
     sendAt,
@@ -113,6 +133,7 @@ export function savedDraft(saved: OutgoingDraft): Draft {
     showBcc: saved.bcc.trim() !== "",
     subject: saved.subject,
     body: saved.body,
+    bodyHtml: saved.bodyHtml,
     sendLater: saved.sendLater ?? null,
     replyTo: saved.replyTo,
     attachments: saved.attachments,

@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Serialize;
-use spark_mail::attachment::{AttachmentData, mime_for};
+use spark_mail::attachment::{AttachmentData, InlineImage, cid_refs, mime_for};
 use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
+use spark_mail::signature;
 use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_store::{
@@ -1059,6 +1060,38 @@ pub fn describe_files(paths: Vec<String>) -> Vec<LocalFile> {
         .collect()
 }
 
+/// Picture types the composer's body shows; what browsers show and mail
+/// clients take.
+const BODY_IMAGES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+];
+
+/// An image file dropped on the composer's body, as a data URL to show in
+/// it. Anything that isn't a picture, or is over the 25 MB servers take,
+/// is refused.
+#[tauri::command]
+pub async fn read_image(path: String) -> Result<String, String> {
+    let mime = mime_for(&path);
+    if !BODY_IMAGES.contains(&mime) {
+        return Err("That isn't a picture.".into());
+    }
+    let size = tokio::fs::metadata(&path).await.map_err(text)?.len();
+    if size > draft::MAX_ATTACHMENTS_BYTES {
+        return Err("That picture is over the 25 MB mail servers take.".into());
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(text)?;
+    Ok(InlineImage {
+        cid: String::new(),
+        mime: mime.into(),
+        bytes,
+    }
+    .data_url())
+}
+
 #[tauri::command]
 pub fn update_message(
     mailbox: State<'_, Mailbox>,
@@ -1364,7 +1397,7 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
     for field in [&draft.to, &draft.cc, &draft.bcc] {
         draft::recipients(field).map_err(text)?;
     }
-    draft::check_attachment_size(&draft.attachments).map_err(text)?;
+    draft.check_size().map_err(text)?;
     // One send per saved draft: another would send it twice.
     if let Some(saved) = draft.draft_id
         && mailbox
@@ -1483,13 +1516,37 @@ pub fn save_draft(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, Stri
 
 /// A draft from Drafts, for the composer.
 #[tauri::command]
-pub fn open_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<Draft, String> {
-    let opened = if mailbox.live() {
-        mailbox.live.engine.open_draft(id).map_err(text)?
-    } else {
-        mailbox.demo.open_draft(id)
-    };
-    opened.ok_or_else(|| "That draft is gone.".to_owned())
+pub async fn open_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<Draft, String> {
+    let gone = || "That draft is gone.".to_owned();
+    if !mailbox.live() {
+        return mailbox.demo.open_draft(id).ok_or_else(gone);
+    }
+    let mut draft = mailbox
+        .live
+        .engine
+        .open_draft(id)
+        .map_err(text)?
+        .ok_or_else(gone)?;
+    // A copy from the server shows its pictures by cid: they come back as
+    // data, for the editor to show and a send to carry again.
+    let shown = [draft.body_html.as_deref(), draft.signature.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|html| !cid_refs(html).is_empty());
+    if shown {
+        match mailbox.live.engine.inline_images(id).await {
+            Ok(images) => {
+                for html in [&mut draft.body_html, &mut draft.signature]
+                    .into_iter()
+                    .flatten()
+                {
+                    *html = signature::inline_parts(html, &images);
+                }
+            }
+            Err(e) => eprintln!("spark-rs: the draft's pictures didn't load: {e}"),
+        }
+    }
+    Ok(draft)
 }
 
 /// Deletes a draft, here and on the server.

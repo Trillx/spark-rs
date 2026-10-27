@@ -3,6 +3,7 @@ import {
   CalendarClock,
   ChevronsUpDown,
   CircleCheck,
+  ImageDown,
   Maximize2,
   Minimize2,
   Paperclip,
@@ -17,27 +18,18 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-  type ChangeEvent,
   type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
   type RefObject,
 } from "react";
-import { describeFiles, getPrefs, onFileDrag, pickFiles, resolveSignature } from "../api";
+import { describeFiles, getPrefs, onFileDrag, pickFiles, readImage, resolveSignature, type DragPoint } from "../api";
 import type { Contact, LocalFile, Signature } from "../types";
 import type { Draft } from "../lib/composeDraft";
 import { useAccounts } from "../lib/accounts";
-import {
-  completeMention,
-  entryFor,
-  joinAddresses,
-  mentionAt,
-  parseEntry,
-  splitAddresses,
-  type Mention,
-} from "../lib/addresses";
-import { caretPoint } from "../lib/caret";
+import { entryFor, joinAddresses, parseEntry, splitAddresses } from "../lib/addresses";
 import { formatBytes, formatLater, laterPresets, pickLater, presetDetail } from "../lib/format";
+import { IMAGE_SIZES, textToHtml, type ImageSize } from "../lib/richText";
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import AiMenu, { type AiRequest } from "./AiMenu";
@@ -45,6 +37,7 @@ import { DateTimeDialog } from "./Dialog";
 import { AttachmentChip } from "./Attachments";
 import Dropdown, { MenuItem } from "./Dropdown";
 import Recipients, { SuggestionList, displayName, useSuggestions, type RecipientsHandle } from "./Recipients";
+import RichEditor, { type MentionQuery, type RichEditorHandle } from "./RichEditor";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import SignaturePicker from "./SignaturePicker";
@@ -57,11 +50,16 @@ const ATTACH_KEYS = IS_MAC ? "⇧⌘A" : "Ctrl+Shift+A";
 /** How many people an @mention suggests, as in Spark. */
 const MENTION_SUGGESTIONS = 6;
 
+/** A picked @mention: Undo takes them off To again if picking added them. */
 interface MentionEdit {
-  before: string;
-  after: string;
+  address: string;
   added: Contact | null;
+  /** How many links to them the body had once it was in. */
+  links: number;
 }
+
+/** Picture files that can go in the body when they're dropped on it. */
+const PICTURE = /\.(png|jpe?g|gif|webp|bmp)$/i;
 
 /**
  * AI working on the body: under way, failed, waiting for a provider to be set
@@ -88,8 +86,8 @@ export interface ComposerAi {
 
 /**
  * Compact floating composer, with a toggle that fills the reading pane.
- * The body is plain text for now (the rich editor comes later); under it
- * are the signature, which is HTML, and a forward's original.
+ * The body is rich text; under it are the signature, which is HTML too,
+ * and a forward's original.
  */
 export default function Composer({
   draft,
@@ -124,10 +122,12 @@ export default function Composer({
   ai?: ComposerAi;
 }) {
   const recipientsRef = useRef<RecipientsHandle>(null);
-  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<RichEditorHandle>(null);
   const quoteRef = useRef<HTMLTextAreaElement>(null);
   const signatureRef = useRef<SignatureFrameHandle>(null);
   const [dropping, setDropping] = useState(false);
+  /** How big pictures go in the body (Spark's image size). */
+  const [imageSize, setImageSize] = useState<ImageSize>("actual");
   /** Picking a day and time for Send Later or Remind me. */
   const [picking, setPicking] = useState<"sendLater" | "remind" | null>(null);
   // File drops arrive through a listener set up once; it reads these.
@@ -148,12 +148,26 @@ export default function Composer({
     }
   }
 
+  /** Dropped files: pictures dropped on the body go in it, the rest are attached. */
+  async function dropFiles(paths: string[], at: DragPoint) {
+    const files = await describeFiles(paths);
+    const editor = editorRef.current;
+    const inline = editor?.covers(at.x, at.y) ? files.filter((f) => PICTURE.test(f.name)) : [];
+    addFiles(files.filter((f) => !inline.includes(f)));
+    if (!inline.length) return;
+    try {
+      await editor!.insertImages(await Promise.all(inline.map((f) => readImage(f.path))), at);
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
   useEffect(
     () =>
       onFileDrag((e) => {
         if (e.type === "drop") {
           setDropping(false);
-          void describeFiles(e.paths).then(addFiles);
+          void dropFiles(e.paths, e.at);
         } else {
           setDropping(e.type === "over");
         }
@@ -183,11 +197,6 @@ export default function Composer({
 
   // Replies arrive with a recipient, so they start in the body; anything else starts in To.
   const [startInTo] = useState(() => !draft.to);
-  useEffect(() => {
-    if (startInTo) return;
-    bodyRef.current?.focus();
-    bodyRef.current?.setSelectionRange(draft.body.length, draft.body.length);
-  }, []); // only when the composer opens
 
   const [suggest, setSuggest] = useState(true);
   useEffect(() => {
@@ -214,98 +223,80 @@ export default function Composer({
     }
   }
 
-  // @mentions in the body: picking someone puts their name in the text and adds them to To.
-  const [mention, setMention] = useState<Mention | null>(null);
+  // @mentions in the body: picking someone links their name in the text and adds them to To.
+  const [mention, setMention] = useState<MentionQuery | null>(null);
   const mentionHistory = useRef<{ undo: MentionEdit[]; redo: MentionEdit[] }>({ undo: [], redo: [] });
   const mentioned = useSuggestions(mention?.query ?? "", MENTION_SUGGESTIONS);
-  const [mentionAnchor, setMentionAnchor] = useState<CSSProperties | null>(null);
+  const latestMention = useRef({ mentioned, pick: pickMention });
+  latestMention.current = { mentioned, pick: pickMention };
 
-  function trackMention(el: HTMLTextAreaElement) {
-    const caret = el.selectionStart;
-    setMention(caret === el.selectionEnd ? mentionAt(el.value, caret) : null);
+  let mentionAnchor: CSSProperties | null = null;
+  if (mention && mentioned.list.length > 0) {
+    const { rect } = mention;
+    const left = Math.max(8, Math.min(rect.left - 12, window.innerWidth - 408));
+    // Under the line, or over it when there's no room below.
+    mentionAnchor =
+      rect.bottom + 240 < window.innerHeight
+        ? { position: "fixed", left, top: rect.bottom + 4 }
+        : { position: "fixed", left, bottom: window.innerHeight - rect.top + 4 };
   }
 
-  useLayoutEffect(() => {
-    const el = bodyRef.current;
-    if (!el || !mention || mentioned.list.length === 0) return setMentionAnchor(null);
-    const point = caretPoint(el, mention.start);
-    const left = Math.max(8, Math.min(point.left - 12, window.innerWidth - 408));
-    // Under the line, or over it when there's no room below.
-    setMentionAnchor(
-      point.top + point.height + 240 < window.innerHeight
-        ? { position: "fixed", left, top: point.top + point.height + 4 }
-        : { position: "fixed", left, bottom: window.innerHeight - point.top + 4 },
-    );
-  }, [mention, mentioned.list.length]);
+  function listed(address: string) {
+    return [draft.to, draft.cc, draft.bcc]
+      .flatMap(splitAddresses)
+      .some((entry) => parseEntry(entry).address.toLowerCase() === address);
+  }
 
   function pickMention(contact: Contact) {
-    const el = bodyRef.current;
-    if (!el || !mention) return;
-    const done = completeMention(draft.body, mention, el.selectionStart, displayName(contact));
+    const editor = editorRef.current;
+    if (!editor || !mention) return;
     const address = contact.address.toLowerCase();
-    const listed = [draft.to, draft.cc, draft.bcc]
-      .flatMap(splitAddresses)
-      .some((e) => parseEntry(e).address.toLowerCase() === address);
-    mentionHistory.current.undo.push({ before: draft.body, after: done.text, added: listed ? null : contact });
+    const added = listed(address) ? null : contact;
+    editor.completeMention(displayName(contact), contact.address);
+    mentionHistory.current.undo.push({ address, added, links: editor.mentions(address) });
     mentionHistory.current.redo = [];
-    // Use the editor's insertion command so the mention is one native undo step.
-    const end = draft.body.length - (done.text.length - done.caret);
-    el.focus();
-    el.setSelectionRange(mention.start, end);
-    document.execCommand("insertText", false, done.text.slice(mention.start, done.caret));
-    onChange({
-      body: done.text,
-      ...(listed ? {} : { to: joinAddresses([...splitAddresses(draft.to), entryFor(contact)]) }),
-    });
+    if (added) onChange({ to: joinAddresses([...splitAddresses(draft.to), entryFor(contact)]) });
     setMention(null);
-    requestAnimationFrame(() => el.setSelectionRange(done.caret, done.caret));
   }
 
-  function onBodyChange(e: ChangeEvent<HTMLTextAreaElement>) {
+  function onBodyChange(html: string, text: string, inputType: string) {
     if (writing?.status === "done") ai?.dismiss();
-    const body = e.target.value;
-    const patch: Partial<Draft> = { body };
-    const inputType = (e.nativeEvent as InputEvent).inputType;
+    const patch: Partial<Draft> = { body: text, bodyHtml: html };
     const history = mentionHistory.current;
+    const editor = editorRef.current;
     const undo = history.undo.at(-1);
     const redo = history.redo.at(-1);
-    if (inputType === "historyUndo" && undo && (body === undo.before || draft.body === undo.after)) {
+    if (inputType === "historyUndo" && undo && editor && editor.mentions(undo.address) < undo.links) {
       history.undo.pop();
       history.redo.push(undo);
       if (undo.added) {
-        const address = undo.added.address.toLowerCase();
-        patch.to = joinAddresses(splitAddresses(draft.to).filter((entry) => parseEntry(entry).address.toLowerCase() !== address));
+        patch.to = joinAddresses(splitAddresses(draft.to).filter((entry) => parseEntry(entry).address.toLowerCase() !== undo.address));
       }
-    } else if (inputType === "historyRedo" && redo && (body === redo.after || draft.body === redo.before)) {
+    } else if (inputType === "historyRedo" && redo && editor && editor.mentions(redo.address) >= redo.links) {
       history.redo.pop();
       history.undo.push(redo);
-      if (redo.added) {
-        const address = redo.added.address.toLowerCase();
-        const listed = [draft.to, draft.cc, draft.bcc].flatMap(splitAddresses)
-          .some((entry) => parseEntry(entry).address.toLowerCase() === address);
-        if (!listed) patch.to = joinAddresses([...splitAddresses(draft.to), entryFor(redo.added)]);
-      }
+      if (redo.added && !listed(redo.address)) patch.to = joinAddresses([...splitAddresses(draft.to), entryFor(redo.added)]);
     } else if (inputType !== "historyUndo" && inputType !== "historyRedo") {
       history.redo = [];
     }
     onChange(patch);
-    trackMention(e.target);
   }
 
-  function onBodyKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    const list = mentioned.list;
-    if (e.nativeEvent.isComposing || list.length === 0 || e.ctrlKey || e.metaKey || e.altKey) return;
+  /** The mention list's keys, while it's showing. */
+  function onBodyKey(e: globalThis.KeyboardEvent) {
+    const { mentioned: shown, pick } = latestMention.current;
+    const list = shown.list;
+    if (e.isComposing || list.length === 0 || e.ctrlKey || e.metaKey || e.altKey) return false;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      mentioned.move(e.key === "ArrowDown" ? 1 : -1, list.length);
+      shown.move(e.key === "ArrowDown" ? 1 : -1, list.length);
     } else if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey) {
-      e.preventDefault();
-      pickMention(list[Math.min(mentioned.active, list.length - 1)]);
+      pick(list[Math.min(shown.active, list.length - 1)]);
     } else if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation();
-      mentioned.dismiss();
+      shown.dismiss();
+    } else {
+      return false;
     }
+    return true;
   }
 
   const attachedBytes = draft.attachments.reduce((sum, a) => sum + a.size, 0);
@@ -313,20 +304,21 @@ export default function Composer({
 
   // The body and a forward's original grow with their text; the area they're in scrolls.
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [areaHeight, setAreaHeight] = useState(0);
   useLayoutEffect(() => {
-    fit(bodyRef);
     fit(quoteRef);
-  }, [draft.body, draft.quote, showSignature, full]);
+  }, [draft.quote, showSignature, full]);
   useEffect(() => {
     const area = scrollRef.current;
     if (!area) return;
     const observer = new ResizeObserver(() => {
-      fit(bodyRef);
+      setAreaHeight(area.clientHeight);
       fit(quoteRef);
     });
     observer.observe(area);
     return () => observer.disconnect();
   }, []);
+  const hasImages = /<img\b/i.test(draft.bodyHtml ?? "");
 
   const writing = ai?.writing ?? null;
   const busy = writing?.status === "writing";
@@ -376,7 +368,7 @@ export default function Composer({
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              bodyRef.current?.focus();
+              editorRef.current?.focus("start");
             }
           }}
         />
@@ -388,26 +380,25 @@ export default function Composer({
           // Below everything is still the body's.
           if (e.target !== e.currentTarget) return;
           e.preventDefault();
-          const body = bodyRef.current;
-          body?.focus();
-          body?.setSelectionRange(body.value.length, body.value.length);
+          editorRef.current?.focus("end");
         }}
       >
-        <textarea
-          ref={bodyRef}
-          aria-label="Message"
-          className={`block w-full resize-none overflow-hidden bg-transparent px-4 pb-2 pt-3 text-sm leading-[1.57] outline-none placeholder:text-text-3 ${
-            showSignature || draft.quote !== undefined ? "min-h-[4.5rem]" : "min-h-full"
-          }`}
-          placeholder={busy ? "" : "Enter text"}
-          value={draft.body}
-          readOnly={busy}
-          aria-busy={busy}
-          onChange={onBodyChange}
-          onSelect={(e) => trackMention(e.currentTarget)}
-          onKeyDown={onBodyKeyDown}
-          onBlur={() => setMention(null)}
-        />
+        <div aria-busy={busy}>
+          <RichEditor
+            ref={editorRef}
+            html={draft.bodyHtml ?? textToHtml(draft.body)}
+            onChange={onBodyChange}
+            placeholder={busy ? "" : "Enter text"}
+            readOnly={busy}
+            minHeight={showSignature || draft.quote !== undefined ? 72 : areaHeight}
+            autoFocus={startInTo ? undefined : "end"}
+            scroller={scrollRef}
+            imageSize={imageSize}
+            onMention={setMention}
+            onKey={onBodyKey}
+            onError={onError}
+          />
+        </div>
         {mentionAnchor && (
           <SuggestionList
             className="w-[400px]"
@@ -537,8 +528,39 @@ export default function Composer({
         </div>
       )}
 
-      {(draft.sendLater || draft.remind) && (
+      {(draft.sendLater || draft.remind || hasImages) && (
         <div className="flex shrink-0 flex-wrap gap-1.5 px-3 pb-2">
+          {hasImages && (
+            <Dropdown
+              direction="up"
+              width="w-48"
+              trigger={({ toggle, open }) => (
+                <button
+                  className={`inline-flex h-6 items-center gap-1 rounded-full px-2 text-xs ${
+                    open ? "bg-primary/10 text-primary" : "bg-base-200 text-text-2 hover:text-base-content"
+                  }`}
+                  aria-expanded={open}
+                  onClick={toggle}
+                >
+                  <ImageDown size={13} /> {IMAGE_SIZES.find((s) => s.key === imageSize)!.label} Image Size
+                </button>
+              )}
+            >
+              <li className="menu-title px-2 py-1 text-[11px]">Change images size</li>
+              {IMAGE_SIZES.map((s) => (
+                <MenuItem
+                  key={s.key}
+                  label={s.label}
+                  detail={Number.isFinite(s.pixels) ? `${s.pixels}px` : undefined}
+                  checked={imageSize === s.key}
+                  onSelect={() => {
+                    setImageSize(s.key);
+                    void editorRef.current?.resizeImages(s.key);
+                  }}
+                />
+              ))}
+            </Dropdown>
+          )}
           {draft.sendLater && (
             <Chip onClear={() => onChange({ sendLater: null })}>
               <CalendarClock size={13} /> Send {formatLater(draft.sendLater.at)}
@@ -568,7 +590,13 @@ export default function Composer({
 
       <div className="flex h-12 shrink-0 items-center gap-0.5 border-t border-hairline px-2">
         {ai && (
-          <AiMenu body={draft.body} bodyRef={bodyRef} quickReplies={ai.quickReplies} disabled={busy} onRun={ai.run} />
+          <AiMenu
+            body={draft.body}
+            selected={() => editorRef.current?.selection() ?? null}
+            quickReplies={ai.quickReplies}
+            disabled={busy}
+            onRun={ai.run}
+          />
         )}
         <IconButton
           title={{ label: "Attach files", keys: ATTACH_KEYS, card: "attach" }}

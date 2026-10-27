@@ -1456,6 +1456,7 @@ impl Engine {
                 references: headers.references,
                 from: message.from_name,
                 text: content.text,
+                html: content.html,
             },
             headers.remote_id,
         )))

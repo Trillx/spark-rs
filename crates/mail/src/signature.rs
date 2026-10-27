@@ -1,8 +1,9 @@
-//! Signatures in outgoing mail. A signature is HTML the user wrote or
-//! pasted, cleaned here before it's kept or sent. Mail with a signature goes
-//! out as text and HTML. The HTML is laid out in sections (body, signature,
-//! then the quoted original), named the way Spark names them, which is also
-//! how a saved draft's signature is found again.
+//! Signatures and rich text in outgoing mail. A signature, like the body
+//! from the rich editor, is HTML the user wrote or pasted, cleaned here
+//! before it's kept or sent. Mail with either goes out as text and HTML. The
+//! HTML is laid out in sections (body, signature, then the quoted original),
+//! named the way Spark names them, which is also how a saved draft's body
+//! and signature are found again.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,7 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use spark_store::{DefaultSignature, Signature, Store};
 
-use crate::attachment::InlineImage;
+use crate::attachment::{self, InlineImage};
 use crate::parse::html_to_text;
 
 pub const BODY_SECTION: &str = "messageBodySection";
@@ -87,8 +88,8 @@ const IMAGE_TYPES: &[&str] = &[
     "image/bmp",
 ];
 
-/// Keeps what signatures are made of (text formatting, inline styles, links,
-/// images and tables) and drops the rest: scripts, styles sheets, event
+/// Keeps what signatures and bodies are made of (text formatting, inline
+/// styles, links, images and tables) and drops the rest: scripts, styles sheets, event
 /// handlers, forms and frames. Links keep http(s), mailto and tel; images
 /// keep http(s), embedded raster images and `cid:` parts. Colors from
 /// Outlook's dark mode are turned back (see [`undo_dark_mode`]).
@@ -262,14 +263,100 @@ fn rgb_from_lab([l, a, b]: [f64; 3]) -> [u8; 3] {
     })
 }
 
+/// An original's HTML as a reply quotes it: cleaned, and without the
+/// images it carries as parts of its own (`cid:`), which don't go along.
+pub fn sanitize_quoted(html: &str) -> String {
+    let clean = sanitize(html);
+    let lower = clean.to_ascii_lowercase();
+    let mut out = String::with_capacity(clean.len());
+    let mut last = 0;
+    for (at, _) in lower.match_indices("<img") {
+        let Some(len) = lower[at..].find('>') else {
+            break;
+        };
+        if at >= last && lower[at..at + len].contains("src=\"cid:") {
+            out.push_str(&clean[last..at]);
+            last = at + len + 1;
+        }
+    }
+    out.push_str(&clean[last..]);
+    out
+}
+
+/// The rich editor's body as plain text, for the text/plain version: like
+/// [`text`], with each list item marked ("- ", or "1. " when numbered).
+pub fn body_text(html: &str) -> String {
+    text(&list_markers(html))
+}
+
+/// `html` with each list item's marker written in after its `<li>`.
+fn list_markers(html: &str) -> String {
+    // ASCII lowercasing keeps the byte offsets.
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    // The lists the scan is in: `None` bulleted, else the items numbered so far.
+    let mut lists: Vec<Option<usize>> = Vec::new();
+    let (mut last, mut pos) = (0, 0);
+    while let Some(i) = lower[pos..].find('<') {
+        let at = pos + i;
+        let Some(len) = lower[at..].find('>') else {
+            break;
+        };
+        let end = at + len + 1;
+        let name: String = lower[at + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '/')
+            .collect();
+        match name.as_str() {
+            "ul" => lists.push(None),
+            "ol" => lists.push(Some(0)),
+            "/ul" | "/ol" => {
+                lists.pop();
+            }
+            "li" => {
+                out.push_str(&html[last..end]);
+                match lists.last_mut() {
+                    Some(Some(n)) => {
+                        *n += 1;
+                        out.push_str(&format!("{n}. "));
+                    }
+                    _ => out.push_str("- "),
+                }
+                last = end;
+            }
+            _ => {}
+        }
+        pos = end;
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
 /// The signature as plain text, line by line: for the text/plain version,
 /// and to name it in lists. Empty for one that's only an image.
 pub fn text(html: &str) -> String {
     // html_to_text only breaks lines at <br> and </p>. A block's end breaks
-    // the line too, unless it's already broken.
+    // the line too, unless it's already broken, and so does a list's start.
     const BREAK: char = '\u{e000}';
     let mut blocks = html.to_owned();
     for tag in [
+        "<ul",
+        "<ol",
+        // A block that starts after text on its line (the editor's second
+        // line, `Hello<div>world</div>`) starts a new one.
+        "<div",
+        "<p",
+        "<li",
+        "<h1",
+        "<h2",
+        "<h3",
+        "<h4",
+        "<h5",
+        "<h6",
+        "<blockquote",
+        "<table",
+        "<tr",
+        "<center",
         "</div>",
         "</li>",
         "</tr>",
@@ -380,6 +467,40 @@ pub fn embed_images(html: &str) -> (String, Vec<InlineImage>) {
     (out, images)
 }
 
+/// The other way round: pictures a message shows by `cid:` put back in as
+/// `data:` URLs from its parts, `images`, as a draft from the server goes
+/// back in the editor. Ones that aren't among them stay as they are.
+pub fn inline_parts(html: &str, images: &[InlineImage]) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut last = 0;
+    for (at, _) in lower.match_indices("cid:") {
+        // As `attachment::cid_refs` reads them: attribute values and url()s.
+        if at < last
+            || !matches!(
+                lower[..at].chars().next_back(),
+                Some('"' | '\'' | '=' | '(')
+            )
+        {
+            continue;
+        }
+        let rest = &html[at + 4..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>'))
+            .unwrap_or(rest.len());
+        let key = attachment::cid_key(&attachment::percent_decode(
+            &rest[..end].replace("&amp;", "&"),
+        ));
+        if let Some(image) = images.iter().find(|i| i.cid == key) {
+            out.push_str(&html[last..at]);
+            out.push_str(&image.data_url());
+            last = at + 4 + end;
+        }
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
 fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
     let (meta, data) = url.strip_prefix("data:")?.split_once(',')?;
     let mime = meta.strip_suffix(";base64")?.to_ascii_lowercase();
@@ -400,7 +521,10 @@ fn random_hex() -> String {
 /// What a message says, in its three parts. `quote` is the original below
 /// the signature: a forward's, or a reply's "… wrote:" and quoted text.
 pub struct Parts<'a> {
+    /// Plain text, unless there's `body_html`.
     pub body: &'a str,
+    /// The body from the rich editor, as sanitized HTML.
+    pub body_html: Option<&'a str>,
     /// Sanitized HTML.
     pub signature: Option<&'a str>,
     pub quote: Option<Quote<'a>>,
@@ -409,15 +533,20 @@ pub struct Parts<'a> {
 pub enum Quote<'a> {
     /// Text that goes out as it is (a forward's header and original).
     Plain(&'a str),
-    /// A reply's original: `from` wrote `text`.
-    Reply { from: &'a str, text: &'a str },
+    /// A reply's original: `from` wrote `text`, and the HTML version
+    /// quotes its `html` if it has one (see [`sanitize_quoted`]).
+    Reply {
+        from: &'a str,
+        text: &'a str,
+        html: Option<&'a str>,
+    },
 }
 
 impl Quote<'_> {
     fn text(&self) -> String {
         match self {
             Self::Plain(text) => text.trim_end().to_owned(),
-            Self::Reply { from, text } => {
+            Self::Reply { from, text, .. } => {
                 let quoted: Vec<String> = text
                     .trim_end()
                     .lines()
@@ -437,10 +566,10 @@ impl Quote<'_> {
     fn html(&self) -> String {
         match self {
             Self::Plain(text) => escape(text.trim_end()),
-            Self::Reply { from, text } => format!(
+            Self::Reply { from, text, html } => format!(
                 "{} wrote:<br><blockquote type=\"cite\" style=\"margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex\">{}</blockquote>",
                 escape(from),
-                escape(text.trim_end())
+                html.map_or_else(|| escape(text.trim_end()), str::to_owned)
             ),
         }
     }
@@ -449,7 +578,11 @@ impl Quote<'_> {
 impl Parts<'_> {
     /// The text/plain version: the body, the signature's text, then the quote.
     pub fn text(&self) -> String {
-        let mut parts = vec![self.body.trim_end().to_owned()];
+        let body = match self.body_html {
+            Some(html) => body_text(html),
+            None => self.body.trim_end().to_owned(),
+        };
+        let mut parts = vec![body];
         if let Some(signature) = self.signature.map(text).filter(|t| !t.is_empty()) {
             parts.push(signature);
         }
@@ -467,9 +600,18 @@ impl Parts<'_> {
         let style = body_style
             .map(|s| format!(" style=\"{s}\""))
             .unwrap_or_default();
-        let body = self.body.trim_end();
-        let mut html = format!("<div name=\"{BODY_SECTION}\"{style}>{}", escape(body));
-        if !body.is_empty() {
+        let (body, empty) = match self.body_html {
+            Some(body) => (
+                body.trim().to_owned(),
+                text(body).is_empty() && !body.contains("<img"),
+            ),
+            None => (
+                escape(self.body.trim_end()),
+                self.body.trim_end().is_empty(),
+            ),
+        };
+        let mut html = format!("<div name=\"{BODY_SECTION}\"{style}>{body}");
+        if !empty {
             html.push_str("<br><br>");
         }
         html.push_str("</div>");
@@ -719,10 +861,12 @@ mod tests {
     fn parts_go_body_signature_quote() {
         let parts = Parts {
             body: "Sounds good.\n",
+            body_html: None,
             signature: Some("<div>Ana</div><div>ACME</div>"),
             quote: Some(Quote::Reply {
                 from: "Bo <b@x.com>",
                 text: "Shall we?\n\nB.",
+                html: None,
             }),
         };
         assert_eq!(
@@ -738,6 +882,7 @@ mod tests {
         );
         let forward = Parts {
             body: "",
+            body_html: None,
             signature: None,
             quote: Some(Quote::Plain("---------- Forwarded message ----------\nHi")),
         };
@@ -749,6 +894,61 @@ mod tests {
             forward
                 .html(Some("font-size:11pt"))
                 .starts_with("<div name=\"messageBodySection\" style=\"font-size:11pt\"></div>")
+        );
+    }
+
+    #[test]
+    fn a_line_typed_after_the_first_is_a_line_of_its_own() {
+        assert_eq!(body_text("Hello<div>world</div>"), "Hello\nworld");
+        assert_eq!(body_text("Hi<p>there</p>"), "Hi\nthere");
+        assert_eq!(text("<b>Ana</b> Ruiz<br>ACME"), "Ana Ruiz\nACME");
+    }
+
+    #[test]
+    fn pictures_shown_by_cid_come_back_as_data() {
+        let images = [InlineImage {
+            cid: "logo@x".into(),
+            mime: "image/png".into(),
+            bytes: b"png".to_vec(),
+        }];
+        assert_eq!(
+            inline_parts(
+                r#"<img src="cid:Logo@x"> cid:logo@x <img src="cid:gone@x">"#,
+                &images
+            ),
+            r#"<img src="data:image/png;base64,cG5n"> cid:logo@x <img src="cid:gone@x">"#
+        );
+    }
+
+    #[test]
+    fn rich_bodies_read_as_text_with_their_list_markers() {
+        assert_eq!(
+            body_text(
+                "<div>Plan:</div><ol><li>Draft</li><li>Send<ul><li>to <b>Ana</b></li></ul></li></ol><div><br></div><div>Thanks&nbsp;all</div>"
+            ),
+            "Plan:\n1. Draft\n2. Send\n- to Ana\n\nThanks all"
+        );
+        let parts = Parts {
+            body: "",
+            body_html: Some("<div><br></div>"),
+            signature: Some("<div>Ana</div>"),
+            quote: None,
+        };
+        assert_eq!(parts.text(), "Ana");
+        assert_eq!(
+            parts.html(None),
+            "<div name=\"messageBodySection\"><div><br></div></div><div name=\"messageSignatureSection\"><div>Ana</div></div>",
+            "an empty body gets no gap"
+        );
+    }
+
+    #[test]
+    fn quoted_html_leaves_out_images_that_dont_go_along() {
+        assert_eq!(
+            sanitize_quoted(
+                r#"<div>Hi<IMG SRC="CID:a@b" alt="logo"></div><img src="https://x/y.png"><script>x</script>"#
+            ),
+            r#"<div>Hi</div><img src="https://x/y.png">"#
         );
     }
 

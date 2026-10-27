@@ -24,8 +24,12 @@ pub struct Draft {
     #[serde(default)]
     pub bcc: String,
     pub subject: String,
-    /// Plain text.
+    /// Plain text: what's typed, or with `body_html`, its text.
     pub body: String,
+    /// The body from the rich editor, as HTML: cleaned when the message is
+    /// built, and sent with `body`'s text alongside. `None` for plain text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_html: Option<String>,
     /// The message this replies to, for threading.
     #[serde(default)]
     pub reply_to: Option<i64>,
@@ -83,8 +87,8 @@ pub struct SendLater {
     pub at: i64,
 }
 
-/// What a draft sends: its text and, with a signature, HTML too, plus the
-/// images the signature embeds.
+/// What a draft sends: its text and, with rich text or a signature, HTML
+/// too, plus the images they embed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bodies {
     pub text: String,
@@ -102,12 +106,14 @@ impl Draft {
     /// The body, the signature, then the original: a reply's `original`
     /// quoted, or a forward's `quote`. `body_style` styles the typed text in
     /// the HTML.
+    ///
+    /// Embedded (`data:`) images become parts of their own.
     pub fn bodies(&self, original: Option<&Original>, body_style: Option<&str>) -> Bodies {
         self.bodies_with(original, body_style, true)
     }
 
     /// The draft as it's kept here while it's saved: no reply quote, and the
-    /// signature's images left in its HTML.
+    /// images left in its HTML.
     pub fn saved_bodies(&self) -> Bodies {
         self.bodies_with(None, None, false)
     }
@@ -118,29 +124,36 @@ impl Draft {
         body_style: Option<&str>,
         embed: bool,
     ) -> Bodies {
-        let (signature, images) = match self.clean_signature() {
-            Some(clean) if embed => {
-                let (html, images) = signature::embed_images(&clean);
-                (Some(html), images)
-            }
-            clean => (clean, Vec::new()),
-        };
-        let quote = match (original.filter(|o| !o.text.trim().is_empty()), &self.quote) {
+        let body_html = self.body_html.as_deref().map(signature::sanitize);
+        let signature = self.clean_signature();
+        let original = original.filter(|o| !o.text.trim().is_empty());
+        let quoted = original.and_then(|o| o.html.as_deref().map(signature::sanitize_quoted));
+        let quote = match (original, &self.quote) {
             (Some(o), _) => Some(Quote::Reply {
                 from: &o.from,
                 text: &o.text,
+                html: quoted.as_deref(),
             }),
             (None, Some(q)) if !q.trim().is_empty() => Some(Quote::Plain(q)),
             _ => None,
         };
         let parts = Parts {
             body: &self.body,
+            body_html: body_html.as_deref(),
             signature: signature.as_deref(),
             quote,
         };
+        let html = (body_html.is_some() || signature.is_some()).then(|| parts.html(body_style));
+        let (html, images) = match html {
+            Some(html) if embed => {
+                let (html, images) = signature::embed_images(&html);
+                (Some(html), images)
+            }
+            html => (html, Vec::new()),
+        };
         Bodies {
             text: parts.text(),
-            html: signature.is_some().then(|| parts.html(body_style)),
+            html,
             images,
         }
     }
@@ -227,9 +240,38 @@ impl OutgoingAttachment {
     }
 }
 
-/// Refuses attachments that add up to more than servers take.
-pub fn check_attachment_size(attachments: &[OutgoingAttachment]) -> Result<()> {
-    let total: u64 = attachments.iter().map(OutgoingAttachment::size).sum();
+impl Draft {
+    /// Refuses a draft whose attachments and embedded images add up to more
+    /// than servers take.
+    pub fn check_size(&self) -> Result<()> {
+        let images = [self.body_html.as_deref(), self.signature.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(embedded_bytes)
+            .sum();
+        check_attachment_size(&self.attachments, images)
+    }
+}
+
+/// About how many bytes the `data:` images in `html` decode to.
+fn embedded_bytes(html: &str) -> u64 {
+    html.match_indices("src=\"data:")
+        .filter_map(|(at, _)| {
+            let url = &html[at + 5..];
+            let data = &url[url.find(',')? + 1..url.find('"')?];
+            Some(data.len() as u64 * 3 / 4)
+        })
+        .sum()
+}
+
+/// Refuses attachments that, with `extra` bytes of images, add up to more
+/// than servers take.
+pub fn check_attachment_size(attachments: &[OutgoingAttachment], extra: u64) -> Result<()> {
+    let total: u64 = attachments
+        .iter()
+        .map(OutgoingAttachment::size)
+        .sum::<u64>()
+        + extra;
     if total > MAX_ATTACHMENTS_BYTES {
         return Err(Error::Config(format!(
             "The attachments add up to {:.1} MB; mail servers take up to 25 MB.",
@@ -244,9 +286,11 @@ pub fn check_attachment_size(attachments: &[OutgoingAttachment]) -> Result<()> {
 pub struct Original {
     pub message_id: Option<String>,
     pub references: Option<String>,
-    /// "Ana Ruiz" and her text, quoted under the reply.
+    /// "Ana Ruiz" and her text, quoted under the reply, in HTML if it has
+    /// one.
     pub from: String,
     pub text: String,
+    pub html: Option<String>,
 }
 
 /// Parses an address field. Empty is fine; anything unparsable is an error
@@ -386,6 +430,7 @@ mod tests {
             references: Some("0@x.com".into()),
             from: "Ana Ruiz".into(),
             text: "Shall we?\n\nA.".into(),
+            html: None,
         };
         let from: Mailbox = "Me <me@gmail.com>".parse().unwrap();
         let message = build_message(from, &draft("ana@x.com"), Some(&original), &[]).unwrap();
@@ -472,6 +517,71 @@ mod tests {
             ["plan.pdf"],
             "the image isn't a file"
         );
+    }
+
+    #[test]
+    fn rich_text_goes_out_as_html_with_its_text_and_images() {
+        let original = Original {
+            message_id: Some("1@x.com".into()),
+            from: "Ana Ruiz".into(),
+            text: "Shall we?".into(),
+            html: Some(
+                r#"<p style="color:red">Shall <b>we</b>?</p><img src="cid:logo@x"><img src="https://x.com/a.png">"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let mut d = draft("ana@x.com");
+        d.body = "ignored".into();
+        d.body_html = Some(
+            r#"<div>Hi <a href="mailto:bo@x.com">Bo</a>,</div><ul><li><b>one</b></li><li>two</li></ul><ol><li>first</li></ol><div><img src="data:image/png;base64,iVBORw0KGgo=" onerror="x()"></div>"#
+                .into(),
+        );
+        let from: Mailbox = "me@gmail.com".parse().unwrap();
+        let raw = build_message(from, &d, Some(&original), &[])
+            .unwrap()
+            .formatted();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(
+            parsed.body_text(0).unwrap().replace("\r\n", "\n"),
+            "Hi Bo,\n- one\n- two\n1. first\n\nAna Ruiz wrote:\n> Shall we?\n"
+        );
+        let html = parsed.body_html(0).unwrap();
+        assert!(
+            html.starts_with(r#"<div name="messageBodySection"><div>Hi <a href="mailto:bo@x.com">Bo</a>,</div><ul><li><b>one</b></li>"#),
+            "{html}"
+        );
+        assert!(
+            !html.contains("onerror") && !html.contains("data:"),
+            "{html}"
+        );
+        // The original's formatting is quoted, without the image it carried.
+        assert!(
+            html.contains(r#"<blockquote type="cite" style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex"><p style="color:red">Shall <b>we</b>?</p><img src="https://x.com/a.png"></blockquote>"#),
+            "{html}"
+        );
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains("multipart/related"),
+            "the body's image is a part: {text}"
+        );
+        // Without a signature, plain text still goes as plain text.
+        let plain = draft("ana@x.com").bodies(None, None);
+        assert_eq!((plain.text.as_str(), plain.html), ("Sounds good.", None));
+    }
+
+    #[test]
+    fn embedded_images_count_toward_the_size_limit() {
+        let mut d = draft("ana@x.com");
+        let data = "A".repeat(4 * 1024 * 1024);
+        d.body_html = Some(format!(r#"<img src="data:image/png;base64,{data}">"#));
+        assert!(d.check_size().is_ok());
+        d.attachments = vec![OutgoingAttachment::File {
+            path: "x".into(),
+            name: "x.bin".into(),
+            size: MAX_ATTACHMENTS_BYTES - 1024 * 1024,
+        }];
+        assert!(d.check_size().is_err(), "3 MB of image and 24 MB of files");
     }
 
     #[test]
@@ -576,8 +686,8 @@ mod tests {
             name: "big.zip".into(),
             size,
         };
-        assert!(check_attachment_size(&[file(MAX_ATTACHMENTS_BYTES)]).is_ok());
-        let err = check_attachment_size(&[file(MAX_ATTACHMENTS_BYTES), file(1)]).unwrap_err();
+        assert!(check_attachment_size(&[file(MAX_ATTACHMENTS_BYTES)], 0).is_ok());
+        let err = check_attachment_size(&[file(MAX_ATTACHMENTS_BYTES), file(1)], 0).unwrap_err();
         assert!(err.to_string().contains("25 MB"), "{err}");
     }
 }

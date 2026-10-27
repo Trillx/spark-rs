@@ -15,7 +15,7 @@ import {
   UserPlus,
   type LucideIcon,
 } from "lucide-react";
-import { useRef, useState, type RefObject } from "react";
+import { useRef, useState } from "react";
 import { QUICK_REPLIES, type QuickReply, type Rewrite } from "../ai";
 import { tipAttrs } from "../lib/tooltip";
 import AiMark from "./AiMark";
@@ -60,14 +60,15 @@ const STARTERS = [
  */
 export default function AiMenu({
   body,
-  bodyRef,
+  selected,
   quickReplies,
   disabled,
   onRun,
 }: {
+  /** The body's text. */
   body: string;
-  /** The body's textarea, to read the selection from. */
-  bodyRef: RefObject<HTMLTextAreaElement | null>;
+  /** What's selected in the body, as offsets in its text. */
+  selected: () => [number, number] | null;
   /** Offer the quick-reply chips while the body is empty. */
   quickReplies: boolean;
   disabled: boolean;
@@ -81,9 +82,7 @@ export default function AiMenu({
 
   /** Opening notes the selection, which clicking the menu doesn't clear. */
   function toggleMenu(toggle: () => void) {
-    const t = bodyRef.current;
-    const picked = t && body.slice(t.selectionStart, t.selectionEnd).trim() ? t : null;
-    setSelection(picked && [picked.selectionStart, picked.selectionEnd]);
+    setSelection(selected());
     toggle();
   }
 

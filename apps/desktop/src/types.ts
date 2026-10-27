@@ -424,8 +424,10 @@ export interface OutgoingDraft {
   cc: string;
   bcc: string;
   subject: string;
-  /** Plain text. */
+  /** Plain text: as typed, or the text of `bodyHtml`. */
   body: string;
+  /** The body from the rich editor, as HTML; absent for plain text. */
+  bodyHtml?: string;
   /** The message being replied to, so the reply is threaded. */
   replyTo?: number;
   /** Unix ms: the end of the undo window for a normal send, or the Send Later time. */

@@ -100,6 +100,7 @@ import {
   finishReminder,
   listReminders,
   listScheduled,
+  getInlineImages,
   openDraft,
   patched,
   prioritizeSenders,
@@ -266,6 +267,7 @@ import {
   shortcutLabel,
   type ActionId,
 } from "./lib/shortcuts";
+import { htmlText, replaceText, resendHtml, textToHtml } from "./lib/richText";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import { forgetSearch, loadRecentSearches, rememberSearch, useSearchHits, useServerSearch } from "./lib/search";
 import { stepZoom } from "./lib/zoom";
@@ -350,8 +352,8 @@ const DEFAULT_APP_PREFS: AppPrefs = {
   autoBcc: {},
 };
 
-/** What AI does in a composer (by `composerKey`), and its body before AI started. */
-type ComposerWriting = Writing & { composer: number; request: AiRequest; before: string };
+/** What AI does in a composer (by `composerKey`), and its body (text and HTML) before AI started. */
+type ComposerWriting = Writing & { composer: number; request: AiRequest; before: Pick<Draft, "body" | "bodyHtml"> };
 
 /** `body` around `range`, and the trimmed text in it; the range's own outer whitespace stays outside. */
 function splitAround(body: string, [start, end]: [number, number]): [string, string, string] {
@@ -2027,13 +2029,18 @@ export default function App() {
     const content = await loadContent(m.id).catch(() => null);
     const people = (list?: string[]) => (list ?? []).filter((r) => r !== "You").join(", ");
     const cc = people(content?.cc);
+    // Its formatting and pictures go again too.
+    const html = content?.html;
+    const images = html && /["'=(]cid:/i.test(html) ? await getInlineImages(m.id).catch(() => ({})) : {};
+    const bodyHtml = html ? resendHtml(html, images) : undefined;
     compose({
       title: "Send again",
       to: people(content?.to ?? m.to),
       cc,
       showCc: cc !== "",
       subject: m.subject,
-      body: (content?.text ?? m.body ?? [m.snippet]).join("\n\n"),
+      body: bodyHtml !== undefined ? htmlText(bodyHtml) : (content?.text ?? m.body ?? [m.snippet]).join("\n\n"),
+      bodyHtml,
       from: m.account,
       attachments: (content?.attachments ?? []).map((a, index) => ({
         kind: "message" as const,
@@ -2449,8 +2456,22 @@ export default function App() {
   function writeWithAi(request: AiRequest) {
     const { draft: d, key: session } = composer.current;
     if (!d) return;
-    const before = d.body;
-    const [head, text, tail] = "range" in request ? splitAround(before, request.range) : ["", "", ""];
+    const before = { body: d.body, bodyHtml: d.bodyHtml };
+    // The text as the editor reads it, which the selection's offsets count in: a draft
+    // reopened from the server keeps the list markers of its text version in `body`.
+    const bodyText = d.bodyHtml === undefined ? d.body : htmlText(d.bodyHtml);
+    // All of it is all of the editor's text, whatever `body`'s length.
+    const range: [number, number] | null =
+      "range" in request
+        ? request.range[0] === 0 && request.range[1] >= d.body.length
+          ? [0, bodyText.length]
+          : request.range
+        : null;
+    const [head, text, tail] = range ? splitAround(bodyText, range) : ["", "", ""];
+    // What's rewritten, as offsets in that text: the rest keeps its formatting and pictures.
+    const span: [number, number] = [head.length, bodyText.length - tail.length];
+    // A new draft goes above any pictures already there.
+    const pictures = d.bodyHtml !== undefined && /<img\b/i.test(d.bodyHtml) ? d.bodyHtml : "";
     const action: ComposeAction =
       request.type === "rewrite"
         ? { type: "rewrite", text, how: request.how }
@@ -2460,9 +2481,22 @@ export default function App() {
     const run = ++writingRun.current;
     const base = { composer: session, request, before };
     const settle = (next: Writing | null) => setWriting(next && { ...base, ...next });
-    const show = (written: string) => setDraft((d) => d && { ...d, body: head + written + tail });
+    const show = (written: string) =>
+      setDraft(
+        (d) =>
+          d && {
+            ...d,
+            body: head + written + tail,
+            bodyHtml:
+              before.bodyHtml === undefined
+                ? undefined
+                : "range" in request
+                  ? replaceText(before.bodyHtml, span, written)
+                  : textToHtml(written) + pictures,
+          },
+      );
     const fail = (next: Writing) => {
-      setDraft((d) => d && { ...d, body: before });
+      setDraft((d) => d && { ...d, ...before });
       settle(next);
     };
     let written = "";
@@ -2516,7 +2550,7 @@ export default function App() {
   function undoAi() {
     if (!writing) return;
     const { before } = writing;
-    setDraft((d) => d && { ...d, body: before });
+    setDraft((d) => d && { ...d, ...before });
     setWriting(null);
   }
 

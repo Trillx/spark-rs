@@ -238,21 +238,33 @@ after a restart or server sync. Click Schedule to queue it for delivery.
 Reply and Reply All use the message's Reply-To addresses when present and
 leave your own account out of the recipients.
 
+The composer writes rich text, as Spark's does. Select some text for the
+formatting bar (bold, italic, underline, strikethrough, link, text and
+highlight color, lists, quote, indent, heading, font and size), or use
+Spark's shortcuts, such as Ctrl+Shift+8 for a bulleted list and Ctrl+Shift+K
+for a link. Ctrl+Shift+V pastes without the formatting. Pictures pasted or
+dropped on what you're writing go in it, and the Image Size button under it
+makes them Small, Medium or Large. Typing @ and a name links the person and
+adds them to To; Undo takes them off again. A reply quotes the original
+with its formatting.
+
 Signatures are in Settings → Signatures, where you write them or paste one
 in (or edit the HTML). Each address starts new mail with its default: Most
 recent (the signature last sent from it), No signature, or a particular one.
 A reply takes the signature you used last in that conversation. In the
 composer the signature sits under what you write and above the email you're
 replying to or forwarding: the arrows at its left switch to another one or
-hide it, and you can change it for that one email. Mail with a signature goes
-out as HTML as well as plain text, with the signature's images in the email.
+hide it, and you can change it for that one email. Mail from the composer
+goes out as HTML as well as plain text, with its pictures and the
+signature's in the email.
 Agents' email gets the account's signature too, unless they leave it off.
 
 Attachments download when you open or save them, also from archived mail.
 Program files (`.exe`, `.js`, `.lnk` and the like) can only be saved, not
 opened, and downloaded files are marked as coming from the internet, so
 Office opens them in Protected View. Attach files with the paperclip,
-Ctrl+Shift+A in the composer, or by dropping them on the window; forwards keep
+Ctrl+Shift+A in the composer, or by dropping them on the window (pictures
+dropped on the message itself go in it); forwards keep
 the original's attachments. Messages over 10 MB are stored without their body
 or file list.
 

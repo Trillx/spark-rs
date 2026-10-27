@@ -1,6 +1,7 @@
 import { Ellipsis, ImageOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { openExternal } from "../api";
+import { cidKey } from "../lib/richText";
 import { useDarkTheme } from "../lib/theme";
 import type { InlineImages } from "../types";
 
@@ -39,17 +40,6 @@ export function hasRemoteImages(html: string) {
 /** Whether the HTML embeds images with `cid:` URLs (the same test as `cid_refs` on the Rust side). */
 export function hasInlineImages(html: string) {
   return /["'=(]cid:/i.test(html);
-}
-
-/** A `cid:` URL's Content-ID as `InlineImages` keys it: decoded, without angle brackets, lowercase. */
-function cidKey(url: string) {
-  let id = url.trim().slice(4);
-  try {
-    id = decodeURIComponent(id);
-  } catch {
-    // A stray `%`: keep it as written.
-  }
-  return id.trim().replace(/^<+/, "").replace(/>+$/, "").toLowerCase();
 }
 
 /** The bar above a body whose remote images are blocked. */
