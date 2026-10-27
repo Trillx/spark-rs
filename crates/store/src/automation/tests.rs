@@ -565,6 +565,35 @@ fn auto_drafts_show_on_the_email_they_reply_to() {
 }
 
 #[test]
+fn an_auto_draft_deleted_in_another_app_answers_nothing() {
+    let (mut store, account) = store();
+    with_drafts_folder(&mut store, account);
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let draft = save_reply(&mut store, account, "1@example.com", "Sure.");
+    let option = [DraftOption {
+        title: String::new(),
+        body: "Sure.".into(),
+    }];
+    store.add_auto_draft(draft, id, &option, 0, NOW).unwrap();
+    let mut later = incoming(account, 2, "a@x.com", NOW + 1000);
+    later.subject = "Re: Message 1".into();
+    later.in_reply_to = Some("<1@example.com>".into());
+    let later = add(&mut store, &later);
+    assert!(store.conversation_has_draft(later).unwrap());
+    // Uploaded, then deleted in Outlook: sync takes it out of Drafts here,
+    // and its row stays (in Deleted Items).
+    store
+        .conn
+        .execute_batch(&format!(
+            "DELETE FROM draft_uploads WHERE message_id = {draft};
+             DELETE FROM folder_members WHERE message_id = {draft};"
+        ))
+        .unwrap();
+    assert!(store.message(draft).unwrap().is_some());
+    assert!(!store.conversation_has_draft(later).unwrap());
+}
+
+#[test]
 fn a_users_own_reply_draft_counts_too() {
     let (mut store, account) = store();
     with_drafts_folder(&mut store, account);

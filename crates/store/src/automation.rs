@@ -900,7 +900,8 @@ impl Store {
     }
 
     /// Whether a draft already answers the conversation of email `id`: an
-    /// auto-draft, or one of the user's replying to any of its emails.
+    /// auto-draft, or one of the user's replying to any of its emails. One
+    /// deleted in another app (out of Drafts there, so here) doesn't.
     pub fn conversation_has_draft(&self, id: i64) -> Result<bool> {
         self.conn.query_row(
             &format!(
@@ -908,7 +909,8 @@ impl Store {
                       drafts AS (SELECT message_id AS id FROM draft_uploads
                                  UNION SELECT fm.message_id FROM folder_members fm
                                  JOIN folders f ON f.id = fm.folder_id WHERE f.role = 'drafts')
-                 SELECT EXISTS (SELECT 1 FROM auto_drafts a JOIN members ON members.id = a.message_id)
+                 SELECT EXISTS (SELECT 1 FROM auto_drafts a JOIN members ON members.id = a.message_id
+                                JOIN drafts ON drafts.id = a.draft_id)
                      OR EXISTS (SELECT 1 FROM drafts JOIN messages d ON d.id = drafts.id, o
                                 WHERE d.account_id = o.account_id
                                   AND trim(d.in_reply_to, '<> ') IN
