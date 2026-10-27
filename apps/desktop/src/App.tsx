@@ -1566,6 +1566,12 @@ export default function App() {
   function moveOffMessages(ids: number[]) {
     const anchor = openId ?? selectedId;
     if (anchor === null || !ids.includes(anchor)) return;
+    // A conversation's own window has no next one to move to: keys act on nothing it doesn't show.
+    if (THREAD_WINDOW !== null) {
+      setOpenId(null);
+      setSelectedId(null);
+      return;
+    }
     const gone = new Set(ids);
     const order = model.order;
     const i = order.indexOf(rowOf(anchor));
@@ -3065,6 +3071,8 @@ export default function App() {
       await storeDraft(closed, session);
     } catch (error) {
       draftError(error, closed);
+      // A conversation's own window keeps it in view, so it can't close on it (and lose it).
+      if (THREAD_WINDOW !== null) openComposer(closed);
       return false;
     }
     showToast("Draft saved", undefined, ICONS.draft);
