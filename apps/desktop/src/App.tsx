@@ -104,6 +104,7 @@ import {
   listScheduled,
   getInlineImages,
   onMailEdited,
+  onInviteAnswered,
   onMailto,
   openThreadWindow,
   closeWindow,
@@ -934,6 +935,8 @@ export default function App() {
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
       onMailEdited(() => events.current.otherWindowEdited()),
+      // Its card, read again, shows the answer.
+      onInviteAnswered((id) => forgetContent([id])),
       // Settings saved in another window (an automatic Bcc, the Undo Send delay, …).
       onSettingsChanged(() => events.current.reloadAppPrefs()),
       // A conversation's own window, asked to summarize it.
@@ -1412,7 +1415,7 @@ export default function App() {
   /** `options.actionLabel` replaces Undo, e.g. "Edit"; such toasts don't answer Ctrl+Z. */
   function showToast(
     text: string,
-    undo?: () => void,
+    undo?: () => unknown,
     icon?: ToastIcon,
     options: Pick<ToastData, "actionLabel" | "duration"> = {},
   ) {
@@ -1429,7 +1432,10 @@ export default function App() {
 
   function undoToast() {
     window.clearTimeout(toastTimer.current);
-    toast?.undo?.();
+    // Undo that's still putting things back (a send cancelled, its draft reopened) keeps a
+    // conversation's own window open till it's done.
+    const work = toast?.undo?.();
+    if (work instanceof Promise) void track(work);
     setToast(null);
     toastNow.current = null;
     // A conversation's own window, undoing what took it off its conversation, shows it again.
@@ -2502,7 +2508,7 @@ export default function App() {
     try {
       id = await sendMessage(outgoingDraft(d, d.sendLater?.at ?? Date.now() + undoMs));
     } catch (error) {
-      showToast(`Couldn't send: ${String(error)}`, () => void reopenComposer(d), ICONS.error, {
+      showToast(`Couldn't send: ${String(error)}`, () => reopenComposer(d), ICONS.error, {
         actionLabel: "Edit",
         duration: ERROR_TOAST_MS,
       });
@@ -2511,7 +2517,7 @@ export default function App() {
     outbox.current.set(id, d);
     void reloadMessages();
     reloadPlanned();
-    showToast(d.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, d), ICONS.send, {
+    showToast(d.sendLater ? "Message scheduled" : "Message sent", () => unsend(id, d), ICONS.send, {
       duration: d.sendLater ? TOAST_MS : undoMs,
     });
   }
@@ -2750,7 +2756,7 @@ export default function App() {
   }
 
   function draftError(error: unknown, d: Draft) {
-    showToast(`Couldn't save the draft: ${String(error)}`, () => void reopenComposer(d), ICONS.error, {
+    showToast(`Couldn't save the draft: ${String(error)}`, () => reopenComposer(d), ICONS.error, {
       actionLabel: "Edit",
       duration: ERROR_TOAST_MS,
     });
@@ -2803,7 +2809,7 @@ export default function App() {
    * Deletes a saved draft once the Undo toast is gone (sooner if another toast
    * replaces it); until then it's out of the lists. `undo` also runs on Undo.
    */
-  function discardLater(ids: number[], undo?: () => void, text = "Draft discarded") {
+  function discardLater(ids: number[], undo?: () => unknown, text = "Draft discarded") {
     if (!ids.length) {
       if (undo) showToast(text, undo, ICONS.trash);
       return;
@@ -2831,7 +2837,7 @@ export default function App() {
         window.clearTimeout(timer);
         pendingDiscards.current.delete(timer);
         keep();
-        undo?.();
+        return undo?.();
       },
       ICONS.trash,
     );
@@ -2852,7 +2858,7 @@ export default function App() {
     const session = composerKey;
     setDraft(null);
     const id = await savedDraftId(closed, session);
-    discardLater(id === undefined ? [] : [id], draftHasContent(closed) ? () => void reopenComposer({ ...closed, draftId: id }) : undefined);
+    discardLater(id === undefined ? [] : [id], draftHasContent(closed) ? () => reopenComposer({ ...closed, draftId: id }) : undefined);
   }
 
   /** From the account the Inbox is narrowed to, else the first. */
@@ -3206,7 +3212,7 @@ export default function App() {
     outbox.current.set(id, sent);
     if (sent.draftId !== undefined) void reloadMessages();
     if (sent.sendLater) reloadPlanned();
-    showToast(sent.sendLater ? "Message scheduled" : "Message sent", () => void unsend(id, sent, undoDone), ICONS.send, {
+    showToast(sent.sendLater ? "Message scheduled" : "Message sent", () => unsend(id, sent, undoDone), ICONS.send, {
       duration: sent.sendLater ? TOAST_MS : undoMs,
     });
   }
@@ -3219,7 +3225,7 @@ export default function App() {
     }
     outbox.current.delete(id);
     undoDone?.();
-    void reopenComposer(sent);
+    await reopenComposer(sent);
     if (sent.draftId !== undefined) void reloadMessages();
     reloadPlanned();
   }

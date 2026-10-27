@@ -14,7 +14,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { answerInvite, openExternal } from "../api";
 import { cacheInviteAnswer } from "../lib/content";
 import type { AccountView, InviteAnswer, InviteCard as Invite, InvitePerson } from "../types";
@@ -47,6 +47,8 @@ const ANSWERS: {
  */
 export default function InviteCard({ id, invite, account }: { id: number; invite: Invite; account?: AccountView }) {
   const [answer, setAnswer] = useState(invite.answer);
+  // Answered in another window: the email's read again, with that answer.
+  useEffect(() => setAnswer(invite.answer), [invite.answer]);
   /** "Change" brings the three buttons back; nothing is sent until one is chosen. */
   const [changing, setChanging] = useState(false);
   const [error, setError] = useState<string | null>(null);

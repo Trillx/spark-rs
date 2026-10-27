@@ -10,7 +10,8 @@ export interface ToastIcon {
 export interface ToastData {
   id: number;
   text: string;
-  undo?: () => void;
+  /** A promise it returns is work a conversation's own window waits for before it closes. */
+  undo?: () => unknown;
   /** The action's label when it isn't Undo, e.g. "Edit" to reopen a draft that failed to send. */
   actionLabel?: string;
   icon?: ToastIcon;

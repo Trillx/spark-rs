@@ -233,7 +233,11 @@ export function getMessageContent(id: number): Promise<MessageContent> {
 
 /** Answers the invitation a message carries, by email to its organizer; resolves once it's sent. */
 export function answerInvite(id: number, answer: InviteAnswer): Promise<void> {
-  if (isTauri()) return invoke("answer_invite", { id, answer });
+  if (isTauri()) {
+    return invoke<void>("answer_invite", { id, answer }).then(() => {
+      void emit("invite-answered", { window: getCurrentWindow().label, id }).catch(() => {});
+    });
+  }
   browserAnswers.set(id, answer);
   return new Promise((resolve) => setTimeout(resolve, 400));
 }
@@ -637,6 +641,16 @@ export function onSettingsChanged(handler: () => void): () => void {
   const here = getCurrentWindow().label;
   const stop = listen<string>("settings-changed", (e) => {
     if (e.payload !== here) handler();
+  });
+  return () => void stop.then((unlisten) => unlisten());
+}
+
+/** Another of the app's windows answered an invitation (`answerInvite`): its email's id. Returns the unsubscribe. */
+export function onInviteAnswered(handler: (id: number) => void): () => void {
+  if (!isTauri()) return () => {};
+  const here = getCurrentWindow().label;
+  const stop = listen<{ window: string; id: number }>("invite-answered", (e) => {
+    if (e.payload.window !== here) handler(e.payload.id);
   });
   return () => void stop.then((unlisten) => unlisten());
 }
