@@ -423,6 +423,19 @@ export function followStart(rule: Repeat | null, was: { start: number; allDay: b
   return { ...presetRule(kind, next)!, ends: rule.ends };
 }
 
+/**
+ * The rule to save for an edit of a repeating event, `before` as the editor opened it: a preset that
+ * only followed the event to a new day is the rule it opened with (the series' days move from there
+ * for All or All Future), with the end the user gave it.
+ */
+export function savedRule(before: EventDraft, given: EventDraft) {
+  const followed = followStart(before.repeat, before, given);
+  const rule = given.repeat;
+  if (!rule || !before.repeat || !followed) return rule;
+  const pattern = (r: Repeat) => JSON.stringify({ ...r, ends: null });
+  return pattern(rule) === pattern(followed) ? { ...before.repeat, ends: rule.ends } : rule;
+}
+
 const weekdayName = (day: number, style: "short" | "long") =>
   new Intl.DateTimeFormat(undefined, { weekday: style }).format(new Date(2023, 0, 1 + day));
 const monthName = (month: number) => new Intl.DateTimeFormat(undefined, { month: "long" }).format(new Date(2023, month - 1, 1));

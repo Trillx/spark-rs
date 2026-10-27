@@ -418,15 +418,16 @@ pub fn changed_event_body(
             end["dateTime"] = json!(ends.unwrap_or_default());
         }
         // Only the ones that changed, so a start moved in Outlook meanwhile
-        // stays when only the end changes; all day or back changes both.
-        let both = draft.all_day != before.all_day;
+        // stays when only the end changes; all day or back changes both, and
+        // so does a series lined up on another date, its end with it.
+        let both = draft.all_day != before.all_day || by_date;
         if both || draft.start != before.start {
             body.insert("start".into(), start);
         }
         if both || draft.end != before.end {
             body.insert("end".into(), end);
         }
-        if both {
+        if draft.all_day != before.all_day {
             body.insert("isAllDay".into(), json!(draft.all_day));
         }
     }
@@ -2592,6 +2593,15 @@ mod tests {
         assert_eq!(body["start"]["dateTime"], "2027-03-01T10:00:00");
         assert_eq!(body["recurrence"]["range"]["startDate"], "2027-03-01");
         assert_eq!(body["recurrence"]["pattern"]["dayOfMonth"], 1);
+        // Its start moved back to the day before, its end kept: a day and an
+        // hour long, every one of them, the series' end lined up too.
+        let longer = EventDraft {
+            start: occurrence - 86_400_000,
+            ..before.clone()
+        };
+        let body = changed_event_body(&longer, &before, &details, PACIFIC, true);
+        assert_eq!(body["start"]["dateTime"], "2027-02-14T10:00:00");
+        assert_eq!(body["end"]["dateTime"], "2027-02-15T11:00:00");
     }
 
     #[tokio::test]

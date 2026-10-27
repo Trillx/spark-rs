@@ -45,7 +45,7 @@ import {
   minutesOf,
   newDraft,
   newEventStart,
-  followStart,
+  savedRule,
   repeatText,
   toUtcDate,
   type DragOutcome,
@@ -595,10 +595,9 @@ export default function CalendarScreen({
   const saveDraft = async (event: CalendarEvent | undefined, given: EventDraft, before: EventDraft | null) => {
     // A preset rule that only followed the event to a new day isn't a new rule: the occurrence
     // moved, and the series' days go with it for All or All Future (Only This Event moves just it).
-    const followed = before && followStart(before.repeat, before, given);
-    const same = (a: EventDraft["repeat"], b: EventDraft["repeat"] | undefined) => JSON.stringify(a) === JSON.stringify(b);
-    const ruleChanged = before !== null && !same(given.repeat, before.repeat) && !same(given.repeat, followed);
-    const draft = before && !ruleChanged ? { ...given, repeat: before.repeat } : given;
+    // Its end may be new all the same.
+    const draft = before ? { ...given, repeat: savedRule(before, given) } : given;
+    const ruleChanged = before !== null && JSON.stringify(draft.repeat) !== JSON.stringify(before.repeat);
     let scope: EventScope = "one";
     if (event?.repeats) {
       const choice = await ask(

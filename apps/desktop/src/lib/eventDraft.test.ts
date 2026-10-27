@@ -350,7 +350,7 @@ test("a copy keeps a Zoom link in its note; a Teams meeting is made anew", async
 });
 
 test("repeat presets come from the first day, and rules read as Spark words them", async () => {
-  const { presetRule, repeatKind, followStart, repeatText, nthOf } = await import("./eventDraft.ts");
+  const { presetRule, repeatKind, followStart, savedRule, repeatText, nthOf } = await import("./eventDraft.ts");
   // Tuesday, October 27, 2026.
   const tuesday = { start: atMinutes(dayOf(new Date(2026, 9, 27).getTime()), 9 * 60), allDay: false };
   const weekly = presetRule("week", tuesday)!;
@@ -362,6 +362,16 @@ test("repeat presets come from the first day, and rules read as Spark words them
   assert.deepEqual(followStart(weekly, tuesday, thursday)!.weekdays, [4], "a preset follows the day");
   const custom = { ...weekly, interval: 2 };
   assert.equal(followStart(custom, tuesday, thursday), custom, "a custom rule stays");
+  // Moved to Thursday, its rule followed: the rule it opened with, so Outlook's own days move with
+  // it. Its end changed too: that rule with the new end.
+  const opened = { ...newDraft(0, tuesday.start, false, defaults), repeat: weekly };
+  const moved = { ...opened, start: thursday.start, end: thursday.start + 60 * MINUTE, repeat: followStart(weekly, tuesday, thursday) };
+  assert.deepEqual(savedRule(opened, moved), weekly);
+  const ending = { ...moved, repeat: { ...moved.repeat!, ends: { kind: "after" as const, times: 5 } } };
+  assert.deepEqual(savedRule(opened, ending), { ...weekly, ends: { kind: "after", times: 5 } });
+  const mondays = { ...moved, repeat: { ...moved.repeat!, weekdays: [1] } };
+  assert.equal(savedRule(opened, mondays), mondays.repeat, "a new pattern is the user's");
+  assert.equal(savedRule(opened, { ...moved, repeat: null }), null);
   assert.equal(presetRule("month", tuesday)!.day, 27);
   assert.deepEqual([presetRule("year", tuesday)!.month, presetRule("year", tuesday)!.day], [10, 27]);
 
