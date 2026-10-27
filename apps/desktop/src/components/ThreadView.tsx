@@ -50,7 +50,7 @@ const CATEGORIES: { key: Category; label: string }[] = [
 import { isFromYou, useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
-import { useInlineImages, useMessageContent } from "../lib/content";
+import { useInlineImages, useMessageContent, type ContentState } from "../lib/content";
 import { allowRemoteImages, useRemoteImagesAllowed } from "../lib/remoteImages";
 import {
   laterPresets,
@@ -61,6 +61,16 @@ import {
   presetDetail,
   type LaterPreset,
 } from "../lib/format";
+import {
+  OVERSCAN,
+  READING_CONTEXT,
+  bodyScheduler,
+  movedByUser,
+  overlaps,
+  scrollToPlace,
+  type BodyScheduler,
+  type Place,
+} from "../lib/readerViewport";
 import { hint, shortcutLabel, type ActionId } from "../lib/shortcuts";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AiMark from "./AiMark";
@@ -70,7 +80,7 @@ import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
 import FindBar from "./FindBar";
 import InviteCard from "./InviteCard";
-import { HtmlBody, TextBody, hasInlineImages } from "./MessageBody";
+import { HtmlBody, TextBody, hasInlineImages, type KeptBody } from "./MessageBody";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
 
 export interface ThreadActions {
@@ -159,6 +169,8 @@ const STYLE_SHORTCUTS: Record<SummaryStyle, ActionId> = {
  * With "Minimize old emails" on, emails before the first one that was unread
  * when it opened (or before the one opened, if that's earlier) start
  * collapsed to a line; clicking a card's header collapses or expands it.
+ * Expanded cards only mount their bodies near the screen (`useBodies`), so a
+ * long conversation opens as quickly as a short one.
  */
 export default function ThreadView({
   message: m,
@@ -195,14 +207,37 @@ export default function ThreadView({
   /** A blocked sender's email stays hidden until asked for, as in Spark. */
   const [shown, setShown] = useState(false);
   const summaryRef = useRef<HTMLElement>(null);
-  /** Stops holding the place reading starts at, once the user moves around. */
+  /** Stops holding the place reading starts at (or the summary jumped to), once the user moves around. */
   const stopHolding = useRef(() => {});
   /** Scrolled down: the subject shrinks to a line over a border, like Spark's header. */
   const [scrolled, setScrolled] = useState(false);
   const closeTip: Tip = singleColumn ? { label: "Back to list", keys: "Esc" } : hint("Close", "close");
   const jumpToSummary = () => {
     stopHolding.current();
-    summaryRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const el = scrollRef.current;
+    const card = summaryRef.current;
+    if (!el || !card) return;
+    // Bodies that mount on the way, or around it, can move it; once the scroll
+    // ends it's held in view like the place reading starts at, unless the user
+    // has taken over (the scrollbar is beside `el`, so its parent listens).
+    const area = el.parentElement ?? el;
+    const arrive = () => {
+      letGo();
+      card.scrollIntoView({ block: "nearest" });
+      stopHolding.current = hold(el, card, card.getBoundingClientRect().top - el.getBoundingClientRect().top);
+    };
+    const letGo = () => {
+      el.removeEventListener("scrollend", arrive);
+      area.removeEventListener("wheel", letGo);
+      area.removeEventListener("pointerdown", letGo);
+      window.removeEventListener("keydown", letGo, true);
+    };
+    el.addEventListener("scrollend", arrive);
+    area.addEventListener("wheel", letGo, { passive: true });
+    area.addEventListener("pointerdown", letGo);
+    window.addEventListener("keydown", letGo, true);
+    stopHolding.current = letGo;
+    card.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
   const [start] = useState(() => conversation[readingStart(conversation, m.id, unread)]?.id);
   /** Collapsed cards. Emails that arrive while it's open aren't in it, so they show expanded. */
@@ -214,19 +249,45 @@ export default function ThreadView({
   const several = conversation.length > 1;
   const latest = conversation[conversation.length - 1];
 
-  const toggle = (id: number) =>
+  /** Search in conversation: open, and asked for again (its field takes focus). */
+  const [finding, setFinding] = useState(false);
+  const [findFocus, setFindFocus] = useState(0);
+
+  // Reading starts at the first expanded email, below the ones collapsed above
+  // it, with a little of the one before still in view. Like Spark, that place
+  // holds as bodies load and grow, until the user scrolls or clicks.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const target =
+      start === undefined || start === conversation[0]?.id
+        ? null
+        : el?.querySelector<HTMLElement>(`[data-message="${start}"]`);
+    if (el && target) stopHolding.current = hold(el, target, READING_CONTEXT);
+    return () => stopHolding.current();
+  }, []); // Only when the conversation opens.
+
+  // Its effects run after the one above, so cards are placed by hand where reading starts.
+  // While Find is open every expanded body mounts, so it can search them all.
+  const [mounted, bodies] = useBodies(
+    scrollRef,
+    conversation.filter((x) => !collapsed.has(x.id)).map((x) => x.id),
+    start,
+    finding,
+  );
+
+  const toggle = (id: number) => {
+    // An email the user expands shows at once, without waiting its turn.
+    if (collapsed.has(id)) bodies.mount(id);
     setCollapsed((c) => {
       const next = new Set(c);
       if (!next.delete(id)) next.add(id);
       return next;
     });
+  };
   const expandAll = () => {
     stopHolding.current();
     setCollapsed(new Set());
   };
-  /** Search in conversation: open, and asked for again (its field takes focus). */
-  const [finding, setFinding] = useState(false);
-  const [findFocus, setFindFocus] = useState(0);
   const find = () => {
     // It searches what shows: every email.
     expandAll();
@@ -245,43 +306,6 @@ export default function ThreadView({
     stopHolding.current();
     setCollapsed(new Set(conversation.filter((x) => x !== latest).map((x) => x.id)));
   };
-
-  // Reading starts at the first expanded email, below the ones collapsed above
-  // it, with a little of the one before still in view. Like Spark, that place
-  // holds as bodies load and grow, until the user scrolls or clicks.
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    const target =
-      start === undefined || start === conversation[0]?.id
-        ? null
-        : el?.querySelector<HTMLElement>(`[data-message="${start}"]`);
-    if (!el || !target) return;
-    let placed = { top: -1, height: -1 };
-    const place = () => {
-      const top = target.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
-      el.scrollTop = Math.max(0, top - READING_CONTEXT);
-      placed = { top: el.scrollTop, height: el.scrollHeight };
-    };
-    // The browser moves the page when content above changes size; only a
-    // move with the same content is the user's.
-    const onScroll = () => {
-      if (el.scrollHeight === placed.height && Math.abs(el.scrollTop - placed.top) > 1) stop();
-    };
-    const resized = new ResizeObserver(place);
-    const stop = () => {
-      resized.disconnect();
-      el.removeEventListener("scroll", onScroll);
-      el.removeEventListener("wheel", stop);
-      el.removeEventListener("pointerdown", stop);
-    };
-    stopHolding.current = stop;
-    place();
-    resized.observe(el.firstElementChild ?? el);
-    el.addEventListener("scroll", onScroll, { passive: true });
-    el.addEventListener("wheel", stop, { passive: true });
-    el.addEventListener("pointerdown", stop);
-    return stop;
-  }, []); // Only when the conversation opens.
 
   return (
     <>
@@ -367,6 +391,8 @@ export default function ThreadView({
                 ) : (
                   <MessageCard
                     message={x}
+                    mounted={mounted.has(x.id)}
+                    bodies={bodies}
                     showReplyBar={!screening}
                     quickReplies={x === latest}
                     onCollapse={several ? () => toggle(x.id) : undefined}
@@ -394,10 +420,177 @@ export default function ThreadView({
   );
 }
 
-/** Spark leaves about this much of the email before the one reading starts at in view. */
-const READING_CONTEXT = 100;
 /** More than the subject gives back when it shrinks to a line. */
 const HEADER_SLACK = 48;
+
+/**
+ * Holds `target` `offset` below the top of the reader `el` while bodies mount,
+ * load and grow, until the user scrolls or clicks. Returns how to let go.
+ */
+function hold(el: HTMLElement, target: Element, offset: number): () => void {
+  let placed = { top: -1, height: -1 };
+  const place = () => {
+    const top = target.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    el.scrollTop = scrollToPlace(el.scrollTop, top, offset);
+    placed = { top: el.scrollTop, height: el.scrollHeight };
+  };
+  const onScroll = () => {
+    if (movedByUser(placed, { top: el.scrollTop, height: el.scrollHeight })) stop();
+  };
+  const resized = new ResizeObserver(place);
+  const stop = () => {
+    resized.disconnect();
+    el.removeEventListener("scroll", onScroll);
+    el.removeEventListener("wheel", stop);
+    el.removeEventListener("pointerdown", stop);
+  };
+  place();
+  resized.observe(el.firstElementChild ?? el);
+  el.addEventListener("scroll", onScroll, { passive: true });
+  el.addEventListener("wheel", stop, { passive: true });
+  el.addEventListener("pointerdown", stop);
+  return stop;
+}
+
+/** What cards tell the reader about their bodies (see `useBodies`). */
+interface Bodies {
+  /** Ref for a card's article, watched for coming near the screen. */
+  card: (el: HTMLElement) => () => void;
+  /** Ref for a mounted body, measured so its placeholder can take its height. */
+  body: (el: HTMLDivElement) => () => void;
+  content: BodyScheduler["content"];
+  images: BodyScheduler["images"];
+  mount: BodyScheduler["mount"];
+  height: BodyScheduler["height"];
+  /** Starts watching the cards in the reader `root`; returns how to stop. */
+  watch: (root: HTMLElement) => () => void;
+  /** After each commit: the expanded cards (with `all`, every body is to mount), and where any new ones are. */
+  update: (cards: readonly number[], all: boolean) => void;
+}
+
+/**
+ * What a card's body keeps while it's out of view and unmounted, so it comes
+ * back as it was. It lasts while the card is expanded, as the body's own
+ * state did before bodies unmounted.
+ */
+interface Kept extends KeptBody {
+  /** An invite's related message, while it's showing: what its body keeps. */
+  related?: KeptBody;
+  /** Auto-download was asked for its files, so a remount doesn't ask again. */
+  prefetched?: boolean;
+}
+
+/**
+ * Mounts the bodies of the expanded `cards` (oldest first) near the reader's
+ * screen, a few loads at a time, as lib/readerViewport decides; the card
+ * reading starts at mounts straight away. With `all` (Find in Conversation
+ * open) every one mounts, still a few loads at a time, and stays. Returns the
+ * cards whose bodies are mounted, and what cards use to report.
+ */
+function useBodies(
+  scrollRef: RefObject<HTMLDivElement | null>,
+  cards: readonly number[],
+  start: number | undefined,
+  all: boolean,
+): [ReadonlySet<number>, Bodies] {
+  const [mounted, setMounted] = useState<ReadonlySet<number>>(() => new Set(start === undefined ? [] : [start]));
+  const [bodies] = useState(() => readerBodies(bodyScheduler(start, setMounted)));
+  useLayoutEffect(() => bodies.watch(scrollRef.current!), [bodies, scrollRef]);
+  useLayoutEffect(() => bodies.update(cards, all));
+  return [mounted, bodies];
+}
+
+/**
+ * The DOM side of `useBodies`: observers that tell the scheduler where cards
+ * are and how tall their bodies were. A card that appears is placed by hand
+ * after the commit that adds it, as observers only report after the next
+ * paint, so the first paint already shows the bodies near the screen.
+ */
+function readerBodies(scheduler: BodyScheduler): Bodies {
+  const cards = new Map<Element, number>();
+  const bodies = new Map<Element, number>();
+  const fresh = new Set<HTMLElement>();
+  let root: HTMLElement | null = null;
+  let watching: { near: IntersectionObserver; onScreen: IntersectionObserver; sizes: ResizeObserver } | null = null;
+  const places = (entries: IntersectionObserverEntry[], place: (id: number, on: boolean) => Place) =>
+    entries.flatMap((e) => {
+      const id = cards.get(e.target);
+      return id === undefined ? [] : [place(id, e.isIntersecting)];
+    });
+
+  return {
+    card(el) {
+      const id = Number(el.dataset.message);
+      cards.set(el, id);
+      fresh.add(el);
+      watching?.near.observe(el);
+      watching?.onScreen.observe(el);
+      return () => {
+        cards.delete(el);
+        fresh.delete(el);
+        watching?.near.unobserve(el);
+        watching?.onScreen.unobserve(el);
+        scheduler.forget(id);
+      };
+    },
+    body(el) {
+      bodies.set(el, Number(el.closest<HTMLElement>("[data-message]")?.dataset.message));
+      watching?.sizes.observe(el);
+      return () => {
+        bodies.delete(el);
+        watching?.sizes.unobserve(el);
+      };
+    },
+    content: scheduler.content,
+    images: scheduler.images,
+    mount: scheduler.mount,
+    height: scheduler.height,
+    watch(el) {
+      root = el;
+      const near = new IntersectionObserver(
+        (entries) => scheduler.place(places(entries, (id, on) => ({ id, near: on }))),
+        { root: el, rootMargin: `${OVERSCAN * 100}% 0px` },
+      );
+      const onScreen = new IntersectionObserver(
+        (entries) => scheduler.place(places(entries, (id, on) => ({ id, visible: on }))),
+        { root: el },
+      );
+      const sizes = new ResizeObserver((entries) => {
+        for (const e of entries) {
+          const id = bodies.get(e.target);
+          if (id !== undefined) scheduler.measure(id, e.borderBoxSize[0]?.blockSize ?? e.contentRect.height);
+        }
+      });
+      for (const card of cards.keys()) {
+        near.observe(card);
+        onScreen.observe(card);
+      }
+      for (const body of bodies.keys()) sizes.observe(body);
+      watching = { near, onScreen, sizes };
+      return () => {
+        near.disconnect();
+        onScreen.disconnect();
+        sizes.disconnect();
+        watching = null;
+        root = null;
+      };
+    },
+    update(expanded, all) {
+      const placed: Place[] = [];
+      if (root) {
+        const screen = root.getBoundingClientRect();
+        for (const el of fresh) {
+          const box = el.getBoundingClientRect();
+          const near = overlaps(box, screen, screen.height * OVERSCAN);
+          placed.push({ id: cards.get(el)!, near, visible: overlaps(box, screen) });
+        }
+        fresh.clear();
+      }
+      scheduler.cards(expanded, all);
+      if (placed.length > 0) scheduler.place(placed);
+    },
+  };
+}
 
 /** Spark's divider above the emails that were unread when the conversation opened. */
 function NewMessagesLine() {
@@ -961,15 +1154,24 @@ function BlockedSenderCard({ message: m, actions }: { message: Message; actions:
   );
 }
 
-/** One email: a one-line header, the body, attachments and the bottom bar. */
+/**
+ * One email: a one-line header, the body, attachments and the bottom bar.
+ * Until its body mounts, and once it unmounts far off screen, the body is a
+ * loading placeholder of the height it last had.
+ */
 function MessageCard({
   message: m,
+  mounted,
+  bodies,
   showReplyBar,
   quickReplies,
   onCollapse,
   actions,
 }: {
   message: Message;
+  /** Whether the body is mounted (see `useBodies`). */
+  mounted: boolean;
+  bodies: Bodies;
   showReplyBar: boolean;
   /** The quick replies, under the latest email. */
   quickReplies: boolean;
@@ -978,80 +1180,27 @@ function MessageCard({
   actions: ThreadActions;
 }) {
   const account = useAccount(m.account);
-  const [state, retry] = useMessageContent(m.id);
-  const content = state.status === "ready" ? state.content : null;
-  const hasFiles = (content?.attachments.length ?? 0) > 0;
-  useEffect(() => {
-    if (hasFiles) actions.prefetchAttachments(m);
-  }, [hasFiles]);
+  const [kept] = useState<Kept>(() => ({}));
   // As in Spark, quick replies are for personal email that someone else sent.
   const offerQuickReplies = quickReplies && m.category === "people" && !isFromYou(m, account);
   return (
-    <article data-message={m.id} className="scroll-mt-2 rounded-2xl border border-hairline bg-card">
-      <header
-        className={`flex items-center gap-3 px-5 pb-1.5 pt-3.5 ${onCollapse ? "cursor-pointer" : ""}`}
-        onClick={onCollapse}
-      >
-        <Avatar name={m.from} size="lg" account={m.account} />
-        <div className="min-w-0 flex-1 truncate text-sm leading-5">
-          <span className="font-bold" data-tip={m.address}>
-            {m.from}
-          </span>
-          {content && <Recipients content={content} account={account} />}
-        </div>
-        <time className="shrink-0 text-xs leading-5 text-text-2" dateTime={new Date(m.timestamp).toISOString()}>
-          {formatFullDate(m.timestamp)}
-        </time>
-        {/* Its clicks and menu stay out of the header's collapse. */}
-        <div className="contents" onClick={(e) => e.stopPropagation()}>
-          <Dropdown
-            align="end"
-            width="w-48"
-            trigger={({ toggle, open }) => (
-              <button
-                className={`grid size-6 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content ${
-                  open ? "bg-base-content/10" : ""
-                }`}
-                data-tip="Message actions"
-                aria-label="Message actions"
-                aria-haspopup="menu"
-                onClick={toggle}
-              >
-                <Ellipsis size={16} />
-              </button>
-            )}
-          >
-            <MessageMenuItems message={m} actions={actions} single />
-          </Dropdown>
-        </div>
-      </header>
-      {state.status === "loading" && <BodySkeleton />}
-      {state.status === "error" && (
-        <div className="px-5 pb-5 pt-2 text-[13px] leading-5">
-          <p className="select-text text-error">Couldn't load this email. {state.message}</p>
-          <button className="mt-1 font-medium text-primary hover:underline" onClick={retry}>
-            Try again
-          </button>
-        </div>
-      )}
-      {content &&
-        (content.invite ? (
-          <InviteBody message={m} content={content} account={account} onImageSettings={actions.openImageSettings} />
-        ) : (
-          <Body
-            message={m}
-            content={content}
-            quotes={!isForward(m.subject)}
-            onImageSettings={actions.openImageSettings}
-          />
-        ))}
-      {content && content.attachments.length > 0 && (
-        <AttachmentList
-          attachments={content.attachments}
-          onOpen={(i) => actions.openAttachment(m, i)}
-          onSave={(i) => actions.saveAttachment(m, i)}
-          onSaveAll={() => actions.saveAllAttachments(m)}
+    <article ref={bodies.card} data-message={m.id} className="scroll-mt-2 rounded-2xl border border-hairline bg-card">
+      {mounted ? (
+        <CardContent
+          message={m}
+          account={account}
+          bodies={bodies}
+          kept={kept}
+          onCollapse={onCollapse}
+          actions={actions}
         />
+      ) : (
+        <>
+          <CardHeader message={m} account={account} content={null} onCollapse={onCollapse} actions={actions} />
+          <div className="flow-root overflow-hidden" style={{ height: bodies.height(m.id) }}>
+            <BodySkeleton />
+          </div>
+        </>
       )}
       {showReplyBar && (
         <footer className="flex flex-wrap items-center justify-end gap-1.5 rounded-b-2xl border-t border-hairline px-4 py-2.5">
@@ -1077,6 +1226,141 @@ function MessageCard({
   );
 }
 
+/** A card with its body mounted: the header with recipients, then the content as it loads, and attachments. */
+function CardContent({
+  message: m,
+  account,
+  bodies,
+  kept,
+  onCollapse,
+  actions,
+}: {
+  message: Message;
+  account?: AccountView;
+  bodies: Bodies;
+  kept: Kept;
+  onCollapse?: () => void;
+  actions: ThreadActions;
+}) {
+  const [state, retry] = useMessageContent(m.id);
+  const content = state.status === "ready" ? state.content : null;
+  useLayoutEffect(() => {
+    bodies.content(m.id, state.status);
+    return () => bodies.content(m.id, null);
+  }, [bodies, m.id, state.status]);
+  const hasFiles = (content?.attachments.length ?? 0) > 0;
+  useEffect(() => {
+    if (!hasFiles || kept.prefetched) return;
+    kept.prefetched = true;
+    actions.prefetchAttachments(m);
+  }, [hasFiles]);
+  return (
+    <>
+      <CardHeader message={m} account={account} content={content} onCollapse={onCollapse} actions={actions} />
+      {/* Measured for its placeholder (flow-root keeps the margins inside); a
+          body loading again after the cache let it go keeps that height. */}
+      <div
+        ref={bodies.body}
+        className="flow-root"
+        style={{ minHeight: state.status === "loading" ? bodies.height(m.id) : undefined }}
+      >
+        {state.status === "loading" && <BodySkeleton />}
+        {state.status === "error" && (
+          <div className="px-5 pb-5 pt-2 text-[13px] leading-5">
+            <p className="select-text text-error">Couldn't load this email. {state.message}</p>
+            <button className="mt-1 font-medium text-primary hover:underline" onClick={retry}>
+              Try again
+            </button>
+          </div>
+        )}
+        {content &&
+          (content.invite ? (
+            <InviteBody
+              message={m}
+              content={content}
+              account={account}
+              bodies={bodies}
+              kept={kept}
+              onImageSettings={actions.openImageSettings}
+            />
+          ) : (
+            <Body
+              message={m}
+              content={content}
+              quotes={!isForward(m.subject)}
+              bodies={bodies}
+              kept={kept}
+              onImageSettings={actions.openImageSettings}
+            />
+          ))}
+        {content && content.attachments.length > 0 && (
+          <AttachmentList
+            attachments={content.attachments}
+            onOpen={(i) => actions.openAttachment(m, i)}
+            onSave={(i) => actions.saveAttachment(m, i)}
+            onSaveAll={() => actions.saveAllAttachments(m)}
+          />
+        )}
+      </div>
+    </>
+  );
+}
+
+/** A card's one-line header: who, to whom once the content has loaded, when, and the email's menu. */
+function CardHeader({
+  message: m,
+  account,
+  content,
+  onCollapse,
+  actions,
+}: {
+  message: Message;
+  account?: AccountView;
+  content: MessageContent | null;
+  onCollapse?: () => void;
+  actions: ThreadActions;
+}) {
+  return (
+    <header
+      className={`flex items-center gap-3 px-5 pb-1.5 pt-3.5 ${onCollapse ? "cursor-pointer" : ""}`}
+      onClick={onCollapse}
+    >
+      <Avatar name={m.from} size="lg" account={m.account} />
+      <div className="min-w-0 flex-1 truncate text-sm leading-5">
+        <span className="font-bold" data-tip={m.address}>
+          {m.from}
+        </span>
+        {content && <Recipients content={content} account={account} />}
+      </div>
+      <time className="shrink-0 text-xs leading-5 text-text-2" dateTime={new Date(m.timestamp).toISOString()}>
+        {formatFullDate(m.timestamp)}
+      </time>
+      {/* Its clicks and menu stay out of the header's collapse. */}
+      <div className="contents" onClick={(e) => e.stopPropagation()}>
+        <Dropdown
+          align="end"
+          width="w-48"
+          trigger={({ toggle, open }) => (
+            <button
+              className={`grid size-6 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content ${
+                open ? "bg-base-content/10" : ""
+              }`}
+              data-tip="Message actions"
+              aria-label="Message actions"
+              aria-haspopup="menu"
+              onClick={toggle}
+            >
+              <Ellipsis size={16} />
+            </button>
+          )}
+        >
+          <MessageMenuItems message={m} actions={actions} single />
+        </Dropdown>
+      </div>
+    </header>
+  );
+}
+
 /**
  * The email's HTML in the sandboxed frame (embedded images fetched, remote
  * ones as Load remote images says, or once the user shows them), else its
@@ -1087,24 +1371,36 @@ function Body({
   message: m,
   content,
   quotes,
+  bodies,
+  kept,
   onImageSettings,
 }: {
   message: Message;
   content: MessageContent;
   quotes: boolean;
+  bodies: Bodies;
+  kept: KeptBody;
   onImageSettings: () => void;
 }) {
   const images = useRemoteImagesAllowed(m);
   const html = content.html;
   const embeds = useMemo(() => html !== null && hasInlineImages(html), [html]);
   const inlineImages = useInlineImages(m.id, embeds);
-  if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} />;
+  // Fetching embedded images takes a turn among the reader's loads, as the content did.
+  const fetching = embeds && inlineImages === null;
+  useLayoutEffect(() => {
+    if (!fetching) return;
+    bodies.images(m.id, true);
+    return () => bodies.images(m.id, false);
+  }, [bodies, m.id, fetching]);
+  if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} kept={kept} />;
   return (
     <HtmlBody
       html={html}
       remoteImages={images}
       inlineImages={inlineImages}
       quotes={quotes}
+      kept={kept}
       onShowImages={() => allowRemoteImages(m)}
       onImageSettings={onImageSettings}
     />
@@ -1119,14 +1415,22 @@ function InviteBody({
   message: m,
   content,
   account,
+  bodies,
+  kept,
   onImageSettings,
 }: {
   message: Message;
   content: MessageContent;
   account?: AccountView;
+  bodies: Bodies;
+  kept: Kept;
   onImageSettings: () => void;
 }) {
-  const [related, setRelated] = useState(false);
+  const [related, setRelated] = useState(kept.related !== undefined);
+  const showRelated = (shown: boolean) => {
+    kept.related = shown ? {} : undefined;
+    setRelated(shown);
+  };
   const hasBody = content.html !== null || content.text.some((p) => p.trim() !== "");
   return (
     <>
@@ -1134,8 +1438,15 @@ function InviteBody({
       {hasBody &&
         (related ? (
           <>
-            <Body message={m} content={content} quotes onImageSettings={onImageSettings} />
-            <button className="mx-5 mb-4 text-xs font-medium text-primary hover:underline" onClick={() => setRelated(false)}>
+            <Body
+              message={m}
+              content={content}
+              quotes
+              bodies={bodies}
+              kept={kept.related ?? {}}
+              onImageSettings={onImageSettings}
+            />
+            <button className="mx-5 mb-4 text-xs font-medium text-primary hover:underline" onClick={() => showRelated(false)}>
               Hide related message
             </button>
           </>
@@ -1144,7 +1455,7 @@ function InviteBody({
             className="mx-5 mb-4 grid h-5 w-8 place-items-center rounded-full bg-chip text-text-2 hover:brightness-95 hover:text-base-content"
             data-tip="Related message"
             aria-label="Show related message"
-            onClick={() => setRelated(true)}
+            onClick={() => showRelated(true)}
           >
             <Ellipsis size={14} />
           </button>

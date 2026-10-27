@@ -26,6 +26,17 @@ export function hasInlineImages(html: string) {
   return /["'=(]cid:/i.test(html);
 }
 
+/**
+ * A body's state that outlives it. The reader unmounts bodies that scroll far
+ * out of view and hands the same object back when one remounts, so its quote
+ * and its size come back as they were.
+ */
+export interface KeptBody {
+  quoteShown?: boolean;
+  /** An HTML body's frame height. */
+  height?: number;
+}
+
 /** Spark's bar above a body whose remote images are off: Show images for this email, or Settings to turn them on. */
 function BlockedImagesBar({ onShow, onSettings }: { onShow: () => void; onSettings: () => void }) {
   return (
@@ -62,8 +73,20 @@ function QuoteToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void
 }
 
 /** Plain-text paragraphs, with web addresses as links. A reply's quote folds away unless `quotes` is off. */
-export function TextBody({ paragraphs, quotes = true }: { paragraphs: string[]; quotes?: boolean }) {
-  const [shown, setShown] = useState(false);
+export function TextBody({
+  paragraphs,
+  quotes = true,
+  kept,
+}: {
+  paragraphs: string[];
+  quotes?: boolean;
+  kept?: KeptBody;
+}) {
+  const [shown, setShown] = useState(kept?.quoteShown ?? false);
+  const toggle = () => {
+    if (kept) kept.quoteShown = !shown;
+    setShown(!shown);
+  };
   const cut = quotes ? quoteStart(paragraphs) : -1;
   const visible = cut < 0 || shown ? paragraphs : paragraphs.slice(0, cut);
   return (
@@ -75,7 +98,7 @@ export function TextBody({ paragraphs, quotes = true }: { paragraphs: string[]; 
           </p>
         ))}
       </div>
-      {cut >= 0 && <QuoteToggle shown={shown} onToggle={() => setShown((s) => !s)} />}
+      {cut >= 0 && <QuoteToggle shown={shown} onToggle={toggle} />}
     </>
   );
 }
@@ -130,6 +153,7 @@ export function HtmlBody({
   quotes = true,
   onShowImages,
   onImageSettings,
+  kept,
 }: {
   html: string;
   remoteImages: boolean;
@@ -137,11 +161,19 @@ export function HtmlBody({
   quotes?: boolean;
   onShowImages: () => void;
   onImageSettings: () => void;
+  kept?: KeptBody;
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  /** Kept across the reloads that "Show images" and arriving embedded images cause, so the card doesn't jump. */
-  const [height, setHeight] = useState(0);
-  const [quoteShown, setQuoteShown] = useState(false);
+  /**
+   * Kept across the reloads that "Show images" and arriving embedded images
+   * cause, and in `kept` across remounts, so the card doesn't jump.
+   */
+  const [height, setHeight] = useState(kept?.height ?? 0);
+  const [quoteShown, setQuoteShown] = useState(kept?.quoteShown ?? false);
+  const toggleQuote = () => {
+    if (kept) kept.quoteShown = !quoteShown;
+    setQuoteShown(!quoteShown);
+  };
   const dark = useDarkTheme();
   const frame = useMemo(
     () => frameDocument(html, { remoteImages, inlineImages, quotes, card: dark ? cardColor() : null }),
@@ -180,7 +212,9 @@ export function HtmlBody({
         setShown((s) => (s?.frame === frame && s.remote === remote ? s : { frame, remote }));
       };
       [measure, unwire] = wireFrame(doc, (h) => {
-        setHeight(Math.min(h, MAX_FRAME_HEIGHT));
+        const capped = Math.min(h, MAX_FRAME_HEIGHT);
+        if (kept) kept.height = capped;
+        setHeight(capped);
         check();
       });
       wiredRef.current = { doc, measure };
@@ -242,7 +276,7 @@ export function HtmlBody({
           style={{ height }}
         />
       </div>
-      {frame.quoted && <QuoteToggle shown={quoteShown} onToggle={() => setQuoteShown((s) => !s)} />}
+      {frame.quoted && <QuoteToggle shown={quoteShown} onToggle={toggleQuote} />}
     </>
   );
 }
