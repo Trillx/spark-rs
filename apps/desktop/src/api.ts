@@ -575,11 +575,13 @@ function mutate<T>(command: string, args: Record<string, unknown>): Promise<T> {
 
 /**
  * This window being closed (its own button, Alt+F4, `closeWindow`): `before` runs first, and
- * then it closes. Returns the unsubscribe.
+ * then it closes, unless `before` says false. Returns the unsubscribe.
  */
-export function onWindowClose(before: () => Promise<void>): () => void {
+export function onWindowClose(before: () => Promise<boolean>): () => void {
   if (!isTauri()) return () => {};
-  const stop = getCurrentWindow().onCloseRequested(() => before());
+  const stop = getCurrentWindow().onCloseRequested(async (event) => {
+    if (!(await before())) event.preventDefault();
+  });
   return () => void stop.then((unlisten) => unlisten());
 }
 

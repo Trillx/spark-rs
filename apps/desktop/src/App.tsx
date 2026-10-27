@@ -545,6 +545,8 @@ export default function App() {
   const draftIds = useRef(new Map<number, number>());
   /** Saves run one after another, so saving again updates the same draft. */
   const draftSaves = useRef<Promise<unknown>>(Promise.resolve());
+  /** Drafts deleted while their Undo is up: what deletes them, by timer. */
+  const pendingDiscards = useRef(new Map<number, () => Promise<void>>());
   /** The composer as it stands, for callbacks that outlive a render (undo, autosave). */
   const composer = useRef({ draft, saved: draftSaved, key: composerKey });
   composer.current = { draft, saved: draftSaved, key: composerKey };
@@ -625,7 +627,10 @@ export default function App() {
   const sidebarSpace = sidebarMode === "locked" ? sidebarWidth : SIDEBAR_RAIL;
   const container = windowWidth - sidebarSpace;
   const listWidthUsed = effectiveListWidth(listWidth, container);
-  const twoColumns = useTwoColumns(container, listWidthUsed);
+  const wide = useTwoColumns(container, listWidthUsed);
+  // A conversation's own window has no list beside it: finishing one closes it rather than
+  // opening the next.
+  const twoColumns = THREAD_WINDOW === null && wide;
 
   const hits = useSearchHits([view.search ?? "", ...layout.smartFolders.map((f) => f.query)], messages);
   const searchingServers = useServerSearch(
@@ -930,7 +935,10 @@ export default function App() {
     if (searching && !homeShown) searchRef.current?.focus();
   }, [searching, homeShown]);
 
-  useEffect(() => saveLayout(layout), [layout]);
+  // The sidebar's layout is the main window's: a conversation's own window has none to save.
+  useEffect(() => {
+    if (THREAD_WINDOW === null) saveLayout(layout);
+  }, [layout]);
   useEffect(() => saveCardPrefs(cardPrefs), [cardPrefs]);
   useEffect(() => saveGrouped(grouped), [grouped]);
   useEffect(() => saveSeen(seen), [seen]);
@@ -1005,24 +1013,44 @@ export default function App() {
     return work;
   }
 
-  /** Closes this conversation's window once its draft is saved and a send is queued. */
-  async function settleWindow() {
-    if (composer.current.draft) await track(closeComposer());
-    await Promise.allSettled([...inFlight.current]);
-    await draftSaves.current.catch(() => {});
+  /**
+   * Gets this conversation's window ready to close: its draft saved, sends queued, drafts
+   * deleted. False if it should stay open: a draft didn't save (its error offers it back), or
+   * with `asked` off, a send failed and put its email back in the composer to see.
+   */
+  async function settleWindow(asked: boolean): Promise<boolean> {
+    const session = composer.current.key;
+    for (let round = 0; round < 4; round++) {
+      const { draft: open, key } = composer.current;
+      if (open) {
+        if (!asked && key !== session) return false;
+        if (!(await track(latestCloseComposer.current()))) return false;
+      }
+      await Promise.allSettled([...inFlight.current]);
+      await draftSaves.current.catch(() => {});
+      for (const [timer, discard] of [...pendingDiscards.current]) {
+        window.clearTimeout(timer);
+        pendingDiscards.current.delete(timer);
+        await discard();
+      }
+      if (!composer.current.draft && inFlight.current.size === 0) return true;
+    }
+    return false;
   }
   const latestSettle = useRef(settleWindow);
   latestSettle.current = settleWindow;
+  const latestCloseComposer = useRef(closeComposer);
+  latestCloseComposer.current = closeComposer;
 
   async function closeThreadWindow() {
-    await settleWindow();
-    closeWindow();
+    if (await latestSettle.current(false)) closeWindow();
   }
 
-  // The window's own close button: the draft is saved and a send queued first.
+  // The window's own close button: the draft is saved and a send queued first; one that
+  // couldn't be saved keeps the window open.
   useEffect(() => {
     if (THREAD_WINDOW === null) return;
-    return onWindowClose(() => latestSettle.current());
+    return onWindowClose(() => latestSettle.current(true));
   }, []);
 
   /** Another window changed mail: read the changes, coalesced. */
@@ -1554,8 +1582,14 @@ export default function App() {
     if (group) return changeView({ sub: { kind: "group", key: group.key } }, true);
     const m = messages.find((x) => x.id === id);
     if (m && isDraft(m, folders)) void editDraft(m);
-    else if (m && alwaysPopOut && !twoColumns && THREAD_WINDOW === null) popOut(m);
-    else openThread(id);
+    else openConversation(id);
+  }
+
+  /** Opens a conversation the way it's asked to be, in a window of its own or in the reader. */
+  function openConversation(id: number, list = messages) {
+    const m = list.find((x) => x.id === id);
+    if (m && alwaysPopOut && !twoColumns && THREAD_WINDOW === null && !isDraft(m, folders)) popOut(m);
+    else openThread(id, list);
   }
 
   /** Spark's "Open Thread in a new Window": the conversation leaves the reader for a window of its own. */
@@ -1590,7 +1624,7 @@ export default function App() {
         startHomeSession();
         const account = view.account === m.account ? m.account : "all";
         changeView({ folder: "inbox", mode: loadInboxMode(account), sub: null, search: null, account }, true);
-        openThread(id, loaded);
+        openConversation(id, loaded);
       },
       (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
     );
@@ -2410,7 +2444,7 @@ export default function App() {
   };
 
   const reminderActions: ReminderActions = {
-    open: (r) => r.message !== undefined && openThread(r.message),
+    open: (r) => r.message !== undefined && openConversation(r.message),
     change: (r) =>
       setPickTime({
         title: "Remind me at",
@@ -2632,7 +2666,7 @@ export default function App() {
     }
     setDiscarding((s) => new Set([...s, ...ids]));
     const keep = () => setDiscarding((s) => new Set([...s].filter((x) => !ids.includes(x))));
-    const timer = window.setTimeout(() => {
+    const discard = () =>
       Promise.all(ids.map((id) => discardDraft(id))).then(
         () => reloadMessages().then(keep),
         (error) => {
@@ -2641,11 +2675,17 @@ export default function App() {
           showToast(`Couldn't delete the draft: ${String(error)}`, undefined, ICONS.error);
         },
       );
+    const timer = window.setTimeout(() => {
+      pendingDiscards.current.delete(timer);
+      void discard();
     }, TOAST_MS);
+    // A window closing now deletes them at once, rather than never.
+    pendingDiscards.current.set(timer, discard);
     showToast(
       text,
       () => {
         window.clearTimeout(timer);
+        pendingDiscards.current.delete(timer);
         keep();
         undo?.();
       },
@@ -2940,8 +2980,9 @@ export default function App() {
   }
 
   /** Closing keeps the draft in Drafts; one emptied out is deleted there. */
-  async function closeComposer() {
-    if (!draft) return;
+  /** Closes the composer, keeping its draft in Drafts. False if saving it failed (`draftError` offers it back). */
+  async function closeComposer(): Promise<boolean> {
+    if (!draft) return true;
     stopWriting();
     const closed = draft;
     const session = composerKey;
@@ -2950,20 +2991,21 @@ export default function App() {
     if (!draftHasContent(closed)) {
       const id = await savedDraftId(closed, session);
       discardLater(id === undefined ? [] : [id]);
-      return;
+      return true;
     }
     if (unchanged) {
       if (draftIds.current.has(session)) showToast("Draft saved", undefined, ICONS.draft);
-      return;
+      return true;
     }
     try {
       await storeDraft(closed, session);
     } catch (error) {
       draftError(error, closed);
-      return;
+      return false;
     }
     showToast("Draft saved", undefined, ICONS.draft);
     void reloadMessages();
+    return true;
   }
 
   /**
