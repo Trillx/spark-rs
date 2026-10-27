@@ -8,6 +8,7 @@ import {
   allDayDays,
   atMinutes,
   attendeesChanged,
+  composing,
   dayOf,
   draftChanged,
   minutesOf,
@@ -168,7 +169,8 @@ export default function EventEditor({
     };
     // Capture, so Esc closes the editor and not the calendar; a list or picker open in it closes first.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || asked()) return;
+      // Esc in an input method (Japanese, Chinese) is for what's being typed there.
+      if (e.key !== "Escape" || e.isComposing || asked()) return;
       if (ref.current?.querySelector("[role='listbox'], [role='dialog']")) return;
       e.stopPropagation();
       e.preventDefault();
@@ -268,7 +270,7 @@ export default function EventEditor({
             value={draft.title}
             onChange={(e) => set({ title: e.target.value.replace(/\n/g, " ") })}
             onKeyDown={(e) => {
-              if (e.key !== "Enter") return;
+              if (e.key !== "Enter" || composing(e)) return;
               e.preventDefault();
               if (!event || changed) void save();
             }}
@@ -495,7 +497,7 @@ function TimeField({ label, value, onChange }: { label: string; value: number; o
         onChange={(e) => edit(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (e.key === "Enter" && !composing(e)) {
             e.preventDefault();
             e.currentTarget.blur();
           } else if (e.key === "Escape") {
@@ -703,7 +705,7 @@ function Attendees({
             if (shown.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
               e.preventDefault();
               suggestions.move(e.key === "ArrowDown" ? 1 : -1, shown.length);
-            } else if (e.key === "Enter" || e.key === "Tab" || e.key === "," || e.key === ";") {
+            } else if (!composing(e) && (e.key === "Enter" || e.key === "Tab" || e.key === "," || e.key === ";")) {
               const picked = shown[suggestions.active];
               if (!typed.trim()) return;
               if (picked ? add(picked) : addTyped(typed)) e.preventDefault();

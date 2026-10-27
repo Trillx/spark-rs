@@ -72,6 +72,21 @@ export function draftOf(e: CalendarEvent): EventDraft {
   };
 }
 
+/**
+ * A copy of `e` (Duplicate, Paste Event). A call link that isn't a Teams meeting Outlook makes
+ * (Zoom, Meet) goes in its note, where the people invited to the copy find it.
+ */
+export function copyOf(e: CalendarEvent): EventDraft {
+  const d = draftOf(e);
+  if (!e.callLink || e.onlineMeeting || d.notes.includes(e.callLink) || d.location.includes(e.callLink)) return d;
+  return { ...d, notes: [d.notes.trim(), e.callLink].filter(Boolean).join("\n\n") };
+}
+
+/** Enter that ends typing in an input method (Japanese, Chinese), rather than the user's own. */
+export function composing(e: { nativeEvent: { isComposing?: boolean }; keyCode: number }) {
+  return e.nativeEvent.isComposing === true || e.keyCode === 229;
+}
+
 /** What new events get: Settings → Calendar's length and alerts. */
 export interface NewEventDefaults {
   minutes: number;

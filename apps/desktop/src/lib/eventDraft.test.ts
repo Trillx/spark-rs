@@ -315,3 +315,34 @@ test("an end after midnight is the next day on the clock, across a DST change to
     else process.env.TZ = zone;
   }
 });
+
+test("a copy keeps a Zoom link in its note; a Teams meeting is made anew", async () => {
+  const { copyOf, composing } = await import("./eventDraft.ts");
+  const zoom: CalendarEvent = {
+    id: 3,
+    calendar: 1,
+    account: 1,
+    title: "Vendor call",
+    start: 0,
+    end: 1,
+    allDay: false,
+    location: "Room 4",
+    notes: "Agenda",
+    callLink: "https://us02web.zoom.us/j/123",
+    attendees: [],
+    response: "organizer",
+    canceled: false,
+    repeats: false,
+    showAs: "busy",
+    private: false,
+    onlineMeeting: false,
+  };
+  assert.equal(copyOf(zoom).notes, "Agenda\n\nhttps://us02web.zoom.us/j/123");
+  assert.equal(copyOf({ ...zoom, notes: undefined }).notes, "https://us02web.zoom.us/j/123");
+  const teams = { ...zoom, callLink: "https://teams.microsoft.com/l/x", onlineMeeting: true };
+  assert.equal(copyOf(teams).notes, "Agenda");
+  assert.equal(copyOf(teams).teams, true);
+  assert.equal(composing({ nativeEvent: { isComposing: true }, keyCode: 13 }), true);
+  assert.equal(composing({ nativeEvent: {}, keyCode: 229 }), true);
+  assert.equal(composing({ nativeEvent: { isComposing: false }, keyCode: 13 }), false);
+});

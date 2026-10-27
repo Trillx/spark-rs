@@ -37,6 +37,7 @@ import {
 import { demoAnswer, demoCalendars, demoDeleteEvent, demoListEvents, demoSaveEvent } from "../lib/demoCalendar";
 import {
   atMinutes,
+  copyOf,
   dayOf,
   draftOf,
   fromUtcDate,
@@ -478,7 +479,7 @@ export default function CalendarScreen({
     if (calendar === undefined) return;
     const defaults = await newEventDefaults();
     setPreview(null);
-    setEditor({ initial: { ...draftOf(e), calendar }, defaults, anchor, modal: kind === "day", unsaved: true });
+    setEditor({ initial: { ...copyOf(e), calendar }, defaults, anchor, modal: kind === "day", unsaved: true });
   };
 
   /** Spark's Copy: the event remembered for Paste Event, and "Title (date, time)" on the clipboard. */
@@ -506,7 +507,7 @@ export default function CalendarScreen({
     const defaults = await newEventDefaults();
     setPreview(null);
     setEditor({
-      initial: { ...draftOf(copied), calendar, start, end: start + length },
+      initial: { ...copyOf(copied), calendar, start, end: start + length },
       defaults,
       anchor,
       modal: kind === "day",
