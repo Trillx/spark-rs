@@ -648,8 +648,10 @@ pub fn series_from(
     };
     let master_times = master_time("start").zip(master_time("end"));
     let (start, end) = if all_day {
-        // As many days as the series has now, unless the user changed its end.
-        let days = if draft.all_day && before.all_day && draft.end != before.end {
+        // As many days as the series has now, unless the user changed its
+        // start or end: then as many as the editor has.
+        let moved = draft.start != before.start || draft.end != before.end;
+        let days = if draft.all_day && before.all_day && moved {
             (draft.end - draft.start).div_euclid(DAY_MS).max(1)
         } else {
             master_times
@@ -858,16 +860,28 @@ fn meeting_in(html: &str) -> Option<(usize, usize)> {
     Some((from, cut))
 }
 
-/// Whether HTML has something to read in it, not only tags and spaces.
+/// Whether HTML has something to read or see in it (an agenda pasted as a
+/// picture), not only tags and spaces.
 fn has_text(html: &str) -> bool {
+    const SEEN: &[&str] = &[
+        "img", "svg", "picture", "video", "audio", "canvas", "object", "embed", "iframe",
+    ];
     let mut inside = false;
+    let mut tag = String::new();
     let mut text = String::new();
     for c in html.chars() {
         match c {
-            '<' => inside = true,
+            '<' => {
+                inside = true;
+                tag.clear();
+            }
             '>' => inside = false,
             c if !inside => text.push(c),
-            _ => {}
+            c => tag.push(c.to_ascii_lowercase()),
+        }
+        let name = tag.split(|c: char| !c.is_ascii_alphanumeric()).next();
+        if !inside && name.is_some_and(|n| SEEN.contains(&n)) {
+            return true;
         }
     }
     !text
@@ -2323,6 +2337,22 @@ mod tests {
         );
         assert_eq!(body["start"]["dateTime"], "2026-11-10T00:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-13T00:00:00");
+        // Its start moved back a day, its end kept: three days, as the
+        // editor has it.
+        let earlier = EventDraft {
+            start: start - DAY_MS,
+            ..before.clone()
+        };
+        let body = series_from(
+            &master,
+            &earlier,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, earlier.start, earlier.all_day),
+            json!(null),
+        );
+        assert_eq!(body["start"]["dateTime"], "2026-11-09T00:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-12T00:00:00");
     }
 
     #[test]
@@ -2415,6 +2445,16 @@ mod tests {
         assert_eq!(
             kept,
             "<html><body><div>Agenda</div><div>Parking: level 2</div></body></html>"
+        );
+        // An agenda pasted as a picture, in Outlook's WordSection1, stays.
+        let html = format!(
+            "<html><body><div class=\"WordSection1\"><p><img src=\"cid:agenda\"></p>\
+             <div><span>{rule}</span></div><div>Teams meeting, join here</div>\
+             <div><span>{rule}</span></div></div></body></html>"
+        );
+        assert_eq!(
+            before_meeting(&html).unwrap(),
+            "<html><body><div class=\"WordSection1\"><p><img src=\"cid:agenda\"></p></div></body></html>"
         );
     }
 
