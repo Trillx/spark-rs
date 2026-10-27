@@ -947,6 +947,8 @@ fn attachment_name(mailbox: &Mailbox, id: i64, index: usize) -> Result<String, S
         .ok_or_else(|| "That attachment isn't part of the email.".to_owned())
 }
 
+/// Attachment `index`: the copy kept since it was last downloaded, if
+/// there is one.
 async fn download(mailbox: &Mailbox, id: i64, index: usize) -> Result<AttachmentData, String> {
     mailbox
         .live
@@ -954,6 +956,13 @@ async fn download(mailbox: &Mailbox, id: i64, index: usize) -> Result<Attachment
         .attachment(id, index)
         .await
         .map_err(text)
+}
+
+/// Runs file work on a blocking thread, off the async ones.
+async fn on_disk(work: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(text)?
 }
 
 /// What opening an attachment did.
@@ -982,11 +991,13 @@ pub async fn open_attachment(
         return Ok(Opened::Risky { name });
     }
     let file = download(&mailbox, id, index).await?;
-    let dir = files::opened_dir().join(format!("{id}-{index}"));
-    std::fs::create_dir_all(&dir).map_err(text)?;
-    let path = dir.join(files::safe_file_name(&file.name));
-    files::write_downloaded(&path, &file.bytes)?;
-    open::that_detached(&path).map_err(|e| format!("Couldn't open {}: {e}", file.name))?;
+    let path = files::opened_dir()
+        .join(format!("{id}-{index}"))
+        .join(files::safe_file_name(&file.name));
+    let opened = path.clone();
+    let name = file.name.clone();
+    on_disk(move || files::write_opened(&opened, &file.bytes)).await?;
+    open::that_detached(&path).map_err(|e| format!("Couldn't open {name}: {e}"))?;
     Ok(Opened::Opened)
 }
 
@@ -1025,7 +1036,8 @@ pub async fn save_attachment(
         return Ok(false);
     };
     let file = download(&mailbox, id, index).await?;
-    files::write_downloaded(target.path(), &file.bytes)?;
+    let target = target.path().to_owned();
+    on_disk(move || files::write_downloaded(&target, &file.bytes)).await?;
     Ok(true)
 }
 
@@ -1052,7 +1064,8 @@ pub async fn save_eml(
         return Ok(false);
     };
     let raw = mailbox.live.engine.raw_message(id).await.map_err(text)?;
-    files::write_downloaded(target.path(), &raw)?;
+    let target = target.path().to_owned();
+    on_disk(move || files::write_downloaded(&target, &raw)).await?;
     Ok(true)
 }
 
@@ -1083,11 +1096,22 @@ pub async fn save_all_attachments(
         return Ok(0);
     };
     let folder: PathBuf = folder.path().to_owned();
-    for index in 0..count {
-        let file = download(&mailbox, id, index).await?;
-        let path = files::unique_path(&folder, &files::safe_file_name(&file.name));
-        files::write_downloaded(&path, &file.bytes)?;
-    }
+    // All in one go: for IMAP, one download of the email.
+    let all: Vec<usize> = (0..count).collect();
+    let downloaded = mailbox
+        .live
+        .engine
+        .attachments(id, &all)
+        .await
+        .map_err(text)?;
+    on_disk(move || {
+        for file in &downloaded {
+            let path = files::unique_path(&folder, &files::safe_file_name(&file.name));
+            files::write_downloaded(&path, &file.bytes)?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(count)
 }
 

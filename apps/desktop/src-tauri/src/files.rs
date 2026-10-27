@@ -138,6 +138,21 @@ pub fn write_downloaded(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// `write_downloaded` for a copy to open, making its folder. A copy already
+/// there with the same bytes is left as it is: a viewer may have it open,
+/// and on Windows writing over it would fail.
+pub fn write_opened(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let same = fs::metadata(path).is_ok_and(|m| m.len() == bytes.len() as u64)
+        && fs::read(path).is_ok_and(|on_disk| on_disk == bytes);
+    if same {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("Couldn't save {}: {e}", path.display()))?;
+    }
+    write_downloaded(path, bytes)
+}
+
 #[cfg(windows)]
 fn mark_from_internet(path: &Path) {
     let mut stream = path.as_os_str().to_owned();
@@ -195,6 +210,31 @@ mod tests {
         let described = describe(&path).unwrap();
         assert_eq!((described.name.as_str(), described.size), ("x.pdf", 4));
         assert!(describe(&dir).is_none(), "folders can't be attached");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_opened_copy_with_the_same_bytes_is_left_as_it_is() {
+        let dir = std::env::temp_dir().join(format!("spark-files-opened-{}", std::process::id()));
+        let path = dir.join("7-0").join("x.pdf");
+        write_opened(&path, b"%PDF").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"%PDF");
+        // Read-only, standing in for a viewer holding it open: the same
+        // bytes needn't be written again, other bytes are.
+        let writable = fs::metadata(&path).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(&path, read_only).unwrap();
+        assert!(write_downloaded(&path, b"%PDF").is_err(), "as opening did");
+        write_opened(&path, b"%PDF").unwrap();
+        assert!(write_opened(&path, b"%PDF-2").is_err());
+        assert!(
+            write_opened(&path, b"%PDG").is_err(),
+            "same size, other bytes"
+        );
+        fs::set_permissions(&path, writable).unwrap();
+        write_opened(&path, b"%PDF-2").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"%PDF-2");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

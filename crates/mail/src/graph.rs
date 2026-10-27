@@ -1243,46 +1243,82 @@ impl Graph {
         index: usize,
         wanted: &Attachment,
     ) -> Result<AttachmentData> {
-        let attachment_id = match &wanted.remote_id {
-            Some(attachment_id) => attachment_id.clone(),
-            None => {
-                let listed = self.attachments(id).await?;
-                listed
-                    .get(index)
-                    .filter(|a| a.name == wanted.name)
-                    .or_else(|| listed.iter().find(|a| a.name == wanted.name))
-                    .and_then(|a| a.remote_id.clone())
-                    .ok_or_else(|| {
-                        Error::Server(format!(
-                            "{} is no longer attached to the email.",
-                            wanted.name
-                        ))
-                    })?
-            }
+        self.attachment_files(id, &[(index, wanted.clone())])
+            .await?
+            .pop()
+            .ok_or(Error::Gone)
+    }
+
+    /// `attachment` for each `(index, attachment)` in `wanted`, in that
+    /// order: listing the message's attachments at most once, and
+    /// downloading a few at a time (`in_turns`), patiently.
+    pub async fn attachment_files(
+        &self,
+        id: &str,
+        wanted: &[(usize, Attachment)],
+    ) -> Result<Vec<AttachmentData>> {
+        let listed = if wanted.iter().any(|(_, a)| a.remote_id.is_none()) {
+            self.attachments(id).await?
+        } else {
+            Vec::new()
         };
-        let response = self
-            .send(self.request(
-                Method::GET,
-                &format!(
-                    "/me/messages/{}/attachments/{}/$value",
-                    path(id),
-                    path(&attachment_id)
-                ),
-            ))
-            .await?;
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::network(HOST, e))?;
-        Ok(AttachmentData {
-            name: wanted.name.clone(),
-            mime: if wanted.mime.is_empty() {
-                mime_for(&wanted.name).to_owned()
-            } else {
-                wanted.mime.clone()
-            },
-            bytes: bytes.to_vec(),
+        let mut urls = Vec::with_capacity(wanted.len());
+        for (index, a) in wanted {
+            let attachment_id = match &a.remote_id {
+                Some(attachment_id) => attachment_id,
+                None => listed
+                    .get(*index)
+                    .filter(|l| l.name == a.name)
+                    .or_else(|| listed.iter().find(|l| l.name == a.name))
+                    .and_then(|l| l.remote_id.as_ref())
+                    .ok_or_else(|| {
+                        Error::Server(format!("{} is no longer attached to the email.", a.name))
+                    })?,
+            };
+            urls.push(format!(
+                "/me/messages/{}/attachments/{}/$value",
+                path(id),
+                path(attachment_id)
+            ));
+        }
+        let downloads = urls
+            .iter()
+            .map(|url| async move {
+                let response = self
+                    .send_patiently(|| self.request(Method::GET, url))
+                    .await?;
+                response.bytes().await.map_err(|e| Error::network(HOST, e))
+            })
+            .collect();
+        let mut fetched: Vec<Option<Result<_>>> = wanted.iter().map(|_| None).collect();
+        in_turns(downloads, |i, bytes| {
+            let ok = bytes.is_ok();
+            fetched[i] = Some(bytes);
+            ok
         })
+        .await;
+        // After a failure the rest don't start: its error is the answer.
+        if let Some(Err(e)) = fetched
+            .iter_mut()
+            .find_map(|f| f.take_if(|bytes| bytes.is_err()))
+        {
+            return Err(e);
+        }
+        wanted
+            .iter()
+            .zip(fetched)
+            .map(|((_, a), bytes)| {
+                Ok(AttachmentData {
+                    name: a.name.clone(),
+                    mime: if a.mime.is_empty() {
+                        mime_for(&a.name).to_owned()
+                    } else {
+                        a.mime.clone()
+                    },
+                    bytes: bytes.ok_or(Error::Gone)??.to_vec(),
+                })
+            })
+            .collect()
     }
 
     /// Sends local changes: read and flagged state, then the move for Done
@@ -2393,6 +2429,111 @@ pub(crate) mod tests {
         assert_eq!(cids, ["image001.png@01dd", "photo"]);
         assert_eq!(both[1].mime, "image/jpeg", "typed by its name");
         assert!(!seen.lock().unwrap().iter().any(|p| p.ends_with("/file")));
+    }
+
+    /// m1's files as a stand-in has them, each taking a while: a1 to a4,
+    /// and a5 called old.pdf, listed by name. a3 is throttled once when
+    /// `throttle` is set.
+    fn files_of_m1(throttle: bool) -> impl Fn(&Asked, usize) -> Answer {
+        move |asked, attempt| {
+            let Some(rest) = asked.path.strip_prefix("/me/messages/m1/attachments") else {
+                return Answer::status(404);
+            };
+            let answer = match rest {
+                r if r.starts_with("?$select=id,name") => Answer::json(json!({ "value": [
+                    { "id": "a5", "name": "old.pdf", "contentType": "application/pdf", "size": 5 },
+                ] })),
+                "/a3/$value" if throttle && attempt == 0 => Answer {
+                    retry_after: Some(1),
+                    ..Answer::status(429)
+                },
+                r => match r.strip_prefix("/a").and_then(|r| r.strip_suffix("/$value")) {
+                    Some(n) if ("1"..="5").contains(&n) => Answer {
+                        body: format!("file {n}"),
+                        ..Answer::json(Value::Null)
+                    },
+                    _ => Answer::status(404),
+                },
+            };
+            answer.after(Duration::from_millis(25))
+        }
+    }
+
+    fn m1_files() -> Vec<(usize, Attachment)> {
+        let file = |name: &str, id: Option<&str>| Attachment {
+            name: name.into(),
+            mime: String::new(),
+            size: 6,
+            remote_id: id.map(str::to_owned),
+        };
+        vec![
+            (0, file("one.pdf", Some("a1"))),
+            (1, file("two.pdf", Some("a2"))),
+            (2, file("three.pdf", Some("a3"))),
+            (3, file("four.pdf", Some("a4"))),
+            (4, file("old.pdf", None)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_messages_files_download_a_few_at_a_time_and_wait_out_throttling() {
+        let (base, seen) = serve(files_of_m1(false)).await;
+        let graph = Graph::with_base(&base, "token");
+        let wanted = m1_files();
+        // One by one, as Save All went, once the HTTP client is set up.
+        for (i, a) in &wanted {
+            graph.attachment("m1", *i, a).await.unwrap();
+        }
+        seen.take();
+        let started = std::time::Instant::now();
+        for (i, a) in &wanted {
+            graph.attachment("m1", *i, a).await.unwrap();
+        }
+        let one_by_one = started.elapsed();
+        assert_eq!(seen.take().len(), 6);
+        let started = std::time::Instant::now();
+        let files = graph.attachment_files("m1", &wanted).await.unwrap();
+        let elapsed = started.elapsed();
+        let asked = seen.take();
+        let most = seen.most.load(SeqCst);
+        eprintln!(
+            "m1's five files: {} requests, at most {most} at once, {elapsed:?}; one by one {one_by_one:?}",
+            asked.len()
+        );
+        let got: Vec<(&str, &str, &[u8])> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.mime.as_str(), f.bytes.as_slice()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("one.pdf", "application/pdf", &b"file 1"[..]),
+                ("two.pdf", "application/pdf", b"file 2"),
+                ("three.pdf", "application/pdf", b"file 3"),
+                ("four.pdf", "application/pdf", b"file 4"),
+                ("old.pdf", "application/pdf", b"file 5"),
+            ]
+        );
+        assert_eq!(asked.len(), 6, "listed once, for old.pdf, then the five");
+        assert_eq!(most, 4, "never more than four at once");
+        assert!(immutable(&asked));
+
+        // Throttled once, a3 waits and is asked again; the others finish.
+        let (base, seen) = serve(files_of_m1(true)).await;
+        let graph = Graph::with_base(&base, "token");
+        let files = graph.attachment_files("m1", &wanted).await.unwrap();
+        assert_eq!(files[2].bytes, b"file 3");
+        let asked = seen.take();
+        let a3 = asked.iter().filter(|a| a.path.contains("/a3/")).count();
+        assert_eq!((asked.len(), a3), (7, 2));
+
+        // One that's gone fails the lot.
+        let mut gone = wanted.clone();
+        gone[1].1.remote_id = Some("a9".into());
+        assert!(graph.attachment_files("m1", &gone).await.is_err());
+        let mut renamed = wanted;
+        renamed[4].1.name = "new.pdf".into();
+        assert!(graph.attachment_files("m1", &renamed).await.is_err());
     }
 
     /// 2026-10-21 14:00 UTC.

@@ -129,6 +129,10 @@ pub fn inline_images(raw: &[u8], wanted: &[String]) -> Vec<InlineImage> {
     let Some(m) = MessageParser::default().parse(raw) else {
         return Vec::new();
     };
+    images_in(&m, wanted)
+}
+
+fn images_in(m: &Message, wanted: &[String]) -> Vec<InlineImage> {
     let mut images: Vec<InlineImage> = Vec::new();
     let mut total = 0;
     for part in &m.parts {
@@ -194,7 +198,24 @@ pub fn extract_all(raw: &[u8], names: &[&str]) -> Vec<Option<AttachmentData>> {
     let Some(m) = MessageParser::default().parse(raw) else {
         return names.iter().map(|_| None).collect();
     };
-    let list: Vec<_> = listed(&m).collect();
+    files_in(&m, names)
+}
+
+/// What `extract_all` gives for `names` and `inline_images` for `wanted`,
+/// parsing the message once.
+pub fn extract_files(
+    raw: &[u8],
+    names: &[&str],
+    wanted: &[String],
+) -> (Vec<Option<AttachmentData>>, Vec<InlineImage>) {
+    let Some(m) = MessageParser::default().parse(raw) else {
+        return (names.iter().map(|_| None).collect(), Vec::new());
+    };
+    (files_in(&m, names), images_in(&m, wanted))
+}
+
+fn files_in(m: &Message, names: &[&str]) -> Vec<Option<AttachmentData>> {
+    let list: Vec<_> = listed(m).collect();
     names
         .iter()
         .enumerate()
@@ -430,6 +451,19 @@ Hello.\r\n\
         assert_eq!(images[0].bytes, b"\x89PNG\r\n\x1a\n");
         assert_eq!(images[0].data_url(), "data:image/png;base64,iVBORw0KGgo=");
         assert!(inline_images(raw, &["other".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn files_and_images_come_from_one_parse() {
+        let raw = MIXED.as_bytes();
+        let names = ["plan.pdf", "missing.doc", "Old thread.eml"];
+        let wanted = ["logo".to_owned()];
+        let (files, images) = extract_files(raw, &names, &wanted);
+        assert_eq!(files, extract_all(raw, &names));
+        assert_eq!(files[1], None);
+        assert_eq!(images, inline_images(raw, &wanted));
+        assert_eq!(images.len(), 1);
+        assert_eq!(extract_files(b"", &names, &wanted), (vec![None; 3], vec![]));
     }
 
     #[test]

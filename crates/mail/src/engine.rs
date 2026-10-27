@@ -16,7 +16,7 @@ use spark_store::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::attachment::{self, AttachmentData, InlineImage};
-use crate::cache::AttachmentCache;
+use crate::cache::{AttachmentCache, Flight};
 use crate::calendar::{Event, Response};
 use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::drafts::{self, DraftsReport};
@@ -194,7 +194,9 @@ pub struct Engine {
     /// didn't have, by account and lowercased address, with when it was asked.
     not_written_to: Mutex<HashMap<(i64, String), i64>>,
     /// Downloaded attachments kept on this computer, if they're kept.
-    files: Option<AttachmentCache>,
+    files: Option<Arc<AttachmentCache>>,
+    /// Where Graph is: `graph::GRAPH`, or a stand-in's address in tests.
+    graph_base: String,
 }
 
 impl Engine {
@@ -207,13 +209,14 @@ impl Engine {
             turns: Mutex::new(HashMap::new()),
             not_written_to: Mutex::new(HashMap::new()),
             files: None,
+            graph_base: graph::GRAPH.to_owned(),
         }
     }
 
     /// Keeps downloaded attachments in `dir` (see `cache`), taking out
     /// those of emails that went while the app was closed.
     pub fn with_attachment_cache(mut self, dir: std::path::PathBuf) -> Self {
-        self.files = Some(AttachmentCache::new(dir));
+        self.files = Some(Arc::new(AttachmentCache::new(dir)));
         self.sweep_files();
         if let Some(files) = &self.files {
             files.prune();
@@ -1011,7 +1014,8 @@ impl Engine {
     }
 
     async fn graph(&self, account_id: i64, client_id: &str, tenant: &str) -> Result<Graph> {
-        Ok(Graph::new(
+        Ok(Graph::with_base(
+            &self.graph_base,
             &self
                 .access_token(account_id, &App::new(client_id, tenant)?)
                 .await?,
@@ -1323,76 +1327,101 @@ impl Engine {
     }
 
     /// The draft's attachments in order: the copies queued with it, and
-    /// forwarded ones fetched again from the server.
+    /// forwarded ones fetched again from the server, each email's in one go
+    /// (`attachments`).
     async fn outgoing_files(&self, outbox_id: i64, draft: &Draft) -> Result<Vec<AttachmentData>> {
         let mut queued = self.store().outbox_files(outbox_id)?.into_iter();
         let mut files = Vec::with_capacity(draft.attachments.len());
+        // Per email forwarded from, its attachments and their places.
+        let mut forwarded: Vec<(i64, Vec<usize>, Vec<usize>)> = Vec::new();
         for a in &draft.attachments {
             match a {
                 OutgoingAttachment::File { name, .. } => {
                     let f = queued.next().ok_or_else(|| {
                         Error::Config(format!("{name} is missing from the outbox."))
                     })?;
-                    files.push(AttachmentData {
+                    files.push(Some(AttachmentData {
                         name: f.name,
                         mime: f.mime,
                         bytes: f.data,
-                    });
+                    }));
                 }
                 OutgoingAttachment::Message { message, index, .. } => {
-                    files.push(self.attachment(*message, *index).await?);
+                    match forwarded.iter_mut().find(|(m, ..)| m == message) {
+                        Some((_, indices, places)) => {
+                            indices.push(*index);
+                            places.push(files.len());
+                        }
+                        None => forwarded.push((*message, vec![*index], vec![files.len()])),
+                    }
+                    files.push(None);
                 }
             }
         }
-        Ok(files)
+        for (message, indices, places) in forwarded {
+            let fetched = self.attachments(message, &indices).await?;
+            for (place, file) in places.into_iter().zip(fetched) {
+                files[place] = Some(file);
+            }
+        }
+        Ok(files.into_iter().flatten().collect())
     }
 
-    /// Attachment `index` of a stored message: the one kept here, else
-    /// downloaded from its server (and kept).
+    /// Attachment `index` of a stored message (see `attachments`).
     pub async fn attachment(&self, message_id: i64, index: usize) -> Result<AttachmentData> {
-        let (at, all, key) = self.attachments_of(message_id)?;
-        let wanted = all
-            .get(index)
-            .cloned()
-            .ok_or_else(|| Error::Config("That attachment isn't part of the email.".into()))?;
-        if let Some(kept) = self
-            .files
-            .as_ref()
-            .and_then(|files| files.get(at.account_id, &key, index, &wanted.name, &wanted.mime))
-        {
-            return Ok(kept);
+        self.attachments(message_id, &[index])
+            .await?
+            .pop()
+            .ok_or_else(not_attached)
+    }
+
+    /// Attachments `indices` of a stored message, in that order: the ones
+    /// kept here, and the rest downloaded from its server in one go (and
+    /// kept). For IMAP that's one session and one download of the email
+    /// however many are missing; for Microsoft, a few at a time.
+    pub async fn attachments(
+        &self,
+        message_id: i64,
+        indices: &[usize],
+    ) -> Result<Vec<AttachmentData>> {
+        let email = self.email_files(message_id)?;
+        if indices.iter().any(|&i| i >= email.attachments.len()) {
+            return Err(not_attached());
         }
-        let account = self.account(at.account_id)?;
-        match config(&account)? {
-            AccountConfig::Imap {
-                username,
-                imap: server,
-                ..
-            } => {
-                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
-                // The whole email came: its other files are kept too.
-                let mut found = self.keep_all(at.account_id, &key, &raw, &all);
-                found.get_mut(index).and_then(Option::take).ok_or_else(|| {
+        let mut files = self.kept(&email, indices).await?;
+        if !missing(&files, indices).is_empty() {
+            // One download at a time: what another brought while this one
+            // waited is kept by then.
+            let _turn = self.turn_at(&email, FILES).await;
+            let came = self.kept(&email, &missing(&files, indices)).await?;
+            fill(&mut files, came);
+            let missing = missing(&files, indices);
+            if !missing.is_empty() {
+                let account = self.account(email.at.account_id)?;
+                let fetched = self
+                    .download(&account, config(&account)?, &email, &missing)
+                    .await?;
+                fill(&mut files, fetched);
+            }
+        }
+        indices
+            .iter()
+            .enumerate()
+            .map(|(n, &i)| {
+                // The same one asked for twice is handed over twice.
+                let file = if indices[n + 1..].contains(&i) {
+                    files[i].clone()
+                } else {
+                    files[i].take()
+                };
+                file.ok_or_else(|| {
                     Error::Server(format!(
                         "{} wasn't in the email on the server.",
-                        wanted.name
+                        email.attachments[i].name
                     ))
                 })
-            }
-            AccountConfig::Microsoft {
-                client_id, tenant, ..
-            } => {
-                let remote = at.remote_id.ok_or(Error::Gone)?;
-                let token = self
-                    .access_token(account.id, &App::new(&client_id, &tenant)?)
-                    .await?;
-                let file = Graph::new(&token)
-                    .attachment(&remote, index, &wanted)
-                    .await?;
-                self.keep(at.account_id, &key, &[(index, &file.bytes)]);
-                Ok(file)
-            }
-        }
+            })
+            .collect()
     }
 
     /// Spark's Auto-download: fetches the attachments of a stored message
@@ -1402,112 +1431,233 @@ impl Engine {
         let Some(files) = &self.files else {
             return Ok(0);
         };
-        let (at, all, key) = self.attachments_of(message_id)?;
-        let missing: Vec<usize> = (0..all.len())
-            .filter(|&i| !files.has(at.account_id, &key, i))
-            .collect();
-        let size: u64 = all.iter().map(|a| a.size).sum();
-        if missing.is_empty() || size > PREFETCH_MAX_BYTES {
+        let email = self.email_files(message_id)?;
+        let missing = || -> Vec<usize> {
+            (0..email.attachments.len())
+                .filter(|&i| !files.has(email.at.account_id, &email.key, i))
+                .collect()
+        };
+        let size: u64 = email.attachments.iter().map(|a| a.size).sum();
+        if size > PREFETCH_MAX_BYTES || missing().is_empty() {
             return Ok(0);
         }
-        let account = self.account(at.account_id)?;
-        match config(&account)? {
-            AccountConfig::Imap {
-                username,
-                imap: server,
-                ..
-            } => {
-                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
-                let found = self.keep_all(at.account_id, &key, &raw, &all);
-                Ok(found.iter().flatten().count())
-            }
-            AccountConfig::Microsoft {
-                client_id, tenant, ..
-            } => {
-                let remote = at.remote_id.ok_or(Error::Gone)?;
-                let token = self
-                    .access_token(account.id, &App::new(&client_id, &tenant)?)
-                    .await?;
-                let graph = Graph::new(&token);
-                for &i in &missing {
-                    let file = graph.attachment(&remote, i, &all[i]).await?;
-                    self.keep(at.account_id, &key, &[(i, &file.bytes)]);
-                }
-                Ok(missing.len())
-            }
+        let _turn = self.turn_at(&email, FILES).await;
+        let missing = missing();
+        if missing.is_empty() {
+            return Ok(0);
         }
+        let account = self.account(email.at.account_id)?;
+        let fetched = self
+            .download(&account, config(&account)?, &email, &missing)
+            .await?;
+        Ok(missing.iter().filter(|&&i| fetched[i].is_some()).count())
     }
 
-    /// Where a stored message is, its attachments, and its name in the
-    /// cache: its id and `files_key`, as a stored id can be another email's
-    /// once the first is gone.
-    fn attachments_of(
-        &self,
-        message_id: i64,
-    ) -> Result<(Location, Vec<spark_store::Attachment>, String)> {
+    /// What a stored message's files are found and kept by. Read in one go,
+    /// so its UIDVALIDITY is the one its location was stored with.
+    fn email_files(&self, message_id: i64) -> Result<EmailFiles> {
         let store = self.store();
         let gone = || Error::Config("That email is no longer here.".into());
         let at = store.location(message_id)?.ok_or_else(gone)?;
         let content = store.content(message_id)?.ok_or_else(gone)?;
+        let validity = stored_validity(&store, &at)?;
         let mut fresh = [0u8; 12];
         getrandom::fill(&mut fresh).map_err(|e| Error::Config(e.to_string()))?;
         let fresh: String = fresh.iter().map(|b| format!("{b:02x}")).collect();
         let key = store.files_key(message_id, &fresh)?.ok_or_else(gone)?;
-        Ok((at, content.attachments, format!("{message_id}-{key}")))
+        Ok(EmailFiles {
+            at,
+            validity,
+            attachments: content.attachments,
+            images: content
+                .html
+                .as_deref()
+                .map(attachment::cid_refs)
+                .unwrap_or_default(),
+            key: format!("{message_id}-{key}"),
+        })
     }
 
-    /// Keeps downloaded attachments (index and bytes) of an account's email,
-    /// unless the account went meanwhile; then makes room.
-    fn keep(&self, account: i64, key: &str, found: &[(usize, &[u8])]) {
-        let Some(files) = &self.files else {
-            return;
-        };
-        {
-            let _held = files.lock();
-            if !matches!(self.store().account(account), Ok(Some(_))) {
-                return;
-            }
-            for (index, bytes) in found {
-                files.put(account, key, *index, bytes);
-            }
-        }
-        files.prune();
+    /// Waits for the turn to look up and download `part` of an email's
+    /// files (`AttachmentCache::flight`); there's none to wait for without
+    /// a cache.
+    async fn turn_at(&self, email: &EmailFiles, part: &str) -> Option<Flight<'_>> {
+        let files = self.files.as_ref()?;
+        let name = format!("{}/{}/{part}", email.at.account_id, email.key);
+        Some(files.flight(name).await)
     }
 
-    /// Every attachment of a fetched email, from one reading of it, kept;
-    /// by index as the email lists them, `None` for one that wasn't there.
-    fn keep_all(
+    /// The kept copies of attachments `indices` of an email, read on a
+    /// blocking thread: by index as the email lists them, `None` for one
+    /// that isn't kept (or wasn't asked for).
+    async fn kept(
         &self,
-        account: i64,
-        key: &str,
-        raw: &[u8],
-        all: &[spark_store::Attachment],
-    ) -> Vec<Option<AttachmentData>> {
-        let names: Vec<&str> = all.iter().map(|a| a.name.as_str()).collect();
-        let found = attachment::extract_all(raw, &names);
-        let kept: Vec<(usize, &[u8])> = found
+        email: &EmailFiles,
+        indices: &[usize],
+    ) -> Result<Vec<Option<AttachmentData>>> {
+        let Some(files) = self.files.clone() else {
+            return Ok(vec![None; email.attachments.len()]);
+        };
+        let (account, key) = (email.at.account_id, email.key.clone());
+        let listed: Vec<(bool, String, String)> = email
+            .attachments
             .iter()
             .enumerate()
-            .filter_map(|(i, file)| Some((i, file.as_ref()?.bytes.as_slice())))
+            .map(|(i, a)| (indices.contains(&i), a.name.clone(), a.mime.clone()))
             .collect();
-        self.keep(account, key, &kept);
-        found
+        blocking(move || {
+            listed
+                .iter()
+                .enumerate()
+                .map(|(i, (asked, name, mime))| {
+                    asked
+                        .then(|| files.get(account, &key, i, name, mime))
+                        .flatten()
+                })
+                .collect()
+        })
+        .await
+    }
+
+    /// The images an email embeds, read on a blocking thread, if they're
+    /// kept.
+    async fn kept_images(&self, email: &EmailFiles) -> Result<Option<Vec<InlineImage>>> {
+        let Some(files) = self.files.clone() else {
+            return Ok(None);
+        };
+        let (account, key, cids) = (email.at.account_id, email.key.clone(), email.images.clone());
+        blocking(move || files.get_images(account, &key, &cids)).await
+    }
+
+    /// Downloads attachments `missing` of a stored message from its server,
+    /// and keeps them: for IMAP the whole email, once, whose other files and
+    /// embedded images are kept too; for Microsoft just those, a few at a
+    /// time. By index as the email lists them, `None` for one that isn't
+    /// there (or wasn't downloaded).
+    async fn download(
+        &self,
+        account: &Account,
+        config: AccountConfig,
+        email: &EmailFiles,
+        missing: &[usize],
+    ) -> Result<Vec<Option<AttachmentData>>> {
+        match config {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => Ok(self
+                .download_imap(account, &server, &username, email)
+                .await?
+                .0),
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let remote = email.at.remote_id.clone().ok_or(Error::Gone)?;
+                let asked: Vec<(usize, spark_store::Attachment)> = missing
+                    .iter()
+                    .map(|&i| (i, email.attachments[i].clone()))
+                    .collect();
+                let fetched = self
+                    .graph(account.id, &client_id, &tenant)
+                    .await?
+                    .attachment_files(&remote, &asked)
+                    .await?;
+                let mut files = vec![None; email.attachments.len()];
+                for (&i, file) in missing.iter().zip(fetched) {
+                    files[i] = Some(file);
+                }
+                Ok(self.keep(email, files, None).await?.0)
+            }
+        }
+    }
+
+    /// Downloads a stored IMAP email once and takes all its files out of it
+    /// with one parse, on a blocking thread: its attachments, by index as
+    /// the store lists them (`None` for one that isn't there), and the
+    /// images its HTML embeds. They're kept, unless the email had to be
+    /// found by Message-ID because its mailbox was renumbered
+    /// (`imap::fetch_raw_checked`).
+    async fn download_imap(
+        &self,
+        account: &Account,
+        server: &Server,
+        username: &str,
+        email: &EmailFiles,
+    ) -> Result<(Vec<Option<AttachmentData>>, Vec<InlineImage>)> {
+        let (raw, trusted) = self
+            .fetch_raw(account, server, username, &email.at, email.validity)
+            .await?;
+        let names: Vec<String> = email.attachments.iter().map(|a| a.name.clone()).collect();
+        let cids = email.images.clone();
+        let (files, images) = blocking(move || {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            attachment::extract_files(&raw, &names, &cids)
+        })
+        .await?;
+        if !trusted {
+            return Ok((files, images));
+        }
+        let (files, images) = self.keep(email, files, Some(images)).await?;
+        Ok((files, images.unwrap_or_default()))
+    }
+
+    /// Keeps what was downloaded of an email, on a blocking thread, unless
+    /// its account went meanwhile; then makes room. `files` are its
+    /// attachments by index, `images` those its HTML embeds if they were
+    /// fetched. Hands them back.
+    async fn keep(
+        &self,
+        email: &EmailFiles,
+        files: Vec<Option<AttachmentData>>,
+        images: Option<Vec<InlineImage>>,
+    ) -> Result<(Vec<Option<AttachmentData>>, Option<Vec<InlineImage>>)> {
+        let Some(cache) = self.files.clone() else {
+            return Ok((files, images));
+        };
+        let store = self.store.clone();
+        let (account, key, cids) = (email.at.account_id, email.key.clone(), email.images.clone());
+        blocking(move || {
+            {
+                let _held = cache.lock();
+                let store = store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !matches!(store.account(account), Ok(Some(_))) {
+                    return (files, images);
+                }
+                drop(store);
+                for (index, file) in files.iter().enumerate() {
+                    if let Some(file) = file {
+                        cache.put(account, &key, index, &file.bytes);
+                    }
+                }
+                if let Some(images) = &images
+                    && !cids.is_empty()
+                {
+                    cache.put_images(account, &key, &cids, images);
+                }
+            }
+            cache.prune();
+            (files, images)
+        })
+        .await
     }
 
     /// A stored message as its server has it, MIME and all: what Save as
     /// .eml writes.
     pub async fn raw_message(&self, message_id: i64) -> Result<Vec<u8>> {
-        let at = self
-            .store()
-            .location(message_id)?
-            .ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
+        let (at, validity) = self.locate(message_id)?;
         let account = self.account(at.account_id)?;
         match config(&account)? {
             AccountConfig::Imap {
                 username,
                 imap: server,
                 ..
-            } => self.fetch_raw(&account, &server, &username, &at).await,
+            } => Ok(self
+                .fetch_raw(&account, &server, &username, &at, validity)
+                .await?
+                .0),
             AccountConfig::Microsoft {
                 client_id, tenant, ..
             } => {
@@ -1524,10 +1674,7 @@ impl Engine {
     /// `List-Unsubscribe` header offers (see `unsubscribe`). The header is
     /// read from the server, so mail stored before this works too.
     pub async fn unsubscribe(&self, message_id: i64) -> Result<Unsubscribed> {
-        let at = self
-            .store()
-            .location(message_id)?
-            .ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
+        let (at, validity) = self.locate(message_id)?;
         let account = self.account(at.account_id)?;
         let (list, post) = match config(&account)? {
             AccountConfig::Imap {
@@ -1535,7 +1682,9 @@ impl Engine {
                 imap: server,
                 ..
             } => {
-                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
+                let (raw, _) = self
+                    .fetch_raw(&account, &server, &username, &at, validity)
+                    .await?;
                 let parsed = mail_parser::MessageParser::default()
                     .parse(&raw)
                     .ok_or_else(|| {
@@ -1568,58 +1717,79 @@ impl Engine {
         unsubscribe::unsubscribe(unsubscribe::options(&list, post.as_deref())).await
     }
 
-    /// The images a stored message's HTML embeds with `cid:` URLs, from its
-    /// server. Empty, without asking the server, when it embeds none.
+    /// The images a stored message's HTML embeds with `cid:` URLs: the ones
+    /// kept here, else from its server (and kept). Empty, without asking the
+    /// server, when it embeds none.
     pub async fn inline_images(&self, message_id: i64) -> Result<Vec<InlineImage>> {
-        let (at, wanted) = {
-            let store = self.store();
-            let gone = || Error::Config("That email is no longer here.".into());
-            let at = store.location(message_id)?.ok_or_else(gone)?;
-            let content = store.content(message_id)?.ok_or_else(gone)?;
-            let wanted = content
-                .html
-                .as_deref()
-                .map(attachment::cid_refs)
-                .unwrap_or_default();
-            (at, wanted)
-        };
-        if wanted.is_empty() {
+        let email = self.email_files(message_id)?;
+        if email.images.is_empty() {
             return Ok(Vec::new());
         }
-        let account = self.account(at.account_id)?;
-        match config(&account)? {
+        if let Some(kept) = self.kept_images(&email).await? {
+            return Ok(kept);
+        }
+        let account = self.account(email.at.account_id)?;
+        let config = config(&account)?;
+        // An IMAP email's images come with its attachments, in one download;
+        // Microsoft's come apart, so they needn't wait for those.
+        let part = match config {
+            AccountConfig::Imap { .. } => FILES,
+            AccountConfig::Microsoft { .. } => IMAGES,
+        };
+        let _turn = self.turn_at(&email, part).await;
+        if let Some(kept) = self.kept_images(&email).await? {
+            return Ok(kept);
+        }
+        match config {
             AccountConfig::Imap {
                 username,
                 imap: server,
                 ..
-            } => {
-                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
-                Ok(attachment::inline_images(&raw, &wanted))
-            }
+            } => Ok(self
+                .download_imap(&account, &server, &username, &email)
+                .await?
+                .1),
             AccountConfig::Microsoft {
                 client_id, tenant, ..
             } => {
-                let remote = at.remote_id.ok_or(Error::Gone)?;
-                let token = self
-                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                let remote = email.at.remote_id.clone().ok_or(Error::Gone)?;
+                let images = self
+                    .graph(account.id, &client_id, &tenant)
+                    .await?
+                    .inline_images(&remote, &email.images)
                     .await?;
-                Graph::new(&token).inline_images(&remote, &wanted).await
+                let (_, images) = self.keep(&email, Vec::new(), Some(images)).await?;
+                Ok(images.unwrap_or_default())
             }
         }
     }
 
-    /// A stored message as the IMAP server has it, wherever it is now.
+    /// Where a stored message is, and the UIDVALIDITY its UID was stored
+    /// under (`stored_validity`), read in one go.
+    fn locate(&self, message_id: i64) -> Result<(Location, Option<u32>)> {
+        let store = self.store();
+        let at = store
+            .location(message_id)?
+            .ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
+        let validity = stored_validity(&store, &at)?;
+        Ok((at, validity))
+    }
+
+    /// A stored message as the IMAP server has it, wherever it is now, and
+    /// whether it's safe to keep what's in it (`imap::fetch_raw_checked`).
+    /// `validity` is the UIDVALIDITY its UID was stored under.
     async fn fetch_raw(
         &self,
         account: &Account,
         server: &Server,
         username: &str,
         at: &Location,
-    ) -> Result<Vec<u8>> {
+        validity: Option<u32>,
+    ) -> Result<(Vec<u8>, bool)> {
         let password = self.password(account.id)?;
         let state: imap::SyncState = from_json(&account.sync_state);
         let mut session = imap::login(server, username, &password).await?;
-        let raw = imap::fetch_raw(&mut session, &state, at).await;
+        let raw = imap::fetch_raw_checked(&mut session, &state, at, validity).await;
         let _ = session.logout().await;
         raw?.ok_or(Error::Gone)
     }
@@ -1802,6 +1972,70 @@ fn default_label(label: &str, kind: AccountKind, email: &str) -> String {
     }
 }
 
+/// The parts of an email's files that are downloaded apart (`turn_at`).
+const FILES: &str = "files";
+const IMAGES: &str = "images";
+
+/// What a stored message's files are found and kept by (`email_files`).
+struct EmailFiles {
+    at: Location,
+    /// The UIDVALIDITY its UID was stored under, if it's known.
+    validity: Option<u32>,
+    attachments: Vec<spark_store::Attachment>,
+    /// The Content-IDs of the images its HTML embeds (`cid_refs`).
+    images: Vec<String>,
+    /// Its name in the cache: its id and `files_key`, as a stored id can be
+    /// another email's once the first is gone.
+    key: String,
+}
+
+/// The UIDVALIDITY a stored IMAP message's UID was given under: its
+/// mailbox's as last synced, if it has a UID and that's known.
+fn stored_validity(store: &Store, at: &Location) -> Result<Option<u32>> {
+    let (Some(mailbox), Some(_)) = (&at.mailbox, at.uid) else {
+        return Ok(None);
+    };
+    if mailbox.eq_ignore_ascii_case(imap::INBOX) {
+        let account = store.account(at.account_id)?;
+        return Ok(account.and_then(|a| from_json::<imap::SyncState>(&a.sync_state).uid_validity));
+    }
+    Ok(store
+        .folders()?
+        .into_iter()
+        .find(|f| f.account_id == at.account_id && &f.remote_id == mailbox)
+        .and_then(|f| from_json::<imap::FolderState>(&f.sync_state).uid_validity))
+}
+
+/// Attachments `indices` that `files` (by index) doesn't have, each once.
+fn missing(files: &[Option<AttachmentData>], indices: &[usize]) -> Vec<usize> {
+    (0..files.len())
+        .filter(|&i| files[i].is_none() && indices.contains(&i))
+        .collect()
+}
+
+/// Fills in what `files` doesn't have from `found`, both by index.
+fn fill(files: &mut [Option<AttachmentData>], found: Vec<Option<AttachmentData>>) {
+    for (file, found) in files.iter_mut().zip(found) {
+        if file.is_none() {
+            *file = found;
+        }
+    }
+}
+
+fn not_attached() -> Error {
+    Error::Config("That attachment isn't part of the email.".into())
+}
+
+/// Runs `work` on a blocking thread, so parsing a big email and file work
+/// don't hold up the async ones. A panic in it carries on here.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(done) => Ok(done),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => Err(Error::Server("Reading the email was stopped.".into())),
+    }
+}
+
 fn to_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("settings serialize")
 }
@@ -1813,8 +2047,14 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(text: &str) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spark_store::{FolderRole, OutboxFile, RemoteFolder};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use spark_store::{Added, Attachment, FolderRole, Incoming, OutboxFile, RemoteFolder};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
     struct TestSecrets;
 
@@ -2240,5 +2480,534 @@ mod tests {
             default_label("", AccountKind::Imap, "a@fastmail.com"),
             "fastmail.com"
         );
+    }
+
+    /// The stand-in's mailboxes: each one's UIDVALIDITY, and its messages
+    /// by UID.
+    type Held = HashMap<String, (u32, Vec<(u32, Vec<u8>)>)>;
+
+    /// A local IMAP server for any number of sessions, counting sign-ins
+    /// and messages sent. Tests change its mailboxes as they go.
+    struct ImapStandIn {
+        server: Server,
+        held: Arc<Mutex<Held>>,
+        logins: Arc<AtomicUsize>,
+        fetches: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ImapStandIn {
+        async fn start(inbox_validity: u32, inbox: Vec<(u32, Vec<u8>)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = Server {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                security: imap::Security::Plain,
+                trusted_cert: None,
+            };
+            let held = Arc::new(Mutex::new(Held::from([(
+                imap::INBOX.to_owned(),
+                (inbox_validity, inbox),
+            )])));
+            let logins = Arc::new(AtomicUsize::new(0));
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let shared = (held.clone(), logins.clone(), fetches.clone());
+            let task = tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let (held, logins, fetches) = shared.clone();
+                    tokio::spawn(async move {
+                        let _ = imap_session(socket, &held, &logins, &fetches).await;
+                    });
+                }
+            });
+            Self {
+                server,
+                held,
+                logins,
+                fetches,
+                task,
+            }
+        }
+
+        fn hold(&self, mailbox: &str, validity: u32, mail: Vec<(u32, Vec<u8>)>) {
+            self.held
+                .lock()
+                .unwrap()
+                .insert(mailbox.into(), (validity, mail));
+        }
+
+        /// Sign-ins and messages sent so far.
+        fn counts(&self) -> (usize, usize) {
+            (self.logins.load(SeqCst), self.fetches.load(SeqCst))
+        }
+    }
+
+    impl Drop for ImapStandIn {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn imap_session(
+        socket: TcpStream,
+        held: &Mutex<Held>,
+        logins: &AtomicUsize,
+        fetches: &AtomicUsize,
+    ) -> std::io::Result<()> {
+        let (read, mut write) = socket.into_split();
+        write.write_all(b"* OK stand-in\r\n").await?;
+        let mut lines = BufReader::new(read).lines();
+        let mut selected = String::new();
+        while let Some(line) = lines.next_line().await? {
+            let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+            let upper = command.to_ascii_uppercase();
+            let mut reply = Vec::new();
+            let mut status = "OK done";
+            if upper.starts_with("LOGIN ") {
+                logins.fetch_add(1, SeqCst);
+            } else if upper.starts_with("SELECT ") {
+                selected = command[7..].trim_matches('"').to_owned();
+                match held.lock().unwrap().get(&selected) {
+                    Some((validity, mail)) => reply.extend(
+                        format!(
+                            "* {} EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n",
+                            mail.len()
+                        )
+                        .into_bytes(),
+                    ),
+                    None => status = "NO no such mailbox",
+                }
+            } else if upper.starts_with("UID SEARCH ") {
+                let wanted = command.split('"').nth(1).unwrap_or_default();
+                let hits: Vec<String> = held.lock().unwrap()[&selected]
+                    .1
+                    .iter()
+                    .filter(|(_, raw)| String::from_utf8_lossy(raw).contains(wanted))
+                    .map(|(uid, _)| uid.to_string())
+                    .collect();
+                reply.extend(format!("* SEARCH {}\r\n", hits.join(" ")).into_bytes());
+            } else if upper.starts_with("UID FETCH ") {
+                let uid: u32 = command.split_whitespace().nth(2).unwrap().parse().unwrap();
+                let found = held.lock().unwrap()[&selected]
+                    .1
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (u, _))| *u == uid)
+                    .map(|(i, (_, raw))| (i + 1, raw.clone()));
+                if let Some((seq, raw)) = found {
+                    fetches.fetch_add(1, SeqCst);
+                    let head = format!("* {seq} FETCH (UID {uid} BODY[] {{{}}}\r\n", raw.len());
+                    write.write_all(head.as_bytes()).await?;
+                    write.write_all(&raw).await?;
+                    reply.extend(b")\r\n");
+                }
+            } else if upper == "LOGOUT" {
+                write
+                    .write_all(format!("* BYE\r\n{tag} OK bye\r\n").as_bytes())
+                    .await?;
+                return Ok(());
+            }
+            reply.extend(format!("{tag} {status}\r\n").into_bytes());
+            write.write_all(&reply).await?;
+        }
+        Ok(())
+    }
+
+    const HTML: &str = "<p><img src=\"cid:logo\"><img src=\"cid:banner\"></p>";
+
+    /// File `i` of `big_message`: `size` bytes of `fill`, but the first is `i`.
+    fn part(fill: u8, i: usize, size: usize) -> Vec<u8> {
+        let mut bytes = vec![fill; size];
+        bytes[0] = i as u8;
+        bytes
+    }
+
+    /// A message embedding two images and with four attached files, as
+    /// `part` makes them.
+    fn big_message(message_id: &str, fill: u8, size: usize) -> Vec<u8> {
+        let base64 = |bytes: &[u8]| {
+            let text = STANDARD.encode(bytes);
+            let lines: Vec<&str> = text
+                .as_bytes()
+                .chunks(76)
+                .map(|line| std::str::from_utf8(line).unwrap())
+                .collect();
+            lines.join("\r\n")
+        };
+        let mut raw = format!(
+            "From: ana@example.com\r\nSubject: Files\r\nMessage-ID: <{message_id}>\r\n\
+             Content-Type: multipart/mixed; boundary=m\r\n\r\n\
+             --m\r\nContent-Type: multipart/related; boundary=r\r\n\r\n\
+             --r\r\nContent-Type: text/html\r\n\r\n{HTML}\r\n"
+        );
+        for cid in ["logo", "banner"] {
+            raw += &format!(
+                "--r\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\n\
+                 Content-ID: <{cid}>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                base64(&[0x89, b'P', b'N', b'G', fill])
+            );
+        }
+        raw += "--r--\r\n";
+        for i in 0..4 {
+            raw += &format!(
+                "--m\r\nContent-Type: application/pdf; name=\"part{i}.pdf\"\r\n\
+                 Content-Disposition: attachment; filename=\"part{i}.pdf\"\r\n\
+                 Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                base64(&part(fill, i, size))
+            );
+        }
+        raw += "--m--\r\n";
+        raw.into_bytes()
+    }
+
+    fn imap_account(store: &Store, server: &Server, validity: u32) -> Account {
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Test",
+                config: &to_json(&AccountConfig::Imap {
+                    username: "me@example.com".into(),
+                    imap: server.clone(),
+                    smtp: server.clone(),
+                }),
+            })
+            .unwrap();
+        store
+            .set_sync_state(account.id, &format!(r#"{{"uidValidity":{validity}}}"#))
+            .unwrap();
+        account
+    }
+
+    /// Stores `raw` as UID `uid` of `mailbox`, as a sync would.
+    fn store_imap(store: &mut Store, account_id: i64, mailbox: &str, uid: u32, raw: &[u8]) -> i64 {
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let incoming = Incoming {
+            account_id,
+            mailbox: Some(mailbox.into()),
+            uid: Some(uid),
+            message_id: parsed.message_id().map(str::to_owned),
+            from_address: "ana@example.com".into(),
+            subject: "Files".into(),
+            date: 1,
+            html: Some(HTML.into()),
+            attachments: attachment::describe(&parsed),
+            ..Default::default()
+        };
+        match store.add_incoming(&incoming, false).unwrap() {
+            Added::New(id) | Added::Known(id) => id,
+        }
+    }
+
+    /// A folder of its own for a test's attachment cache.
+    fn files_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("spark-engine-files-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// An engine keeping attachments in `dir`.
+    fn caching(store: Arc<Mutex<Store>>, dir: &Path) -> Engine {
+        Engine::new(store, Arc::new(TestSecrets)).with_attachment_cache(dir.to_owned())
+    }
+
+    /// The files kept in a cache folder.
+    fn kept_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, |found| {
+            found
+                .flatten()
+                .map(|f| {
+                    if f.path().is_dir() {
+                        kept_files(&f.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        })
+    }
+
+    #[tokio::test]
+    async fn save_all_downloads_an_imap_email_once_and_keeps_its_images_too() {
+        const SIZE: usize = 512 * 1024;
+        let raw = big_message("big@example.com", 1, SIZE);
+        assert!(raw.len() > 4 * SIZE, "a big message");
+        let imap = ImapStandIn::start(7, vec![(42, raw.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let id = store_imap(&mut store, account.id, "INBOX", 42, &raw);
+        let store = Arc::new(Mutex::new(store));
+
+        // Without a cache: still one session and one download for all four.
+        let bare = Engine::new(store.clone(), Arc::new(TestSecrets));
+        let all = bare.attachments(id, &[0, 1, 2, 3]).await.unwrap();
+        let names: Vec<&str> = all.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["part0.pdf", "part1.pdf", "part2.pdf", "part3.pdf"]);
+        for (i, file) in all.iter().enumerate() {
+            assert_eq!(file.bytes, part(1, i, SIZE));
+            assert_eq!(file.mime, "application/pdf");
+        }
+        assert_eq!(imap.counts(), (1, 1), "one session, one download");
+        // A forward of two, one of them twice.
+        let forwarded = bare.attachments(id, &[1, 0, 1]).await.unwrap();
+        assert_eq!(forwarded, [all[1].clone(), all[0].clone(), all[1].clone()]);
+        assert_eq!(imap.counts(), (2, 2));
+        assert!(bare.attachments(id, &[0, 4]).await.is_err(), "no fifth");
+
+        let dir = files_dir("save-all");
+        let engine = caching(store.clone(), &dir);
+        assert_eq!(engine.attachments(id, &[0, 1, 2, 3]).await.unwrap(), all);
+        assert_eq!(imap.counts(), (3, 3));
+        assert_eq!(kept_files(&dir), 5, "four files and the images");
+
+        // Opening or saving them again, or showing the images, uses what's kept.
+        assert_eq!(engine.attachment(id, 2).await.unwrap(), all[2]);
+        let again = engine.attachments(id, &[3, 0]).await.unwrap();
+        assert_eq!(again, [all[3].clone(), all[0].clone()]);
+        let images = engine.inline_images(id).await.unwrap();
+        let cids: Vec<&str> = images.iter().map(|i| i.cid.as_str()).collect();
+        assert_eq!(cids, ["logo", "banner"]);
+        assert_eq!(images[0].bytes, [0x89, b'P', b'N', b'G', 1]);
+        assert_eq!(engine.inline_images(id).await.unwrap(), images);
+        assert_eq!(imap.counts(), (3, 3));
+
+        // And after a restart.
+        let restarted = caching(store.clone(), &dir);
+        assert_eq!(restarted.attachment(id, 1).await.unwrap(), all[1]);
+        assert_eq!(restarted.inline_images(id).await.unwrap(), images);
+        assert_eq!(restarted.prefetch_attachments(id).await.unwrap(), 0);
+        assert_eq!(imap.counts(), (3, 3));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_an_email_downloads_it_once_for_its_files_and_images() {
+        const SIZE: usize = 64 * 1024;
+        let (one, two) = (
+            big_message("one@example.com", 1, SIZE),
+            big_message("two@example.com", 2, SIZE),
+        );
+        let imap = ImapStandIn::start(7, vec![(42, one.clone()), (43, two.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let a = store_imap(&mut store, account.id, "INBOX", 42, &one);
+        let b = store_imap(&mut store, account.id, "INBOX", 43, &two);
+        let dir = files_dir("open");
+        let engine = caching(Arc::new(Mutex::new(store)), &dir);
+
+        // Auto-download and the images, asked for as it opens.
+        let (fetched, images) =
+            tokio::join!(engine.prefetch_attachments(a), engine.inline_images(a));
+        assert_eq!(fetched.unwrap(), 4);
+        assert_eq!(images.unwrap().len(), 2);
+        assert_eq!(imap.counts(), (1, 1));
+        let (x, y, z) = tokio::join!(
+            engine.attachment(a, 0),
+            engine.attachment(a, 0),
+            engine.inline_images(a)
+        );
+        assert_eq!(x.unwrap(), y.unwrap());
+        assert_eq!(z.unwrap().len(), 2);
+        assert_eq!(imap.counts(), (1, 1));
+        // What's kept doesn't wait for a download under way.
+        let email = engine.email_files(a).unwrap();
+        let _downloading = engine.turn_at(&email, FILES).await;
+        let wait = std::time::Duration::from_secs(5);
+        let kept = tokio::time::timeout(wait, engine.attachment(a, 1)).await;
+        assert_eq!(kept.unwrap().unwrap().bytes, part(1, 1, SIZE));
+        assert!(
+            tokio::time::timeout(wait, engine.inline_images(a))
+                .await
+                .is_ok()
+        );
+        drop(_downloading);
+
+        // Shown first, with Auto-download off: its files are kept from that.
+        assert_eq!(engine.inline_images(b).await.unwrap()[1].bytes[4], 2);
+        assert_eq!(engine.prefetch_attachments(b).await.unwrap(), 0);
+        assert_eq!(
+            engine.attachment(b, 3).await.unwrap().bytes,
+            part(2, 3, SIZE)
+        );
+        assert_eq!(imap.counts(), (2, 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_renumbered_mailbox_never_gives_another_emails_files() {
+        const SIZE: usize = 1024;
+        let first = big_message("first@example.com", 1, SIZE);
+        let second = big_message("second@example.com", 2, SIZE);
+        let imap = ImapStandIn::start(7, vec![(42, first.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let a = store_imap(&mut store, account.id, "INBOX", 42, &first);
+        let projects = {
+            store
+                .replace_folders(
+                    account.id,
+                    &[RemoteFolder {
+                        remote_id: "Projects".into(),
+                        parent: None,
+                        name: "Projects".into(),
+                        role: None,
+                        selectable: true,
+                    }],
+                )
+                .unwrap();
+            store.folders().unwrap()[0].id
+        };
+        store
+            .set_folder_synced(projects, r#"{"uidValidity":3}"#, 1)
+            .unwrap();
+        imap.hold("Projects", 3, vec![(5, second.clone())]);
+        let b = store_imap(&mut store, account.id, "Projects", 5, &second);
+        let dir = files_dir("renumbered");
+        let engine = caching(Arc::new(Mutex::new(store)), &dir);
+
+        // The server renumbers both before a sync notices: the UIDs stored
+        // now name the other email, which is found by Message-ID instead.
+        imap.hold("INBOX", 8, vec![(42, second.clone()), (44, first.clone())]);
+        imap.hold("Projects", 4, vec![(5, first.clone()), (6, second.clone())]);
+        assert_eq!(
+            engine.attachment(a, 0).await.unwrap().bytes,
+            part(1, 0, SIZE)
+        );
+        assert_eq!(engine.inline_images(a).await.unwrap()[0].bytes[4], 1);
+        assert_eq!(
+            engine.attachment(b, 0).await.unwrap().bytes,
+            part(2, 0, SIZE)
+        );
+        let eml = String::from_utf8(engine.raw_message(a).await.unwrap()).unwrap();
+        assert!(eml.contains("<first@example.com>"));
+        // Found that way, they aren't kept: asked for again, they come again.
+        let (_, fetched) = imap.counts();
+        assert_eq!(
+            engine.attachment(a, 0).await.unwrap().bytes,
+            part(1, 0, SIZE)
+        );
+        assert_eq!(imap.counts().1, fetched + 1);
+        assert_eq!(kept_files(&dir), 0);
+
+        // Once the sync has stored the new numbering, they're kept again.
+        engine
+            .store()
+            .set_sync_state(account.id, r#"{"uidValidity":8}"#)
+            .unwrap();
+        store_imap(&mut engine.store(), account.id, "INBOX", 44, &first);
+        for _ in 0..2 {
+            assert_eq!(
+                engine.attachment(a, 1).await.unwrap().bytes,
+                part(1, 1, SIZE)
+            );
+        }
+        assert_eq!(imap.counts().1, fetched + 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn graph_m1(path: &str) -> Option<serde_json::Value> {
+        use serde_json::json;
+        Some(match path.strip_prefix("/me/messages/m1/attachments")? {
+            p if p.starts_with("?$select=id,name") => json!({ "value": [
+                { "id": "a3", "name": "old.pdf", "contentType": "application/pdf", "size": 5 },
+            ] }),
+            p if p.starts_with('?') => json!({ "value": [
+                { "id": "logo", "contentType": "image/png", "size": 10, "isInline": true },
+            ] }),
+            "/a1/$value" => json!("first"),
+            "/a2/$value" => json!("second"),
+            "/a3/$value" => json!("third"),
+            "/a4/$value" => json!("fourth"),
+            "/logo" => json!({ "contentType": "image/png", "contentId": "<logo>",
+                               "contentBytes": "iVBORw0KGgo=" }),
+            _ => return None,
+        })
+    }
+
+    /// A Microsoft account signed in to the Graph stand-in at `base`, with
+    /// message m1: four files, the last stored without its attachment id.
+    fn graph_engine(base: String, dir: &Path) -> (Engine, i64) {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Microsoft,
+                email: "me@contoso.com",
+                name: "Me",
+                label: "Work",
+                config: &to_json(&AccountConfig::Microsoft {
+                    client_id: "c".into(),
+                    tenant: "t".into(),
+                    calendar: false,
+                }),
+            })
+            .unwrap();
+        let attached = |name: &str, id: Option<&str>| Attachment {
+            name: name.into(),
+            mime: "application/pdf".into(),
+            size: 5,
+            remote_id: id.map(str::to_owned),
+        };
+        let incoming = Incoming {
+            account_id: account.id,
+            remote_id: Some("m1".into()),
+            message_id: Some("m1@contoso.com".into()),
+            from_address: "ana@contoso.com".into(),
+            date: 1,
+            html: Some("<img src=\"cid:logo\">".into()),
+            attachments: vec![
+                attached("one.pdf", Some("a1")),
+                attached("two.pdf", Some("a2")),
+                attached("four.pdf", Some("a4")),
+                // Stored before attachment ids were: found by name.
+                attached("old.pdf", None),
+            ],
+            ..Default::default()
+        };
+        let (Added::New(id) | Added::Known(id)) = store.add_incoming(&incoming, false).unwrap();
+        let mut engine = caching(Arc::new(Mutex::new(store)), dir);
+        engine.graph_base = base;
+        engine.cache_token(
+            account.id,
+            &oauth::Tokens {
+                access_token: "token".into(),
+                refresh_token: None,
+                expires_at: now_ms() + 3_600_000,
+            },
+        );
+        (engine, id)
+    }
+
+    #[tokio::test]
+    async fn graph_attachments_and_images_are_downloaded_once() {
+        let (base, asked) = graph::tests::stand_in(graph_m1).await;
+        let dir = files_dir("graph");
+        let (engine, id) = graph_engine(base, &dir);
+        let asked_for = || std::mem::take(&mut *asked.lock().unwrap());
+
+        let files = engine.attachments(id, &[0, 1, 2, 3]).await.unwrap();
+        let bytes: Vec<&[u8]> = files.iter().map(|f| f.bytes.as_slice()).collect();
+        assert_eq!(
+            bytes,
+            [
+                &b"\"first\""[..],
+                b"\"second\"",
+                b"\"fourth\"",
+                b"\"third\""
+            ]
+        );
+        assert_eq!(asked_for().len(), 5, "old.pdf's listing, then the four");
+        assert_eq!(engine.attachments(id, &[0, 1, 2, 3]).await.unwrap(), files);
+        assert_eq!(engine.attachment(id, 1).await.unwrap(), files[1]);
+        assert_eq!(engine.prefetch_attachments(id).await.unwrap(), 0);
+        assert!(asked_for().is_empty());
+
+        let images = engine.inline_images(id).await.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(asked_for().len(), 2, "the list, then the image");
+        assert_eq!(engine.inline_images(id).await.unwrap(), images);
+        assert!(asked_for().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

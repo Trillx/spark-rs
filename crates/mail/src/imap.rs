@@ -1579,10 +1579,28 @@ pub async fn fetch_raw(
     state: &SyncState,
     at: &Location,
 ) -> Result<Option<Vec<u8>>> {
+    Ok(fetch_raw_checked(session, state, at, None)
+        .await?
+        .map(|(raw, _)| raw))
+}
+
+/// `fetch_raw`, given the UIDVALIDITY the stored UID was given under, if
+/// it's known. When the mailbox has another now, the UID may name some
+/// other message, so it isn't fetched: the message is found by Message-ID
+/// instead. Also says whether what was found is safe to keep: not what was
+/// found that way, as another message may have the same Message-ID.
+pub async fn fetch_raw_checked(
+    session: &mut Session,
+    state: &SyncState,
+    at: &Location,
+    validity: Option<u32>,
+) -> Result<Option<(Vec<u8>, bool)>> {
+    let mut renumbered = false;
     if let (Some(mailbox), Some(uid)) = (&at.mailbox, at.uid) {
-        session.select(mailbox).await?;
-        if let Some(raw) = fetch_body(session, uid).await? {
-            return Ok(Some(raw));
+        let selected = session.select(mailbox).await?;
+        renumbered = validity.is_some_and(|v| selected.uid_validity != Some(v));
+        if !renumbered && let Some(raw) = fetch_body(session, uid).await? {
+            return Ok(Some((raw, true)));
         }
     }
     let Some(message_id) = &at.message_id else {
@@ -1612,7 +1630,7 @@ pub async fn fetch_raw(
         if let Some(uid) = found.into_iter().max()
             && let Some(raw) = fetch_body(session, uid).await?
         {
-            return Ok(Some(raw));
+            return Ok(Some((raw, !renumbered)));
         }
     }
     Ok(None)
