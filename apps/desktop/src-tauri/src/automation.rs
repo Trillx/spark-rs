@@ -585,11 +585,11 @@ async fn cleanup(app: &AppHandle) {
             // Can't tell now (offline, or gone from the server): next time.
             Err(_) => continue,
         }
-        // Asked again: it may have been edited or sent while the server was asked.
+        // Asked again: it may have been edited, opened, sent, or the
+        // settings changed while the server was asked.
         let mut store = engine.store();
-        if store.draft_reserved(id).unwrap_or(true)
-            || !store.auto_draft_untouched(id).unwrap_or(false)
-        {
+        let held = app.state::<Editing>().holds(id);
+        if !may_clean(&store, id, held, now_ms()).unwrap_or(false) {
             continue;
         }
         match store.discard_draft(id) {
@@ -600,6 +600,23 @@ async fn cleanup(app: &AppHandle) {
     if removed {
         let _ = app.emit("mailbox-changed", ());
     }
+}
+
+/// Whether auto-draft `id` may be deleted now (while the store is held for
+/// it): cleanup is still on, the draft is older than it keeps them, still
+/// untouched, and not open in a composer (`held`), being sent or queued.
+fn may_clean(store: &Store, id: i64, held: bool, now: i64) -> spark_store::Result<bool> {
+    let Some(days) = store.automation_settings()?.cleanup_days else {
+        return Ok(false);
+    };
+    let Some(draft) = store.auto_draft(id)? else {
+        return Ok(false);
+    };
+    Ok(draft.created_at < now - i64::from(days) * 86_400_000
+        && !held
+        && !store.draft_reserved(id)?
+        && !store.draft_held(id)?
+        && store.auto_draft_untouched(id)?)
 }
 
 /// The user replied to email `reply_to`: its conversation's To respond
@@ -893,10 +910,10 @@ pub async fn choose_auto_draft_option(
 
 /// Whether auto-draft `id`, read when it was last saved at `read_at`, may
 /// say another option now (while the store is held for the save): not while
-/// it's sent or open in a composer (`held`), once edited, or if it was saved
-/// again since it was read.
+/// it's being sent or queued to send, open in a composer (`held`), once
+/// edited, or if it was saved again since it was read.
 fn may_pick(store: &Store, id: i64, read_at: Option<i64>, held: bool) -> Result<(), String> {
-    if store.draft_reserved(id).map_err(text)? {
+    if store.draft_reserved(id).map_err(text)? || store.draft_held(id).map_err(text)? {
         Err("This draft is being sent.".into())
     } else if held {
         Err("This draft is open in the composer: pick a reply there.".into())
@@ -1148,6 +1165,53 @@ mod tests {
         assert_eq!(
             wanted(&engine.store(), &for_new_senders, id).unwrap(),
             Wanted::Yes
+        );
+    }
+
+    #[test]
+    fn cleanup_asks_again_before_deleting() {
+        let (engine, account, id) = one_email();
+        let Ok(draft_id) = save_draft(&engine, id, &options(), Asked::User) else {
+            panic!("saved");
+        };
+        let day = 86_400_000;
+        let later = now_ms() + 8 * day;
+        let mut store = engine.store();
+        let settings = AutomationSettings {
+            draft_accounts: [(account, now_ms())].into(),
+            cleanup_days: Some(7),
+            ..Default::default()
+        };
+        store.set_automation_settings(&settings).unwrap();
+        assert!(may_clean(&store, draft_id, false, later).unwrap());
+        // Open in a composer meanwhile.
+        assert!(!may_clean(&store, draft_id, true, later).unwrap());
+        // Kept longer, or not cleaned up any more, meanwhile.
+        let longer = AutomationSettings {
+            cleanup_days: Some(30),
+            ..settings.clone()
+        };
+        store.set_automation_settings(&longer).unwrap();
+        assert!(!may_clean(&store, draft_id, false, later).unwrap());
+        let never = AutomationSettings {
+            cleanup_days: None,
+            ..settings.clone()
+        };
+        store.set_automation_settings(&never).unwrap();
+        assert!(!may_clean(&store, draft_id, false, later).unwrap());
+        // Queued to be sent meanwhile.
+        store.set_automation_settings(&settings).unwrap();
+        let outbox = store.queue_send(account, "{}", later, &[]).unwrap();
+        store.hold_draft_for_send(outbox, draft_id).unwrap();
+        assert!(!may_clean(&store, draft_id, false, later).unwrap());
+        assert!(
+            may_pick(
+                &store,
+                draft_id,
+                store.draft_saved_at(draft_id).unwrap(),
+                false
+            )
+            .is_err()
         );
     }
 
