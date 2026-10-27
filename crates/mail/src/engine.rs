@@ -28,7 +28,7 @@ use crate::imap::{self, Server};
 use crate::invite::{self, Answer, Invite};
 use crate::labels;
 use crate::oauth::{self, App};
-use crate::recurrence::{self, Ends, Repeat};
+use crate::recurrence::{self, Repeat};
 use crate::unsubscribe::{self, Unsubscribed};
 use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
 
@@ -1740,18 +1740,23 @@ impl Engine {
             None
         };
         let mut new = recurrence::changed(&old, rule, days, Some((&from, zone.name)), &from);
-        let was = Repeat::from_graph(&old);
-        let ends_kept = rule.is_none_or(|r| was.as_ref().is_some_and(|w| w.ends == r.ends));
-        if let Some(was) = was.as_ref().filter(|_| ends_kept)
-            && let Ends::After { times } = was.ends
-        {
-            let period = match was.every {
-                recurrence::Every::Day => 1,
-                recurrence::Every::Week => 7,
-                recurrence::Every::Month => 31,
-                recurrence::Every::Year => 366,
+        // Read from Outlook's own range, so a rule the editor doesn't know
+        // counts too.
+        let ends_kept =
+            rule.is_none_or(|r| Repeat::from_graph(&old).is_some_and(|w| w.ends == r.ends));
+        if ends_kept && old["range"]["type"] == "numbered" {
+            let times = old["range"]["numberOfOccurrences"]
+                .as_i64()
+                .unwrap_or(1)
+                .max(1);
+            let interval = old["pattern"]["interval"].as_i64().unwrap_or(1).max(1);
+            let period = match old["pattern"]["type"].as_str() {
+                Some("daily") => 1,
+                Some("weekly") => 7,
+                Some("absoluteMonthly" | "relativeMonthly") => 31,
+                _ => 366,
             };
-            let span = (i64::from(was.interval) * i64::from(times) * period + 366) * 86_400_000;
+            let span = (interval * times * period + 366) * 86_400_000;
             let from_ms = stored.start - 86_400_000;
             if let Some((_, last)) = graph
                 .occurrence_span(&series, from_ms, from_ms + span, zone.name)
@@ -1775,38 +1780,61 @@ impl Engine {
         let created = match graph.create_event(&calendar.remote_id, &body).await {
             Ok(created) => created,
             Err(e) => {
-                let _ = graph
-                    .update_event(&series, &serde_json::json!({ "recurrence": old }))
-                    .await;
-                return Err(e);
+                // Put back as it was, waiting out Graph's pauses a while; if
+                // that fails too, say what's gone.
+                let restore = serde_json::json!({ "recurrence": old });
+                let mut restored = false;
+                for wait in [0, 10, 30, 60] {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    if graph.update_event(&series, &restore).await.is_ok() {
+                        restored = true;
+                        break;
+                    }
+                }
+                if restored {
+                    return Err(e);
+                }
+                return Err(Error::Config(format!(
+                    "Couldn't make the new series ({e}), nor put the old one back: its meetings from \
+                     {split} on are gone. Put them back in Outlook."
+                )));
             }
         };
         // Its files (an agenda) go with it, those Graph takes in one go (up
         // to 3 MB each); an update then sends them to the people invited.
         if master["hasAttachments"] == true {
-            let mut copied = false;
-            for file in graph.event_attachments(&series).await.unwrap_or_default() {
-                let small = file["size"].as_u64().is_some_and(|s| s <= 3_000_000);
-                if file["@odata.type"] == "#microsoft.graph.fileAttachment"
-                    && small
-                    && file["contentBytes"].is_string()
-                {
-                    let copy = serde_json::json!({
-                        "@odata.type": "#microsoft.graph.fileAttachment",
-                        "name": file["name"],
-                        "contentType": file["contentType"],
-                        "contentBytes": file["contentBytes"],
-                        "isInline": file["isInline"],
-                        "contentId": file["contentId"],
-                    });
-                    copied |= graph.add_attachment(&created, &copy).await.is_ok();
+            let copied = async {
+                let mut any = false;
+                for file in graph.event_attachments(&series).await? {
+                    let small = file["size"].as_u64().is_some_and(|s| s <= 3_000_000);
+                    if file["@odata.type"] == "#microsoft.graph.fileAttachment"
+                        && small
+                        && file["contentBytes"].is_string()
+                    {
+                        let copy = serde_json::json!({
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": file["name"],
+                            "contentType": file["contentType"],
+                            "contentBytes": file["contentBytes"],
+                            "isInline": file["isInline"],
+                            "contentId": file["contentId"],
+                        });
+                        graph.add_attachment(&created, &copy).await?;
+                        any = true;
+                    }
                 }
+                if any {
+                    let subject = serde_json::json!({ "subject": body["subject"] });
+                    graph.update_event(&created, &subject).await?;
+                }
+                Ok::<_, Error>(())
             }
-            if copied {
-                let subject = body["subject"].clone();
-                let _ = graph
-                    .update_event(&created, &serde_json::json!({ "subject": subject }))
-                    .await;
+            .await;
+            if let Err(e) = copied {
+                return Err(Error::Config(format!(
+                    "The meetings from {split} on are changed, but their files didn't all \
+                     reach them ({e}). Add them in Outlook."
+                )));
             }
         }
         Ok(())

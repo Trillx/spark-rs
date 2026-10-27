@@ -161,6 +161,11 @@ impl Repeat {
             .as_u64()
             .filter(|m| (1..=12).contains(m))
             .map(|m| m as u8);
+        // "On the last weekday" is one rule with several days; the editor's
+        // "on the …" takes one, so it leaves such a rule as it is.
+        if pattern["index"].is_string() && weekdays.len() != 1 {
+            return None;
+        }
         let (every, nth, day, month) = match pattern["type"].as_str()? {
             "daily" => (Every::Day, None, None, None),
             "weekly" => (Every::Week, None, None, None),
@@ -495,6 +500,16 @@ mod tests {
         assert_eq!(
             Repeat::from_graph(&json!({ "pattern": { "type": "hourly" } })),
             None
+        );
+        let last_weekday = json!({
+            "pattern": { "type": "relativeMonthly", "interval": 1, "index": "last",
+                         "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"] },
+            "range": { "type": "noEnd", "startDate": "2026-10-30" }
+        });
+        assert_eq!(
+            Repeat::from_graph(&last_weekday),
+            None,
+            "left as Outlook has it"
         );
     }
 
