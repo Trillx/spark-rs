@@ -1104,12 +1104,25 @@ impl Graph {
             "/me/messages?$search={}&$top={SERVER_HITS}",
             path(&format!("\"{kql}\""))
         );
-        let listing: Page<Listed> = self
+        let mut listing: Page<Listed> = self
             .json(self.request(
                 Method::GET,
                 &format!("{found}&$select={LISTED},parentFolderId"),
             ))
             .await?;
+        // Graph's search gives REST ids whatever `Prefer` asks for, and the
+        // store has immutable ones: what it finds is looked up, fetched and
+        // stored by those, or mail stored already would be stored again.
+        let ids: Vec<&str> = listing.value.iter().map(|m| m.id.as_str()).collect();
+        let immutable = self.immutable_ids(&ids).await?;
+        listing.value.retain_mut(|m| match immutable.get(&m.id) {
+            Some(id) => {
+                m.id = id.clone();
+                true
+            }
+            // Gone since it was found.
+            None => false,
+        });
         // Where each new one goes: the inbox (`None`) or a stored folder.
         let mut wanted: Vec<(&Listed, Option<&Folder>)> = Vec::new();
         {
@@ -1137,7 +1150,10 @@ impl Graph {
                         .header("Prefer", "outlook.body-content-type=\"html\""),
                 )
                 .await?;
-            full.extend(page.value.into_iter().map(|m| (m.id.clone(), m)));
+            full.extend(page.value.into_iter().filter_map(|mut m| {
+                m.id = immutable.get(&m.id)?.clone();
+                Some((m.id.clone(), m))
+            }));
         } else {
             let ids: Vec<&str> = wanted.iter().map(|(m, _)| m.id.as_str()).collect();
             full = self.messages_in_full(&ids).await?;
@@ -1170,6 +1186,38 @@ impl Graph {
             listed_for_repair(b, account_id, repairs)?;
             Ok(stored)
         })?)
+    }
+
+    /// The immutable ids of the messages with REST ids `ids`, by REST id.
+    /// Ones Graph can't translate, such as messages gone since, are left
+    /// out. Graph refuses the lot if any is immutable already.
+    async fn immutable_ids(&self, ids: &[&str]) -> Result<HashMap<String, String>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Translated {
+            source_id: Option<String>,
+            target_id: Option<String>,
+        }
+        let mut immutable = HashMap::new();
+        // Graph translates up to 1,000 at a time.
+        for chunk in ids.chunks(1000) {
+            let page: Page<Translated> = self
+                .json(
+                    self.request(Method::POST, "/me/translateExchangeIds")
+                        .json(&json!({
+                            "inputIds": chunk,
+                            "sourceIdType": "restId",
+                            "targetIdType": "restImmutableEntryId",
+                        })),
+                )
+                .await?;
+            immutable.extend(
+                page.value
+                    .into_iter()
+                    .filter_map(|t| Some((t.source_id?, t.target_id?))),
+            );
+        }
+        Ok(immutable)
     }
 
     /// Creates a folder, in `parent` (a folder id) or at the top; returns its id.
@@ -3487,12 +3535,18 @@ pub(crate) mod tests {
     /// (inbox), `k4` (stored already), `m5` (folder f1), `t6` (Deleted
     /// Items), `x7` (a folder not listed), `a8` (Archive) and `i20` (inbox);
     /// "many" finds `i20`…`i31`. The digits say how many hours old each is.
-    fn searchable(path: &str) -> Option<Value> {
+    /// As in Graph, a search gives REST ids (`rest-i3`) whatever `Prefer`
+    /// asks for, a message asked for by one keeps it, and
+    /// `translateExchangeIds` gives the immutable ids (`i3`) the rest of
+    /// the mailbox uses.
+    fn searchable(asked: &Asked) -> Option<Value> {
+        let path = asked.path.as_str();
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let full = |id: &str| {
-            let n: usize = id[1..].parse().unwrap();
+            let bare = id.strip_prefix("rest-").unwrap_or(id);
+            let n: usize = bare[1..].parse().unwrap();
             json!({
-                "id": id, "subject": format!("Invoice {id}"), "isRead": false,
+                "id": id, "subject": format!("Invoice {bare}"), "isRead": false,
                 "receivedDateTime": iso_date(received(n)),
                 "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
                 "body": { "contentType": "text", "content": "The invoice" },
@@ -3500,6 +3554,22 @@ pub(crate) mod tests {
         };
         if route == "/me/mailFolders/inbox" {
             return Some(json!({ "id": "inbox-id" }));
+        }
+        if route == "/me/translateExchangeIds" {
+            let asked: Value = serde_json::from_str(&asked.body).unwrap();
+            assert_eq!(asked["sourceIdType"], "restId");
+            assert_eq!(asked["targetIdType"], "restImmutableEntryId");
+            let value: Vec<Value> = asked["inputIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| {
+                    let id = id.as_str().unwrap();
+                    let immutable = id.strip_prefix("rest-").expect("only REST ids translate");
+                    json!({ "sourceId": id, "targetId": immutable })
+                })
+                .collect();
+            return Some(json!({ "value": value }));
         }
         if let Some(id) = route.strip_prefix("/me/messages/") {
             return Some(full(id));
@@ -3525,9 +3595,9 @@ pub(crate) mod tests {
         let value: Vec<Value> = hits
             .iter()
             .map(|(id, folder)| {
-                let mut m = full(id);
+                let mut m = full(&format!("rest-{id}"));
                 if listing {
-                    m = json!({ "id": id, "receivedDateTime": m["receivedDateTime"] });
+                    m = json!({ "id": m["id"], "receivedDateTime": m["receivedDateTime"] });
                 }
                 m["parentFolderId"] = json!(folder);
                 m
@@ -3579,7 +3649,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn searches_store_what_the_mailbox_finds_where_it_belongs() {
-        let (base, seen) = stand_in(searchable).await;
+        let (base, seen) = serve(searched).await;
+        let paths_asked = || -> Vec<String> { seen.take().into_iter().map(|a| a.path).collect() };
         let graph = Graph::with_base(&base, "token");
         let (store, account_id) = searched_store();
         let state = searchable_state(&base);
@@ -3589,7 +3660,7 @@ pub(crate) mod tests {
             .search_server(&store, account_id, &state, &query)
             .await;
         assert_eq!(stored.unwrap(), 3);
-        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
+        let paths = paths_asked();
         assert!(
             paths[1].starts_with(
                 "/me/messages?$search=%22invoice+AND+from%3Aana%40contoso.com%22&$top=100&$select=id,"
@@ -3619,23 +3690,25 @@ pub(crate) mod tests {
         assert_eq!(state_of("Invoice a8"), (Done, false));
         assert_eq!(messages.len(), 4);
         assert_eq!(lock(&store).search("invoice").unwrap().len(), 3);
+        assert_eq!(remote_ids(&store), ["a8", "i20", "k4", "m5"]);
 
         // Again: nothing new to fetch.
         let again = graph
             .search_server(&store, account_id, &state, &query)
             .await;
         assert_eq!(again.unwrap(), 0);
-        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
-        assert_eq!(paths.len(), 2, "{paths:?}");
+        let paths = paths_asked();
+        assert_eq!(paths.len(), 3, "{paths:?}");
 
         // Many new ones come in one listing with bodies.
         let many = graph
             .search_server(&store, account_id, &state, &Query::parse("many"))
             .await;
         assert_eq!(many.unwrap(), 11, "i20 was stored already");
-        let paths: Vec<String> = seen.lock().unwrap().drain(..).collect();
-        assert_eq!(paths.len(), 3, "{paths:?}");
-        assert!(paths[2].contains("$select=subject,"), "{paths:?}");
+        let paths = paths_asked();
+        assert_eq!(paths.len(), 4, "{paths:?}");
+        assert!(paths[3].contains("$select=subject,"), "{paths:?}");
+        assert!(remote_ids(&store).iter().all(|id| !id.starts_with("rest-")));
 
         // Filters alone, or before the first sync, ask nothing.
         let unread = Query::parse("is:unread");
@@ -3654,7 +3727,57 @@ pub(crate) mod tests {
                 .unwrap(),
             0
         );
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(paths_asked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_search_doesnt_store_again_what_a_sync_stored() {
+        let (base, _) = serve(searched).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = searched_store();
+        let state = searchable_state(&base);
+        // m5, as its folder's sync stores it: by its immutable id.
+        {
+            let mut s = lock(&store);
+            let f1 = s
+                .folders()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.remote_id == "f1")
+                .unwrap();
+            let m5 = Incoming {
+                account_id,
+                remote_id: Some("m5".into()),
+                subject: "Invoice m5".into(),
+                date: received(5),
+                ..Default::default()
+            };
+            s.add_folder_message(f1.id, &m5).unwrap();
+        }
+
+        let stored = graph
+            .search_server(&store, account_id, &state, &Query::parse("invoice"))
+            .await;
+        assert_eq!(stored.unwrap(), 2, "a8 and i20");
+        assert_eq!(remote_ids(&store), ["a8", "i20", "k4", "m5"]);
+    }
+
+    /// The `searchable` stand-in as `serve` asks it.
+    fn searched(asked: &Asked, _: usize) -> Answer {
+        searchable(asked).map_or_else(|| Answer::status(404), Answer::json)
+    }
+
+    /// The remote ids of the stored messages, sorted.
+    fn remote_ids(store: &Mutex<Store>) -> Vec<String> {
+        let s = lock(store);
+        let mut ids: Vec<String> = s
+            .messages()
+            .unwrap()
+            .iter()
+            .filter_map(|m| s.location(m.id).unwrap()?.remote_id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     #[test]
@@ -4544,7 +4667,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
                 },
             };
         }
-        let Some(mut reply) = searchable(&asked.path) else {
+        let Some(mut reply) = searchable(asked) else {
             return Answer::status(404);
         };
         if asked.path.starts_with("/me/messages/a8?") {
@@ -4600,7 +4723,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
                     { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
                 ] }));
             }
-            let Some(mut reply) = searchable(&asked.path) else {
+            let Some(mut reply) = searchable(asked) else {
                 return Answer::status(404);
             };
             if let Some(found) = reply["value"].as_array_mut() {
