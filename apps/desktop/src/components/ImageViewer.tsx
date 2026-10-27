@@ -46,6 +46,8 @@ export function ImageViewer({ images, start, onClose }: { images: ViewedImage[];
       anchor.current = { fx: (x - r.left) / r.width, fy: (y - r.top) / r.height, x, y };
     }
     setActual(!actual);
+    // So ↑, ↓, Page Up and the like pan it at once, even after the zoom button.
+    boxRef.current?.focus();
   };
   const measure = () => {
     const img = imgRef.current;
@@ -53,17 +55,17 @@ export function ImageViewer({ images, start, onClose }: { images: ViewedImage[];
     setShrunk(img.naturalWidth > img.clientWidth + 1 || img.naturalHeight > img.clientHeight + 1);
   };
 
-  /** Tab goes round the buttons and never to the app behind. */
+  /** Tab goes round the picture and the buttons, never to the app behind. */
   const cycleFocus = (by: number) => {
-    const buttons = [...rootRef.current!.querySelectorAll("button")];
-    const i = buttons.indexOf(document.activeElement as HTMLButtonElement);
-    buttons[i < 0 ? (by > 0 ? 0 : buttons.length - 1) : (i + by + buttons.length) % buttons.length]?.focus();
+    const stops: HTMLElement[] = [boxRef.current!, ...rootRef.current!.querySelectorAll("button")];
+    const i = stops.indexOf(document.activeElement as HTMLElement);
+    stops[i < 0 ? (by > 0 ? 0 : stops.length - 1) : (i + by + stops.length) % stops.length].focus();
   };
 
-  // Takes focus when it opens, and back from a button that goes away (zoom, for a picture that fits).
+  // The picture takes focus when it opens (so the keys that scroll pan it), and back from a
+  // button that goes away (zoom, for a picture that fits).
   useEffect(() => {
-    const root = rootRef.current;
-    if (root && !root.contains(document.activeElement)) root.focus();
+    if (!rootRef.current?.contains(document.activeElement)) boxRef.current?.focus();
   });
 
   useEffect(() => {
@@ -87,12 +89,14 @@ export function ImageViewer({ images, start, onClose }: { images: ViewedImage[];
     };
   });
 
-  // Zoomed in, the spot clicked stays under the pointer.
+  // Zoomed in, the spot clicked stays under the pointer. Fitted again, the window may have
+  // grown meanwhile to fit it all.
   useLayoutEffect(() => {
     const at = anchor.current;
     const box = boxRef.current;
     const img = imgRef.current;
     anchor.current = null;
+    if (!actual) measure();
     if (!actual || !at || !box || !img) return;
     const r = img.getBoundingClientRect();
     box.scrollLeft += r.left + at.fx * r.width - at.x;
@@ -113,7 +117,12 @@ export function ImageViewer({ images, start, onClose }: { images: ViewedImage[];
       tabIndex={-1}
       className="fixed inset-0 z-[2950] bg-black/85 outline-none animate-[appear_120ms_ease-out]"
     >
-      <div ref={boxRef} className="absolute inset-0 flex overflow-auto p-14" onClick={closeBeside}>
+      <div
+        ref={boxRef}
+        tabIndex={-1}
+        className="absolute inset-0 flex overflow-auto p-14 outline-none"
+        onClick={closeBeside}
+      >
         <img
           ref={imgRef}
           key={index}
