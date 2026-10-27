@@ -125,6 +125,8 @@ async fn round(app: &AppHandle) -> Duration {
     // round aren't tried again in it either.
     let mut last: Vec<i64> = Vec::new();
     let mut tried: HashSet<i64> = HashSet::new();
+    // Emails whose bodies couldn't be downloaded this round (`with_bodies`).
+    let mut unready: HashSet<i64> = HashSet::new();
     loop {
         let Some(settings) = saved_settings(&engine) else {
             return LOOK_EVERY;
@@ -145,7 +147,7 @@ async fn round(app: &AppHandle) -> Duration {
         };
         let mut worked = false;
 
-        let batch = next_batch(&engine.store(), &settings, &automation);
+        let batch = next_batch(&engine.store(), &settings, &automation, &unready);
         let batch = match batch {
             Ok(batch) => batch.filter(|b| !b.ids.is_empty() && b.ids != last),
             Err(e) => {
@@ -153,10 +155,27 @@ async fn round(app: &AppHandle) -> Duration {
                 return LOOK_EVERY;
             }
         };
-        if let Some(batch) = batch {
+        if let Some(mut batch) = batch {
             worked = true;
             last = batch.ids.clone();
-            let answer = complete(&client, &batch.request).await;
+            let fetch = |id| {
+                let engine = engine.clone();
+                async move { engine.fetch_body(id).await }
+            };
+            let (ready, filled) = with_bodies(&engine, &batch.ids, &mut unready, fetch).await;
+            if filled {
+                let _ = app.emit("mailbox-changed", ());
+            }
+            batch.ids = ready;
+            let request = match sort_request(&engine.store(), &batch) {
+                Ok(Some(request)) if !batch.ids.is_empty() => request,
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("spark-rs: inbox automation: {e}");
+                    return LOOK_EVERY;
+                }
+            };
+            let answer = complete(&client, &request).await;
             let now = now_ms();
             let verdicts = match answer {
                 Ok(Some(text)) => {
@@ -260,19 +279,26 @@ fn saved_settings(engine: &Engine) -> Option<AutomationSettings> {
         .ok()
 }
 
-/// The next emails to sort, all of one account, and the request for them.
+/// The next emails to sort, all of one account.
 struct Batch {
     account: i64,
     ids: Vec<i64>,
-    request: ChatRequest,
 }
 
+/// The next emails to sort, but for those whose bodies couldn't be
+/// downloaded this round (`unready`).
 fn next_batch(
     store: &Store,
     settings: &AutomationSettings,
     automation: &Automation,
+    unready: &HashSet<i64>,
 ) -> spark_store::Result<Option<Batch>> {
-    let candidates = store.automation_candidates(settings, now_ms(), BATCH)?;
+    let candidates: Vec<Candidate> = store
+        .automation_candidates(settings, now_ms(), BATCH + unready.len())?
+        .into_iter()
+        .filter(|c| !unready.contains(&c.id))
+        .take(BATCH)
+        .collect();
     let Some(first) = candidates.first() else {
         return Ok(None);
     };
@@ -280,21 +306,80 @@ fn next_batch(
     let writing = automation.writing.lock().unwrap().clone();
     let ids: Vec<i64> = candidates
         .iter()
-        .filter(|c: &&Candidate| c.account_id == account && !writing.contains(&c.id))
+        .filter(|c| c.account_id == account && !writing.contains(&c.id))
         .map(|c| c.id)
         .collect();
-    let Some(user) = user(store, account)? else {
+    if user(store, account)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Batch { account, ids }))
+}
+
+/// The request to sort `batch`'s emails, `None` if its account is gone.
+fn sort_request(store: &Store, batch: &Batch) -> spark_store::Result<Option<ChatRequest>> {
+    let Some(user) = user(store, batch.account)? else {
         return Ok(None);
     };
     let mut emails = Vec::new();
-    for &id in &ids {
+    for &id in &batch.ids {
         emails.push(email(store, id)?.unwrap_or_default());
     }
-    Ok(Some(Batch {
-        account,
-        request: prompts::sort_request(&user, &emails),
-        ids,
-    }))
+    Ok(Some(prompts::sort_request(&user, &emails)))
+}
+
+/// Of the emails `ids`, those stored without their bodies (the background
+/// download's older mail) get them first (`fetch`, `Engine::fetch_body`):
+/// sorted by their preview, a request further on could be missed, and what
+/// AI says of an email stands. Those that can't be downloaded are left out,
+/// unchecked, while the rest go on: offline, they wait for a later round
+/// (`unready`), as do the rest of them, not tried; else they're tried again
+/// later as when AI couldn't answer (`record_check_failed`). Returns those
+/// to sort, and whether a body was filled in.
+async fn with_bodies<F, Fut>(
+    engine: &Engine,
+    ids: &[i64],
+    unready: &mut HashSet<i64>,
+    fetch: F,
+) -> (Vec<i64>, bool)
+where
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<bool, spark_mail::Error>>,
+{
+    let mut ready = Vec::with_capacity(ids.len());
+    let mut filled = false;
+    let mut offline = false;
+    for &id in ids {
+        let missing = engine
+            .store()
+            .content(id)
+            .map(|c| c.is_some_and(|c| c.body_missing));
+        if !missing.unwrap_or(false) {
+            ready.push(id);
+            continue;
+        }
+        if offline {
+            unready.insert(id);
+            continue;
+        }
+        match fetch(id).await {
+            Ok(was) => {
+                filled |= was;
+                ready.push(id);
+            }
+            Err(e) => {
+                unready.insert(id);
+                if matches!(e, spark_mail::Error::Network { .. }) {
+                    offline = true;
+                    continue;
+                }
+                eprintln!("spark-rs: inbox automation: email {id} couldn't be downloaded: {e}");
+                if let Err(e) = engine.store().record_check_failed(id, now_ms()) {
+                    eprintln!("spark-rs: inbox automation: {e}");
+                }
+            }
+        }
+    }
+    (ready, filled)
 }
 
 /// Whether to write the reply due for email `id` now. One no longer wanted
@@ -1144,6 +1229,96 @@ mod tests {
         assert!(older.text.contains("only the start"), "{}", older.text);
         let whole = email(&store, whole).unwrap().unwrap();
         assert!(!whole.text.contains("only the start"), "{}", whole.text);
+    }
+
+    #[tokio::test]
+    async fn mail_stored_without_its_body_gets_it_before_ai_sorts_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        use spark_store::{Added, Body, Incoming};
+        let (engine, account, whole) = one_email();
+        let head = |uid: u32| Incoming {
+            account_id: account,
+            mailbox: Some("INBOX".into()),
+            uid: Some(uid),
+            message_id: Some(format!("<{uid}@x.com>")),
+            from_address: "dana@x.com".into(),
+            subject: format!("Budget {uid}"),
+            snippet: "The figures for May".into(),
+            text: "The figures for May".into(),
+            date: now_ms() - i64::from(uid) * 1000,
+            body: Body::Missing,
+            ..Default::default()
+        };
+        let older: Vec<i64> = (2..5)
+            .map(
+                |uid| match engine.store().add_incoming(&head(uid), false).unwrap() {
+                    Added::New(id) => id,
+                    Added::Known(_) => panic!("new"),
+                },
+            )
+            .collect();
+        let (a, b, c) = (older[0], older[1], older[2]);
+        let asked = AtomicUsize::new(0);
+
+        // Offline: those without their bodies wait for a later round, with
+        // nothing held against them, and the first failure stops the asking.
+        let mut unready = HashSet::new();
+        let offline = |_| {
+            asked.fetch_add(1, SeqCst);
+            async {
+                Err(spark_mail::Error::Network {
+                    host: "imap.x.com".into(),
+                    detail: "offline".into(),
+                })
+            }
+        };
+        let (ready, filled) = with_bodies(&engine, &[whole, a, b], &mut unready, offline).await;
+        assert_eq!((ready, filled), (vec![whole], false));
+        assert_eq!(unready, HashSet::from([a, b]));
+        assert_eq!(asked.load(SeqCst), 1);
+        let settings = AutomationSettings {
+            label_accounts: [(account, now_ms())].into(),
+            ..Default::default()
+        };
+        let candidates = |engine: &Engine| -> HashSet<i64> {
+            let store = engine.store();
+            let found = store
+                .automation_candidates(&settings, now_ms(), 10)
+                .unwrap();
+            found.into_iter().map(|c| c.id).collect()
+        };
+        assert_eq!(candidates(&engine), HashSet::from([whole, a, b, c]));
+
+        // One the server can't give is tried again later, as when AI can't
+        // answer; the rest are downloaded, and sorted whole.
+        let mut unready = HashSet::new();
+        let fetch = |id| {
+            let engine = &engine;
+            let whole = Incoming {
+                text: "The figures for May, and a question for you.".into(),
+                body: Body::Whole,
+                ..head(if id == b { 3 } else { 4 })
+            };
+            async move {
+                if id == a {
+                    return Err(spark_mail::Error::Gone);
+                }
+                Ok(engine.store().fill_in_body(id, &whole).unwrap() == Some(true))
+            }
+        };
+        let (ready, filled) = with_bodies(&engine, &[whole, a, b, c], &mut unready, fetch).await;
+        assert_eq!((ready, filled), (vec![whole, b, c], true));
+        assert_eq!(unready, HashSet::from([a]));
+        assert_eq!(candidates(&engine), HashSet::from([whole, b, c]));
+        let batch = Batch {
+            account,
+            ids: vec![b],
+        };
+        let request = sort_request(&engine.store(), &batch).unwrap().unwrap();
+        let asked = serde_json::to_string(&request.messages).unwrap();
+        assert!(asked.contains("a question for you"), "{asked}");
+        assert!(!asked.contains("only the start"), "{asked}");
     }
 
     fn options() -> Vec<DraftOption> {
