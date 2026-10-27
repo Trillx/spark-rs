@@ -141,6 +141,10 @@ pub struct Report {
     /// New inbox mail an IMAP server wouldn't give this round, even
     /// message by message: the next round that fetches asks for it again.
     pub skipped: usize,
+    /// Older Microsoft inbox mail that a pass over it found changed
+    /// elsewhere: read, flagged, moved or deleted
+    /// (`graph::Graph::reconcile_inbox`).
+    pub reconciled: usize,
 }
 
 impl Report {
@@ -154,6 +158,7 @@ impl Report {
             + self.headers
             + self.accepted
             + self.repaired
+            + self.reconciled
             > 0
     }
 
@@ -231,12 +236,28 @@ const BACKFILL_PAUSE: Duration = Duration::from_secs(2);
 const BACKFILL_RETRY: Duration = Duration::from_secs(30);
 const BACKFILL_LONGEST_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// How often a pass goes over the Microsoft inbox mail stored from before
+/// the delta query's window (`graph::Graph::reconcile_inbox`), besides once
+/// after the app starts.
+const RECONCILE_EVERY: Duration = Duration::from_secs(60 * 60);
+
 /// When an account's next background download step may start (`Engine::backfill`).
 #[derive(Default)]
 struct Pace {
     next: Option<Instant>,
     /// Steps that failed in a row.
     failures: u32,
+    /// When the account's last pass over older inbox mail ended
+    /// (`graph::Graph::reconcile_inbox`): none since the app started.
+    reconciled: Option<Instant>,
+}
+
+impl Pace {
+    /// Whether a new pass over older inbox mail is due.
+    fn reconcile_due(&self) -> bool {
+        self.reconciled
+            .is_none_or(|ended| ended.elapsed() >= RECONCILE_EVERY)
+    }
 }
 
 pub struct Engine {
@@ -726,17 +747,23 @@ impl Engine {
     }
 
     /// Whether the account's background download has a step to take now
-    /// (`backfill`): its first sync is done, its inbox isn't covered back to
-    /// `BACKFILL_DAYS` yet nor complete, the pause since its last step is
-    /// over, and nothing else waits for the account: no local change or
-    /// draft to push, nor mail to send.
+    /// (`backfill`): its first sync is done, the pause since its last step
+    /// is over, nothing else waits for the account (no local change or
+    /// draft to push, nor mail to send), and its inbox isn't covered back to
+    /// `BACKFILL_DAYS` yet nor complete, or (Microsoft) a pass over the
+    /// older mail it has is under way or due: every `RECONCILE_EVERY`, and
+    /// once after the app starts.
     pub fn backfill_due(&self, account_id: i64) -> bool {
         let now = now_ms();
-        let paused = self
-            .paces_lock()
-            .get(&account_id)
-            .and_then(|pace| pace.next)
-            .is_some_and(|next| Instant::now() < next);
+        let (paused, reconcile) = {
+            let paces = self.paces_lock();
+            let pace = paces.get(&account_id);
+            (
+                pace.and_then(|pace| pace.next)
+                    .is_some_and(|next| Instant::now() < next),
+                pace.is_none_or(Pace::reconcile_due),
+            )
+        };
         if paused {
             return false;
         }
@@ -747,7 +774,9 @@ impl Engine {
         let left = match config(&account) {
             Ok(AccountConfig::Imap { .. }) => imap::backfill_due(&from_json(&account.sync_state)),
             Ok(AccountConfig::Microsoft { .. }) => {
-                graph::backfill_due(&from_json(&account.sync_state), backfill_since(now))
+                let state: graph::SyncState = from_json(&account.sync_state);
+                graph::backfill_due(&state, backfill_since(now))
+                    || (graph::reconcile_due(&state) && (reconcile || state.reconcile.is_some()))
             }
             Err(_) => false,
         };
@@ -763,20 +792,29 @@ impl Engine {
     /// One step of the account's background download of older inbox mail:
     /// reaching back `OLDER_STEP` messages, without their bodies, as
     /// scrolling does, while what's stored doesn't go back `BACKFILL_DAYS`.
-    /// Where it got to is kept with the sync state, so a restart goes on
+    /// Then, on a Microsoft account, a page of a pass over that older mail,
+    /// which the delta query doesn't see (`graph::Graph::reconcile_inbox`).
+    /// Where they got to is kept with the sync state, so a restart goes on
     /// from there. It takes the account's turn, like a round, and keeps to
     /// Microsoft's pause. The next step waits `BACKFILL_PAUSE`, or after a
     /// failure longer each time (`backfill_due`). The report says what it
-    /// brought in, as `older`.
+    /// brought in, as `older`, and what the pass changed, as `reconciled`.
     pub async fn backfill(&self, account_id: i64) -> Result<Report> {
         let turn = self.turn(account_id);
         let _turn = turn.lock().await;
-        let stepped = self.backfill_step(account_id).await;
+        let reconcile = self
+            .paces_lock()
+            .get(&account_id)
+            .is_none_or(Pace::reconcile_due);
+        let stepped = self.backfill_step(account_id, reconcile).await;
         let mut paces = self.paces_lock();
         let pace = paces.entry(account_id).or_default();
         let wait = match &stepped {
-            Ok(_) => {
+            Ok((_, ended)) => {
                 pace.failures = 0;
+                if *ended {
+                    pace.reconciled = Some(Instant::now());
+                }
                 BACKFILL_PAUSE
             }
             Err(_) => {
@@ -787,13 +825,12 @@ impl Engine {
             }
         };
         pace.next = Some(Instant::now() + wait);
-        Ok(Report {
-            older: stepped?,
-            ..Default::default()
-        })
+        Ok(stepped?.0)
     }
 
-    async fn backfill_step(&self, account_id: i64) -> Result<usize> {
+    /// `backfill`'s step: what it did, and whether a pass over older mail
+    /// ended. `reconcile`: a new pass may start.
+    async fn backfill_step(&self, account_id: i64, reconcile: bool) -> Result<(Report, bool)> {
         let account = self.account(account_id)?;
         let since = backfill_since(now_ms());
         match config(&account)? {
@@ -804,7 +841,7 @@ impl Engine {
             } => {
                 let mut state: imap::SyncState = from_json(&account.sync_state);
                 if !imap::backfill_due(&state) {
-                    return Ok(0);
+                    return Ok(Default::default());
                 }
                 let password = self.password(account_id)?;
                 let mut session = imap::login(&server, &username, &password).await?;
@@ -814,20 +851,43 @@ impl Engine {
                 // Keep the lowered floor even if part of it failed.
                 self.store().set_sync_state(account_id, &to_json(&state))?;
                 let _ = session.logout().await;
-                older
+                let report = Report {
+                    older: older?,
+                    ..Default::default()
+                };
+                Ok((report, false))
             }
             AccountConfig::Microsoft {
                 client_id, tenant, ..
             } => {
                 let mut state: graph::SyncState = from_json(&account.sync_state);
-                if !graph::backfill_due(&state, since) {
-                    return Ok(0);
+                let older = graph::backfill_due(&state, since);
+                let reconcile =
+                    graph::reconcile_due(&state) && (reconcile || state.reconcile.is_some());
+                if !older && !reconcile {
+                    return Ok(Default::default());
                 }
                 let graph = self.syncing_graph(account_id, &client_id, &tenant).await?;
-                let older = graph.older_inbox(&self.store, account_id, &mut state).await;
-                // Keep how far it got even if part of it failed.
+                if older {
+                    let older = graph.older_inbox(&self.store, account_id, &mut state).await;
+                    // Keep how far it got even if part of it failed.
+                    graph::save_state(&self.store(), account_id, &state)?;
+                    let report = Report {
+                        older: older?,
+                        ..Default::default()
+                    };
+                    return Ok((report, false));
+                }
+                let reconciled = graph
+                    .reconcile_inbox(&self.store, account_id, &mut state)
+                    .await;
                 graph::save_state(&self.store(), account_id, &state)?;
-                older
+                let reconciled = reconciled?;
+                let report = Report {
+                    reconciled: reconciled.changed,
+                    ..Default::default()
+                };
+                Ok((report, reconciled.done))
             }
         }
     }
@@ -4228,6 +4288,62 @@ mod tests {
         assert!(engine.fetch_body(id).await.unwrap());
         let content = store.lock().unwrap().content(id).unwrap().unwrap();
         assert_eq!(content.html.as_deref(), Some(HTML));
+    }
+
+    #[tokio::test]
+    async fn older_microsoft_mail_is_gone_over_after_start_and_hourly() {
+        fn empty(_: &str) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "value": [] }))
+        }
+        let (base, seen) = graph::tests::stand_in(empty).await;
+        let (engine, account_id) = microsoft_engine(base.clone());
+        // Reached back a year, all of it: only the pass is left.
+        let now = now_ms();
+        let synced = |reconcile: Option<graph::Reconcile>| {
+            let state = graph::SyncState {
+                delta_link: Some(format!("{base}/delta")),
+                since: Some(now - 30 * 86_400_000),
+                older_than: Some(now - 400 * 86_400_000),
+                complete: true,
+                reconcile,
+                ..Default::default()
+            };
+            graph::save_state(&engine.store(), account_id, &state).unwrap();
+        };
+        synced(None);
+        assert!(engine.backfill_due(account_id), "once after the start");
+        let report = engine.backfill(account_id).await.unwrap();
+        assert!(!report.changed());
+        let asked = seen.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(
+            asked[0].starts_with("/me/mailFolders/inbox/messages?$filter=receivedDateTime+lt+")
+        );
+        let unpaused = || engine.paces_lock().get_mut(&account_id).unwrap().next = None;
+        unpaused();
+        assert!(!engine.backfill_due(account_id), "the pass is over");
+
+        // A pass under way goes on; a new one starts every hour.
+        synced(Some(graph::Reconcile {
+            before: now - 100 * 86_400_000,
+            until: now - 400 * 86_400_000,
+        }));
+        assert!(engine.backfill_due(account_id));
+        synced(None);
+        assert!(!engine.backfill_due(account_id));
+        engine.paces_lock().get_mut(&account_id).unwrap().reconciled =
+            Some(Instant::now() - RECONCILE_EVERY);
+        assert!(engine.backfill_due(account_id));
+
+        // Nothing older than the delta's window: no pass.
+        let state = graph::SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(now - 30 * 86_400_000),
+            complete: true,
+            ..Default::default()
+        };
+        graph::save_state(&engine.store(), account_id, &state).unwrap();
+        assert!(!engine.backfill_due(account_id));
     }
 
     #[tokio::test]

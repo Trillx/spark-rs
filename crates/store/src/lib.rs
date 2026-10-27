@@ -1106,6 +1106,14 @@ impl Store {
         Ok(true)
     }
 
+    /// The id of the message stored last: messages stored later have
+    /// higher ones. 0 with none.
+    pub fn newest_message_id(&self) -> Result<i64> {
+        self.conn
+            .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM messages")?
+            .query_row([], |r| r.get(0))
+    }
+
     /// Whether message `id` is stored without its body (`Body::Missing`).
     pub fn body_missing(&self, id: i64) -> Result<bool> {
         Ok(self
@@ -2059,6 +2067,37 @@ impl Batch<'_> {
     /// `Store::has_remote_id`, in the batch.
     pub fn has_remote_id(&self, account_id: i64, remote_id: &str) -> Result<bool> {
         has_remote_id_in(self.conn, account_id, remote_id)
+    }
+
+    /// `add_incoming` for stored mail a listing of the server's inbox told
+    /// of (its flags, `Body::Partial`), as the delta query tells of changes:
+    /// flags follow the server where the user hasn't changed them, and it's
+    /// in the inbox again unless a change of the user's waits. Returns
+    /// whether that changed anything.
+    pub fn observe_listed(&self, m: &Incoming) -> Result<bool> {
+        let before = self.conn.total_changes();
+        add_incoming_in(self.conn, m, false)?;
+        Ok(self.conn.total_changes() != before)
+    }
+
+    /// The Graph ids of account `account_id`'s mail the server had in its
+    /// inbox when last told, received from `from` up to `to` (Unix ms), of
+    /// those stored up to message `newest` (`Store::newest_message_id`).
+    pub fn inbox_remote_ids(
+        &self,
+        account_id: i64,
+        from: i64,
+        to: i64,
+        newest: i64,
+    ) -> Result<Vec<String>> {
+        self.conn
+            .prepare_cached(
+                "SELECT remote_id FROM messages
+                 WHERE date >= ?2 AND date < ?3 AND account_id = ?1 AND remote_place = 'inbox'
+                   AND remote_id IS NOT NULL AND id <= ?4",
+            )?
+            .query_map(params![account_id, from, to, newest], |r| r.get(0))?
+            .collect()
     }
 
     /// `Store::observe_gone_remote`, in the batch.
