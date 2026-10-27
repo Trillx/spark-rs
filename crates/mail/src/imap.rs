@@ -29,6 +29,7 @@ use spark_store::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
@@ -43,6 +44,8 @@ pub const FOLDER_LIMIT: u32 = 200;
 /// Bigger messages are stored without their body.
 const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
 const FETCH_BATCH: usize = 25;
+/// Most mail one fetch of bodies asks for, by the server's sizes.
+const FETCH_BYTES: u64 = 16 * 1024 * 1024;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1021,7 +1024,9 @@ async fn fetch_new(
 
 /// Fetches and parses messages from the selected `mailbox`, with their
 /// location, flags and arrival time; big ones without their body. The
-/// account is left for the caller.
+/// account is left for the caller. Bodies come `FETCH_BYTES` at a time and
+/// are parsed as they arrive, so the raw mail held stays bounded however
+/// many messages are asked for; all of them or none come back.
 async fn fetch_messages(
     session: &mut Session,
     uids: &[u32],
@@ -1040,42 +1045,96 @@ async fn fetch_messages(
         .filter_map(|f| Some((f.uid?, f.size.unwrap_or(0))))
         .partition(|(_, size)| *size <= MAX_BODY_BYTES);
 
+    let mut fetches: Vec<(Vec<u32>, &str)> = batches(&small)
+        .into_iter()
+        .map(|uids| (uids, "(UID FLAGS INTERNALDATE BODY.PEEK[])"))
+        .collect();
+    if !large.is_empty() {
+        let uids = large.into_iter().map(|(uid, _)| uid).collect();
+        fetches.push((uids, "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])"));
+    }
     let mut messages = Vec::new();
-    for (uids, query) in [
-        (small, "(UID FLAGS INTERNALDATE BODY.PEEK[])"),
-        (large, "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])"),
-    ] {
-        if uids.is_empty() {
-            continue;
-        }
-        let uids: Vec<u32> = uids.into_iter().map(|(uid, _)| uid).collect();
-        let fetched: Vec<Fetch> = session
-            .uid_fetch(uid_set(&uids), query)
-            .await?
-            .try_collect()
-            .await?;
-        for fetch in &fetched {
-            let Some(uid) = fetch.uid else { continue };
-            let raw = fetch.body().or_else(|| fetch.header()).unwrap_or_default();
-            let Some(mut m) = parse::parse_message(raw) else {
-                continue;
-            };
-            if fetch.body().is_none() {
-                m.text = "This message is too large to show here.".into();
-                m.snippet = m.text.clone();
-            }
-            let (unread, flagged) = read_flags(fetch);
-            m.mailbox = Some(mailbox.into());
-            m.uid = Some(uid);
-            m.unread = unread;
-            m.flagged = flagged;
-            if let Some(date) = fetch.internal_date() {
-                m.date = date.timestamp_millis();
-            }
-            messages.push(m);
-        }
+    for (uids, query) in fetches {
+        let fetched = session.uid_fetch(uid_set(&uids), query).await?;
+        parse_each(fetched, incoming, &mut messages).await?;
+    }
+    for m in &mut messages {
+        m.mailbox = Some(mailbox.into());
     }
     Ok(messages)
+}
+
+/// Splits messages (UID and size, in order) into fetches of at most
+/// `FETCH_BATCH` messages and `FETCH_BYTES` of mail; a bigger message is
+/// fetched alone.
+fn batches(sized: &[(u32, u32)]) -> Vec<Vec<u32>> {
+    let mut batches: Vec<Vec<u32>> = Vec::new();
+    let mut bytes = 0;
+    for &(uid, size) in sized {
+        let size = u64::from(size);
+        match batches.last_mut() {
+            Some(batch) if batch.len() < FETCH_BATCH && bytes + size <= FETCH_BYTES => {
+                batch.push(uid);
+                bytes += size;
+            }
+            _ => {
+                batches.push(vec![uid]);
+                bytes = size;
+            }
+        }
+    }
+    batches
+}
+
+/// Parses each fetched message on a blocking thread as it arrives, one at a
+/// time, reading the next meanwhile: at most two raw messages are held, the
+/// one being parsed and the one being read. Messages that can't be parsed
+/// are left out; a failed read fails the lot.
+async fn parse_each<T: Send + 'static>(
+    mut fetched: impl futures_util::Stream<Item = async_imap::error::Result<T>> + Unpin,
+    parse: fn(T) -> Option<Incoming>,
+    messages: &mut Vec<Incoming>,
+) -> Result<()> {
+    let mut parsing = None;
+    while let Some(fetch) = fetched.try_next().await? {
+        if let Some(previous) = parsing.take() {
+            messages.extend(parsed(previous).await?);
+        }
+        parsing = Some(spawn_blocking(move || parse(fetch)));
+    }
+    if let Some(last) = parsing {
+        messages.extend(parsed(last).await?);
+    }
+    Ok(())
+}
+
+/// A parse's result; a panic in it carries on here as it would have inline.
+async fn parsed(parse: JoinHandle<Option<Incoming>>) -> Result<Option<Incoming>> {
+    match parse.await {
+        Ok(m) => Ok(m),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => Err(Error::Server("Reading a message was stopped.".into())),
+    }
+}
+
+/// A fetched message with its UID, flags and arrival time; `None` if it
+/// can't be parsed. A big one, fetched without its body, says so instead.
+fn incoming(fetch: Fetch) -> Option<Incoming> {
+    let uid = fetch.uid?;
+    let raw = fetch.body().or_else(|| fetch.header()).unwrap_or_default();
+    let mut m = parse::parse_message(raw)?;
+    if fetch.body().is_none() {
+        m.text = "This message is too large to show here.".into();
+        m.snippet = m.text.clone();
+    }
+    let (unread, flagged) = read_flags(&fetch);
+    m.uid = Some(uid);
+    m.unread = unread;
+    m.flagged = flagged;
+    if let Some(date) = fetch.internal_date() {
+        m.date = date.timestamp_millis();
+    }
+    Some(m)
 }
 
 /// Sends local changes to the server: flags (read, pinned as flagged), then
@@ -1632,12 +1691,114 @@ fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
     use super::*;
 
     #[test]
     fn uid_sets_collapse_runs() {
         assert_eq!(uid_set(&[5, 1, 2, 3, 9, 10]), "1:3,5,9:10");
         assert_eq!(uid_set(&[7]), "7");
+    }
+
+    #[test]
+    fn body_fetches_keep_to_the_byte_budget() {
+        const MIB: u32 = 1024 * 1024;
+        let sized =
+            |sizes: &[u32]| -> Vec<(u32, u32)> { (1..).zip(sizes.iter().copied()).collect() };
+        let lens =
+            |sizes: &[u32]| -> Vec<usize> { batches(&sized(sizes)).iter().map(Vec::len).collect() };
+        // A hundred messages just under the limit: one a fetch, not 950 MiB at once.
+        let big = sized(&[MIB * 19 / 2; 100]);
+        let planned = batches(&big);
+        assert_eq!(planned.len(), 100);
+        assert_eq!(planned.concat(), (1..=100).collect::<Vec<u32>>());
+        // Small mail goes FETCH_BATCH at a time, as does mail without a size.
+        assert_eq!(lens(&[100 * 1024; 30]), [25, 5]);
+        assert_eq!(lens(&[0; 30]), [25, 5]);
+        // Mixed sizes share a fetch until the next would pass the budget.
+        assert_eq!(
+            lens(&[6 * MIB, 6 * MIB, 6 * MIB, 1, 9 * MIB, 7 * MIB]),
+            [2, 3, 1]
+        );
+        assert_eq!(lens(&[1, 20 * MIB, 1]), [1, 1, 1]);
+        assert!(batches(&[]).is_empty());
+    }
+
+    /// Stands in for a fetched message, counting how many are held at once.
+    struct Held {
+        n: u32,
+        counts: Arc<Counts>,
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        held: AtomicUsize,
+        most_held: AtomicUsize,
+        parsing: AtomicUsize,
+        most_parsing: AtomicUsize,
+    }
+
+    impl Held {
+        fn new(n: u32, counts: &Arc<Counts>) -> Self {
+            let held = counts.held.fetch_add(1, SeqCst) + 1;
+            counts.most_held.fetch_max(held, SeqCst);
+            Self {
+                n,
+                counts: counts.clone(),
+            }
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.counts.held.fetch_sub(1, SeqCst);
+        }
+    }
+
+    /// Every third message can't be parsed.
+    fn parse_held(raw: Held) -> Option<Incoming> {
+        let parsing = raw.counts.parsing.fetch_add(1, SeqCst) + 1;
+        raw.counts.most_parsing.fetch_max(parsing, SeqCst);
+        std::thread::sleep(Duration::from_millis(2));
+        raw.counts.parsing.fetch_sub(1, SeqCst);
+        (!raw.n.is_multiple_of(3)).then(|| Incoming {
+            uid: Some(raw.n),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn fetched_mail_is_parsed_one_message_at_a_time() {
+        let counts = Arc::new(Counts::default());
+        let fetched = futures_util::stream::iter((1..=20).map(|n| Ok(Held::new(n, &counts))));
+        let mut messages = Vec::new();
+        parse_each(fetched, parse_held, &mut messages)
+            .await
+            .unwrap();
+        let uids: Vec<u32> = messages.iter().filter_map(|m| m.uid).collect();
+        let readable: Vec<u32> = (1..=20u32).filter(|n| !n.is_multiple_of(3)).collect();
+        assert_eq!(uids, readable);
+        assert_eq!(counts.most_parsing.load(SeqCst), 1);
+        assert!(counts.most_held.load(SeqCst) <= 2);
+        assert_eq!(counts.held.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_mid_fetch_fails_it() {
+        let counts = Arc::new(Counts::default());
+        let fetched = futures_util::stream::iter((1..=5).map(|n| match n {
+            4 => Err(async_imap::error::Error::ConnectionLost),
+            n => Ok(Held::new(n, &counts)),
+        }));
+        let mut messages = Vec::new();
+        assert!(
+            parse_each(fetched, parse_held, &mut messages)
+                .await
+                .is_err()
+        );
+        assert!(counts.most_held.load(SeqCst) <= 2);
     }
 
     fn listed(name: &str, delimiter: &str, attributes: &[Attr]) -> Listed {
