@@ -1048,15 +1048,20 @@ impl Engine {
                     (raw, whole)
                 })
                 .await?;
-                let whole = whole.ok_or_else(|| {
+                let mut whole = whole.ok_or_else(|| {
                     Error::Server("The email on the server is unreadable.".into())
                 })?;
+                whole.account_id = account.id;
                 // What's filled in stays: not a changed copy sent again
                 // with its Message-ID, found as its UID was gone.
                 if !imap::same_email(&at, &whole) {
                     return Err(Error::Server(imap::NOT_THE_ONE.into()));
                 }
-                let filled = self.store().fill_in_body(message_id, &whole)?;
+                // Deleted meanwhile, its id may be another email's by now.
+                let filled = self
+                    .store()
+                    .fill_in_body(message_id, &whole)?
+                    .ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
                 // Not what was found by Message-ID in a renumbered mailbox
                 // (`imap::fetch_raw_checked`), as `download_imap` doesn't.
                 if filled && trusted {
@@ -3888,6 +3893,12 @@ mod tests {
     /// by UID.
     type Held = HashMap<String, (u32, Vec<(u32, Vec<u8>)>)>;
 
+    /// What the stand-in does once, as it's about to send a whole message.
+    #[derive(Default)]
+    struct BeforeBody {
+        then: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
     /// A local IMAP server for any number of sessions, counting sign-ins
     /// and messages sent. Tests change its mailboxes as they go.
     struct ImapStandIn {
@@ -3895,6 +3906,7 @@ mod tests {
         held: Arc<Mutex<Held>>,
         logins: Arc<AtomicUsize>,
         fetches: Arc<AtomicUsize>,
+        before_body: Arc<BeforeBody>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -3913,12 +3925,18 @@ mod tests {
             )])));
             let logins = Arc::new(AtomicUsize::new(0));
             let fetches = Arc::new(AtomicUsize::new(0));
-            let shared = (held.clone(), logins.clone(), fetches.clone());
+            let before_body = Arc::new(BeforeBody::default());
+            let shared = (
+                held.clone(),
+                logins.clone(),
+                fetches.clone(),
+                before_body.clone(),
+            );
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let (held, logins, fetches) = shared.clone();
+                    let (held, logins, fetches, before_body) = shared.clone();
                     tokio::spawn(async move {
-                        let _ = imap_session(socket, &held, &logins, &fetches).await;
+                        let _ = imap_session(socket, &held, &logins, &fetches, &before_body).await;
                     });
                 }
             });
@@ -3927,8 +3945,14 @@ mod tests {
                 held,
                 logins,
                 fetches,
+                before_body,
                 task,
             }
+        }
+
+        /// Runs `then` as the next whole message is about to go out.
+        fn before_body(&self, then: impl FnOnce() + Send + 'static) {
+            *self.before_body.then.lock().unwrap() = Some(Box::new(then));
         }
 
         fn hold(&self, mailbox: &str, validity: u32, mail: Vec<(u32, Vec<u8>)>) {
@@ -3995,6 +4019,7 @@ mod tests {
         held: &Mutex<Held>,
         logins: &AtomicUsize,
         fetches: &AtomicUsize,
+        before_body: &BeforeBody,
     ) -> std::io::Result<()> {
         let (read, mut write) = socket.into_split();
         write.write_all(b"* OK stand-in\r\n").await?;
@@ -4070,6 +4095,10 @@ mod tests {
                         data
                     } else {
                         fetches.fetch_add(1, SeqCst);
+                        let then = before_body.then.lock().unwrap().take();
+                        if let Some(then) = then {
+                            then();
+                        }
                         let head = format!("* {seq} FETCH (UID {uid} BODY[] {{{}}}\r\n", raw.len());
                         write.write_all(head.as_bytes()).await?;
                         raw
@@ -4441,6 +4470,38 @@ mod tests {
         assert!(engine.fetch_body(id).await.unwrap());
         let content = store.lock().unwrap().content(id).unwrap().unwrap();
         assert_eq!(content.html.as_deref(), Some(HTML));
+    }
+
+    #[tokio::test]
+    async fn a_body_downloaded_for_mail_deleted_meanwhile_fills_in_no_other() {
+        let mine = big_message("42@example.com", 1, 1024);
+        let imap = ImapStandIn::start(7, vec![(42, mine.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let id = store_head(&mut store, account.id, 42, &mine);
+        let store = Arc::new(Mutex::new(store));
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+        // Deleted for good as its body downloads; the background download
+        // stores another (from the same sender, on the same subject), which
+        // gets its id.
+        let deleting = store.clone();
+        imap.before_body(move || {
+            let mut store = deleting.lock().unwrap();
+            store.remove_messages(&[id]).unwrap();
+            store_head(
+                &mut store,
+                account.id,
+                43,
+                b"Message-ID: <43@example.com>\r\n\r\n",
+            );
+        });
+        let fetched = engine.fetch_body(id).await;
+        assert!(matches!(&fetched, Err(Error::Config(_))), "{fetched:?}");
+        let store = store.lock().unwrap();
+        assert_eq!(store.location(id).unwrap().unwrap().uid, Some(43));
+        let content = store.content(id).unwrap().unwrap();
+        assert!(content.body_missing && content.html.is_none());
+        assert_eq!(content.attachments.len(), 1);
     }
 
     #[tokio::test]

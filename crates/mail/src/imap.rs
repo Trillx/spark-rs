@@ -1719,7 +1719,7 @@ async fn fill_in_found(
                         b.add_folder_message(folder, m)?;
                         bodies
                     }
-                    None => b.fill_in_body(id, m)?,
+                    None => b.fill_in_body(id, m)? == Some(true),
                 };
                 if bodies {
                     filled.push(id);

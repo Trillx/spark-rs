@@ -1349,7 +1349,8 @@ impl Graph {
     /// for the account's rounds (`repair`); till then the message keeps what
     /// its listing told of them. Returns whether it was waiting for its
     /// body: false if it had it by then. Fails as gone if the mailbox no
-    /// longer has it.
+    /// longer has it, and if the store doesn't: deleted meanwhile, its id
+    /// may be another email's by then.
     pub async fn fetch_body(
         &self,
         store: &Mutex<Store>,
@@ -1367,13 +1368,14 @@ impl Graph {
         let repairs = self.complete_all(vec![(&m, &mut whole)]).await;
         let mut store = lock(store);
         keep_listed(&store, id, &mut whole, &repairs)?;
-        Ok(store.batch(|b| {
+        let filled = store.batch(|b| {
             let filled = b.fill_in_body(id, &whole)?;
-            if filled {
+            if filled == Some(true) {
                 listed_for_repair(b, account_id, repairs)?;
             }
             Ok(filled)
-        })?)
+        })?;
+        filled.ok_or_else(|| Error::Config("That email is no longer here.".into()))
     }
 
     /// Puts a search to the mailbox (all its folders) and stores the newest
@@ -1541,10 +1543,11 @@ impl Graph {
                 }
             }
             for (incoming, id) in &whole {
-                if b.fill_in_body(*id, incoming)? {
+                if b.fill_in_body(*id, incoming)? == Some(true) {
                     stored += 1;
                 } else {
-                    // Filled in meanwhile, with its own repairs listed.
+                    // Filled in meanwhile, with its own repairs listed, or
+                    // deleted, its id maybe another email's by now.
                     repairs.retain(|r| incoming.remote_id.as_deref() != Some(r.id.as_str()));
                 }
             }
@@ -6301,6 +6304,52 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         let invite = Invite::from_json(content.invite.as_deref().unwrap()).unwrap();
         assert_eq!(invite.summary, "Sync");
         assert!(listed(&store, account_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_body_downloaded_for_mail_deleted_meanwhile_fills_in_no_other() {
+        let (base, _) = serve(attached).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(250) + 1_800_000),
+            ..Default::default()
+        };
+        graph
+            .older_inbox(&store, account_id, &mut state)
+            .await
+            .unwrap();
+        // The newest stored is opened, and deleted for good as its body
+        // downloads; the next one stored gets its id.
+        let newest = lock(&store)
+            .messages()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .max();
+        let newest = newest.unwrap();
+        let at = lock(&store).location(newest).unwrap().unwrap();
+        lock(&store).remove_messages(&[newest]).unwrap();
+        let other = Incoming {
+            account_id,
+            remote_id: Some("other".into()),
+            subject: "Something else".into(),
+            snippet: "Something else".into(),
+            text: "Something else".into(),
+            body: Body::Missing,
+            ..Default::default()
+        };
+        let added = lock(&store).add_incoming(&other, false).unwrap();
+        assert_eq!(added, Added::New(newest));
+
+        let remote = at.remote_id.unwrap();
+        let fetched = graph.fetch_body(&store, account_id, newest, &remote).await;
+        assert!(matches!(fetched, Err(Error::Config(_))), "{fetched:?}");
+        let content = lock(&store).content(newest).unwrap().unwrap();
+        assert!(content.body_missing);
+        assert_eq!(content.text, "Something else");
+        assert!(listed(&store, account_id).is_empty(), "nothing to repair");
     }
 
     #[tokio::test]

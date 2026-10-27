@@ -1305,7 +1305,10 @@ impl Store {
     /// invite as `m` has them, and its preview. Nothing else of it changes,
     /// so what the user changed (read, pinned, Done, filed) stays. Returns
     /// whether it was waiting for its body: one that has it is left as it is.
-    pub fn fill_in_body(&self, id: i64, m: &Incoming) -> Result<bool> {
+    /// `None` if it isn't stored, or isn't the email `m` is (`is_stored_as`):
+    /// ids are given again once the newest message goes, so one deleted
+    /// while its body downloaded can be another email by then.
+    pub fn fill_in_body(&self, id: i64, m: &Incoming) -> Result<Option<bool>> {
         fill_in_body_in(&self.conn, id, m)
     }
 
@@ -2131,7 +2134,7 @@ impl Batch<'_> {
     }
 
     /// `Store::fill_in_body`, in the batch.
-    pub fn fill_in_body(&self, id: i64, m: &Incoming) -> Result<bool> {
+    pub fn fill_in_body(&self, id: i64, m: &Incoming) -> Result<Option<bool>> {
         fill_in_body_in(self.conn, id, m)
     }
 
@@ -2144,7 +2147,7 @@ impl Batch<'_> {
             return Ok(false);
         }
         match find_stored(self.conn, m)? {
-            Some(id) => body_missing_in(self.conn, id),
+            Some(id) => Ok(body_missing_in(self.conn, id)? && is_stored_as(self.conn, id, m)?),
             None => Ok(false),
         }
     }
@@ -2202,7 +2205,9 @@ fn set_sync_state_in(conn: &Connection, id: i64, sync_state: &str) -> Result<()>
 fn add_incoming_in(conn: &Connection, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
     if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
-        fill_in_body_in(conn, id, m)?;
+        if m.body == Body::Whole {
+            fill_in_body_in(conn, id, m)?;
+        }
         let (dirty, folder_only, from_address): (bool, bool, String) = conn
             .prepare_cached(
                 "SELECT changed_at != 0, folder_only, from_address FROM messages WHERE id = ?1",
@@ -2284,7 +2289,9 @@ fn add_folder_message_in(conn: &Connection, folder_id: i64, m: &Incoming) -> Res
     let home = (place == Place::Folder).then_some(folder_id);
     let added = if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
-        fill_in_body_in(conn, id, m)?;
+        if m.body == Body::Whole {
+            fill_in_body_in(conn, id, m)?;
+        }
         let (dirty, remote_place, mailbox): (bool, String, Option<String>) = conn
             .prepare_cached(
                 "SELECT changed_at != 0, remote_place, mailbox FROM messages WHERE id = ?1",
@@ -2391,7 +2398,11 @@ fn observe_gone_remote_in(conn: &Connection, account_id: i64, remote_id: &str) -
 /// The stored copy of a fetched message: by its Graph id, which never
 /// changes (a copy in Sent Items has its own); else by IMAP mailbox and UID,
 /// or failing those its Message-ID (it may have moved and come back with a
-/// new UID).
+/// new UID): the newest with it and `m`'s sender and subject (`same_head`),
+/// else the newest. But not one stored without its body that has another
+/// sender or subject: `m` is a changed copy of it sent again with its
+/// Message-ID, an email of its own, and taking it for the stored one would
+/// fill in the wrong body, and move that one to its UID.
 fn find_stored(conn: &Connection, m: &Incoming) -> Result<Option<i64>> {
     if let Some(remote_id) = &m.remote_id {
         return conn
@@ -2410,15 +2421,60 @@ fn find_stored(conn: &Connection, m: &Incoming) -> Result<Option<i64>> {
     };
     match (by_location, &m.message_id) {
         (Some(id), _) => Ok(Some(id)),
-        (None, Some(message_id)) => conn
-            .prepare_cached(
-                "SELECT id FROM messages WHERE account_id = ?1 AND message_id = ?2
-                 ORDER BY date DESC LIMIT 1",
-            )?
-            .query_row(params![m.account_id, message_id], |r| r.get(0))
-            .optional(),
+        (None, Some(message_id)) => {
+            let stored: Vec<(i64, bool, bool)> = conn
+                .prepare_cached(
+                    "SELECT id, body_missing, from_address, subject FROM messages
+                     WHERE account_id = ?1 AND message_id = ?2 ORDER BY date DESC, id DESC",
+                )?
+                .query_map(params![m.account_id, message_id], |r| {
+                    let head = same_head(m, &r.get::<_, String>(2)?, &r.get::<_, String>(3)?);
+                    Ok((r.get(0)?, r.get(1)?, head))
+                })?
+                .collect::<Result<_>>()?;
+            let same = stored.iter().find(|(_, _, head)| *head);
+            let whole = || stored.iter().find(|(_, body_missing, _)| !body_missing);
+            Ok(same.or_else(whole).map(|(id, ..)| *id))
+        }
         (None, None) => Ok(None),
     }
+}
+
+/// Whether `m` has sender `from_address` and subject `subject`, as an email
+/// stored with them does: a copy of it can't change them, though a changed
+/// one sent again with its Message-ID can. `m` with neither (its flags, a
+/// Message-ID) can't be told apart, so it's taken to be it.
+fn same_head(m: &Incoming, from_address: &str, subject: &str) -> bool {
+    (m.from_address.is_empty() && m.subject.is_empty())
+        || (m.from_address.eq_ignore_ascii_case(from_address) && m.subject == subject)
+}
+
+/// Whether stored message `id` is the email `m`, fetched from the server,
+/// is: of its account, and with its Graph id if it has one, else with its
+/// Message-ID (where both have one), sender and subject (`same_head`).
+fn is_stored_as(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT account_id, remote_id, message_id, from_address, subject
+             FROM messages WHERE id = ?1",
+        )?
+        .query_row([id], |r| {
+            let remote_id: Option<String> = r.get(1)?;
+            let message_id: Option<String> = r.get(2)?;
+            Ok(r.get::<_, i64>(0)? == m.account_id
+                && match &m.remote_id {
+                    Some(remote) => remote_id.as_ref() == Some(remote),
+                    None => {
+                        remote_id.is_none()
+                            && (message_id.is_none()
+                                || m.message_id.is_none()
+                                || message_id == m.message_id)
+                            && same_head(m, &r.get::<_, String>(3)?, &r.get::<_, String>(4)?)
+                    }
+                })
+        })
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Lists a message in a folder, with its UID there, unless a pending change
@@ -2512,12 +2568,15 @@ fn body_missing_in(conn: &Connection, id: i64) -> Result<bool> {
 
 /// `Store::fill_in_body`. Only a message fetched whole fills it in: not
 /// one fetched without its body, nor its flags or a few of its headers.
-fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
-    if m.body != Body::Whole {
-        return Ok(false);
+fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<Option<bool>> {
+    if !is_stored_as(conn, id, m)? {
+        return Ok(None);
     }
-    Ok(conn
-        .prepare_cached(
+    if m.body != Body::Whole {
+        return Ok(Some(false));
+    }
+    Ok(Some(
+        conn.prepare_cached(
             "UPDATE messages SET text_body = ?2, html_body = ?3, attachments = ?4, invite = ?5,
                 snippet = CASE WHEN ?6 = '' THEN snippet ELSE ?6 END, body_missing = 0,
                 content_rev = content_rev + 1
@@ -2530,8 +2589,8 @@ fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
             json(&m.attachments),
             m.invite,
             m.snippet
-        ])?
-        > 0)
+        ])? > 0,
+    ))
 }
 
 /// Full header fetches refresh reply addresses; flags-only fetches leave them alone.

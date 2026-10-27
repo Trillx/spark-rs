@@ -1516,10 +1516,16 @@ fn mail_stored_without_its_body_gets_it_once_and_keeps_the_users_changes() {
     let before = store.message(id).unwrap().unwrap();
 
     // A fetch without the body fills in nothing.
-    assert!(!store.fill_in_body(id, &head(account, 1)).unwrap());
+    assert_eq!(
+        store.fill_in_body(id, &head(account, 1)).unwrap(),
+        Some(false)
+    );
     assert!(store.content(id).unwrap().unwrap().body_missing);
 
-    assert!(store.fill_in_body(id, &whole(account, 1)).unwrap());
+    assert_eq!(
+        store.fill_in_body(id, &whole(account, 1)).unwrap(),
+        Some(true)
+    );
     let content = store.content(id).unwrap().unwrap();
     assert!(!content.body_missing);
     assert!(content.text.ends_with("for margins."));
@@ -1544,7 +1550,7 @@ fn mail_stored_without_its_body_gets_it_once_and_keeps_the_users_changes() {
     // Once it has its body, it's left as it is.
     let mut later = whole(account, 1);
     later.text = "Something else".into();
-    assert!(!store.fill_in_body(id, &later).unwrap());
+    assert_eq!(store.fill_in_body(id, &later).unwrap(), Some(false));
     assert!(
         store
             .content(id)
@@ -1553,6 +1559,115 @@ fn mail_stored_without_its_body_gets_it_once_and_keeps_the_users_changes() {
             .text
             .ends_with("for margins.")
     );
+}
+
+#[test]
+fn a_body_downloaded_late_fills_in_no_other_email_given_its_id() {
+    // IMAP: the newest message, stored without its body, is opened, and
+    // deleted for good while its body downloads. The background download
+    // then stores another, which gets its id.
+    let (mut store, account) = store_with_account();
+    let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());
+    store.remove_messages(&[id]).unwrap();
+    let other = Incoming {
+        message_id: Some("<other@parts.com>".into()),
+        subject: "Something else".into(),
+        ..head(account, 2)
+    };
+    assert_eq!(new_id(store.add_incoming(&other, false).unwrap()), id);
+    assert_eq!(store.fill_in_body(id, &whole(account, 1)).unwrap(), None);
+    let content = store.content(id).unwrap().unwrap();
+    assert!(content.body_missing && !content.text.contains("margins"));
+    // Even one with its sender and subject, if not its Message-ID.
+    store.remove_messages(&[id]).unwrap();
+    let alike = Incoming {
+        uid: Some(2),
+        message_id: Some("<other@parts.com>".into()),
+        ..head(account, 1)
+    };
+    assert_eq!(new_id(store.add_incoming(&alike, false).unwrap()), id);
+    assert_eq!(store.fill_in_body(id, &whole(account, 1)).unwrap(), None);
+    assert!(store.content(id).unwrap().unwrap().body_missing);
+    assert_eq!(
+        store.fill_in_body(id + 1, &whole(account, 1)).unwrap(),
+        None
+    );
+
+    // Microsoft: by its Graph id, whatever else it has.
+    let graph = |remote: &str, uid| Incoming {
+        mailbox: None,
+        uid: None,
+        remote_id: Some(remote.into()),
+        ..head(account, uid)
+    };
+    store.remove_messages(&[id]).unwrap();
+    assert_eq!(
+        new_id(store.add_incoming(&graph("AAMk-1", 1), false).unwrap()),
+        id
+    );
+    store.remove_messages(&[id]).unwrap();
+    assert_eq!(
+        new_id(store.add_incoming(&graph("AAMk-2", 1), false).unwrap()),
+        id
+    );
+    let downloaded = Incoming {
+        mailbox: None,
+        uid: None,
+        remote_id: Some("AAMk-1".into()),
+        ..whole(account, 1)
+    };
+    assert_eq!(store.fill_in_body(id, &downloaded).unwrap(), None);
+    assert!(store.content(id).unwrap().unwrap().body_missing);
+    let own = Incoming {
+        remote_id: Some("AAMk-2".into()),
+        ..downloaded
+    };
+    assert_eq!(store.fill_in_body(id, &own).unwrap(), Some(true));
+    check_search_index(&store);
+}
+
+#[test]
+fn a_changed_copy_sent_again_is_its_own_email_not_the_body_of_one_without_it() {
+    // An email stored without its body, then sent again changed, with its
+    // Message-ID, arriving at a new UID.
+    let (mut store, account) = store_with_account();
+    let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());
+    let again = |uid| Incoming {
+        uid: Some(uid),
+        ..whole(account, 1)
+    };
+    let corrected = Incoming {
+        subject: "Message 1 (corrected)".into(),
+        text: "The right figures this time.".into(),
+        ..again(5)
+    };
+    let fills = |store: &mut Store, m: &Incoming| store.batch(|b| b.fills_in(m)).unwrap();
+    assert!(!fills(&mut store, &corrected));
+    let resent = new_id(store.add_incoming(&corrected, false).unwrap());
+    assert_ne!(resent, id);
+    let content = store.content(id).unwrap().unwrap();
+    assert!(content.body_missing, "opening it downloads its own");
+    assert_eq!(content.text, "Quarterly figures attached");
+    let at = store.location(id).unwrap().unwrap();
+    assert_eq!((at.mailbox.as_deref(), at.uid), (Some("INBOX"), Some(1)));
+    assert!(found(&store, "right").contains(&resent));
+    assert!(!found(&store, "right").contains(&id));
+    // From someone else, too.
+    let forged = Incoming {
+        from_address: "someone@else.com".into(),
+        ..again(6)
+    };
+    assert!(!fills(&mut store, &forged));
+    let (Added::New(other) | Added::Known(other)) = store.add_incoming(&forged, false).unwrap();
+    assert_ne!(other, id);
+    assert!(store.content(id).unwrap().unwrap().body_missing);
+
+    // A copy as it was (moved and back, a new UID) is the stored one.
+    let copy = again(7);
+    assert!(fills(&mut store, &copy));
+    assert_eq!(store.add_incoming(&copy, false).unwrap(), Added::Known(id));
+    assert!(!store.content(id).unwrap().unwrap().body_missing);
+    check_search_index(&store);
 }
 
 #[test]
@@ -1608,7 +1723,7 @@ fn content_filled_in_later_is_a_change_to_the_list() {
         attachments: listed.attachments.clone(),
         ..whole(account, 1)
     };
-    assert!(store.fill_in_body(id, &whole).unwrap());
+    assert_eq!(store.fill_in_body(id, &whole).unwrap(), Some(true));
     let changes = store.message_changes(&mark.unwrap()).unwrap().unwrap();
     assert_eq!(changes.messages.len(), 1);
     assert_eq!(changes.messages[0].content_rev, 1);
