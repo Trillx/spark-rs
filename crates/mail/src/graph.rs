@@ -18,7 +18,7 @@ use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spark_store::{
-    Added, Attachment, Batch, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed,
+    Added, Attachment, Batch, Body, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed,
     Query, RemoteFolder, Store,
 };
 
@@ -676,11 +676,19 @@ impl Graph {
                 missing.remove(&m.id);
                 changes.push(match m.removed {
                     Some(_) => Delta::Gone(m.id.clone()),
-                    None => Delta::Changed {
-                        incoming: Box::new(to_incoming(account_id, m)),
-                        // A header-only delta must not overwrite the stored flags.
-                        flags: m.is_read.is_some(),
-                    },
+                    None => {
+                        let mut incoming = to_incoming(account_id, m);
+                        // Stored mail isn't completed (attachments, invites),
+                        // so it can't fill in a body stored without them.
+                        if known.contains(&m.id) {
+                            incoming.body = Body::Partial;
+                        }
+                        Delta::Changed {
+                            incoming: Box::new(incoming),
+                            // A header-only delta must not overwrite the stored flags.
+                            flags: m.is_read.is_some(),
+                        }
+                    }
                 });
             }
             let new = page
@@ -1082,7 +1090,7 @@ impl Graph {
     ) -> Result<bool> {
         let m = self.message_in_full(remote_id).await?.ok_or(Error::Gone)?;
         let mut whole = to_incoming(account_id, &m);
-        if whole.body_missing {
+        if whole.body != Body::Whole {
             return Err(Error::Server(
                 "Microsoft Graph sent the email without its body.".into(),
             ));
@@ -2432,7 +2440,8 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         Category::People
     };
     // Without its body, it lists as it would whole: with an attachment if it
-    // has any, and with the kind of invite its type says it carries.
+    // has any, and with the kind of invite its type says it carries. With
+    // it, it's whole once `complete_all` has brought the rest.
     let body_missing = m.body.is_none();
     let attachments = match m.has_attachments {
         Some(true) if body_missing => vec![Attachment {
@@ -2470,7 +2479,11 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         category,
         unread: !m.is_read.unwrap_or(false),
         flagged: m.flag.as_ref().is_some_and(|f| f.flag_status == "flagged"),
-        body_missing,
+        body: if body_missing {
+            Body::Missing
+        } else {
+            Body::Whole
+        },
         ..Default::default()
     }
 }
@@ -5122,7 +5135,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         let gone = Incoming {
             account_id,
             remote_id: Some("i3".into()),
-            body_missing: true,
+            body: Body::Missing,
             ..Default::default()
         };
         let Added::New(i3) = lock(&store).add_incoming(&gone, false).unwrap() else {

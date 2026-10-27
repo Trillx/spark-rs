@@ -1452,7 +1452,7 @@ fn head(account_id: i64, uid: u32) -> Incoming {
             ..Default::default()
         }],
         invite: Some(r#"{"kind":"invitation"}"#.into()),
-        body_missing: true,
+        body: Body::Missing,
         ..incoming(account_id, uid, "ana@parts.com")
     }
 }
@@ -1470,7 +1470,7 @@ fn whole(account_id: i64, uid: u32) -> Incoming {
             remote_id: None,
         }],
         invite: None,
-        body_missing: false,
+        body: Body::Whole,
         ..head(account_id, uid)
     }
 }
@@ -1576,6 +1576,72 @@ fn mail_fetched_whole_elsewhere_fills_in_the_body_stored_without_it() {
     assert!(!store.content(other).unwrap().unwrap().body_missing);
     store.add_incoming(&head(account, 2), false).unwrap();
     assert!(!store.content(other).unwrap().unwrap().body_missing);
+    check_search_index(&store);
+}
+
+#[test]
+fn what_a_folder_sync_knows_of_stored_mail_leaves_its_body_to_come() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[RemoteFolder {
+                remote_id: "Projects".into(),
+                parent: None,
+                name: "Projects".into(),
+                role: None,
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    let folder = store.folders().unwrap()[0].id;
+
+    // IMAP: in a Gmail label too, known by its Message-ID, Reply-To and
+    // flags, at its UID there.
+    let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());
+    let label = Incoming {
+        account_id: account,
+        mailbox: Some("Projects".into()),
+        uid: Some(70),
+        message_id: head(account, 1).message_id,
+        reply_to: Some(vec![]),
+        unread: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        store.add_folder_message(folder, &label).unwrap(),
+        Added::Known(id)
+    );
+    // Graph: archived elsewhere, and Archive lists it by its id and flags.
+    let graph = Incoming {
+        remote_id: Some("AAMk-1".into()),
+        ..head(account, 2)
+    };
+    let other = new_id(store.add_incoming(&graph, false).unwrap());
+    let archived = Incoming {
+        account_id: account,
+        remote_id: Some("AAMk-1".into()),
+        reply_to: Some(vec![]),
+        unread: true,
+        flagged: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        store.add_folder_message(folder, &archived).unwrap(),
+        Added::Known(other)
+    );
+    store.add_incoming(&archived, false).unwrap();
+
+    for id in [id, other] {
+        let content = store.content(id).unwrap().unwrap();
+        assert!(content.body_missing, "opening it still downloads it");
+        assert_eq!(content.text, "Quarterly figures attached");
+        assert_eq!(content.attachments[0].name, "figures.xlsx");
+        assert!(content.invite.is_some());
+        let row = store.message(id).unwrap().unwrap();
+        assert_eq!(row.snippet, "Quarterly figures attached");
+    }
+    assert_eq!(found(&store, "quarterly").len(), 2);
     check_search_index(&store);
 }
 

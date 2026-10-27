@@ -43,7 +43,7 @@ use futures_util::TryStreamExt;
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 use spark_store::{
-    Account, AccountKind, Added, Attachment, Folder, FolderRole, Incoming, Location, Pending,
+    Account, AccountKind, Added, Attachment, Body, Folder, FolderRole, Incoming, Location, Pending,
     Place, Pushed, Query, RemoteFolder, Store,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -1051,9 +1051,15 @@ pub async fn sync_inbox(
     }
     state.floor = Some(floor);
     state.complete = complete;
-    // Mail the server wouldn't give is to be asked for again.
+    // Mail the server wouldn't give, or gave without its body (and an OK),
+    // is to be asked for again: only with all of it stored does the inbox
+    // stand as it was seen.
+    let all_stored = new.is_empty() || {
+        let stored = lock(store).uids(account_id, INBOX)?;
+        present.iter().all(|uid| stored.contains(uid))
+    };
     state.seen = match mailbox.uid_next {
-        Some(uid_next) if report.skipped == 0 => Some(Seen {
+        Some(uid_next) if all_stored => Some(Seen {
             uid_next,
             exists: mailbox.exists,
             floor,
@@ -1812,6 +1818,7 @@ fn incoming(fetch: Fetched) -> Option<Incoming> {
     if fetch.body().is_none() {
         m.text = "This message is too large to show here.".into();
         m.snippet = m.text.clone();
+        m.body = Body::Partial;
     }
     let (unread, flagged) = read_flags(&fetch);
     m.uid = Some(uid);
@@ -1996,6 +2003,8 @@ fn method(ty: &ContentType<'_>) -> Option<invite::Kind> {
         "REPLY" => Some(invite::Kind::Reply),
         "CANCEL" => Some(invite::Kind::Cancellation),
         "COUNTER" => Some(invite::Kind::Proposal),
+        // An event to look at, as `Invite::parse` reads it.
+        "PUBLISH" => Some(invite::Kind::Event),
         _ => None,
     }
 }
@@ -2251,20 +2260,31 @@ pub async fn fetch_raw(
 /// `fetch_raw`, given the UIDVALIDITY the stored UID was given under, if
 /// it's known. When the mailbox has another now, the UID may name some
 /// other message, so it isn't fetched: the message is found by Message-ID
-/// instead. Also says whether what was found is safe to keep: not what was
-/// found that way, as another message may have the same Message-ID.
+/// instead, that one exactly (`find_message_id`). Whatever is fetched is
+/// checked to have the stored Message-ID, if it has one. Also says whether
+/// what was found is safe to keep: not what was found by Message-ID in a
+/// renumbered mailbox, nor at a UID that held some other message, as
+/// another message may have the same Message-ID.
 pub async fn fetch_raw_checked(
     session: &mut Session,
     state: &SyncState,
     at: &Location,
     validity: Option<u32>,
 ) -> Result<Option<(Vec<u8>, bool)>> {
+    let is_it = |raw: &[u8]| {
+        at.message_id
+            .as_deref()
+            .is_none_or(|id| parse::message_id(raw) == Some(parse::bare_id(id)))
+    };
     let mut renumbered = false;
     if let (Some(mailbox), Some(uid)) = (&at.mailbox, at.uid) {
         let selected = session.select(mailbox).await?;
         renumbered = validity.is_some_and(|v| selected.uid_validity != Some(v));
         if !renumbered && let Some(raw) = fetch_body(session, uid).await? {
-            return Ok(Some((raw, true)));
+            if is_it(&raw) {
+                return Ok(Some((raw, true)));
+            }
+            renumbered = true;
         }
     }
     let Some(message_id) = &at.message_id else {
@@ -2289,10 +2309,12 @@ pub async fn fetch_raw_checked(
             Err(async_imap::error::Error::No(_)) => continue,
             Err(e) => return Err(e.into()),
         }
-        let query = format!("HEADER Message-ID {}", quoted(message_id));
-        let found = uid_search(session, query).await?;
-        if let Some(uid) = found.into_iter().max()
+        if let Some(uid) = find_message_id(session, message_id)
+            .await?
+            .into_iter()
+            .max()
             && let Some(raw) = fetch_body(session, uid).await?
+            && is_it(&raw)
         {
             return Ok(Some((raw, !renumbered)));
         }
@@ -2934,7 +2956,7 @@ mod tests {
              BODY[TEXT]<0> {{}}{text}\u{1})"
         );
         let m = head(read_fetch_response(&fetch)).unwrap();
-        assert!(m.body_missing && m.html.is_none());
+        assert!(m.body == Body::Missing && m.html.is_none());
         assert_eq!((m.uid, m.unread, m.flagged), (Some(70), true, true));
         assert_eq!(m.date, 1_761_055_205_000, "INTERNALDATE");
         assert_eq!(
@@ -2984,6 +3006,43 @@ mod tests {
         );
         assert_eq!(head(read_fetch_response(&fetch)).unwrap().snippet, "");
         assert!(head(read_fetch_response("* 1 FETCH (UID 9 FLAGS ())")).is_none());
+    }
+
+    #[test]
+    fn a_published_event_lists_as_an_event() {
+        let fields = "From: hr@y.org\r\nSubject: Holidays\r\n\r\n";
+        let kind = |method: &str| {
+            let fetch = format!(
+                "* 1 FETCH (UID 9 FLAGS () BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \
+                 \"us-ascii\") NIL NIL \"7BIT\" 12 1 NIL NIL NIL NIL)(\"TEXT\" \"CALENDAR\" \
+                 (\"CHARSET\" \"utf-8\" \"METHOD\" \"{method}\") NIL NIL \"7BIT\" 500 10 NIL NIL \
+                 NIL NIL) \"MIXED\" (\"BOUNDARY\" \"m\") NIL NIL NIL) \
+                 BODY[HEADER.FIELDS (FROM)] {{}}{fields}\u{1})"
+            );
+            let m = head(read_fetch_response(&fetch)).unwrap();
+            m.invite.and_then(|i| Invite::from_json(&i)).map(|i| i.kind)
+        };
+        assert_eq!(kind("PUBLISH"), Some(invite::Kind::Event));
+        assert_eq!(kind("publish"), Some(invite::Kind::Event));
+        assert_eq!(kind("REQUEST"), Some(invite::Kind::Invitation));
+        assert_eq!(kind("X-OTHER"), None);
+    }
+
+    #[test]
+    fn only_a_whole_fetch_says_it_has_the_body() {
+        let raw = "From: bob@y.org\r\nSubject: Hi\r\n\r\nHi there.\r\n";
+        let whole = format!("* 1 FETCH (UID 9 FLAGS () BODY[] {{}}{raw}\u{1})");
+        assert_eq!(
+            incoming(read_fetch_response(&whole)).unwrap().body,
+            Body::Whole
+        );
+        // Too big to fetch whole: only its header came, with a note for a
+        // body, which mustn't stand in for one still to come.
+        let header = "From: bob@y.org\r\nSubject: Hi\r\n\r\n";
+        let big = format!("* 1 FETCH (UID 9 FLAGS () BODY[HEADER] {{}}{header}\u{1})");
+        let m = incoming(read_fetch_response(&big)).unwrap();
+        assert_eq!(m.text, "This message is too large to show here.");
+        assert_eq!(m.body, Body::Partial);
     }
 
     #[test]

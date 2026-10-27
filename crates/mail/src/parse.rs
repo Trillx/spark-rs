@@ -2,7 +2,7 @@
 //! categories (people, notifications, newsletters) from headers alone.
 
 use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
-use spark_store::{Category, Incoming};
+use spark_store::{Body, Category, Incoming};
 
 use crate::attachment;
 use crate::invite::Invite;
@@ -63,11 +63,12 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         html,
         attachments,
         invite: Invite::find(&m).map(|i| i.to_json()),
+        body: Body::Whole,
         ..Default::default()
     })
 }
 
-/// Parses a message fetched without its body (`Incoming::body_missing`):
+/// Parses a message fetched without its body (`Body::Missing`):
 /// `header`, its header or the fields of it a sync reads, and `text`, the
 /// start of what follows. `cut`: the message goes on past `text`. Of the
 /// text only the preview is kept, as its text too, for the search index.
@@ -122,7 +123,7 @@ pub fn parse_head(header: &[u8], text: &[u8], cut: bool) -> Option<Incoming> {
     m.html = None;
     m.attachments = Vec::new();
     m.invite = None;
-    m.body_missing = true;
+    m.body = Body::Missing;
     Some(m)
 }
 
@@ -440,7 +441,7 @@ MIME-Version: 1.0\r\n";
         assert_eq!(m.date, 1_761_055_200_000);
         assert_eq!(m.snippet, "Hello Ana, the figures.");
         assert_eq!(m.text, m.snippet, "only the preview, for search");
-        assert!(m.body_missing && m.html.is_none() && m.attachments.is_empty());
+        assert!(m.body == Body::Missing && m.html.is_none() && m.attachments.is_empty());
 
         // The fields come without the blank line that ends them, or with
         // nothing after them at all.

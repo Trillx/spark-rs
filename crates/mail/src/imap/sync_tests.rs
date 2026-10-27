@@ -1,7 +1,7 @@
 //! Syncs against a scripted IMAP server that counts what they ask for:
 //! commands, records (FETCH responses and SEARCH hits) and bytes sent back.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use spark_store::{AccountKind, Message, NewAccount};
@@ -133,6 +133,8 @@ struct Shared {
     /// Messages (by id) left out of FETCHes containing their text, which
     /// then end in NO: as Gmail answers for mail it can't fetch.
     broken: HashMap<u32, &'static str>,
+    /// Messages (by id) whose body comes as NIL, in a FETCH that ends OK.
+    bodiless: HashSet<u32>,
     tally: Tally,
 }
 
@@ -162,6 +164,7 @@ impl StandIn {
             condstore,
             refuse: None,
             broken: HashMap::new(),
+            bodiless: HashSet::new(),
             tally: Tally::default(),
         }));
         let shared = state.clone();
@@ -204,10 +207,16 @@ impl StandIn {
         self.state.lock().unwrap().broken.insert(id, fetch);
     }
 
+    /// Answers message `id`'s body as NIL from now on, and the fetch OK.
+    fn without_body(&self, id: u32) {
+        self.state.lock().unwrap().bodiless.insert(id);
+    }
+
     fn heal(&self) {
         let mut state = self.state.lock().unwrap();
         state.refuse = None;
         state.broken.clear();
+        state.bodiless.clear();
     }
 }
 
@@ -358,7 +367,9 @@ fn respond(
         if items.contains("BODY.PEEK[TEXT]<0.") {
             parts.push(format!("BODY[TEXT]<0> {{{}}}\r\n{text}", text.len()));
         }
-        if items.contains("BODY.PEEK[]") {
+        if items.contains("BODY.PEEK[]") && state.bodiless.contains(&m.id) {
+            parts.push("BODY[] NIL".into());
+        } else if items.contains("BODY.PEEK[]") {
             parts.push(format!("BODY[] {{{}}}\r\n{raw}", raw.len()));
         } else if items.contains("BODY.PEEK[HEADER]") {
             let header = &raw[..raw.find("\r\n\r\n").unwrap() + 4];
@@ -1309,6 +1320,29 @@ async fn a_lone_new_message_refused_is_counted_as_skipped() {
         let report = cached.sync().await.unwrap();
         assert_eq!((report.new.len(), report.skipped), (1, 0), "{fetch}");
     }
+}
+
+/// A new message the server gives without its body, in a fetch that ends
+/// OK, isn't stored, and the next sync asks for it again even though
+/// nothing came or went since.
+#[tokio::test]
+async fn mail_that_came_without_its_body_is_asked_for_again() {
+    let mut cached = Cached::synced(true).await;
+    let id = ON_SERVER + 1;
+    cached.stand_in.with(INBOX, |b| b.arrive(id));
+    cached.stand_in.without_body(id);
+    let report = cached.sync().await.unwrap();
+    assert!(report.new.is_empty() && report.skipped == 0, "{report:?}");
+    assert!(stored(&cached.store, id).is_none());
+    assert_eq!(cached.state.seen, None);
+
+    cached.stand_in.heal();
+    cached.stand_in.take_tally();
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.new.len(), 1, "{report:?}");
+    assert!(stored(&cached.store, id).is_some());
+    assert!(cached.stand_in.take_tally().asked("UID SEARCH UID 6003:*"));
+    assert!(cached.state.seen.is_some());
 }
 
 /// A message reaching back can't fetch is passed like the rest, but it's

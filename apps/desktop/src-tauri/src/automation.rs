@@ -1116,7 +1116,7 @@ mod tests {
 
     #[test]
     fn mail_stored_without_its_body_is_told_to_be_only_its_start() {
-        use spark_store::{Added, Incoming};
+        use spark_store::{Added, Body, Incoming};
         let (engine, account, whole) = one_email();
         let mut store = engine.store();
         let Added::New(older) = store
@@ -1130,7 +1130,7 @@ mod tests {
                     subject: "Budget".into(),
                     snippet: "The figures for May".into(),
                     text: "The figures for May".into(),
-                    body_missing: true,
+                    body: Body::Missing,
                     ..Default::default()
                 },
                 false,

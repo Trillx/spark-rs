@@ -833,7 +833,7 @@ impl Engine {
     }
 
     /// Downloads the body of a stored message that came without it
-    /// (`Incoming::body_missing`: reaching back, and the background
+    /// (`Body::Missing`: reaching back, and the background
     /// download), and fills it in (`Store::fill_in_body`) with its
     /// attachments and invite. An IMAP email comes whole, once, and the
     /// files in it are kept too, so opening them doesn't download it again.
@@ -3144,7 +3144,7 @@ mod tests {
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    use spark_store::{Added, Attachment, FolderRole, Incoming, OutboxFile, RemoteFolder};
+    use spark_store::{Added, Attachment, Body, FolderRole, Incoming, OutboxFile, RemoteFolder};
 
     use crate::graph::tests::{Answer, Asked};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -3819,19 +3819,44 @@ mod tests {
                     .collect();
                 reply.extend(format!("* SEARCH {}\r\n", hits.join(" ")).into_bytes());
             } else if upper.starts_with("UID FETCH ") {
-                let uid: u32 = command.split_whitespace().nth(2).unwrap().parse().unwrap();
-                let found = held.lock().unwrap()[&selected]
+                // A UID set of single UIDs and ranges.
+                let set = command.split_whitespace().nth(2).unwrap().to_owned();
+                let wanted = |uid: u32| {
+                    set.split(',').any(|r| match r.split_once(':') {
+                        Some((low, high)) => {
+                            (low.parse().unwrap()..=high.parse().unwrap_or(u32::MAX)).contains(&uid)
+                        }
+                        None => r.parse() == Ok(uid),
+                    })
+                };
+                let found: Vec<(usize, u32, Vec<u8>)> = held.lock().unwrap()[&selected]
                     .1
                     .iter()
                     .enumerate()
-                    .find(|(_, (u, _))| *u == uid)
-                    .map(|(i, (_, raw))| (i + 1, raw.clone()));
-                if let Some((seq, raw)) = found {
-                    fetches.fetch_add(1, SeqCst);
-                    let head = format!("* {seq} FETCH (UID {uid} BODY[] {{{}}}\r\n", raw.len());
-                    write.write_all(head.as_bytes()).await?;
-                    write.write_all(&raw).await?;
-                    reply.extend(b")\r\n");
+                    .filter(|(_, (u, _))| wanted(*u))
+                    .map(|(i, (u, raw))| (i + 1, *u, raw.clone()))
+                    .collect();
+                for (seq, uid, raw) in found {
+                    // The Message-ID alone, to check a search's hits.
+                    let data = if upper.contains("HEADER.FIELDS") {
+                        let id = crate::parse::message_id(&raw)
+                            .map(|id| format!("Message-ID: <{id}>\r\n"))
+                            .unwrap_or_default();
+                        let data = format!("{id}\r\n").into_bytes();
+                        let head = format!(
+                            "* {seq} FETCH (UID {uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n",
+                            data.len()
+                        );
+                        write.write_all(head.as_bytes()).await?;
+                        data
+                    } else {
+                        fetches.fetch_add(1, SeqCst);
+                        let head = format!("* {seq} FETCH (UID {uid} BODY[] {{{}}}\r\n", raw.len());
+                        write.write_all(head.as_bytes()).await?;
+                        raw
+                    };
+                    write.write_all(&data).await?;
+                    write.write_all(b")\r\n").await?;
                 }
             } else if upper == "LOGOUT" {
                 write
@@ -4085,7 +4110,7 @@ mod tests {
                 name: "part0.pdf".into(),
                 ..Default::default()
             }],
-            body_missing: true,
+            body: Body::Missing,
             ..Default::default()
         };
         match store.add_incoming(&incoming, false).unwrap() {
@@ -4155,6 +4180,48 @@ mod tests {
                 .body_missing
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_older_mail_never_fills_in_another_emails_body() {
+        // UID 42 is gone, and the Message-ID stored for it is part of 142's.
+        let other = big_message("142@example.com", 2, 1024);
+        let imap = ImapStandIn::start(7, vec![(142, other.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let id = store_head(
+            &mut store,
+            account.id,
+            42,
+            b"Message-ID: <42@example.com>\r\n\r\n",
+        );
+        let store = Arc::new(Mutex::new(store));
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+        let fetched = engine.fetch_body(id).await;
+        assert!(matches!(fetched, Err(Error::Gone)), "{fetched:?}");
+        let content = store.lock().unwrap().content(id).unwrap().unwrap();
+        assert!(content.body_missing && content.html.is_none());
+        assert_eq!(content.attachments.len(), 1);
+
+        // Nor what a UID that names some other email now holds.
+        imap.hold(imap::INBOX, 7, vec![(42, other.clone())]);
+        assert!(engine.fetch_body(id).await.is_err());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .content(id)
+                .unwrap()
+                .unwrap()
+                .body_missing
+        );
+
+        // The email itself, found by Message-ID: filled in.
+        let mine = big_message("42@example.com", 1, 1024);
+        imap.hold(imap::INBOX, 7, vec![(42, other), (50, mine)]);
+        assert!(engine.fetch_body(id).await.unwrap());
+        let content = store.lock().unwrap().content(id).unwrap().unwrap();
+        assert_eq!(content.html.as_deref(), Some(HTML));
     }
 
     #[tokio::test]

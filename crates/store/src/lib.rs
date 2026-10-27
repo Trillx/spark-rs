@@ -193,11 +193,26 @@ pub struct Incoming {
     pub flagged: bool,
     /// The calendar invite it carries, JSON owned by the mail crate.
     pub invite: Option<String>,
+    /// How much of the message the fetch brought: only a whole one fills in
+    /// the body of one stored without it.
+    pub body: Body,
+}
+
+/// How much of a message a fetch brought (`Incoming::body`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Body {
+    /// Not said: its flags, or the headers stored mail is checked against.
+    /// Stored as it comes; a body still to come stays to come.
+    #[default]
+    Partial,
     /// Fetched without its body, as the background download fetches older
     /// mail: `text` is only its preview, it has no HTML, and its attachments
     /// and invite are what its listing told of them. The rest comes when
     /// it's opened (`Store::fill_in_body`).
-    pub body_missing: bool,
+    Missing,
+    /// The whole message, with its attachments and invite as far as they
+    /// could be read.
+    Whole,
 }
 
 /// A file attached to a stored message. Only what describes it is kept; the
@@ -311,8 +326,8 @@ pub struct Content {
     /// the answer to it sent from here.
     pub invite: Option<String>,
     pub rsvp: Option<String>,
-    /// Stored without its body (`Incoming::body_missing`): `text` is its
-    /// preview until the body is downloaded.
+    /// Stored without its body (`Body::Missing`): `text` is its preview
+    /// until the body is downloaded.
     pub body_missing: bool,
 }
 
@@ -873,7 +888,7 @@ impl Store {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
                 "-- Stored without its body, which downloads when it's opened
-                 -- (`Incoming::body_missing`).
+                 -- (`Body::Missing`).
                  ALTER TABLE messages ADD COLUMN body_missing INTEGER NOT NULL DEFAULT 0;",
             )?;
             tx.pragma_update(None, "user_version", 26)?;
@@ -1209,7 +1224,7 @@ impl Store {
     }
 
     /// Fills in the body of message `id`, stored without it
-    /// (`Incoming::body_missing`), from `m`, a fetch of it in full: its
+    /// (`Body::Missing`), from `m`, a fetch of it in full: its
     /// text and HTML, which the search index takes in, its attachments and
     /// invite as `m` has them, and its preview. Nothing else of it changes,
     /// so what the user changed (read, pinned, Done, filed) stays. Returns
@@ -2315,10 +2330,10 @@ fn has_remote_id_in(conn: &Connection, account_id: i64, remote_id: &str) -> Resu
     .query_row(params![account_id, remote_id], |r| r.get(0))
 }
 
-/// `Store::fill_in_body`. A message fetched without its body fills in
-/// nothing.
+/// `Store::fill_in_body`. Only a message fetched whole fills it in: not
+/// one fetched without its body, nor its flags or a few of its headers.
 fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
-    if m.body_missing {
+    if m.body != Body::Whole {
         return Ok(false);
     }
     Ok(conn
@@ -2399,7 +2414,7 @@ fn insert_message(
         json(&m.bcc),
         m.invite,
         json(m.reply_to.as_deref().unwrap_or_default()),
-        m.body_missing,
+        m.body == Body::Missing,
     ])?;
     let id = conn.last_insert_rowid();
     let threading = conversations::Threading {
