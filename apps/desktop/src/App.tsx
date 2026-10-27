@@ -1941,7 +1941,7 @@ export default function App() {
     snooze: (m: Message, p: LaterPreset) => snoozeUntil([m], laterTime(p), p.label.toLowerCase()),
     snoozeCustom: (m: Message) => askSnoozeTime([m]),
     sendAgain,
-    sendDraft: (m: Message) => void sendDraftNow(m),
+    sendDraft: (m: Message) => void track(sendDraftNow(m)),
     move: (m: Message) => openMove([own(m)]),
     changeCategory: (m: Message, category: Category) => void changeCategory(m, category),
     groupSender,
@@ -2466,11 +2466,14 @@ export default function App() {
     });
   }
 
-  /** Sends a saved draft from the list, without opening it; Undo opens it in the composer. */
+  /**
+   * Sends a saved draft from the list, without opening it; Undo opens it in the composer.
+   * Tracked (`track`): a conversation's window showing the draft waits for it to be queued.
+   */
   async function sendDraftNow(m: Message) {
     // Open in the composer: what's there is the latest, and sending closes it.
     const open = composer.current;
-    if (open.draft && (open.draft.draftId === m.id || draftIds.current.get(open.key) === m.id)) return void send();
+    if (open.draft && (open.draft.draftId === m.id || draftIds.current.get(open.key) === m.id)) return send();
     // Open in another window's composer: that window comes forward, to send from there.
     if (await draftOpenElsewhere(m.id)) {
       showToast("This draft is open in another window");
@@ -2499,7 +2502,7 @@ export default function App() {
     try {
       id = await sendMessage(outgoingDraft(d, d.sendLater?.at ?? Date.now() + undoMs));
     } catch (error) {
-      showToast(`Couldn't send: ${String(error)}`, () => openComposer(d), ICONS.error, {
+      showToast(`Couldn't send: ${String(error)}`, () => void reopenComposer(d), ICONS.error, {
         actionLabel: "Edit",
         duration: ERROR_TOAST_MS,
       });
@@ -2717,6 +2720,18 @@ export default function App() {
     setComposerKey(key);
   }
 
+  /**
+   * A draft back in the composer (Undo, Edit), unless another window has opened its saved copy
+   * meanwhile: it's edited there, and that window comes forward.
+   */
+  async function reopenComposer(d: Draft) {
+    if (d.draftId !== undefined && (await draftOpenElsewhere(d.draftId))) {
+      showToast("This draft is open in another window");
+      return;
+    }
+    openComposer(d);
+  }
+
   /** Saves a composer session's draft to its account's Drafts, after any save still running. Resolves to its id. */
   function storeDraft(d: Draft, session: number): Promise<number> {
     const run = draftSaves.current.then(async () => {
@@ -2735,7 +2750,7 @@ export default function App() {
   }
 
   function draftError(error: unknown, d: Draft) {
-    showToast(`Couldn't save the draft: ${String(error)}`, () => openComposer(d), ICONS.error, {
+    showToast(`Couldn't save the draft: ${String(error)}`, () => void reopenComposer(d), ICONS.error, {
       actionLabel: "Edit",
       duration: ERROR_TOAST_MS,
     });
@@ -2837,7 +2852,7 @@ export default function App() {
     const session = composerKey;
     setDraft(null);
     const id = await savedDraftId(closed, session);
-    discardLater(id === undefined ? [] : [id], draftHasContent(closed) ? () => openComposer({ ...closed, draftId: id }) : undefined);
+    discardLater(id === undefined ? [] : [id], draftHasContent(closed) ? () => void reopenComposer({ ...closed, draftId: id }) : undefined);
   }
 
   /** From the account the Inbox is narrowed to, else the first. */
@@ -3204,7 +3219,7 @@ export default function App() {
     }
     outbox.current.delete(id);
     undoDone?.();
-    openComposer(sent);
+    void reopenComposer(sent);
     if (sent.draftId !== undefined) void reloadMessages();
     reloadPlanned();
   }
@@ -3625,7 +3640,7 @@ export default function App() {
             ? [{ id: "send-again", label: "Send Again", keywords: "resend new copy", Icon: Send, run: () => void sendAgain(m) }]
             : []),
           ...(isDraft(m, folders)
-            ? [{ id: "send-draft", label: "Send Draft", keywords: "send now", Icon: Send, run: () => void sendDraftNow(m) }]
+            ? [{ id: "send-draft", label: "Send Draft", keywords: "send now", Icon: Send, run: () => void track(sendDraftNow(m)) }]
             : []),
           {
             id: "move",
