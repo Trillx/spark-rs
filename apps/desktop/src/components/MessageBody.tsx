@@ -147,6 +147,9 @@ export function HtmlBody({
     () => frameDocument(html, { remoteImages, inlineImages, quotes, card: dark ? cardColor() : null }),
     [html, remoteImages, inlineImages, quotes, dark],
   );
+  /** What the laid-out frame shows from the web (`showsRemote`); until it's laid out, `frame.remote`. */
+  const [shown, setShown] = useState<{ frame: Frame; remote: boolean } | null>(null);
+  const remoteShown = shown?.frame === frame ? shown.remote : frame.remote;
   /** The quote's state for a document that loads later. */
   const quoteShownRef = useRef(quoteShown);
   quoteShownRef.current = quoteShown;
@@ -168,16 +171,29 @@ export function HtmlBody({
       if (!doc || doc === wired || doc.URL !== "about:srcdoc" || !doc.body) return;
       unwire();
       wired = doc;
-      [measure, unwire] = wireFrame(doc, (h) => setHeight(Math.min(h, MAX_FRAME_HEIGHT)));
+      // Once it's parsed (and its colors adapted, which hides it meanwhile), and again as its
+      // layout changes: a media query or the quote can show or hide a picture.
+      let laidOut = false;
+      const check = () => {
+        if (!laidOut || remoteImages || !frame.remote) return;
+        const remote = showsRemote(doc);
+        setShown((s) => (s?.frame === frame && s.remote === remote ? s : { frame, remote }));
+      };
+      [measure, unwire] = wireFrame(doc, (h) => {
+        setHeight(Math.min(h, MAX_FRAME_HEIGHT));
+        check();
+      });
       wiredRef.current = { doc, measure };
       showQuote(doc, quoteShownRef.current);
       const card = frame.adapt;
-      if (card) {
-        whenParsed(doc, () => {
+      whenParsed(doc, () => {
+        if (card) {
           adaptColors(doc, card);
           measure();
-        });
-      }
+        }
+        laidOut = true;
+        check();
+      });
     }
     const poll = () => {
       wire();
@@ -206,7 +222,7 @@ export function HtmlBody({
 
   return (
     <>
-      {!remoteImages && frame.remote && <BlockedImagesBar onShow={onShowImages} onSettings={onImageSettings} />}
+      {!remoteImages && remoteShown && <BlockedImagesBar onShow={onShowImages} onSettings={onImageSettings} />}
       {/* The light theme's sheet blends into the card. In the dark theme, emails
           that stay light sit on a white inset sheet; the rest take the card's color. */}
       <div
@@ -239,7 +255,7 @@ interface Frame {
   adapt: Rgb | null;
   /** A reply's quote of earlier mail is folded into `#spark-quoted`. */
   quoted: boolean;
-  /** It loads something from the web (`loadsRemote`). */
+  /** It loads something from the web (`loadsRemote`), shown or not. */
   remote: boolean;
 }
 
@@ -297,24 +313,46 @@ function frameDocument(
 }
 
 /**
- * Whether an email loads anything from the web: an element's src, srcset or background, or a CSS
- * url(). Read from the parsed document, so an attribute's entities count as the frame reads them.
- * Tracking pixels don't count: the backend has taken them out, so a newsletter with only a tracker
- * gets no bar, as in Spark.
+ * The elements that load something from the web: by src, srcset, background or inline style.
+ * Read from the parsed document, so an attribute's entities count as the frame reads them.
+ * Tracking pixels aren't among them: the backend has taken them out, so a newsletter with only a
+ * tracker gets no bar, as in Spark.
  */
-function loadsRemote(doc: Document) {
-  for (const el of doc.querySelectorAll("[src], [srcset], [background], [style]")) {
+function remoteElements(doc: Document) {
+  return [...doc.querySelectorAll("[src], [srcset], [background], [style]")].filter((el) => {
     const attr = (name: string) => el.getAttribute(name) ?? "";
-    if (
+    return (
       isRemoteUrl(attr("src")) ||
       isRemoteUrl(attr("background")) ||
       srcsetIsRemote(attr("srcset")) ||
       cssIsRemote(attr("style"))
-    ) {
-      return true;
-    }
-  }
+    );
+  });
+}
+
+/** Whether a style sheet loads anything from the web; what it applies to isn't worked out. */
+function sheetsLoadRemote(doc: Document) {
   return [...doc.querySelectorAll("style")].some((style) => cssIsRemote(style.textContent ?? ""));
+}
+
+/** Whether an email loads anything from the web, shown or not. */
+function loadsRemote(doc: Document) {
+  return remoteElements(doc).length > 0 || sheetsLoadRemote(doc);
+}
+
+/**
+ * Whether the laid-out email shows anything from the web. A hidden picture, like a newsletter's
+ * banner for phones on a wide screen, doesn't count: Show images wouldn't show it. A `<source>`
+ * shows through its picture's `<img>`.
+ */
+function showsRemote(doc: Document) {
+  return (
+    sheetsLoadRemote(doc) ||
+    remoteElements(doc).some((el) => {
+      const shown = el.tagName === "SOURCE" ? el.parentElement?.querySelector("img") : el;
+      return shown?.checkVisibility({ visibilityProperty: true, opacityProperty: true }) ?? false;
+    })
+  );
 }
 
 // `:root:root` outranks the email's own html/body rules, so the document's
