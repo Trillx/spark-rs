@@ -107,7 +107,9 @@ import {
   onMailto,
   openThreadWindow,
   closeWindow,
+  onSearchInMain,
   onWindowClose,
+  searchInMain,
   openDraft,
   patched,
   prioritizeSenders,
@@ -891,6 +893,7 @@ export default function App() {
     openCalendarAt,
     openSettings,
     otherWindowEdited,
+    searchFor,
   });
   events.current = {
     reloadMessages,
@@ -904,6 +907,7 @@ export default function App() {
     openCalendarAt,
     openSettings,
     otherWindowEdited,
+    searchFor,
   };
   useEffect(() => {
     const stops = [
@@ -924,6 +928,7 @@ export default function App() {
             onAgentSending((e) => events.current.agentSending(e)),
             onOpenCalendar((focus) => events.current.openCalendarAt(focus)),
             onOpenSettings((page) => events.current.openSettings(page)),
+            onSearchInMain((query) => events.current.searchFor(query)),
           ]
         : []),
     ];
@@ -1020,20 +1025,26 @@ export default function App() {
    */
   async function settleWindow(asked: boolean): Promise<boolean> {
     const session = composer.current.key;
+    /** Composer sessions this closed: one still showing is waiting for React to catch up. */
+    const closed = new Set<number>();
     for (let round = 0; round < 4; round++) {
       const { draft: open, key } = composer.current;
-      if (open) {
+      if (open && !closed.has(key)) {
         if (!asked && key !== session) return false;
         if (!(await track(latestCloseComposer.current()))) return false;
+        closed.add(key);
       }
-      await Promise.allSettled([...inFlight.current]);
+      const results = await Promise.allSettled([...inFlight.current]);
+      // A composer close that was already saving, and failed: its error offers the draft back.
+      if (results.some((r) => r.status === "fulfilled" && r.value === false)) return false;
       await draftSaves.current.catch(() => {});
       for (const [timer, discard] of [...pendingDiscards.current]) {
         window.clearTimeout(timer);
         pendingDiscards.current.delete(timer);
         await discard();
       }
-      if (!composer.current.draft && inFlight.current.size === 0) return true;
+      const now = composer.current;
+      if ((!now.draft || closed.has(now.key)) && inFlight.current.size === 0) return true;
     }
     return false;
   }
@@ -1856,14 +1867,16 @@ export default function App() {
     unsnooze: (m: Message) => act(together(m), { state: "inbox" }, "Snooze discarded", ICONS.inbox),
     mute,
     unsubscribe: unsubscribeFrom,
-    searchSender: (m: Message) => searchFor(`from:${m.address}`),
+    // A conversation's own window has no list: the main window searches.
+    searchSender: (m: Message) =>
+      THREAD_WINDOW === null ? searchFor(`from:${m.address}`) : void searchInMain(`from:${m.address}`),
     accept: (m: Message) => decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept),
     acceptAndOpen: (m: Message) => {
       decide(forSenders([m], "accepted"), "Sender accepted", ICONS.accept);
       if (view.folder !== "inbox" || view.sub || view.search !== null) {
         changeView({ folder: "inbox", sub: null, search: null }, true);
       }
-      openThread(m.id);
+      openConversation(m.id);
     },
     acceptAndDone: (m: Message) => {
       const waiting = waitingFrom(m);
@@ -4052,7 +4065,7 @@ export default function App() {
               onFilter={changeHomeFilter}
               onOpen={(m) => {
                 setPicked(new Set());
-                openThread(m.id);
+                openConversation(m.id);
               }}
               onDismiss={(m) => updateHome((s) => dismissFromHome(s, m.id))}
               onClearAll={() => updateHome((s) => clearHomeFeed(s, Date.now()))}

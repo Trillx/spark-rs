@@ -3,7 +3,9 @@
 //! it's for by a script that runs before the page (`window.__sparkThread`);
 //! it shows that conversation alone, and closes when it's done with it.
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+use crate::background;
 
 /// Opens conversation `id` (titled `title`) in its own window, or brings
 /// its window forward if it has one. Async, as making a window from a
@@ -27,4 +29,12 @@ pub async fn open_thread_window(app: AppHandle, id: i64, title: String) -> Resul
         .build()
         .map(|_| ())
         .map_err(|e| format!("Couldn't open the window: {e}"))
+}
+
+/// A search asked for in a conversation's own window (Search Emails by
+/// Sender): the main window, which has the list, comes forward and does it.
+#[tauri::command]
+pub fn search_in_main(app: AppHandle, query: String) {
+    background::show(&app);
+    let _ = app.emit_to("main", "search-in-main", query);
 }

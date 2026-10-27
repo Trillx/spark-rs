@@ -158,6 +158,7 @@ fn main() {
             mailbox::read_image,
             mailbox::save_eml,
             thread_window::open_thread_window,
+            thread_window::search_in_main,
             mailbox::prefetch_attachments,
             mailto::take_mailto,
             mailto::mail_app,

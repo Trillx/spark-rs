@@ -585,6 +585,15 @@ export function onWindowClose(before: () => Promise<boolean>): () => void {
   return () => void stop.then((unlisten) => unlisten());
 }
 
+/** Has the main window search (from a conversation's own window, which has no list), and come forward. */
+export function searchInMain(query: string): Promise<void> {
+  if (isTauri()) return invoke("search_in_main", { query });
+  return Promise.resolve();
+}
+
+/** For the main window: a conversation's own window asked for a search. */
+export const onSearchInMain = (handler: (query: string) => void) => on("search-in-main", handler);
+
 /** Closes this window (a conversation's own). */
 export function closeWindow() {
   if (isTauri()) void getCurrentWindow().close();
