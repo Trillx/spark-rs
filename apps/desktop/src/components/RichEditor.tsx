@@ -52,8 +52,8 @@ import { tipAttrs, type Tip } from "../lib/tooltip";
 // signature it's edited in a frame sandboxed without `allow-scripts`, under
 // its own CSP. `allow-same-origin` lets this side size it, read what's typed
 // and run the editing commands; with scripts off, the content can't use it.
-// Unlike a signature it takes the app's colors: what's typed has none of its
-// own, so the recipient reads it in theirs.
+// It takes the app's colors, and unlike a signature's, its own colors aren't
+// adapted: what's typed has none, so the recipient reads it in theirs.
 
 /** Shortcuts the editor keeps; other ones with Ctrl/Cmd, and Esc, go to the app. */
 const EDITING_KEYS = new Set(["a", "b", "c", "i", "u", "v", "x", "y", "z"]);
