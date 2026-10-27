@@ -164,6 +164,7 @@ struct GraphEventDetails {
     start: Option<GraphTime>,
     end: Option<GraphTime>,
     is_all_day: bool,
+    original_start_time_zone: Option<String>,
     attendees: Vec<serde_json::Value>,
     body: Option<GraphBody>,
     recurrence: serde_json::Value,
@@ -492,6 +493,7 @@ pub fn changed_event_body(
                 recurrence::changed(
                     old,
                     rule,
+                    before.repeat.as_ref(),
                     days,
                     start,
                     &date_in(zone, draft.start, draft.all_day),
@@ -613,6 +615,17 @@ pub fn series_from(
             (
                 json!({ "dateTime": start, "timeZone": zone.name }),
                 json!({ "dateTime": end, "timeZone": zone.name }),
+            )
+        }
+        // All day: as many days as the series has now, unless the user
+        // changed its end.
+        (Some((from, _)), Some((to, _)))
+            if draft.all_day && before.all_day && draft.end == before.end =>
+        {
+            let days = ((to - from) as f64 / DAY_MS as f64).round().max(1.0) as i64;
+            (
+                zone.time(draft.start, true),
+                zone.time(draft.start + days * DAY_MS, true),
             )
         }
         _ => (
@@ -1024,7 +1037,8 @@ impl Graph {
                 self.request(
                     Method::GET,
                     &format!(
-                        "/me/events/{}?$select=start,end,isAllDay,attendees,body,recurrence",
+                        "/me/events/{}?$select=start,end,isAllDay,attendees,body,recurrence,\
+                         originalStartTimeZone",
                         path(id)
                     ),
                 )
@@ -1036,9 +1050,32 @@ impl Graph {
             let ms = t.and_then(|t| parse_iso_date(&t.date_time))?;
             Some(if all_day { nearest_midnight(ms) } else { ms })
         };
+        let (mut start, mut end) = (time(e.start), time(e.end));
+        // An all-day event's days are its own time zone's: read there, as
+        // rounding UTC's to the nearest midnight is a day off 13 hours from it.
+        let own = e
+            .original_start_time_zone
+            .filter(|z| !z.is_empty() && z != "UTC");
+        if let (true, Some(own)) = (all_day, own) {
+            let there: serde_json::Value = self
+                .json(
+                    self.request(
+                        Method::GET,
+                        &format!("/me/events/{}?$select=start,end", path(id)),
+                    )
+                    .header("Prefer", format!("outlook.timezone=\"{own}\"")),
+                )
+                .await?;
+            let day = |key: &str| {
+                let date = there[key]["dateTime"].as_str()?.get(..10)?;
+                parse_iso_date(&format!("{date}T00:00:00Z"))
+            };
+            start = day("start").or(start);
+            end = day("end").or(end);
+        }
         Ok(EventDetails {
-            start: time(e.start).unwrap_or_default(),
-            end: time(e.end).unwrap_or_default(),
+            start: start.unwrap_or_default(),
+            end: end.unwrap_or_default(),
             attendees: e.attendees,
             body: e.body.and_then(|b| b.content).unwrap_or_default(),
             recurrence: e.recurrence,
@@ -2011,6 +2048,32 @@ mod tests {
         let body = series_from(&master, &later, &before, PACIFIC, json!(null));
         assert_eq!(body["start"]["dateTime"], "2026-11-03T09:30:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T10:30:00");
+    }
+
+    #[test]
+    fn all_future_keeps_an_all_day_series_length_as_outlook_has_it() {
+        // Two days when the editor opened; three in Outlook now.
+        let master = json!({
+            "subject": "Retreat",
+            "isAllDay": true,
+            "start": { "dateTime": "2026-10-13T07:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-10-16T07:00:00.0000000", "timeZone": "UTC" }
+        });
+        let start = parse_iso_date("2026-11-10T00:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Retreat".into(),
+            start,
+            end: start + 2 * DAY_MS,
+            all_day: true,
+            ..Default::default()
+        };
+        let renamed = EventDraft {
+            title: "Team retreat".into(),
+            ..before.clone()
+        };
+        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        assert_eq!(body["start"]["dateTime"], "2026-11-10T00:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-13T00:00:00");
     }
 
     #[test]

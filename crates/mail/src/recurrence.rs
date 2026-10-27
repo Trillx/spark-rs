@@ -290,7 +290,8 @@ pub fn by_date(recurrence: &Value) -> bool {
 }
 
 /// What a series' Graph `old` recurrence becomes for a change: `rule` if
-/// the editor changed it, else `old` itself. An occurrence moved `days`
+/// the editor changed it (from `opened`, the rule it opened with), else
+/// `old` itself. An occurrence moved `days`
 /// days, to `on` ("2026-10-27"): a pattern that was the series' own moves
 /// with it, weekly days by as many and monthly and yearly ones to `on`'s
 /// date or week. With `start`, the series' first day and time zone moved
@@ -300,6 +301,7 @@ pub fn by_date(recurrence: &Value) -> bool {
 pub fn changed(
     old: &Value,
     rule: Option<&Repeat>,
+    opened: Option<&Repeat>,
     days: i64,
     start: Option<(&str, &str)>,
     on: &str,
@@ -322,7 +324,10 @@ pub fn changed(
         },
         |(_, zone)| zone.to_owned(),
     );
-    let was = Repeat::from_graph(old);
+    // The pattern is the user's only if they changed it from what the
+    // editor opened with (`opened`); else Outlook's, which may have changed
+    // since.
+    let was = opened.cloned().or_else(|| Repeat::from_graph(old));
     let own_pattern = match (rule, &was) {
         (None, _) => true,
         (Some(rule), Some(was)) => pattern(rule) == pattern(was),
@@ -543,7 +548,7 @@ mod tests {
         // Only its end changed: the pattern stays exactly as it was.
         let mut rule = Repeat::from_graph(&old).unwrap();
         rule.ends = Ends::After { times: 6 };
-        let out = changed(&old, Some(&rule), 0, None, "2026-10-31");
+        let out = changed(&old, Some(&rule), None, 0, None, "2026-10-31");
         assert_eq!(out["pattern"], old["pattern"]);
         assert_eq!(
             out["range"],
@@ -552,7 +557,7 @@ mod tests {
         // A new pattern keeps the week's first day.
         rule.weekdays = vec![6];
         assert_eq!(
-            changed(&old, Some(&rule), 0, None, "2026-10-31")["pattern"]["firstDayOfWeek"],
+            changed(&old, Some(&rule), None, 0, None, "2026-10-31")["pattern"]["firstDayOfWeek"],
             "monday"
         );
 
@@ -570,6 +575,7 @@ mod tests {
         let out = changed(
             &tuesdays,
             None,
+            None,
             1,
             Some(("2026-11-11", "Pacific Standard Time")),
             "2026-11-11",
@@ -582,7 +588,14 @@ mod tests {
             "pattern": { "type": "weekly", "interval": 2, "daysOfWeek": ["friday", "saturday"], "firstDayOfWeek": "sunday" },
             "range": { "type": "noEnd", "startDate": "2026-10-30", "recurrenceTimeZone": "UTC" }
         });
-        let out = changed(&weekend, None, 1, Some(("2026-10-31", "UTC")), "2026-10-31");
+        let out = changed(
+            &weekend,
+            None,
+            None,
+            1,
+            Some(("2026-10-31", "UTC")),
+            "2026-10-31",
+        );
         assert_eq!(out["pattern"]["daysOfWeek"], json!(["saturday", "sunday"]));
         assert_eq!(out["pattern"]["firstDayOfWeek"], "monday");
         let monthly = json!({
@@ -591,6 +604,7 @@ mod tests {
         });
         let out = changed(
             &monthly,
+            None,
             None,
             15,
             Some(("2026-10-28", "UTC")),
@@ -604,6 +618,32 @@ mod tests {
             ending_on(&tuesdays, "2027-01-26")["range"]["endDate"],
             "2027-01-26"
         );
+    }
+
+    #[test]
+    fn an_end_changed_here_keeps_days_added_in_outlook() {
+        // The editor opened with Tuesdays; Outlook has Tuesdays and Thursdays now.
+        let opened = Repeat {
+            every: Every::Week,
+            interval: 1,
+            weekdays: vec![2],
+            nth: None,
+            day: None,
+            month: None,
+            ends: Ends::Never,
+        };
+        let now = Repeat {
+            weekdays: vec![2, 4],
+            ..opened.clone()
+        }
+        .to_graph("2026-10-27", "UTC");
+        let ends = Repeat {
+            ends: Ends::After { times: 8 },
+            ..opened.clone()
+        };
+        let out = changed(&now, Some(&ends), Some(&opened), 0, None, "2026-10-27");
+        assert_eq!(out["pattern"]["daysOfWeek"], json!(["tuesday", "thursday"]));
+        assert_eq!(out["range"]["numberOfOccurrences"], 8);
     }
 
     #[test]

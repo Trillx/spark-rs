@@ -1746,7 +1746,14 @@ impl Engine {
         } else {
             None
         };
-        let mut new = recurrence::changed(&old, rule, days, Some((&from, zone.name)), &from);
+        let mut new = recurrence::changed(
+            &old,
+            rule,
+            before.repeat.as_ref(),
+            days,
+            Some((&from, zone.name)),
+            &from,
+        );
         // Read from Outlook's own range, so a rule the editor doesn't know
         // counts too.
         let ends_kept =
