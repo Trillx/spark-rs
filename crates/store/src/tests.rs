@@ -1308,6 +1308,41 @@ fn queued_sends_can_be_cancelled_until_claimed() {
 }
 
 #[test]
+fn due_sends_are_claimed_one_at_a_time() {
+    let (mut store, account) = store_with_account();
+    let a = store.queue_send(account, "{\"a\":1}", 5_000, &[]).unwrap();
+    let b = store.queue_send(account, "{\"b\":1}", 4_000, &[]).unwrap();
+    let later = store.queue_send(account, "{\"c\":1}", 9_000, &[]).unwrap();
+    assert_eq!(store.due_sends(account, 5_000).unwrap(), [b, a]);
+    assert!(store.due_sends(account + 1, 5_000).unwrap().is_empty());
+
+    // The one being tried can no longer be cancelled; the next one can.
+    assert_eq!(
+        store.claim_send(b, 5_000).unwrap().as_deref(),
+        Some("{\"b\":1}")
+    );
+    assert!(store.is_sending(b).unwrap() && !store.is_sending(a).unwrap());
+    assert!(!store.cancel_send(b).unwrap());
+    assert_eq!(store.claim_send(b, 5_000).unwrap(), None, "claimed once");
+    assert!(store.cancel_send(a).unwrap());
+    assert_eq!(store.claim_send(a, 5_000).unwrap(), None, "cancelled");
+    assert_eq!(store.claim_send(later, 5_000).unwrap(), None, "not due");
+    assert_eq!(store.due_sends(account, 9_000).unwrap(), [later]);
+
+    store.retry_send(b, 6_000).unwrap();
+    assert!(!store.is_sending(b).unwrap());
+    assert!(!store.release_send(b).unwrap(), "settled already");
+    assert!(store.due_sends(account, 5_999).unwrap().is_empty());
+
+    // A try cut off goes back in the queue as it was.
+    assert!(store.claim_send(b, 6_000).unwrap().is_some());
+    assert!(store.release_send(b).unwrap());
+    assert_eq!(store.due_sends(account, 6_000).unwrap(), [b]);
+    store.finish_send(b).unwrap();
+    assert!(!store.is_sending(b).unwrap() && !store.release_send(b).unwrap());
+}
+
+#[test]
 fn queued_files_stay_with_their_draft_until_it_is_gone() {
     let (mut store, account) = store_with_account();
     let files = [

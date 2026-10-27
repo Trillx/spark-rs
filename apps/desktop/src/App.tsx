@@ -1488,6 +1488,14 @@ export default function App() {
     }, options.duration ?? TOAST_MS);
   }
 
+  /** Takes toast `id` down if it's still showing. */
+  function closeToast(id: number) {
+    if (toastNow.current?.id !== id) return;
+    window.clearTimeout(toastTimer.current);
+    setToast(null);
+    toastNow.current = null;
+  }
+
   function undoToast() {
     window.clearTimeout(toastTimer.current);
     // Undo that's still putting things back (a send cancelled, its draft reopened) keeps a
@@ -2613,10 +2621,32 @@ export default function App() {
 
   // ---- Scheduled and Reminders ----
 
+  /**
+   * Changes a queued send, once a try of it under way is over: says it's waiting if that takes a moment, and why
+   * if the change failed (undefined then).
+   */
+  async function changeQueued<T>(change: () => Promise<T>): Promise<T | undefined> {
+    let waiting: number | undefined;
+    const slow = window.setTimeout(() => {
+      showToast("Waiting for the try under way to end…", undefined, ICONS.send, { duration: 5 * 60_000 });
+      waiting = toastNow.current?.id;
+    }, 600);
+    try {
+      return await change();
+    } catch (error) {
+      showToast(String(error), undefined, ICONS.error, { duration: ERROR_TOAST_MS });
+      return undefined;
+    } finally {
+      window.clearTimeout(slow);
+      if (waiting !== undefined) closeToast(waiting);
+      reloadPlanned();
+    }
+  }
+
   /** Takes a queued send into Drafts exactly as queued, then opens it there: nothing is lost if editing stops. */
   async function editQueued(outboxId: number) {
-    const id = await unscheduleSend(outboxId, true).catch(() => null);
-    reloadPlanned();
+    const id = await changeQueued(() => unscheduleSend(outboxId, true));
+    if (id === undefined) return;
     if (id === null) return showToast("Already sent", undefined, ICONS.send);
     await reloadMessages();
     void editDraft({ id });
@@ -2625,9 +2655,8 @@ export default function App() {
   const scheduledActions: ScheduledActions = {
     edit: (item) => editQueued(item.id),
     sendNow: async (item) => {
-      const moved = await rescheduleSend(item.id, null).catch(() => false);
-      showToast(moved ? "Sending now" : "Already sent", undefined, ICONS.send);
-      reloadPlanned();
+      const moved = await changeQueued(() => rescheduleSend(item.id, null));
+      if (moved !== undefined) showToast(moved ? "Sending now" : "Already sent", undefined, ICONS.send);
     },
     reschedule: (item) =>
       setPickTime({
@@ -2635,14 +2664,14 @@ export default function App() {
         confirmLabel: "Schedule",
         initial: item.sendAt,
         run: async (at) => {
-          const moved = await rescheduleSend(item.id, at);
+          const moved = await changeQueued(() => rescheduleSend(item.id, at));
+          if (moved === undefined) return;
           showToast(moved ? `Scheduled for ${formatLater(at)}` : "Already sent", undefined, ICONS.send);
-          reloadPlanned();
         },
       }),
     cancel: async (item) => {
-      const id = await unscheduleSend(item.id, false).catch(() => null);
-      reloadPlanned();
+      const id = await changeQueued(() => unscheduleSend(item.id, false));
+      if (id === undefined) return;
       if (id === null) return showToast("Already sent", undefined, ICONS.send);
       showToast("Not sent: it's in Drafts", undefined, ICONS.draft);
       void reloadMessages();

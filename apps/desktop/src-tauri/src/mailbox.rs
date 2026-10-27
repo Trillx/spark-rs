@@ -717,9 +717,10 @@ pub fn list_scheduled(mailbox: State<'_, Mailbox>) -> Result<Vec<ScheduledView>,
         .collect())
 }
 
-/// Sends a scheduled message at `at` instead, or now. False once it's gone out.
+/// Sends a scheduled message at `at` instead, or now, once a try of it under
+/// way is over. False once it's gone out.
 #[tauri::command]
-pub fn reschedule_send(
+pub async fn reschedule_send(
     mailbox: State<'_, Mailbox>,
     id: i64,
     at: Option<i64>,
@@ -727,12 +728,7 @@ pub fn reschedule_send(
     if !mailbox.live() {
         return Ok(false);
     }
-    let moved = mailbox
-        .live
-        .engine
-        .store()
-        .reschedule_send(id, at, now_ms())
-        .map_err(text)?;
+    let moved = mailbox.live.engine.reschedule(id, at).await.map_err(text)?;
     // Sent now: the account's worker sends it on its next round.
     if moved && at.is_none() {
         mailbox.live.sync_now();
@@ -740,11 +736,12 @@ pub fn reschedule_send(
     Ok(moved)
 }
 
-/// Takes a scheduled message out of the queue into Drafts, exactly as it
-/// was queued, to edit (`keep_schedule`: with its time) or to keep. Returns
-/// the draft's id, or `None` once it's gone out.
+/// Takes a queued message out of the queue into Drafts, exactly as it was
+/// queued, to edit (`keep_schedule`: with its time) or to keep, once a try
+/// of it under way is over. Returns the draft's id, or `None` once it's
+/// gone out.
 #[tauri::command]
-pub fn unschedule_send(
+pub async fn unschedule_send(
     app: AppHandle,
     mailbox: State<'_, Mailbox>,
     id: i64,
@@ -757,6 +754,7 @@ pub fn unschedule_send(
         .live
         .engine
         .unschedule(id, keep_schedule)
+        .await
         .map_err(text)?;
     let _ = app.emit("mailbox-changed", ());
     Ok(draft)

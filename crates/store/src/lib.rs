@@ -2093,6 +2093,40 @@ impl Store {
         Ok(due)
     }
 
+    /// The account's sends due by `now`, soonest first, to be tried one at a
+    /// time (`claim_send`): the others stay queued meanwhile.
+    pub fn due_sends(&self, account_id: i64, now: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM outbox
+             WHERE account_id = ?1 AND status = 'queued' AND send_at <= ?2 ORDER BY send_at, id",
+        )?;
+        stmt.query_map(params![account_id, now], |r| r.get(0))?
+            .collect()
+    }
+
+    /// Takes send `id` to try now, if it's still queued and due by `now`,
+    /// marking it as sending so it can no longer be cancelled. Returns its
+    /// draft (JSON).
+    pub fn claim_send(&self, id: i64, now: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "UPDATE outbox SET status = 'sending'
+                 WHERE id = ?1 AND status = 'queued' AND send_at <= ?2 RETURNING draft",
+                params![id, now],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Whether a try of send `id` is under way (`claim_send`).
+    pub fn is_sending(&self, id: i64) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM outbox WHERE id = ?1 AND status = 'sending')",
+            [id],
+            |r| r.get(0),
+        )
+    }
+
     /// Puts a claimed draft back in the queue to try again at `send_at`.
     pub fn retry_send(&self, id: i64, send_at: i64) -> Result<()> {
         self.conn.execute(
@@ -2100,6 +2134,15 @@ impl Store {
             params![id, send_at],
         )?;
         Ok(())
+    }
+
+    /// Puts send `id` back in the queue if a try of it was cut off before
+    /// it was settled (it's still sending); one settled is left be.
+    pub fn release_send(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE outbox SET status = 'queued' WHERE id = ?1 AND status = 'sending'",
+            [id],
+        )? == 1)
     }
 
     /// The draft is out (or failed for good): forget it.

@@ -45,6 +45,10 @@ const SEND_RETRY_MS: i64 = 60_000;
 /// or the network coming back after sleep, isn't.
 const SEND_TELL_TRIES: u32 = 3;
 const SEND_TELL_AFTER_MS: i64 = 10 * 60_000;
+/// The longest taking back or moving a queued send waits for a try of it
+/// under way to end (`Engine::between_tries`): a try's every request has a
+/// time limit, and those of a big forward add up.
+const SEND_WAIT: Duration = Duration::from_secs(5 * 60);
 /// How many waiting senders a round asks the Sent folder about, at most.
 const SENT_CHECKS: usize = 20;
 /// A waiting sender the Sent folder didn't have is asked about again after
@@ -231,6 +235,26 @@ struct FailingSend {
     told: bool,
 }
 
+/// A send claimed for a try (`Store::claim_send`). Once the try is over,
+/// whoever waits to change the send hears so (`Engine::between_tries`).
+/// A try cut off part way, as when the account's worker stops, puts the
+/// send back in the queue, as a restart does; one that ended in an error
+/// of the store's doesn't, as it may have gone out.
+struct Trying<'a> {
+    engine: &'a Engine,
+    id: i64,
+    cut_off: bool,
+}
+
+impl Drop for Trying<'_> {
+    fn drop(&mut self) {
+        if self.cut_off {
+            let _ = self.engine.store().release_send(self.id);
+        }
+        self.engine.send_tried.notify_waiters();
+    }
+}
+
 /// Whether an account's calendar can show.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
@@ -353,6 +377,8 @@ pub struct Engine {
     /// Queued sends failing on the network, by outbox id, in memory only:
     /// a restart counts their tries again.
     failing_sends: Mutex<HashMap<i64, FailingSend>>,
+    /// A try of a queued send ended (`Trying`).
+    send_tried: Notify,
 }
 
 impl Engine {
@@ -370,6 +396,7 @@ impl Engine {
             paces: Mutex::new(HashMap::new()),
             bodies: Mutex::new(HashMap::new()),
             failing_sends: Mutex::new(HashMap::new()),
+            send_tried: Notify::new(),
         }
     }
 
@@ -1808,109 +1835,129 @@ impl Engine {
         Ok(OwnDraft::Deleted)
     }
 
-    /// Sends the account's drafts whose time has come. One that fails on the
-    /// network stays queued, to be tried again. One that keeps failing so,
-    /// as a forward does whose original the server drops the connection
-    /// over, is told of once (`failed_again`), and still tried.
-    pub async fn send_due(&self, account_id: i64) -> Result<Vec<SendOutcome>> {
-        self.send_due_each(account_id, |_| {}).await
-    }
-
-    /// `send_due`, telling `each` how each send went as soon as it's done:
-    /// a reply that's gone is answered then, not once the others are too.
+    /// Sends the account's drafts whose time has come, one at a time: those
+    /// waiting their turn stay queued, so they can still be taken back.
+    /// `tell` hears how each went as soon as it's over, well before it's
+    /// tried again. One that fails on the network stays queued, to be tried
+    /// again. One that keeps failing so, as a forward does whose original
+    /// the server drops the connection over, is told of once
+    /// (`failed_again`), and still tried.
     pub async fn send_due_each(
         &self,
         account_id: i64,
-        mut each: impl FnMut(&SendOutcome),
-    ) -> Result<Vec<SendOutcome>> {
-        let due = self.store().claim_due_sends(account_id, now_ms())?;
-        let mut outcomes = Vec::new();
-        for (id, json) in due {
-            let parsed = serde_json::from_str::<Draft>(&json);
-            let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
-            let reply_to = parsed
-                .as_ref()
-                .ok()
-                .and_then(|d| self.answers(account_id, d));
-            let recipients = parsed.as_ref().map(drafts::sent_to).unwrap_or_default();
-            let result = match &parsed {
-                Ok(draft) => self.send_draft(account_id, id, draft).await,
-                Err(e) => Err(Error::Config(format!(
-                    "The queued message is unreadable: {e}"
-                ))),
+        mut tell: impl FnMut(SendOutcome),
+    ) -> Result<()> {
+        let due = self.store().due_sends(account_id, now_ms())?;
+        for id in due {
+            // Taken back or put off meanwhile.
+            let Some(json) = self.store().claim_send(id, now_ms())? else {
+                continue;
             };
-            let mut draft_id = None;
-            let mut queued = false;
-            if !matches!(result, Err(Error::Network { .. })) {
-                self.failing_sends_lock().remove(&id);
-            }
-            let result = match result {
-                Ok(message_id) => {
-                    // The saved draft it came from is done with, here and on the server.
-                    if let Some(saved) = saved_draft {
-                        self.store().discard_draft(saved)?;
-                    }
-                    self.store().finish_send(id)?;
-                    if let Ok(draft) = &parsed
-                        && let Some(remind) = &draft.remind
-                    {
-                        let to = [&draft.to, &draft.cc, &draft.bcc]
-                            .into_iter()
-                            .filter(|f| !f.trim().is_empty())
-                            .map(|f| f.trim())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.store().add_reminder(&NewReminder {
-                            account_id,
-                            message_id: message_id.as_deref(),
-                            reply_to: draft.reply_to,
-                            subject: draft.subject.trim(),
-                            to: &to,
-                            sent_at: now_ms(),
-                            remind_at: remind.at,
-                            if_no_reply: remind.if_no_reply,
-                        })?;
-                    }
-                    // Delivery is complete even if learning its recipients fails.
-                    let _ = self.store().record_sent(&recipients, now_ms());
-                    Ok(true)
-                }
-                // Offline or the server is busy: keep it queued.
-                Err(e @ Error::Network { .. }) => {
-                    self.store().retry_send(id, now_ms() + SEND_RETRY_MS)?;
-                    queued = self.failed_again(id, &json, now_ms());
-                    if queued { Err(e) } else { Ok(false) }
-                }
-                Err(e) => {
-                    if let Ok(draft) = parsed {
-                        let mut store = self.store();
-                        let account = store
-                            .account(account_id)?
-                            .ok_or_else(|| Error::Config("That account was removed.".into()))?;
-                        let files = store.outbox_files(id)?;
-                        draft_id = Some(drafts::recover_failed_send(
-                            &mut store,
-                            &account,
-                            &draft,
-                            &files,
-                            now_ms(),
-                            id,
-                        )?);
-                    }
-                    Err(e)
-                }
-            };
-            let outcome = SendOutcome {
+            let mut trying = Trying {
+                engine: self,
                 id,
-                draft_id,
-                reply_to,
-                result,
-                queued,
+                cut_off: true,
             };
-            each(&outcome);
-            outcomes.push(outcome);
+            let outcome = self.send_claimed(account_id, id, &json).await;
+            trying.cut_off = false;
+            drop(trying);
+            tell(outcome?);
         }
+        Ok(())
+    }
+
+    /// `send_due_each`, told of them all at the end.
+    pub async fn send_due(&self, account_id: i64) -> Result<Vec<SendOutcome>> {
+        let mut outcomes = Vec::new();
+        self.send_due_each(account_id, |outcome| outcomes.push(outcome))
+            .await?;
         Ok(outcomes)
+    }
+
+    /// Tries claimed send `id` (`json`), and settles it: sent, queued again,
+    /// or back in Drafts.
+    async fn send_claimed(&self, account_id: i64, id: i64, json: &str) -> Result<SendOutcome> {
+        let parsed = serde_json::from_str::<Draft>(json);
+        let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
+        let reply_to = parsed
+            .as_ref()
+            .ok()
+            .and_then(|d| self.answers(account_id, d));
+        let recipients = parsed.as_ref().map(drafts::sent_to).unwrap_or_default();
+        let result = match &parsed {
+            Ok(draft) => self.send_draft(account_id, id, draft).await,
+            Err(e) => Err(Error::Config(format!(
+                "The queued message is unreadable: {e}"
+            ))),
+        };
+        let mut draft_id = None;
+        let mut queued = false;
+        if !matches!(result, Err(Error::Network { .. })) {
+            self.failing_sends_lock().remove(&id);
+        }
+        let result = match result {
+            Ok(message_id) => {
+                // The saved draft it came from is done with, here and on the server.
+                if let Some(saved) = saved_draft {
+                    self.store().discard_draft(saved)?;
+                }
+                self.store().finish_send(id)?;
+                if let Ok(draft) = &parsed
+                    && let Some(remind) = &draft.remind
+                {
+                    let to = [&draft.to, &draft.cc, &draft.bcc]
+                        .into_iter()
+                        .filter(|f| !f.trim().is_empty())
+                        .map(|f| f.trim())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.store().add_reminder(&NewReminder {
+                        account_id,
+                        message_id: message_id.as_deref(),
+                        reply_to: draft.reply_to,
+                        subject: draft.subject.trim(),
+                        to: &to,
+                        sent_at: now_ms(),
+                        remind_at: remind.at,
+                        if_no_reply: remind.if_no_reply,
+                    })?;
+                }
+                // Delivery is complete even if learning its recipients fails.
+                let _ = self.store().record_sent(&recipients, now_ms());
+                Ok(true)
+            }
+            // Offline or the server is busy: keep it queued.
+            Err(e @ Error::Network { .. }) => {
+                self.store().retry_send(id, now_ms() + SEND_RETRY_MS)?;
+                queued = self.failed_again(id, json, now_ms());
+                if queued { Err(e) } else { Ok(false) }
+            }
+            Err(e) => {
+                if let Ok(draft) = parsed {
+                    let mut store = self.store();
+                    let account = store
+                        .account(account_id)?
+                        .ok_or_else(|| Error::Config("That account was removed.".into()))?;
+                    let files = store.outbox_files(id)?;
+                    draft_id = Some(drafts::recover_failed_send(
+                        &mut store,
+                        &account,
+                        &draft,
+                        &files,
+                        now_ms(),
+                        id,
+                    )?);
+                }
+                Err(e)
+            }
+        };
+        Ok(SendOutcome {
+            id,
+            draft_id,
+            reply_to,
+            result,
+            queued,
+        })
     }
 
     /// The stored email `draft` replies to: the one it quotes, or, for one
@@ -1962,27 +2009,81 @@ impl Engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Takes a scheduled send out of the queue into Drafts, exactly as it was
+    /// Takes a queued send out of the queue into Drafts, exactly as it was
     /// queued, its files too (in one step, so nothing is lost), to edit or to
-    /// keep; `keep_schedule` keeps its Send Later time on the draft. Returns
-    /// the draft, or `None` once it's sending or gone.
-    pub fn unschedule(&self, outbox_id: i64, keep_schedule: bool) -> Result<Option<i64>> {
-        let mut store = self.store();
-        let Some((account_id, json)) = store.queued_send(outbox_id)? else {
-            return Ok(None);
-        };
-        let mut draft: Draft = serde_json::from_str(&json)
-            .map_err(|e| Error::Config(format!("The queued message is unreadable: {e}")))?;
-        if !keep_schedule {
-            draft.send_later = None;
+    /// keep; `keep_schedule` keeps its Send Later time on the draft. A try of
+    /// it under way is waited out (`between_tries`). Returns the draft, or
+    /// `None` once it's gone: sent, or back in Drafts having failed.
+    pub async fn unschedule(&self, outbox_id: i64, keep_schedule: bool) -> Result<Option<i64>> {
+        let id = self
+            .between_tries(outbox_id, |store| {
+                let Some((account_id, json)) = store.queued_send(outbox_id)? else {
+                    return Ok(None);
+                };
+                let mut draft: Draft = serde_json::from_str(&json)
+                    .map_err(|e| Error::Config(format!("The queued message is unreadable: {e}")))?;
+                if !keep_schedule {
+                    draft.send_later = None;
+                }
+                let account = store
+                    .account(account_id)?
+                    .ok_or_else(|| Error::Config("That account was removed.".into()))?;
+                let files = store.outbox_files(outbox_id)?;
+                let id = drafts::recover_failed_send(
+                    store,
+                    &account,
+                    &draft,
+                    &files,
+                    now_ms(),
+                    outbox_id,
+                )?;
+                Ok(Some(id))
+            })
+            .await?;
+        if id.is_some() {
+            self.failing_sends_lock().remove(&outbox_id);
         }
-        let account = store
-            .account(account_id)?
-            .ok_or_else(|| Error::Config("That account was removed.".into()))?;
-        let files = store.outbox_files(outbox_id)?;
-        let id =
-            drafts::recover_failed_send(&mut store, &account, &draft, &files, now_ms(), outbox_id)?;
-        Ok(Some(id))
+        Ok(id)
+    }
+
+    /// Sends a queued send at `at` instead, or with `None` now (it's no
+    /// longer scheduled), once a try of it under way is over
+    /// (`between_tries`). False once it's gone.
+    pub async fn reschedule(&self, outbox_id: i64, at: Option<i64>) -> Result<bool> {
+        self.between_tries(outbox_id, |store| {
+            Ok(store.reschedule_send(outbox_id, at, now_ms())?)
+        })
+        .await
+    }
+
+    /// Runs `change` on queued send `id` once no try of it is under way: one
+    /// that is, is waited out, `SEND_WAIT` at most, rather than taken for
+    /// the send being gone. Each look and `change` hold the store, so a try
+    /// can't start between them.
+    async fn between_tries<T>(
+        &self,
+        id: i64,
+        change: impl FnOnce(&mut Store) -> Result<T>,
+    ) -> Result<T> {
+        let until = tokio::time::Instant::now() + SEND_WAIT;
+        let mut change = Some(change);
+        loop {
+            let tried = self.send_tried.notified();
+            let mut tried = std::pin::pin!(tried);
+            tried.as_mut().enable();
+            {
+                let mut store = self.store();
+                if !store.is_sending(id)? {
+                    let change = change.take().expect("changed once");
+                    return change(&mut store);
+                }
+            }
+            if tokio::time::timeout_at(until, tried).await.is_err() {
+                return Err(Error::Config(
+                    "It's still being sent. Try again once that's over.".into(),
+                ));
+            }
+        }
     }
 
     /// Sends a queued draft. Returns its Message-ID, for reminders.
@@ -3745,11 +3846,11 @@ mod tests {
                 let _ = go.send(());
             }
         });
-        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(10), sent)
+        tokio::time::timeout(std::time::Duration::from_secs(10), sent)
             .await
             .expect("the first send was heard before the second went")
             .unwrap();
-        assert_eq!((outcomes.len(), heard), (2, 2));
+        assert_eq!(heard, 2);
         server.await.unwrap();
     }
 
@@ -3888,8 +3989,8 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn unscheduling_keeps_exactly_what_was_queued_in_drafts() {
+    #[tokio::test]
+    async fn unscheduling_keeps_exactly_what_was_queued_in_drafts() {
         let mut store = Store::open_in_memory().unwrap();
         let account = test_account(&mut store, Server::new("127.0.0.1", 465));
         let queued = Draft {
@@ -3919,17 +4020,18 @@ mod tests {
             .unwrap();
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
 
-        let id = engine.unschedule(outbox, false).unwrap().unwrap();
-        let store = engine.store();
-        assert!(store.scheduled_sends().unwrap().is_empty());
-        assert!(store.is_draft(id).unwrap());
-        let saved: Draft = serde_json::from_str(&store.draft(id).unwrap().unwrap()).unwrap();
-        assert_eq!((saved.body.as_str(), saved.send_later), ("As sent", None));
-        assert_eq!(saved.remind, queued.remind);
-        assert_eq!(store.draft_files(id).unwrap(), [file]);
-        drop(store);
+        let id = engine.unschedule(outbox, false).await.unwrap().unwrap();
+        {
+            let store = engine.store();
+            assert!(store.scheduled_sends().unwrap().is_empty());
+            assert!(store.is_draft(id).unwrap());
+            let saved: Draft = serde_json::from_str(&store.draft(id).unwrap().unwrap()).unwrap();
+            assert_eq!((saved.body.as_str(), saved.send_later), ("As sent", None));
+            assert_eq!(saved.remind, queued.remind);
+            assert_eq!(store.draft_files(id).unwrap(), [file]);
+        }
         // Gone from the queue: there's nothing left to take out.
-        assert_eq!(engine.unschedule(outbox, true).unwrap(), None);
+        assert_eq!(engine.unschedule(outbox, true).await.unwrap(), None);
     }
 
     #[test]
@@ -5175,16 +5277,199 @@ mod tests {
             Arc::new(TestSecrets),
         );
         let minute = 60_000;
+        let failed_again = |draft, at| engine.failed_again(1, draft, at);
         // Offline over sleep: a try before and after, an hour apart.
-        assert!(!engine.failed_again(1, "a", 0));
-        assert!(!engine.failed_again(1, "a", 60 * minute));
+        assert!(!failed_again("a", 0));
+        assert!(!failed_again("a", 60 * minute));
         // Ten minutes and the third try in a row.
-        assert!(engine.failed_again(1, "a", 61 * minute));
-        assert!(!engine.failed_again(1, "a", 62 * minute));
+        assert!(failed_again("a", 61 * minute));
+        assert!(!failed_again("a", 62 * minute));
         // An outbox id given again to another send counts afresh.
-        assert!(!engine.failed_again(1, "b", 63 * minute));
-        assert!(!engine.failed_again(1, "b", 73 * minute));
-        assert!(engine.failed_again(1, "b", 74 * minute));
+        assert!(!failed_again("b", 63 * minute));
+        assert!(!failed_again("b", 73 * minute));
+        assert!(failed_again("b", 74 * minute));
+    }
+
+    /// An SMTP server that holds each connection until `release` is told
+    /// once for it, then hangs up: a try that fails on the network when the
+    /// test says so.
+    async fn smtp_holding() -> (Server, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let release = Arc::new(Notify::new());
+        let held = release.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                held.notified().await;
+                drop(socket);
+            }
+        });
+        (smtp_at(port), release, task)
+    }
+
+    /// A plain SMTP server on this computer at `port`.
+    fn smtp_at(port: u16) -> Server {
+        Server {
+            host: "127.0.0.1".into(),
+            port,
+            security: imap::Security::Plain,
+            trusted_cert: None,
+        }
+    }
+
+    /// An SMTP server nothing listens at: every try fails on the network.
+    async fn smtp_offline() -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        smtp_at(listener.local_addr().unwrap().port())
+    }
+
+    /// Queues an email to Ana titled `subject` from `account`, to go at
+    /// `send_at`; returns its outbox id and draft, as queued.
+    fn queue_to_ana(store: &mut Store, account: i64, subject: &str, send_at: i64) -> (i64, String) {
+        let draft = to_json(&Draft {
+            account,
+            to: "ana@example.com".into(),
+            subject: subject.into(),
+            body: "Hi".into(),
+            send_at,
+            ..Default::default()
+        });
+        (
+            store.queue_send(account, &draft, send_at, &[]).unwrap(),
+            draft,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_send_can_be_taken_back_while_the_one_before_it_is_tried() {
+        let (smtp, release, server) = smtp_holding().await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp).id;
+        let (first, _) = queue_to_ana(&mut store, account, "First", 0);
+        let (second, _) = queue_to_ana(&mut store, account, "Second", 1);
+        let engine = Arc::new(Engine::new(
+            Arc::new(Mutex::new(store)),
+            Arc::new(TestSecrets),
+        ));
+        let sending = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.send_due(account).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !engine.store().is_sending(first).unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first is tried");
+
+        // The second, waiting its turn, comes out at once.
+        let taken = engine.unschedule(second, true).await.unwrap();
+        assert!(taken.is_some(), "still queued, not being sent");
+        // The first comes out once its try is over, not as "Already sent".
+        let editing = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.unschedule(first, true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!editing.is_finished(), "it waits for the try");
+        release.notify_one();
+        let outcomes = sending.await.unwrap().unwrap();
+        assert!(
+            matches!(&outcomes[..], [o] if o.id == first && matches!(o.result, Ok(false))),
+            "{outcomes:?}"
+        );
+        let taken = editing.await.unwrap().unwrap();
+        assert!(taken.is_some(), "taken back after its try failed");
+        let store = engine.store();
+        assert!(store.due_sends(account, i64::MAX).unwrap().is_empty());
+        let drafts: Vec<String> = store
+            .messages()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.subject)
+            .collect();
+        assert_eq!(drafts.len(), 2, "both in Drafts: {drafts:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_try_cut_off_puts_its_send_back_in_the_queue() {
+        let (smtp, _release, server) = smtp_holding().await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp).id;
+        let (first, _) = queue_to_ana(&mut store, account, "First", 0);
+        let engine = Arc::new(Engine::new(
+            Arc::new(Mutex::new(store)),
+            Arc::new(TestSecrets),
+        ));
+        let sending = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.send_due(account).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !engine.store().is_sending(first).unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("it's tried");
+        let editing = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.unschedule(first, true).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!editing.is_finished(), "it waits for the try");
+
+        // The account's worker stops part way.
+        sending.abort();
+        assert!(sending.await.unwrap_err().is_cancelled());
+        let taken = tokio::time::timeout(Duration::from_secs(10), editing)
+            .await
+            .expect("told the try is over")
+            .unwrap()
+            .unwrap();
+        assert!(taken.is_some(), "back in the queue, and taken from it");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn each_send_is_told_of_as_soon_as_its_try_is_over() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp_offline().await).id;
+        let (first, queued) = queue_to_ana(&mut store, account, "First", 0);
+        let (second, _) = queue_to_ana(&mut store, account, "Second", 1);
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        // The first has failed twice over ten minutes: this try is told of.
+        let then = now_ms() - SEND_TELL_AFTER_MS;
+        for _ in 1..SEND_TELL_TRIES {
+            assert!(!engine.failed_again(first, &queued, then));
+        }
+
+        // As each is told of, the next hasn't been tried yet, and the one
+        // told of isn't due again yet: its Edit finds it queued.
+        let mut told = Vec::new();
+        engine
+            .send_due_each(account, |o| {
+                let store = engine.store();
+                let due = store.due_sends(account, now_ms()).unwrap();
+                told.push((
+                    o.id,
+                    o.queued,
+                    store.queued_send(o.id).unwrap().is_some() && !due.contains(&o.id),
+                    store.queued_send(second).unwrap().is_some(),
+                    engine.failing_sends_lock().contains_key(&second),
+                ));
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            told,
+            [
+                (first, true, true, true, false),
+                (second, false, true, true, true)
+            ]
+        );
     }
 
     #[test]

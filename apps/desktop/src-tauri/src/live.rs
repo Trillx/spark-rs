@@ -459,43 +459,43 @@ async fn work(
             break;
         }
 
-        // Answered once it's gone, not when it was queued (Undo and Send
-        // Later can still take it back), and before the next one goes.
-        let answered = |outcome: &spark_mail::engine::SendOutcome| {
-            if matches!(outcome.result, Ok(true))
-                && let Some(original) = outcome.reply_to
-            {
-                crate::automation::replied(&app, original);
-            }
-        };
-        match engine.send_due_each(account_id, answered).await {
-            Ok(outcomes) => {
-                for outcome in outcomes {
-                    let event = match outcome.result {
-                        Ok(true) => SendEvent {
-                            id: outcome.id,
-                            account: account_id,
-                            draft_id: outcome.draft_id,
-                            status: "sent",
-                            message: None,
-                            certificate: None,
-                            queued: false,
-                        },
-                        Ok(false) => continue,
-                        Err(e) => SendEvent {
-                            id: outcome.id,
-                            account: account_id,
-                            draft_id: outcome.draft_id,
-                            status: "failed",
-                            message: Some(e.to_string()),
-                            certificate: certificate_of(&e),
-                            queued: outcome.queued,
-                        },
-                    };
-                    let _ = app.emit("send-status", event);
+        // Each told of as soon as it's tried, before it's tried again.
+        let sent = engine
+            .send_due_each(account_id, |outcome| {
+                // Answered once it's gone, not when it was queued (Undo and
+                // Send Later can still take it back), and before the next
+                // one goes.
+                if matches!(outcome.result, Ok(true))
+                    && let Some(original) = outcome.reply_to
+                {
+                    crate::automation::replied(&app, original);
                 }
-            }
-            Err(e) => eprintln!("spark-rs: sending for account {account_id}: {e}"),
+                let event = match outcome.result {
+                    Ok(true) => SendEvent {
+                        id: outcome.id,
+                        account: account_id,
+                        draft_id: outcome.draft_id,
+                        status: "sent",
+                        message: None,
+                        certificate: None,
+                        queued: false,
+                    },
+                    Ok(false) => return,
+                    Err(e) => SendEvent {
+                        id: outcome.id,
+                        account: account_id,
+                        draft_id: outcome.draft_id,
+                        status: "failed",
+                        message: Some(e.to_string()),
+                        certificate: certificate_of(&e),
+                        queued: outcome.queued,
+                    },
+                };
+                let _ = app.emit("send-status", event);
+            })
+            .await;
+        if let Err(e) = sent {
+            eprintln!("spark-rs: sending for account {account_id}: {e}");
         }
 
         // Waiters first: their asks are in by then.
