@@ -19,12 +19,15 @@ export default function CommandCenter({
   title,
   placeholder,
   commands,
+  fallback,
   onRun,
   onClose,
 }: {
   title: string;
   placeholder: string;
   commands: Command[];
+  /** A last command for what's typed, e.g. creating a folder of that name. */
+  fallback?: (query: string) => Command | null;
   onRun: (command: Command) => void;
   onClose: () => void;
 }) {
@@ -34,11 +37,13 @@ export default function CommandCenter({
 
   const results = useMemo(() => {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-    return commands.filter((c) => {
+    const found = commands.filter((c) => {
       const text = `${c.label} ${c.keywords ?? ""}`.toLowerCase();
       return words.every((w) => text.includes(w));
     });
-  }, [commands, query]);
+    const extra = query.trim() ? fallback?.(query.trim()) : null;
+    return extra ? [...found, extra] : found;
+  }, [commands, query, fallback]);
   const active = Math.min(index, Math.max(results.length - 1, 0));
 
   useEffect(() => {

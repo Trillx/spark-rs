@@ -1,11 +1,21 @@
 import { Check, ChevronRight, Ellipsis, Mail, Minus, Plus, ThumbsDown, ThumbsUp, Zap } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Message } from "../types";
-import { CARDS, GATEKEEPER, type CardKey, type GroupKey } from "../lib/layout";
+import { CARDS, GATEKEEPER, groupInfo, type CardKey, type GroupKey } from "../lib/layout";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem } from "./Dropdown";
 
 /** Smart Inbox card: icon header, complete-all, the first `shown` rows, "Show all (N)". */
+/** Rows a card can show before "Show all", in its menu. */
+const CARD_ROWS = [3, 5, 10];
+
+/** A card's own settings, from its menu. */
+export interface CardSettings {
+  setRows: (rows: number) => void;
+  /** Turns the card off; its mail goes to People. Not offered for People. */
+  hide: () => void;
+}
+
 export function SmartInboxCard({
   cardKey,
   items,
@@ -13,6 +23,7 @@ export function SmartInboxCard({
   renderRow,
   onCompleteAll,
   onShowAll,
+  settings,
 }: {
   cardKey: CardKey;
   items: Message[];
@@ -20,6 +31,7 @@ export function SmartInboxCard({
   renderRow: (m: Message, inPriorityCard: boolean) => ReactNode;
   onCompleteAll: () => void;
   onShowAll: () => void;
+  settings: CardSettings;
 }) {
   if (cardKey === "priority") {
     return (
@@ -41,6 +53,34 @@ export function SmartInboxCard({
         </span>
         <h3 className="min-w-0 flex-1 truncate text-[13px] font-medium leading-[18px]">{label}</h3>
         <CompleteAll label={label} count={items.length} onClick={onCompleteAll} />
+        <Dropdown
+          align="end"
+          width="w-48"
+          trigger={({ toggle, open }) => (
+            <button
+              data-tip="Cards settings"
+              aria-label={`${label} card settings`}
+              aria-haspopup="menu"
+              aria-expanded={open}
+              onClick={toggle}
+              className={`grid size-7 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content ${
+                open ? "bg-base-content/10" : ""
+              }`}
+            >
+              <Ellipsis size={16} />
+            </button>
+          )}
+        >
+          {CARD_ROWS.map((n) => (
+            <MenuItem key={n} label={`Show ${n} emails`} checked={shown === n} onSelect={() => settings.setRows(n)} />
+          ))}
+          {cardKey !== "people" && (
+            <>
+              <li role="none" className="my-0.5 h-px bg-hairline" />
+              <MenuItem label="Turn off this card" onSelect={settings.hide} />
+            </>
+          )}
+        </Dropdown>
       </header>
       <div className="px-[5px]">{items.slice(0, shown).map((m) => renderRow(m, false))}</div>
       <button
@@ -272,14 +312,41 @@ function SenderCard({
 }
 
 /** Pale tints for the Focused list's group icons (green3 / purple3 at low alpha). */
-const GROUP_TINT: Record<GroupKey, string> = {
+const GROUP_TINT: Record<string, string> = {
   notifications: "bg-[#48c725]/15 text-[#48c725]",
   newsletters: "bg-[#a06ad0]/15 text-[#a06ad0]",
+  invitations: "bg-[#f05a5a]/15 text-[#f05a5a]",
 };
+/** A grouped sender's or domain's row. */
+const OWN_GROUP_TINT = "bg-primary/10 text-primary";
 
-/** Focused list composite row: a group of notifications or newsletters that opens as a sub-list. */
-export function GroupRow({ groupKey, items, onOpen }: { groupKey: GroupKey; items: Message[]; onOpen: () => void }) {
-  const { label, Icon } = CARDS[groupKey];
+/**
+ * Composite row: Focused's notifications, newsletters or invitations, or a
+ * sender or domain the user grouped, opening as a sub-list.
+ */
+export function GroupRow({
+  groupKey,
+  items,
+  selected = false,
+  picked = false,
+  onOpen,
+  onPick,
+}: {
+  groupKey: GroupKey;
+  items: Message[];
+  /** Under the list cursor, or in the selection for a batch action. */
+  selected?: boolean;
+  picked?: boolean;
+  onOpen: () => void;
+  /** Ctrl/⌘-click and Shift-click, as on rows. */
+  onPick?: (range: boolean) => void;
+}) {
+  const { label, Icon } = groupInfo(groupKey, items);
+  const ref = useRef<HTMLDivElement>(null);
+  // Like rows, it scrolls into view when the cursor moves to it.
+  useEffect(() => {
+    if (selected && !ref.current?.matches(":hover")) ref.current?.scrollIntoView({ block: "nearest" });
+  }, [selected]);
   const unread = items.filter((m) => m.unread).length;
   const senders = new Map<string, { count: number; unread: boolean }>();
   for (const m of items) {
@@ -288,16 +355,23 @@ export function GroupRow({ groupKey, items, onOpen }: { groupKey: GroupKey; item
   }
   return (
     <div
+      ref={ref}
       role="button"
       tabIndex={-1}
+      aria-pressed={selected || picked}
       data-group={groupKey}
-      onClick={onOpen}
-      className="group grid min-h-[60px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 hover:bg-row-hover"
+      onClick={(e) => {
+        if (onPick && (e.ctrlKey || e.metaKey || e.shiftKey)) onPick(e.shiftKey);
+        else onOpen();
+      }}
+      className={`group grid min-h-[60px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 ${
+        selected || picked ? "bg-row-selected" : "hover:bg-row-hover"
+      }`}
     >
       <span className="flex h-5 items-center justify-center">
         {unread > 0 && <span className="size-2 rounded-full bg-primary" />}
       </span>
-      <span className={`grid size-[26px] place-items-center rounded-full ${GROUP_TINT[groupKey]}`}>
+      <span className={`grid size-[26px] place-items-center rounded-full ${GROUP_TINT[groupKey] ?? OWN_GROUP_TINT}`}>
         <Icon size={14} />
       </span>
       <div className="min-w-0 pl-2.5">

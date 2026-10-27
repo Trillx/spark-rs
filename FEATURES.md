@@ -25,7 +25,7 @@ Last full check: 2026-10-26.
 |---|:-:|---|
 | Unlimited Email Accounts | ✅ | Microsoft 365 through Microsoft Graph, Gmail, and any IMAP server |
 | Cross-Device Sync | ➖ | There's no sync server. Mail, read, Done, pins and folders go through your mail servers, so every device sees them; snooze, Set Aside, Priority and Gatekeeper decisions stay on the computer you set them on |
-| Smart Inbox | ✅ | Priority, Pins, People, Notifications and Newsletters as cards, or as one focused list |
+| Smart Inbox | ✅ | Priority, Pins, Invitations, People, Responses, Notifications and Newsletters as cards (each can be turned off or show more), or as one focused list; a sender can be moved to another category |
 | Unified Inbox | ✅ | Every account in one inbox, with a row per account to see one alone |
 | Smart Search | 🟡 | Full-text search on your computer and on each mail server, in every account or just the one you're in, with `from:`, `has:attachment`, `is:unread` and `date:today`, search by sender and recent searches; no plain-language searches such as "PDFs from Anna last week" |
 | Smart Notifications | ✅ | Only mail from people notifies, unless you change it to all mail or only Priority mail |
@@ -46,7 +46,7 @@ Last full check: 2026-10-26.
 |---|:-:|---|
 | Priority | ✅ | Priority conversations and Priority senders, whose mail is all Priority; the Priority card's size is in Settings → Priority |
 | Gatekeeper | ✅ | Spark's three modes (before the Inbox, inside it, off); accept or block a new sender or a whole domain once for every account; colleagues, people you've written to and big companies get through without asking; blocked mail moves to a Blocked folder on the server |
-| Group by Sender & Domain | ❌ | |
+| Group by Sender & Domain | ✅ | A sender's or custom domain's mail folds into one row in the Inbox, opening as a list of its own |
 | Smart Folders | ✅ | Save any search as a smart folder; its search can't be edited afterwards |
 | Mute Threads | ✅ | New mail in a muted conversation doesn't notify |
 | Templates | ❌ | |

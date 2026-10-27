@@ -115,6 +115,8 @@ export interface Message {
   muted?: boolean;
   /** A reminder that came due on it (`at`): it's in the Inbox until Done. */
   reminder?: { id: number; at: number };
+  /** The calendar invite it carries, by kind, for the Invitations and Responses cards. */
+  inviteKind?: "invitation" | "reply" | "cancellation" | "proposal";
 }
 
 /** Mail scheduled with Send Later; `id` is its outbox id. */

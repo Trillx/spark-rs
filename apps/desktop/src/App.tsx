@@ -6,22 +6,25 @@ import {
   BellOff,
   Bot,
   Check,
+  CheckCheck,
+  Circle,
   CircleAlert,
   CircleCheck,
-  Circle,
   Clock,
-  CheckCheck,
   Copy,
   Download,
   FileText,
   Folder,
+  FolderInput,
+  FolderPlus,
   FolderSearch,
   Forward,
+  Group,
   Inbox,
   LayoutGrid,
-  Mail,
   List,
   ListChecks,
+  Mail,
   MailOpen,
   MailX,
   PanelLeft,
@@ -39,6 +42,7 @@ import {
   ShieldCheck,
   Signature,
   Sparkles,
+  Tags,
   Text,
   ThumbsDown,
   ThumbsUp,
@@ -107,6 +111,7 @@ import {
   setBadge,
   setMuted,
   setReminder,
+  setSenderCategory,
   syncFolders,
   syncNow,
   trustCertificate,
@@ -132,6 +137,7 @@ import Composer, {
 } from "./components/Composer";
 import { CertificateDialog, ConfirmDialog, DateTimeDialog, PromptDialog } from "./components/Dialog";
 import MessageList, { Splitter, type GatekeeperActions } from "./components/MessageList";
+import type { CardSettings } from "./components/SmartInboxCard";
 import type { RowActions } from "./components/MessageRow";
 import Settings, { type SettingsPage } from "./components/Settings";
 import { useUpdates } from "./lib/updates";
@@ -167,13 +173,19 @@ import {
 } from "./lib/format";
 import { loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
+  CARDS,
   INBOX_MODES,
   badgeCount,
   buildList,
+  loadCardPrefs,
+  loadGrouped,
   loadInboxMode,
+  saveCardPrefs,
+  saveGrouped,
   saveInboxMode,
   sidebarCounts,
   type AccountFilter,
+  type CardKey,
   type InboxMode,
   type ListContext,
   type ListModel,
@@ -198,6 +210,7 @@ import {
   dropPatch,
   folderIdOf,
   folderKey,
+  folderPath,
   hasAccountRows,
   inSidebar,
   isPlannedList,
@@ -232,6 +245,7 @@ import type {
   AccountId,
   AccountView,
   AgentSendingEvent,
+  Category,
   FolderView,
   GatekeeperMode,
   Message,
@@ -247,7 +261,34 @@ import type {
 } from "./types";
 
 /** `targetId` points the actions at one row (its ⋯) rather than the current message. */
-type Palette = { kind: "actions"; targetId?: number } | { kind: "snooze"; targetIds: number[] };
+type Palette =
+  | { kind: "actions"; targetId?: number }
+  | { kind: "snooze"; targetIds: number[] }
+  | { kind: "move"; targetIds: number[] };
+
+/** Folders moved to lately, newest first, per account: the Move picker offers them first. */
+const MOVE_RECENT_KEY = "spark-rs.move-recent";
+
+function loadMoveRecent(): Record<string, number[]> {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MOVE_RECENT_KEY) ?? "{}");
+    return typeof saved === "object" && saved ? saved : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberMove(account: AccountId, folder: number) {
+  const saved = loadMoveRecent();
+  const list = [folder, ...(saved[String(account)] ?? []).filter((id) => id !== folder)].slice(0, 5);
+  localStorage.setItem(MOVE_RECENT_KEY, JSON.stringify({ ...saved, [String(account)]: list }));
+}
+
+const CATEGORY_LABELS: Record<Category, string> = {
+  people: "People",
+  notifications: "Notifications",
+  newsletters: "Newsletters",
+};
 
 /** A question before something that can't be undone, or a big batch (`ConfirmDialog`). */
 interface Confirm {
@@ -398,6 +439,9 @@ export default function App() {
   const [scheduled, setScheduled] = useState<ScheduledView[]>([]);
   const [reminders, setReminders] = useState<ReminderView[]>([]);
   const [recentSearches, setRecentSearches] = useState(loadRecentSearches);
+  /** Cards settings, and the senders and domains grouped into one row. */
+  const [cardPrefs, setCardPrefs] = useState(loadCardPrefs);
+  const [grouped, setGrouped] = useState(loadGrouped);
   /** A server certificate to ask about, from a sync or send that failed on it. */
   const [certificate, setCertificate] = useState<{ account: AccountId; certificate: Untrusted } | null>(null);
   /** The settings App acts on: the app icon badge, and how the composer starts and sends. */
@@ -458,8 +502,10 @@ export default function App() {
       hits,
       gatekeeper: gatekeeperMode,
       priorityLines,
+      cards: cardPrefs,
+      grouped,
     }),
-    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode, priorityLines],
+    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode, priorityLines, cardPrefs, grouped],
   );
   const listed = useMemo(
     () => (discarding.size ? messages.filter((m) => !discarding.has(m.id)) : messages),
@@ -497,7 +543,17 @@ export default function App() {
   const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
   /** The selected rows still listed, in list order. */
   const pickedRows = useMemo(() => model.order.filter((id) => picked.has(id)), [model.order, picked]);
-  const pickedMessages = pickedRows.flatMap((id) => byId.get(id) ?? []);
+  /** The selected conversations; a selected group row stands for all of its. */
+  const pickedMessages = pickedRows.flatMap((id) => {
+    const group = model.groups.get(id);
+    return group ? group.items.flatMap((m) => byId.get(m.id) ?? []) : (byId.get(id) ?? []);
+  });
+  /** A group row under the cursor, with nothing open: single keys act on all of its conversations. */
+  const cursorGroup = openId === null && selectedId !== null ? model.groups.get(selectedId) : undefined;
+  /** What batch actions and single keys work on: the selection, else the group at the cursor. */
+  const batchRows = pickedRows.length
+    ? pickedMessages
+    : (cursorGroup?.items.flatMap((m) => byId.get(m.id) ?? []) ?? []);
   const badge = useMemo(
     () => (demo ? 0 : badgeCount(listed, appPrefs.badge, appPrefs.badgeExcluded, gatekeeperMode)),
     [demo, listed, appPrefs, gatekeeperMode],
@@ -568,6 +624,8 @@ export default function App() {
   }, [searching]);
 
   useEffect(() => saveLayout(layout), [layout]);
+  useEffect(() => saveCardPrefs(cardPrefs), [cardPrefs]);
+  useEffect(() => saveGrouped(grouped), [grouped]);
   useEffect(() => saveSeen(seen), [seen]);
 
   // The backend keeps the sidebar's folders and the open one in sync.
@@ -1018,6 +1076,8 @@ export default function App() {
 
   /** Opens a message: a draft in the composer, other mail in the reader. */
   function openListed(id: number) {
+    const group = model.groups.get(id);
+    if (group) return changeView({ sub: { kind: "group", key: group.key } }, true);
     const m = messages.find((x) => x.id === id);
     if (m && isDraft(m, folders)) void editDraft(m);
     else openThread(id);
@@ -1026,7 +1086,8 @@ export default function App() {
   /** The cursor moved: split view shows the message there, but a draft only opens when asked. */
   function follow(id: number) {
     const m = messages.find((x) => x.id === id);
-    if (m && isDraft(m, folders)) {
+    // A group row only opens when asked, like a draft.
+    if (model.groups.has(id) || (m && isDraft(m, folders))) {
       setOpenId(null);
       setSelectedId(id);
     } else {
@@ -1262,6 +1323,15 @@ export default function App() {
     snoozeCustom: (m: Message) => askSnoozeTime([m]),
     sendAgain,
     sendDraft: (m: Message) => void sendDraftNow(m),
+    move: (m: Message) => openMove([own(m)]),
+    changeCategory: (m: Message, category: Category) => void changeCategory(m, category),
+    groupSender,
+    groupDomain,
+    grouping: (m: Message) => ({
+      sender: grouped.senders.includes(m.address.toLowerCase()),
+      domain: decidableDomain(m.address),
+      domainGrouped: grouped.domains.includes(decidableDomain(m.address) ?? ""),
+    }),
     /** Spark's Discard Snooze: back in the Inbox now. */
     unsnooze: (m: Message) => act(together(m), { state: "inbox" }, "Snooze discarded", ICONS.inbox),
     mute,
@@ -1407,7 +1477,7 @@ export default function App() {
   }
 
   /** A batch action on the selected conversations (or `rows`); a big one asks first. */
-  function batch(run: (rows: Message[]) => void, rows = pickedMessages) {
+  function batch(run: (rows: Message[]) => void, rows = batchRows) {
     if (!rows.length) return;
     const emails = rows.reduce((n, m) => n + threadOf(m).length, 0);
     if (emails <= HEAVY_BATCH) return run(rows);
@@ -1495,12 +1565,13 @@ export default function App() {
             ),
       ),
     snooze: (p) => batch((rows) => snoozeRows(rows, p)),
-    snoozeCustom: () => askSnoozeTime(pickedMessages),
+    snoozeCustom: () => askSnoozeTime(batchRows),
     unsnooze: () =>
       batch((rows) =>
         act(rows.flatMap(together), { state: "inbox" }, `${conversationCount(rows)} back in the Inbox`, ICONS.inbox),
       ),
     spam: () => batch(spam),
+    move: () => openMove(batchRows),
     clear: clearPicked,
   };
 
@@ -1529,6 +1600,149 @@ export default function App() {
       },
       ICONS.snooze,
     );
+  }
+
+  // ---- organising ----
+
+  /** Spark's Move to folder: the conversations' account's folders, in a picker. */
+  function openMove(rows: Message[]) {
+    const movable = rows.filter((m) => !isDraft(m, folders));
+    if (!movable.length) return;
+    if (new Set(movable.map((m) => m.account)).size > 1) {
+      showToast("Select emails from the same account to move them", undefined, ICONS.folder);
+      return;
+    }
+    setPalette({ kind: "move", targetIds: movable.map((m) => m.id) });
+  }
+
+  /** Where emails can be moved: the Inbox, Archive, Trash, Spam and the account's own folders, recent ones first. */
+  function moveCommands(targets: Message[]): Command[] {
+    if (!targets.length) return [];
+    const account = targets[0].account;
+    const recent = loadMoveRecent()[String(account)] ?? [];
+    const own = folders.filter((f) => f.account === account && f.selectable && f.role === undefined);
+    const spamFolder = folders.find((f) => f.account === account && f.role === "spam");
+    const rank = (f: FolderView) => (recent.includes(f.id) ? recent.indexOf(f.id) : recent.length);
+    const sorted = [...own].sort((a, b) => rank(a) - rank(b) || folderPath(a, folders).localeCompare(folderPath(b, folders)));
+    const moved = targets.flatMap(together);
+    return [
+      { id: "inbox", label: "Inbox", Icon: Inbox, run: () => act(moved, { state: "inbox" }, "Moved to Inbox", ICONS.inbox) },
+      // Done and Delete, as everywhere else: the account needn't have listed those folders yet.
+      {
+        id: "archive",
+        label: SYSTEM_LISTS.archive.label,
+        keywords: "done all mail",
+        Icon: SYSTEM_LISTS.archive.Icon,
+        run: () => act(moved, { state: "done" }, "Marked as Done", ICONS.done),
+      },
+      {
+        id: "trash",
+        label: SYSTEM_LISTS.trash.label,
+        keywords: "delete bin",
+        Icon: SYSTEM_LISTS.trash.Icon,
+        run: () => act(moved, { state: "deleted" }, "Moved to Trash", ICONS.trash),
+      },
+      ...(spamFolder
+        ? [
+            {
+              id: "spam",
+              label: SYSTEM_LISTS.spam.label,
+              keywords: "junk",
+              Icon: SYSTEM_LISTS.spam.Icon,
+              run: () => act(moved, { folder: spamFolder.id }, "Moved to Spam", ICONS.spam),
+            },
+          ]
+        : []),
+      ...sorted.map((f) => ({
+        id: `folder-${f.id}`,
+        label: folderPath(f, folders),
+        keywords: f.name,
+        Icon: Folder,
+        detail: recent.includes(f.id) ? "Recent" : undefined,
+        run: () => moveTo(targets, f),
+      })),
+    ];
+  }
+
+  function moveTo(targets: Message[], f: FolderView) {
+    rememberMove(f.account, f.id);
+    act(targets.flatMap(together), { folder: f.id }, `Moved to ${f.name}`, ICONS.folder);
+  }
+
+  /** The Move picker's last line: a name that isn't a folder yet creates one, and moves there. */
+  function createAndMove(targets: Message[], name: string): Command | null {
+    if (!targets.length) return null;
+    const account = targets[0].account;
+    const exists = folders.some((f) => f.account === account && f.name.toLowerCase() === name.toLowerCase());
+    if (exists) return null;
+    return {
+      id: "create",
+      label: `Create folder “${name}” and move`,
+      Icon: FolderPlus,
+      run: async () => {
+        try {
+          const created = await createFolder(account, undefined, name);
+          await reloadFolders();
+          moveTo(targets, created);
+        } catch (error) {
+          showToast(`Couldn't create the folder: ${String(error)}`, undefined, ICONS.error);
+        }
+      },
+    };
+  }
+
+  /** Spark's Change category: the sender's mail, now and later, in every account. */
+  async function changeCategory(m: Message, category: Category) {
+    const address = m.address;
+    const set = async (to: Category | null) => {
+      if (to) {
+        setMessages((ms) =>
+          ms.map((x) => (x.address.toLowerCase() === address.toLowerCase() ? { ...x, category: to } : x)),
+        );
+      }
+      const before = await setSenderCategory(address, to);
+      await reloadMessages();
+      return before;
+    };
+    try {
+      const before = await set(category);
+      showToast(`${m.from || address} moved to ${CATEGORY_LABELS[category]}`, () => void set(before), ICONS.folder);
+    } catch (error) {
+      showToast(`Couldn't change the category: ${String(error)}`, undefined, ICONS.error);
+      void reloadMessages();
+    }
+  }
+
+  /** Spark's Group by Sender / Domain: their mail folds into one row in the Inbox; again to ungroup. */
+  function toggleGroup(kind: "senders" | "domains", value: string, label: string) {
+    const key = value.toLowerCase();
+    const on = !grouped[kind].includes(key);
+    const set = (add: boolean) =>
+      setGrouped((g) => ({ ...g, [kind]: add ? [...g[kind].filter((x) => x !== key), key] : g[kind].filter((x) => x !== key) }));
+    set(on);
+    showToast(on ? `Emails from ${label} grouped` : `Emails from ${label} ungrouped`, () => set(!on), ICONS.folder);
+  }
+
+  function groupSender(m: Message) {
+    toggleGroup("senders", m.address, m.from || m.address);
+  }
+  function groupDomain(m: Message) {
+    const domain = decidableDomain(m.address);
+    if (!domain) return showToast("Grouping by domain is only for custom domains", undefined, ICONS.folder);
+    toggleGroup("domains", domain, domain);
+  }
+
+  /** A card's menu, and Settings → Appearance: its rows, or turning it off (People takes its mail). */
+  function cardSettings(key: CardKey): CardSettings {
+    return {
+      setRows: (rows) => setCardPrefs((p) => ({ ...p, rows: { ...p.rows, [key]: rows } })),
+      hide: () => {
+        const set = (off: boolean) =>
+          setCardPrefs((p) => ({ ...p, hidden: off ? [...p.hidden.filter((k) => k !== key), key] : p.hidden.filter((k) => k !== key) }));
+        set(true);
+        showToast(`${CARDS[key].label} card turned off`, () => set(false), ICONS.folder);
+      },
+    };
   }
 
   /** Asks for a day and time to snooze conversations until. */
@@ -2346,7 +2560,7 @@ export default function App() {
       case "zoomReset":
         return zoom(0);
     }
-    if (pickedRows.length) {
+    if (batchRows.length) {
       switch (action) {
         case "done":
         case "trash":
@@ -2356,7 +2570,9 @@ export default function App() {
         case "aside":
           return bulk[action]();
         case "snooze":
-          return setPalette({ kind: "snooze", targetIds: pickedRows });
+          return setPalette({ kind: "snooze", targetIds: batchRows.map((m) => m.id) });
+        case "move":
+          return openMove(batchRows);
       }
       return;
     }
@@ -2379,6 +2595,8 @@ export default function App() {
         return m.state !== "blocked" ? actions.blockDomain(m) : undefined;
       case "snooze":
         return snoozeMenu(m);
+      case "move":
+        return openMove([own(m)]);
       case "pin":
         return actions.pin(m);
       case "aside":
@@ -2629,6 +2847,44 @@ export default function App() {
             ? [{ id: "send-draft", label: "Send Draft", keywords: "send now", Icon: Send, run: () => void sendDraftNow(m) }]
             : []),
           {
+            id: "move",
+            label: "Move to Folder…",
+            keywords: "file folder label",
+            Icon: FolderInput,
+            shortcut: shortcutLabel("move"),
+            run: () => actions.move(m),
+          },
+          ...(Object.keys(CATEGORY_LABELS) as Category[])
+            .filter((c) => c !== m.category)
+            .map((c) => ({
+              id: `category-${c}`,
+              label: `Change Category to ${CATEGORY_LABELS[c]}`,
+              detail: m.address,
+              keywords: "type sender personal",
+              Icon: Tags,
+              run: () => actions.changeCategory(m, c),
+            })),
+          {
+            id: "group-sender",
+            label: actions.grouping(m).sender ? "Ungroup Emails from Sender" : "Group Emails by Sender",
+            detail: m.address,
+            keywords: "fold together",
+            Icon: Group,
+            run: () => actions.groupSender(m),
+          },
+          ...(actions.grouping(m).domain
+            ? [
+                {
+                  id: "group-domain",
+                  label: actions.grouping(m).domainGrouped ? "Ungroup Emails from Domain" : "Group Emails by Domain",
+                  detail: actions.grouping(m).domain,
+                  keywords: "fold together company",
+                  Icon: Group,
+                  run: () => actions.groupDomain(m),
+                },
+              ]
+            : []),
+          {
             id: "search-sender",
             label: "Search Emails by Sender",
             detail: m.address,
@@ -2854,6 +3110,7 @@ export default function App() {
   }
 
   const snoozeTargets = palette?.kind === "snooze" ? palette.targetIds.flatMap((id) => byId.get(id) ?? []) : [];
+  const moveTargets = palette?.kind === "move" ? palette.targetIds.flatMap((id) => byId.get(id) ?? []) : [];
   const snoozeCommands: Command[] = snoozeTargets.length
     ? [
         ...(snoozeTargets.every((m) => m.state === "snoozed")
@@ -3030,6 +3287,7 @@ export default function App() {
                   onSearchKeyDown={onSearchKeyDown}
                   onCompose={() => compose()}
                   onToggleDone={toggleDone}
+                  cardSettings={cardSettings}
                   onOpenGatekeeper={() => changeView({ sub: { kind: "gatekeeper" } }, true)}
                   searchRef={searchRef}
                   demo={isDemoMode(accounts)}
@@ -3134,6 +3392,20 @@ export default function App() {
             onClose={() => setPalette(null)}
           />
         )}
+        {palette?.kind === "move" && (
+          <CommandCenter
+            key="move"
+            title="Move to folder"
+            placeholder="Folder name…"
+            commands={moveCommands(moveTargets)}
+            fallback={(name) => createAndMove(moveTargets, name)}
+            onRun={(c) => {
+              setPalette(null);
+              c.run();
+            }}
+            onClose={() => setPalette(null)}
+          />
+        )}
         {palette?.kind === "snooze" && (
           <CommandCenter
             key="snooze"
@@ -3167,6 +3439,8 @@ export default function App() {
             onTheme={changeTheme}
             minimize={minimize}
             onMinimize={changeMinimize}
+            cards={cardPrefs}
+            onCards={setCardPrefs}
             priorityLines={priorityLines}
             onPriorityLines={changePriorityLines}
             prioritySenders={prioritySenders}

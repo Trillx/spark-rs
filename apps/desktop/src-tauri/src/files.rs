@@ -40,9 +40,38 @@ pub fn clear_opened() {
 
 /// Extensions that run code when opened. Those attachments can only be saved.
 const RISKY: &[&str] = &[
-    "exe", "com", "scr", "pif", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf",
-    "wsh", "hta", "msi", "msp", "msc", "cpl", "jar", "reg", "lnk", "url", "scf", "inf",
-    "application", "appref-ms", "gadget", "iso", "img", "vhd", "vhdx",
+    "exe",
+    "com",
+    "scr",
+    "pif",
+    "bat",
+    "cmd",
+    "ps1",
+    "psm1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "hta",
+    "msi",
+    "msp",
+    "msc",
+    "cpl",
+    "jar",
+    "reg",
+    "lnk",
+    "url",
+    "scf",
+    "inf",
+    "application",
+    "appref-ms",
+    "gadget",
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
 ];
 
 pub fn is_risky(name: &str) -> bool {
@@ -72,8 +101,8 @@ pub fn safe_file_name(name: &str) -> String {
         .unwrap_or_default()
         .to_ascii_uppercase();
     const DEVICES: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
         "attachment".into()

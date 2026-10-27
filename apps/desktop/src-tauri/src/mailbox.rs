@@ -80,6 +80,9 @@ pub struct Message {
     /// A reminder that came due on it: it's in the Inbox until Done.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reminder: Option<DueReminder>,
+    /// The calendar invite it carries, by kind ("invitation", "reply", …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_kind: Option<String>,
 }
 
 /// Mail scheduled with Send Later, for the Scheduled list.
@@ -338,6 +341,7 @@ fn from_store(m: spark_store::Message) -> Message {
         returned_at: m.returned_at,
         muted: m.muted,
         reminder: m.reminder,
+        invite_kind: m.invite_kind,
     }
 }
 
@@ -699,6 +703,26 @@ pub fn finish_reminder(mailbox: State<'_, Mailbox>, id: i64, done: bool) -> Resu
         .engine
         .store()
         .finish_reminder(id, done)
+        .map_err(text)
+}
+
+/// Files a sender's mail under `category` in every account, now and later
+/// (Spark's Change category); `None` goes back to what the headers say.
+/// Returns the sender's category before, for undo.
+#[tauri::command]
+pub fn set_sender_category(
+    mailbox: State<'_, Mailbox>,
+    address: String,
+    category: Option<Category>,
+) -> Result<Option<Category>, String> {
+    if !mailbox.live() {
+        return Ok(mailbox.demo.set_sender_category(&address, category));
+    }
+    mailbox
+        .live
+        .engine
+        .store()
+        .set_sender_category(&address, category)
         .map_err(text)
 }
 
@@ -1666,6 +1690,7 @@ mod tests {
             returned_at: None,
             muted: true,
             reminder: None,
+            invite_kind: None,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["muted"], true);

@@ -14,6 +14,7 @@ import type {
   AgentSendingEvent,
   AgentsView,
   AccountView,
+  Category,
   Failure,
   FolderRole,
   FolderView,
@@ -406,6 +407,25 @@ export function setReminder(id: number, at: number | null): Promise<void> {
 export function finishReminder(id: number, done: boolean): Promise<void> {
   if (isTauri()) return invoke("finish_reminder", { id, done });
   return Promise.resolve();
+}
+
+/**
+ * Files a sender's mail under `category`, now and as it arrives, in every
+ * account; null goes back to what the headers say. Resolves to the sender's
+ * category before, for undo.
+ */
+export function setSenderCategory(address: string, category: Category | null): Promise<Category | null> {
+  if (isTauri()) return invoke("set_sender_category", { address, category });
+  // Like the store: the sender's choice, over each email's own category.
+  const key = address.toLowerCase();
+  const before = browserCategories.get(key) ?? null;
+  if (category) browserCategories.set(key, category);
+  else browserCategories.delete(key);
+  for (const [i, m] of browserMailbox.entries()) {
+    if (m.address.toLowerCase() !== key) continue;
+    browserMailbox[i] = { ...m, category: category ?? browserOwnCategory.get(m.id) ?? m.category };
+  }
+  return Promise.resolve(before);
 }
 
 /** Mutes or unmutes a conversation (`Message.conversation`, or the message's id). */
@@ -934,7 +954,7 @@ const BROWSER_FOLDERS: FolderView[] = demoFolders.map((f) => ({
 
 // Like DemoMailbox::load: each entry's age becomes a timestamp relative to now.
 const loadedAt = Date.now();
-const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, invite: _invite, ...m }) => ({
+const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, invite, ...m }) => ({
   state: "inbox",
   unread: false,
   pinned: false,
@@ -944,7 +964,12 @@ const browserMailbox: Message[] = demo.map(({ ageMinutes, account, html: _html, 
   account: DEMO_ACCOUNT_IDS[account],
   timestamp: loadedAt - ageMinutes * 60_000,
   folders: demoFolders.filter((f) => (f.members as number[]).includes(m.id)).map((f) => f.id),
+  inviteKind: invite?.kind,
 })) as Message[];
+
+/** Each demo email's own category, and the senders' chosen ones, for `setSenderCategory`. */
+const browserOwnCategory = new Map(browserMailbox.map((m) => [m.id, m.category]));
+const browserCategories = new Map<string, Category>();
 
 /** Gatekeeper decisions in the preview, by `s:<address>` and `d:<domain>`. Senders not waiting were accepted, as after a first sync. */
 const browserDecisions = new Map<string, SenderDecision>(

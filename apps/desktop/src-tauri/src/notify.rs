@@ -544,6 +544,7 @@ mod tests {
             returned_at: None,
             muted: false,
             reminder: None,
+            invite_kind: None,
         }
     }
 

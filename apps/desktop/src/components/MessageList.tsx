@@ -30,7 +30,7 @@ import { hint, shortcutLabel } from "../lib/shortcuts";
 import Dropdown, { MenuItem } from "./Dropdown";
 import MessageRow, { type RowActions } from "./MessageRow";
 import OverlayScroll from "./OverlayScroll";
-import { GatekeeperCard, GroupRow, SmartInboxCard } from "./SmartInboxCard";
+import { GatekeeperCard, GroupRow, SmartInboxCard, type CardSettings } from "./SmartInboxCard";
 import { tipAttrs } from "../lib/tooltip";
 
 export interface GatekeeperActions {
@@ -79,6 +79,8 @@ interface Props {
   searchingServers: boolean;
   /** Set for lists that can be emptied (Trash, Spam, folders): deletes all their mail for good. */
   onEmpty?: () => void;
+  /** A card's menu: how many rows it shows, and turning it off. */
+  cardSettings: (key: CardKey) => CardSettings;
   /** Past searches, newest first, offered while the field is empty. */
   recentSearches: string[];
   onForgetSearch: (query: string) => void;
@@ -183,6 +185,7 @@ export default function MessageList(props: Props) {
                       renderRow={row}
                       onCompleteAll={() => props.onDoneAll(block.items)}
                       onShowAll={() => props.onShowAll(block.key)}
+                      settings={props.cardSettings(block.key)}
                     />
                   );
                 case "gatekeeper":
@@ -206,7 +209,10 @@ export default function MessageList(props: Props) {
                       key={`g-${block.key}-${i}`}
                       groupKey={block.key}
                       items={block.items}
+                      selected={block.items[0].id === selectedRow}
+                      picked={props.picked.has(block.items[0].id)}
                       onOpen={() => props.onOpenGroup(block.key)}
+                      onPick={(range) => rows.pick(block.items[0].id, range)}
                     />
                   );
               }

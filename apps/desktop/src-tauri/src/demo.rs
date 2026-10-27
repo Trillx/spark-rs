@@ -192,6 +192,8 @@ pub struct DemoMailbox(
     Mutex<Store>,
     Mutex<DemoGatekeeper>,
     Mutex<BTreeSet<String>>,
+    /// Senders' chosen categories, lowercased (Change category).
+    Mutex<HashMap<String, Category>>,
 );
 
 /// Gatekeeper decisions, by lowercased address and domain, and the mode.
@@ -238,6 +240,7 @@ impl DemoMailbox {
             Mutex::default(),
             Mutex::new(people),
             Mutex::new(gatekeeper),
+            Mutex::default(),
             Mutex::default(),
         )
     }
@@ -433,6 +436,31 @@ impl DemoMailbox {
         Ok(message.clone())
     }
 
+    /// Files a sender's mail under `category`, or with `None` as the demo
+    /// file has it, like the store. Returns the sender's category before.
+    pub fn set_sender_category(
+        &self,
+        address: &str,
+        category: Option<Category>,
+    ) -> Option<Category> {
+        let key = address.to_lowercase();
+        let before = match category {
+            Some(c) => self.6.lock().unwrap().insert(key, c),
+            None => self.6.lock().unwrap().remove(&key),
+        };
+        let original = demo_messages(0);
+        let mut messages = self.0.lock().unwrap();
+        for m in messages
+            .iter_mut()
+            .filter(|m| m.address.eq_ignore_ascii_case(address))
+        {
+            m.category = category
+                .or_else(|| original.iter().find(|o| o.id == m.id).map(|o| o.category))
+                .unwrap_or(m.category);
+        }
+        before
+    }
+
     /// Mutes or unmutes a conversation.
     pub fn set_muted(&self, conversation: i64, muted: bool) {
         let mut messages = self.0.lock().unwrap();
@@ -521,6 +549,7 @@ impl DemoMailbox {
             returned_at: None,
             muted: false,
             reminder: None,
+            invite_kind: None,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -699,8 +728,17 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             returned_at: None,
             muted: false,
             reminder: None,
+            invite_kind: e.invite.map(|i| kind_name(i.kind)),
         })
         .collect()
+}
+
+/// An invite's kind as the UI names it ("invitation", "reply", …).
+fn kind_name(kind: Kind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// The HTML of demo message `id`, if it has one.

@@ -261,6 +261,9 @@ pub struct Message {
     pub muted: bool,
     /// A reminder that came due on it: it waits in the Inbox until Done.
     pub reminder: Option<DueReminder>,
+    /// The calendar invite it carries, by kind ("invitation", "reply",
+    /// "cancellation", "proposal"), for the Invitations and Responses cards.
+    pub invite_kind: Option<String>,
 }
 
 /// A reminder in the Inbox, on the email it came back as.
@@ -610,7 +613,8 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      CASE WHEN state = 'filed' THEN home_folder_id END, to_list, COALESCE(conversation, id), reply_to_list, \
      returned_at, EXISTS (SELECT 1 FROM muted WHERE muted.conversation = COALESCE(messages.conversation, messages.id)), \
      (SELECT id FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
-     (SELECT remind_at FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1)";
+     (SELECT remind_at FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
+     json_extract(invite, '$.kind')";
 
 const FOLDER_COLUMNS: &str = "f.id, f.account_id, f.remote_id, p.id, f.name, f.role, f.selectable, \
      f.sync_state, f.synced_at";
@@ -728,6 +732,21 @@ impl Store {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(calendar::SCHEMA_CALENDAR_OWN)?;
             tx.pragma_update(None, "user_version", 18)?;
+            tx.commit()?;
+        }
+        if version < 19 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "-- What each email's headers say, under a category the user chose for its sender.
+                 ALTER TABLE messages ADD COLUMN auto_category TEXT;
+                 UPDATE messages SET auto_category = category;
+                 -- Spark's Change category, per sender (every account).
+                 CREATE TABLE sender_categories (
+                     address TEXT PRIMARY KEY COLLATE NOCASE,
+                     category TEXT NOT NULL
+                 );",
+            )?;
+            tx.pragma_update(None, "user_version", 19)?;
             tx.commit()?;
         }
         Ok(Self { conn })
@@ -1203,6 +1222,42 @@ impl Store {
              RETURNING id"
         ))?;
         stmt.query_map([now], |r| r.get(0))?.collect()
+    }
+
+    /// Files a sender's mail under `category`, now and as it arrives, in
+    /// every account (Spark's Change category); `None` goes back to what each
+    /// email's headers say. Returns the sender's category before, for undo.
+    pub fn set_sender_category(
+        &mut self,
+        address: &str,
+        category: Option<Category>,
+    ) -> Result<Option<Category>> {
+        let tx = self.conn.transaction()?;
+        let before: Option<String> = tx
+            .query_row(
+                "SELECT category FROM sender_categories WHERE address = ?1",
+                [address],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match category {
+            Some(c) => tx.execute(
+                "INSERT INTO sender_categories (address, category) VALUES (?1, ?2)
+                 ON CONFLICT (address) DO UPDATE SET category = excluded.category",
+                params![address, category_str(c)],
+            )?,
+            None => tx.execute(
+                "DELETE FROM sender_categories WHERE address = ?1",
+                [address],
+            )?,
+        };
+        tx.execute(
+            "UPDATE messages SET category = COALESCE(?2, auto_category, category)
+             WHERE from_address = ?1",
+            params![address, category.map(category_str)],
+        )?;
+        tx.commit()?;
+        Ok(before.as_deref().map(parse_category))
     }
 
     /// Mutes or unmutes a conversation (`Message::conversation`).
@@ -1895,9 +1950,13 @@ fn insert_message(
             account_id, remote_id, mailbox, uid, message_id, thread_id, in_reply_to, refs,
             from_name, from_address, to_list, cc_list, subject, snippet, date,
             text_body, html_body, attachments, category, state, unread, pinned, screening,
-            remote_place, remote_unread, remote_pinned, bcc_list, invite, reply_to_list)
+            remote_place, remote_unread, remote_pinned, bcc_list, invite, reply_to_list,
+            auto_category)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27)",
+                 ?16, ?17, ?18,
+                 -- The sender's category if the user chose one, else what its headers say.
+                 COALESCE((SELECT category FROM sender_categories WHERE address = ?10), ?19),
+                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19)",
         params![
             m.account_id,
             m.remote_id,
@@ -2068,6 +2127,7 @@ fn message_row(r: &Row) -> Result<Message> {
             (Some(id), Some(at)) => Some(DueReminder { id, at }),
             _ => None,
         },
+        invite_kind: r.get(24)?,
     })
 }
 

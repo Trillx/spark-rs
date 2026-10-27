@@ -45,7 +45,8 @@ export type ActionId =
   | "blockDomain"
   | "zoomIn"
   | "zoomOut"
-  | "zoomReset";
+  | "zoomReset"
+  | "move";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -108,6 +109,8 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   zoomIn: [{ key: "=", mod: true }, { key: "+", mod: true, shift: true }, { key: "+", mod: true }],
   zoomOut: [{ key: "-", mod: true }],
   zoomReset: [{ key: "0", mod: true }],
+  /** Move to folder. */
+  move: [{ key: "m" }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {

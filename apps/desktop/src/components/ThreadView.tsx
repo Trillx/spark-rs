@@ -12,7 +12,9 @@ import {
   Circle,
   Clock,
   Ellipsis,
+  FolderInput,
   Forward,
+  Group,
   Inbox,
   ListChecks,
   MailX,
@@ -23,6 +25,7 @@ import {
   Send,
   ShieldAlert,
   ShieldCheck,
+  Tags,
   Text,
   ThumbsDown,
   ThumbsUp,
@@ -33,7 +36,13 @@ import {
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { QUICK_REPLIES, SUMMARY_STYLES, type QuickReply, type SummaryStyle } from "../ai";
 import { senderStatus } from "../api";
-import type { AccountView, Message, MessageContent, SenderStatus } from "../types";
+import type { AccountView, Category, Message, MessageContent, SenderStatus } from "../types";
+
+const CATEGORIES: { key: Category; label: string }[] = [
+  { key: "people", label: "People" },
+  { key: "notifications", label: "Notifications" },
+  { key: "newsletters", label: "Newsletters" },
+];
 import { isFromYou, useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
@@ -88,6 +97,14 @@ export interface ThreadActions {
   searchSender: (m: Message) => void;
   /** Your sent email as a new one, to send again. */
   sendAgain: (m: Message) => void;
+  /** Opens Move to folder. */
+  move: (m: Message) => void;
+  /** Files the sender's mail under another category. */
+  changeCategory: (m: Message, category: Category) => void;
+  /** Group by Sender / Domain, or ungroup. */
+  groupSender: (m: Message) => void;
+  groupDomain: (m: Message) => void;
+  grouping: (m: Message) => { sender: boolean; domain?: string; domainGrouped: boolean };
   summarize: (m: Message, style: SummaryStyle) => void;
   stopSummary: (m: Message) => void;
   deleteSummary: (m: Message) => void;
@@ -593,6 +610,7 @@ function MessageMenuItems({
   const deleted = m.state === "deleted";
   const senderPriority = actions.senderPriority(m);
   const yours = isFromYou(m, useAccount(m.account));
+  const grouping = actions.grouping(m);
   return (
     <>
       <MenuItem label="Reply" detail={shortcutLabel("reply")} icon={<Reply size={15} />} onSelect={() => actions.reply(m)} />
@@ -609,6 +627,30 @@ function MessageMenuItems({
         onSelect={() => actions.forward(m)}
       />
       {yours && <MenuItem label="Send Again" icon={<Send size={15} />} onSelect={() => actions.sendAgain(m)} />}
+      <MenuItem label="Move to Folder…" detail={shortcutLabel("move")} icon={<FolderInput size={15} />} onSelect={() => actions.move(m)} />
+      {!yours &&
+        CATEGORIES.filter((c) => c.key !== m.category).map((c) => (
+          <MenuItem
+            key={c.key}
+            label={`Change Category to ${c.label}`}
+            icon={<Tags size={15} />}
+            onSelect={() => actions.changeCategory(m, c.key)}
+          />
+        ))}
+      {!yours && (
+        <MenuItem
+          label={grouping.sender ? "Ungroup Emails from Sender" : "Group Emails by Sender"}
+          icon={<Group size={15} />}
+          onSelect={() => actions.groupSender(m)}
+        />
+      )}
+      {!yours && grouping.domain && (
+        <MenuItem
+          label={grouping.domainGrouped ? `Ungroup Emails from ${grouping.domain}` : `Group Emails from ${grouping.domain}`}
+          icon={<Group size={15} />}
+          onSelect={() => actions.groupDomain(m)}
+        />
+      )}
       <MenuItem label="Search Emails by Sender" icon={<Search size={15} />} onSelect={() => actions.searchSender(m)} />
       {!single && (
         <MenuItem

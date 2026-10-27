@@ -3,6 +3,7 @@ import {
   Check,
   Circle,
   Clock,
+  FolderInput,
   Inbox,
   Pin,
   ShieldAlert,
@@ -43,6 +44,8 @@ export interface BulkActions {
   snoozeCustom: () => void;
   unsnooze: () => void;
   spam: () => void;
+  /** Opens Move to folder. */
+  move: () => void;
   clear: () => void;
 }
 
@@ -146,6 +149,7 @@ function Buttons({ selection: s, actions }: { selection: Selection; actions: Bul
             Icon={ArrowDownLeft}
             onClick={actions.aside}
           />
+          <Action tip={hint("Move to Folder…", "move")} Icon={FolderInput} onClick={actions.move} />
           <Action
             tip={s.allSpam ? "Not Spam" : "Move to Spam"}
             Icon={s.allSpam ? ShieldCheck : ShieldAlert}

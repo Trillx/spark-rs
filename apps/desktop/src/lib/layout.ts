@@ -1,4 +1,17 @@
-import { Bell, MailOpen, Newspaper, Pin, UserPlus, Users, Zap, type LucideIcon } from "lucide-react";
+import {
+  Bell,
+  CalendarCheck,
+  CalendarDays,
+  Globe,
+  MailOpen,
+  Newspaper,
+  Pin,
+  User,
+  UserPlus,
+  Users,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
 import type { AccountId, AccountView, BadgeCount, FolderView, GatekeeperMode, Message } from "../types";
 import { asThread, conversationOf, indexConversations, participantNames } from "./conversation";
 import { datePeriod, futurePeriod } from "./format";
@@ -8,8 +21,17 @@ import { folderIdOf, hasAccountRows, listFolderIds, listInfo, smartIdOf, type Li
 
 export type InboxMode = "focused" | "cards" | "simple";
 export type AccountFilter = AccountId | "all";
-export type CardKey = "priority" | "pinned" | "people" | "notifications" | "newsletters" | "seen";
-export type GroupKey = "notifications" | "newsletters";
+export type CardKey =
+  | "priority"
+  | "pinned"
+  | "invitations"
+  | "people"
+  | "responses"
+  | "notifications"
+  | "newsletters"
+  | "seen";
+/** A composite row: Focused's notifications, newsletters and invitations, or a sender or domain the user grouped. */
+export type GroupKey = "notifications" | "newsletters" | "invitations" | `sender:${string}` | `domain:${string}`;
 export type SubList = { kind: "card"; key: CardKey } | { kind: "group"; key: GroupKey } | { kind: "gatekeeper" };
 
 export interface ListView {
@@ -53,7 +75,14 @@ export interface ListModel {
   rowOf: ReadonlyMap<number, number>;
   /** Each row's conversation, by row id. */
   threads: ReadonlyMap<number, ThreadInfo>;
+  /**
+   * Group rows by the id they take in `order` (their newest email's): the
+   * cursor and the selection reach them like rows, and act on all of them.
+   */
+  groups: ReadonlyMap<number, GroupBlock>;
 }
+
+export type GroupBlock = Extract<ListBlock, { kind: "group" }>;
 
 export interface ThreadInfo {
   /** Its emails, as the thread view shows them. */
@@ -94,7 +123,9 @@ export function saveInboxMode(account: AccountFilter, mode: InboxMode) {
 export const CARDS: Record<CardKey, { label: string; Icon: LucideIcon; iconClass: string }> = {
   priority: { label: "Priority", Icon: Zap, iconClass: "bg-[#ffaa3b]" },
   pinned: { label: "Pinned", Icon: Pin, iconClass: "bg-[#ffaa3b]" },
+  invitations: { label: "Invitations", Icon: CalendarDays, iconClass: "bg-[#f05a5a]" },
   people: { label: "People", Icon: Users, iconClass: "bg-[#007cff]" },
+  responses: { label: "Responses", Icon: CalendarCheck, iconClass: "bg-[#f05a5a]" },
   notifications: { label: "Notifications", Icon: Bell, iconClass: "bg-[#48c725]" },
   newsletters: { label: "Newsletters", Icon: Newspaper, iconClass: "bg-[#a06ad0]" },
   seen: { label: "Seen", Icon: MailOpen, iconClass: "bg-[#868d97]" },
@@ -105,7 +136,95 @@ export const GATEKEEPER = { label: "New senders", Icon: UserPlus, iconClass: "bg
 /** Rows shown per card before "Show all". */
 export const CARD_LIMIT = 3;
 
-const CARD_ORDER: CardKey[] = ["priority", "pinned", "people", "notifications", "newsletters", "seen"];
+export const CARD_ORDER: CardKey[] = [
+  "priority",
+  "pinned",
+  "invitations",
+  "people",
+  "responses",
+  "notifications",
+  "newsletters",
+  "seen",
+];
+
+/**
+ * Cards settings, kept on this machine like the sidebar: the cards turned
+ * off (their mail goes to its category's card, or People) and how many rows
+ * each shows. People can't be turned off; Priority's size is Settings → Priority's.
+ */
+export interface CardPrefs {
+  hidden: CardKey[];
+  rows: Partial<Record<CardKey, number>>;
+}
+
+const CARDS_KEY = "spark-rs.cards";
+
+export function loadCardPrefs(): CardPrefs {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CARDS_KEY) ?? "{}");
+    const known = (k: unknown): k is CardKey => typeof k === "string" && k in CARDS && k !== "people";
+    return {
+      hidden: Array.isArray(saved.hidden) ? saved.hidden.filter(known) : [],
+      rows: typeof saved.rows === "object" && saved.rows ? saved.rows : {},
+    };
+  } catch {
+    return { hidden: [], rows: {} };
+  }
+}
+
+export function saveCardPrefs(prefs: CardPrefs) {
+  localStorage.setItem(CARDS_KEY, JSON.stringify(prefs));
+}
+
+/** Senders and custom domains whose mail folds into one row (Spark's Group by Sender / Domain), lowercased. */
+export interface Grouped {
+  senders: string[];
+  domains: string[];
+}
+
+const GROUPED_KEY = "spark-rs.grouped";
+
+export function loadGrouped(): Grouped {
+  try {
+    const saved = JSON.parse(localStorage.getItem(GROUPED_KEY) ?? "{}");
+    const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+    return { senders: list(saved.senders), domains: list(saved.domains) };
+  } catch {
+    return { senders: [], domains: [] };
+  }
+}
+
+export function saveGrouped(grouped: Grouped) {
+  localStorage.setItem(GROUPED_KEY, JSON.stringify(grouped));
+}
+
+/** `Grouped` as sets, for looking up every email of a big Inbox. */
+interface GroupSets {
+  senders: ReadonlySet<string>;
+  domains: ReadonlySet<string>;
+}
+
+const groupSets = (grouped: Grouped | undefined): GroupSets => ({
+  senders: new Set(grouped?.senders),
+  domains: new Set(grouped?.domains),
+});
+
+/** The sender or domain group an email folds into, if the user grouped either. */
+function groupOf(m: Message, sets: GroupSets): GroupKey | undefined {
+  if (!sets.senders.size && !sets.domains.size) return undefined;
+  const address = m.address.toLowerCase();
+  if (sets.senders.has(address)) return `sender:${address}`;
+  const domain = address.split("@")[1];
+  return domain && sets.domains.has(domain) ? `domain:${domain}` : undefined;
+}
+
+/** A group row's name and look: Focused's built-in groups, or the grouped sender or domain. */
+export function groupInfo(key: GroupKey, items: Message[]): { label: string; Icon: LucideIcon } {
+  if (key.startsWith("sender:")) return { label: items[0]?.from || key.slice("sender:".length), Icon: User };
+  if (key.startsWith("domain:")) return { label: key.slice("domain:".length), Icon: Globe };
+  const { label, Icon } = CARDS[key as "notifications" | "newsletters" | "invitations"];
+  return { label, Icon };
+}
 
 /** What lists other than the Inbox are made of. */
 export interface ListContext {
@@ -120,6 +239,9 @@ export interface ListContext {
   gatekeeper?: GatekeeperMode;
   /** Rows the Priority card shows before "Show all" (Settings → Priority); 0 shows them all. */
   priorityLines?: number;
+  /** Cards settings. */
+  cards?: CardPrefs;
+  grouped?: Grouped;
 }
 
 /** Mail waiting in New Senders, out of the lists until its sender is accepted. */
@@ -172,22 +294,27 @@ export function inboxMessages(
  * in its card once read, until it's Done (Spark's `priorityCardShowsRead`
  * defaults to on).
  */
-export function smartCards(mail: Message[], sticky: ReadonlySet<number>): Record<CardKey, Message[]> {
+export function smartCards(
+  mail: Message[],
+  sticky: ReadonlySet<number>,
+  hidden: readonly CardKey[] = [],
+): Record<CardKey, Message[]> {
   const unread = (m: Message) => m.unread || sticky.has(m.id);
-  const cards: Record<CardKey, Message[]> = {
-    priority: [],
-    pinned: [],
-    people: [],
-    notifications: [],
-    newsletters: [],
-    seen: [],
+  const on = (key: CardKey) => !hidden.includes(key);
+  const cards = Object.fromEntries(CARD_ORDER.map((key) => [key, []])) as unknown as Record<CardKey, Message[]>;
+  const card = (m: Message): CardKey => {
+    if (m.state === "done") return "seen";
+    if (m.priority && on("priority")) return "priority";
+    if (m.pinned && on("pinned")) return "pinned";
+    if (!unread(m)) return "seen";
+    if (m.inviteKind === "invitation") return "invitations";
+    if (m.inviteKind === "reply") return "responses";
+    return m.category;
   };
   for (const m of mail) {
-    if (m.state === "done") cards.seen.push(m);
-    else if (m.priority) cards.priority.push(m);
-    else if (m.pinned) cards.pinned.push(m);
-    else if (!unread(m)) cards.seen.push(m);
-    else cards[m.category].push(m);
+    // A card turned off gives its mail to People.
+    const key = card(m);
+    cards[on(key) ? key : "people"].push(m);
   }
   return cards;
 }
@@ -224,7 +351,13 @@ function withReturnPeriods(items: Message[]): ListBlock[] {
 
 function rowIds(blocks: ListBlock[]) {
   return blocks.flatMap((b) =>
-    b.kind === "row" ? [b.message.id] : b.kind === "card" ? b.items.slice(0, b.shown).map((m) => m.id) : [],
+    b.kind === "row"
+      ? [b.message.id]
+      : b.kind === "card"
+        ? b.items.slice(0, b.shown).map((m) => m.id)
+        : b.kind === "group"
+          ? [b.items[0].id]
+          : [],
   );
 }
 
@@ -271,7 +404,8 @@ function listRows(messages: Message[], read: ReadonlySet<number>, ctx: ListConte
       const shown = block.kind === "row" ? [block.message] : block.kind === "period" ? [] : block.items;
       for (const m of shown) for (const id of members.get(m.id) ?? [m.id]) rowOf.set(id, m.id);
     }
-    return { title, blocks, order: rowIds(blocks), bulk, rowOf, threads };
+    const groups = new Map(blocks.flatMap((b) => (b.kind === "group" ? [[b.items[0].id, b] as const] : [])));
+    return { title, blocks, order: rowIds(blocks), bulk, rowOf, threads, groups };
   }
 
   return { of, model, sticky };
@@ -357,11 +491,53 @@ export function buildList(
     );
   }
 
+  const hidden = ctx.cards?.hidden ?? [];
+  const sets = groupSets(ctx.grouped);
+  const focused = view.mode === "focused";
+  const grouped = (m: Message) => groupOf(m, sets) !== undefined;
+  /** The group a row folds into: a grouped sender or domain, and in Focused, invitations, notifications and newsletters. */
+  const groupKey = (m: Message): GroupKey | undefined =>
+    groupOf(m, sets) ??
+    (!focused
+      ? undefined
+      : m.inviteKind === "invitation"
+        ? "invitations"
+        : m.category === "notifications" || m.category === "newsletters"
+          ? m.category
+          : undefined);
+  /** Rows, each group folded into one row where its newest email is. */
+  const fold = (items: Message[]) => {
+    const out: (Message | GroupBlock)[] = [];
+    const groups = new Map<GroupKey, GroupBlock>();
+    for (const m of items) {
+      const key = groupKey(m);
+      if (!key) {
+        out.push(m);
+        continue;
+      }
+      let group = groups.get(key);
+      if (!group) {
+        group = { kind: "group", key, items: [] };
+        groups.set(key, group);
+        out.push(group);
+      }
+      group.items.push(m);
+    }
+    return out;
+  };
+
+  // What each part of the Inbox holds, the same for its block and the list it opens:
+  // in Unread cards grouped mail leaves the cards; in Focused, Priority mail leaves the groups.
+  const cardMail = view.mode === "cards" ? mail.filter((m) => !grouped(m)) : mail;
+  const cards = smartCards(cardMail, rows.sticky, hidden);
+  const priority = new Set(focused ? cards.priority : []);
+  const groupMail =
+    view.mode === "cards" ? mail.filter(grouped) : focused ? mail.filter((m) => !priority.has(m)) : mail;
+
   const sub = view.sub;
   if (sub) {
-    const items =
-      sub.kind === "card" ? smartCards(mail, rows.sticky)[sub.key] : mail.filter((m) => m.category === sub.key);
-    const label = CARDS[sub.key].label;
+    const items = sub.kind === "card" ? cards[sub.key] : groupMail.filter((m) => groupKey(m) === sub.key);
+    const label = sub.kind === "card" ? CARDS[sub.key].label : groupInfo(sub.key, items).label;
     return rows.model(
       label,
       items.map((m) => ({ kind: "row", message: m })),
@@ -376,13 +552,15 @@ export function buildList(
     key,
     items,
     total: items.length,
-    shown: key !== "priority" ? CARD_LIMIT : priorityLines || items.length,
+    shown: key !== "priority" ? (ctx.cards?.rows[key] ?? CARD_LIMIT) : priorityLines || items.length,
   });
 
   if (view.mode === "cards") {
-    const cards = smartCards(mail, rows.sticky);
+    // Grouped senders and domains are rows of their own, after the cards with unread mail.
+    const groups = fold(groupMail) as GroupBlock[];
     const blocks: ListBlock[] = [];
     for (const key of CARD_ORDER) {
+      if (key === "seen") blocks.push(...groups);
       if (cards[key].length) blocks.push(card(key, cards[key]));
       // New senders sit right under Priority.
       if (key === "priority") blocks.push(...gatekeeper);
@@ -390,27 +568,14 @@ export function buildList(
     return rows.model(title, blocks);
   }
 
-  if (view.mode === "focused") {
+  if (focused) {
     // Priority mail sits in a card on top; the rest is grouped by date,
-    // with notifications and newsletters folded into one row each.
-    const priority = smartCards(mail, rows.sticky).priority;
-    const rest = mail.filter((m) => !priority.includes(m));
-    const items: (Message | Extract<ListBlock, { kind: "group" }>)[] = [];
-    const grouped = new Set<GroupKey>();
-    for (const m of rest) {
-      if (m.category === "notifications" || m.category === "newsletters") {
-        if (grouped.has(m.category)) continue;
-        grouped.add(m.category);
-        items.push({ kind: "group", key: m.category, items: rest.filter((x) => x.category === m.category) });
-      } else {
-        items.push(m);
-      }
-    }
-    const top: ListBlock[] = priority.length ? [card("priority", priority)] : [];
-    return rows.model(title, [...top, ...gatekeeper, ...withPeriods(items, inboxTime)]);
+    // with invitations, notifications and newsletters folded into one row each.
+    const top: ListBlock[] = priority.size ? [card("priority", cards.priority)] : [];
+    return rows.model(title, [...top, ...gatekeeper, ...withPeriods(fold(groupMail), inboxTime)]);
   }
 
-  return rows.model(title, [...gatekeeper, ...withPeriods(mail, inboxTime)]);
+  return rows.model(title, [...gatekeeper, ...withPeriods(fold(mail), inboxTime)]);
 }
 
 /** A search's `from:`, `has:attachment`, `is:unread` and `date:today`, and the free text left. */

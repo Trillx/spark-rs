@@ -80,6 +80,7 @@ fn main() {
             mailbox::delete_folder,
             mailbox::delete_forever,
             mailbox::set_muted,
+            mailbox::set_sender_category,
             mailbox::list_scheduled,
             mailbox::reschedule_send,
             mailbox::unschedule_send,

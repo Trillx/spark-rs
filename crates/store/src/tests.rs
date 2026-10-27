@@ -3050,3 +3050,74 @@ fn turning_the_gatekeeper_off_keeps_a_blocked_domain_blocked() {
         MessageState::Blocked
     );
 }
+
+#[test]
+fn a_senders_category_holds_for_their_mail_now_and_later() {
+    let (mut store, account) = store_with_account();
+    let news = |uid| Incoming {
+        category: Category::Newsletters,
+        ..incoming(account, uid, "news@shop.example")
+    };
+    let first = new_id(store.add_incoming(&news(1), false).unwrap());
+    let other = new_id(
+        store
+            .add_incoming(&incoming(account, 2, "ana@x.com"), false)
+            .unwrap(),
+    );
+
+    assert_eq!(
+        store
+            .set_sender_category("NEWS@shop.example", Some(Category::People))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store.message(first).unwrap().unwrap().category,
+        Category::People
+    );
+    let later = new_id(store.add_incoming(&news(3), false).unwrap());
+    assert_eq!(
+        store.message(later).unwrap().unwrap().category,
+        Category::People
+    );
+    assert_eq!(
+        store.message(other).unwrap().unwrap().category,
+        Category::People
+    );
+
+    // Undone: back to what the headers say.
+    assert_eq!(
+        store
+            .set_sender_category("news@shop.example", None)
+            .unwrap(),
+        Some(Category::People)
+    );
+    assert_eq!(
+        store.message(first).unwrap().unwrap().category,
+        Category::Newsletters
+    );
+    assert_eq!(
+        store.message(later).unwrap().unwrap().category,
+        Category::Newsletters
+    );
+}
+
+#[test]
+fn messages_say_what_kind_of_invite_they_carry() {
+    let (mut store, account) = store_with_account();
+    let invited = Incoming {
+        invite: Some(r#"{"kind":"invitation","uid":"x"}"#.into()),
+        ..incoming(account, 1, "ana@x.com")
+    };
+    let id = new_id(store.add_incoming(&invited, false).unwrap());
+    let plain = new_id(
+        store
+            .add_incoming(&incoming(account, 2, "bo@x.com"), false)
+            .unwrap(),
+    );
+    assert_eq!(
+        store.message(id).unwrap().unwrap().invite_kind.as_deref(),
+        Some("invitation")
+    );
+    assert_eq!(store.message(plain).unwrap().unwrap().invite_kind, None);
+}

@@ -85,6 +85,7 @@ import {
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo, plural } from "../lib/format";
 import { PRIORITY_LINE_CHOICES } from "../lib/priority";
+import { CARDS, CARD_LIMIT, CARD_ORDER, type CardKey, type CardPrefs } from "../lib/layout";
 import type { ThemePref } from "../lib/theme";
 import { signatureLabel } from "../lib/signatures";
 import type {
@@ -153,6 +154,8 @@ export default function Settings({
   onTheme,
   minimize,
   onMinimize,
+  cards,
+  onCards,
   priorityLines,
   onPriorityLines,
   prioritySenders,
@@ -170,6 +173,9 @@ export default function Settings({
   /** Minimize old emails in a conversation. */
   minimize: boolean;
   onMinimize: (on: boolean) => void;
+  /** Unread cards: which are on, and how many emails each shows. */
+  cards: CardPrefs;
+  onCards: (cards: CardPrefs) => void;
   /** Rows the Priority card shows; 0 shows them all. */
   priorityLines: number;
   onPriorityLines: (lines: number) => void;
@@ -275,7 +281,14 @@ export default function Settings({
               )}
               {page === "notifications" && <NotificationsPage />}
               {page === "appearance" && (
-                <AppearancePage theme={theme} onTheme={onTheme} minimize={minimize} onMinimize={onMinimize} />
+                <AppearancePage
+                  theme={theme}
+                  onTheme={onTheme}
+                  minimize={minimize}
+                  onMinimize={onMinimize}
+                  cards={cards}
+                  onCards={onCards}
+                />
               )}
             </div>
           </div>
@@ -1677,12 +1690,18 @@ function AppearancePage({
   onTheme,
   minimize,
   onMinimize,
+  cards,
+  onCards,
 }: {
   theme: ThemePref;
   onTheme: (theme: ThemePref) => void;
   minimize: boolean;
   onMinimize: (on: boolean) => void;
+  cards: CardPrefs;
+  onCards: (cards: CardPrefs) => void;
 }) {
+  // Priority's size is Settings → Priority's; People always shows.
+  const sized = (key: CardKey) => key !== "priority";
   return (
     <>
       <section className="mb-7">
@@ -1716,6 +1735,45 @@ function AppearancePage({
         >
           <Switch id="minimize-old" on={minimize} onToggle={() => onMinimize(!minimize)} />
         </Row>
+      </Group>
+
+      <Group title="Unread cards" note="A card that's off gives its emails to People.">
+        {CARD_ORDER.map((key) => {
+          const on = !cards.hidden.includes(key);
+          return (
+            <Row key={key} label={CARDS[key].label} htmlFor={`card-${key}`}>
+              <div className="flex items-center gap-2">
+                {sized(key) && (
+                  <select
+                    aria-label={`Emails the ${CARDS[key].label} card shows`}
+                    value={cards.rows[key] ?? CARD_LIMIT}
+                    disabled={!on}
+                    onChange={(e) => onCards({ ...cards, rows: { ...cards.rows, [key]: Number(e.target.value) } })}
+                    className="select select-sm h-8 w-32 rounded-lg border-hairline text-[13px]"
+                  >
+                    {[3, 5, 10].map((n) => (
+                      <option key={n} value={n}>
+                        {n} emails
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {key !== "people" && (
+                  <Switch
+                    id={`card-${key}`}
+                    on={on}
+                    onToggle={() =>
+                      onCards({
+                        ...cards,
+                        hidden: on ? [...cards.hidden, key] : cards.hidden.filter((k) => k !== key),
+                      })
+                    }
+                  />
+                )}
+              </div>
+            </Row>
+          );
+        })}
       </Group>
     </>
   );
