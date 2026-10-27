@@ -538,6 +538,10 @@ pub fn series_from(
         "sensitivity",
         "isOnlineMeeting",
         "onlineMeetingProvider",
+        "categories",
+        "importance",
+        "responseRequested",
+        "allowNewTimeProposals",
     ] {
         if let Some(value) = master.get(key).filter(|v| !v.is_null()) {
             body.insert(key.into(), value.clone());
@@ -664,7 +668,7 @@ pub fn series_from(
 /// What `series_from` reads of a series.
 pub const MASTER_SELECT: &str = "subject,body,start,end,isAllDay,location,attendees,hideAttendees,\
      isReminderOn,reminderMinutesBeforeStart,showAs,sensitivity,isOnlineMeeting,\
-     onlineMeetingProvider,recurrence,originalStartTimeZone,hasAttachments";
+     onlineMeetingProvider,recurrence,originalStartTimeZone,hasAttachments,categories,importance,responseRequested,allowNewTimeProposals";
 
 /// `html`, an event's description, with `notes` in place of what comes
 /// before the Teams meeting Outlook put in it (found by its rule of
