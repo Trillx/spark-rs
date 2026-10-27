@@ -252,6 +252,40 @@ struct DeltaPage {
     delta_link: Option<String>,
 }
 
+/// A message's attachment listing (`attachment_listing`).
+#[derive(Deserialize)]
+struct Attachments {
+    value: Vec<ListedAttachment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedAttachment {
+    id: Option<String>,
+    name: Option<String>,
+    content_type: Option<String>,
+    size: Option<u64>,
+    is_inline: Option<bool>,
+}
+
+impl Attachments {
+    /// The attachments listed, not counting inline images.
+    fn files(self) -> Vec<Attachment> {
+        self.value
+            .into_iter()
+            .filter(|a| a.is_inline != Some(true))
+            .filter_map(|a| {
+                Some(Attachment {
+                    name: a.name?,
+                    mime: a.content_type.unwrap_or_default(),
+                    size: a.size.unwrap_or(0),
+                    remote_id: a.id,
+                })
+            })
+            .collect()
+    }
+}
+
 /// What a delta page says about one message, ready to store.
 enum Delta {
     Gone(String),
@@ -308,11 +342,20 @@ impl Graph {
         json_of(self.send(request).await?).await
     }
 
-    /// `send` for requests that go a few at a time (`in_turns`). One Graph
+    /// `send` for requests that go a few at a time (`in_turns`), tried
+    /// again when Graph throttles them (`answered_patiently`).
+    async fn send_patiently(
+        &self,
+        request: impl Fn() -> RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        checked(self.answered_patiently(request).await?).await
+    }
+
+    /// Graph's answer to a request, whatever its status. One Graph
     /// throttles is tried again once the pause is over, unless the pause
     /// is longer than `LONGEST_PAUSE` or it was tried `THROTTLED_RETRIES`
     /// times already. `request` makes it anew for each try.
-    async fn send_patiently(
+    async fn answered_patiently(
         &self,
         request: impl Fn() -> RequestBuilder,
     ) -> Result<reqwest::Response> {
@@ -322,7 +365,7 @@ impl Graph {
                 (_, Some(pause)) if retries < THROTTLED_RETRIES && pause <= LONGEST_PAUSE => {
                     retries += 1;
                 }
-                (response, _) => return checked(response).await,
+                (response, _) => return Ok(response),
             }
         }
     }
@@ -447,7 +490,9 @@ impl Graph {
                 other => other?,
             };
             // New mail is completed (attachments, invites) before the page
-            // is stored, in one transaction.
+            // is stored, in one transaction. If some can't be yet, none of
+            // the page is: the sync fails short of a new delta link, and
+            // the next one gets the page again.
             let known: HashSet<String> = {
                 let store = lock(store);
                 let mut known = HashSet::new();
@@ -485,7 +530,7 @@ impl Graph {
                     _ => None,
                 })
                 .collect();
-            self.complete_all(new).await;
+            self.complete_all(new).await?;
             lock(store).batch(|b| {
                 for change in &changes {
                     match change {
@@ -630,7 +675,7 @@ impl Graph {
                 None => ended = true,
             }
         }
-        state.complete = ended && listing.len() <= limit;
+        let complete = ended && listing.len() <= limit;
         listing.truncate(limit);
         let (before, known): (HashSet<i64>, HashSet<String>) = {
             let store = lock(store);
@@ -679,7 +724,9 @@ impl Graph {
                 .iter_mut()
                 .filter_map(|(incoming, m)| Some(((*m)?, incoming)))
                 .collect();
-            self.complete_all(new).await;
+            // If some can't be completed yet, the chunk isn't stored and the
+            // folder fails; its next listing finds them unknown still.
+            self.complete_all(new).await?;
             lock(store).batch(|b| {
                 for (incoming, _) in &incomings {
                     changed += usize::from(b.observe_reply_to(incoming)?);
@@ -695,6 +742,7 @@ impl Graph {
             })?;
         }
         changed += lock(store).set_folder_members(folder.id, &members)?;
+        state.complete = complete;
         Ok(Some(changed))
     }
 
@@ -838,8 +886,10 @@ impl Graph {
                 .collect();
             let mut incomings: Vec<Incoming> =
                 new.iter().map(|m| to_incoming(account_id, m)).collect();
+            // If some can't be completed yet, the page isn't stored and the
+            // next round reaches back from where this one got to.
             self.complete_all(new.into_iter().zip(&mut incomings).collect())
-                .await;
+                .await?;
             stored += lock(store).batch(|b| {
                 let mut new = 0;
                 for incoming in &incomings {
@@ -963,9 +1013,10 @@ impl Graph {
                 found.push((to_incoming(account_id, m), folder));
             }
         }
+        // If some can't be completed yet, none of what it found is stored.
         let incomings = found.iter_mut().map(|(incoming, _)| incoming);
         self.complete_all(new.into_iter().zip(incomings).collect())
-            .await;
+            .await?;
         Ok(lock(store).batch(|b| {
             let mut stored = 0;
             for (incoming, folder) in &found {
@@ -1062,26 +1113,62 @@ impl Graph {
     }
 
     /// Completes new messages, each given with its message as listed
-    /// (`complete`), a few at a time.
-    async fn complete_all(&self, new: Vec<(&GraphMessage, &mut Incoming)>) {
+    /// (`complete`), a few at a time. When one can't be completed yet, no
+    /// more start, and once those under way are done it fails as that one
+    /// did: the caller stores none of them, for a later round to complete.
+    async fn complete_all(&self, new: Vec<(&GraphMessage, &mut Incoming)>) -> Result<()> {
+        let mut failed = None;
         let completing = new
             .into_iter()
             .map(|(m, incoming)| self.complete(m, incoming))
             .collect();
-        in_turns(completing, |_, ()| true).await;
+        in_turns(completing, |_, completed| match completed {
+            Ok(()) => true,
+            Err(e) => {
+                failed.get_or_insert(e);
+                false
+            }
+        })
+        .await;
+        failed.map_or(Ok(()), Err)
     }
 
     /// What a listing leaves out of a new message: its attachments, and
-    /// the invite a meeting message carries.
-    async fn complete(&self, m: &GraphMessage, incoming: &mut Incoming) {
+    /// the invite a meeting message carries. What Graph won't give is left
+    /// out; fails if Graph may give it later (`completing`).
+    async fn complete(&self, m: &GraphMessage, incoming: &mut Incoming) -> Result<()> {
         if m.has_attachments == Some(true) {
-            incoming.attachments = self.attachments(&m.id).await.unwrap_or_default();
+            // Listed unreadably, they're left out too.
+            let listing = self.completing(&attachment_listing(&m.id)).await?;
+            incoming.attachments = listing
+                .and_then(|l| serde_json::from_slice::<Attachments>(&l).ok())
+                .map_or_else(Vec::new, Attachments::files);
         }
         if m.odata_type
             .as_deref()
             .is_some_and(|t| t.contains("eventMessage"))
         {
-            incoming.invite = self.invite(&m.id).await.map(|i| i.to_json());
+            incoming.invite = self.invite(&m.id).await?.map(|i| i.to_json());
+        }
+        Ok(())
+    }
+
+    /// The body of Graph's answer to `url`, for completing a new message
+    /// (`complete`); `None` if Graph won't give it, e.g. an attachment
+    /// deleted since the message was listed. Fails if Graph may give it
+    /// when asked again later (`later`), or the answer was cut off.
+    async fn completing(&self, url: &str) -> Result<Option<Vec<u8>>> {
+        let response = self
+            .answered_patiently(|| self.request(Method::GET, url))
+            .await?;
+        let status = response.status();
+        match checked(response).await {
+            Ok(response) => match response.bytes().await {
+                Ok(body) => Ok(Some(body.into())),
+                Err(e) => Err(Error::network(HOST, e)),
+            },
+            Err(e) if later(status) => Err(e),
+            Err(_) => Ok(None),
         }
     }
 
@@ -1097,15 +1184,13 @@ impl Graph {
             .to_vec())
     }
 
-    /// The invite in a meeting message. Exchange keeps meeting messages as
+    /// The invite in a meeting message; `None` if Graph won't give its MIME
+    /// (`completing`) or it has none. Exchange keeps meeting messages as
     /// items of their own and writes the calendar part out only in their MIME.
-    async fn invite(&self, id: &str) -> Option<Invite> {
+    async fn invite(&self, id: &str) -> Result<Option<Invite>> {
         let url = format!("/me/messages/{}/$value", path(id));
-        let response = self
-            .send_patiently(|| self.request(Method::GET, &url))
-            .await
-            .ok()?;
-        Invite::from_raw(&response.bytes().await.ok()?)
+        let raw = self.completing(&url).await?;
+        Ok(raw.and_then(|raw| Invite::from_raw(&raw)))
     }
 
     /// Sends a message given whole as MIME: one with parts Graph's JSON
@@ -1122,39 +1207,11 @@ impl Graph {
 
     /// A message's attachments, not counting inline images.
     pub async fn attachments(&self, id: &str) -> Result<Vec<Attachment>> {
-        #[derive(Deserialize)]
-        struct Page {
-            value: Vec<Listed>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Listed {
-            id: Option<String>,
-            name: Option<String>,
-            content_type: Option<String>,
-            size: Option<u64>,
-            is_inline: Option<bool>,
-        }
-        let url = format!(
-            "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
-            path(id)
-        );
-        let page: Page = self
+        let url = attachment_listing(id);
+        let listing: Attachments = self
             .json_patiently(|| self.request(Method::GET, &url))
             .await?;
-        Ok(page
-            .value
-            .into_iter()
-            .filter(|a| a.is_inline != Some(true))
-            .filter_map(|a| {
-                Some(Attachment {
-                    name: a.name?,
-                    mime: a.content_type.unwrap_or_default(),
-                    size: a.size.unwrap_or(0),
-                    remote_id: a.id,
-                })
-            })
-            .collect())
+        Ok(listing.files())
     }
 
     /// The images of message `id` whose Content-IDs (as `cid_key` gives
@@ -1895,6 +1952,14 @@ pub(crate) fn path(id: &str) -> String {
     url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
 }
 
+/// Where message `id`'s attachments are listed (`Attachments`).
+fn attachment_listing(id: &str) -> String {
+    format!(
+        "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
+        path(id)
+    )
+}
+
 /// `2026-10-21T14:00:00Z` (Graph's format) from Unix ms.
 pub(crate) fn iso_date(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
@@ -1972,6 +2037,18 @@ async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
 /// What a throttled request fails with: it's tried again in a later round.
 fn busy() -> Error {
     Error::network(HOST, "Microsoft is busy; trying again shortly")
+}
+
+/// Whether Graph may give what it refused with `status` when asked again
+/// later: it was busy, failing or too slow, or the sign-in ran out (which
+/// fails every request alike). Other refusals stand, such as for an
+/// attachment deleted since its message was listed.
+fn later(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT | StatusCode::UNAUTHORIZED
+        )
 }
 
 async fn json_of<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> Result<T> {
@@ -2998,10 +3075,9 @@ pub(crate) mod tests {
         (route == "/me/messages").then(|| json!({ "value": value }))
     }
 
-    #[tokio::test]
-    async fn searches_store_what_the_mailbox_finds_where_it_belongs() {
-        let (base, seen) = stand_in(searchable).await;
-        let graph = Graph::with_base(&base, "token");
+    /// A store with the `searchable` stand-in's folders f1, Archive and
+    /// Deleted Items, and k4.
+    fn searched_store() -> (Mutex<Store>, i64) {
         let (store, account_id) = microsoft_store();
         {
             let mut s = lock(&store);
@@ -3028,12 +3104,24 @@ pub(crate) mod tests {
             };
             s.add_incoming(&stored, false).unwrap();
         }
-        // The delta query has the last 10 hours.
-        let state = SyncState {
+        (store, account_id)
+    }
+
+    /// A synced account whose delta query has the last 10 hours.
+    fn searchable_state(base: &str) -> SyncState {
+        SyncState {
             delta_link: Some(format!("{base}/delta")),
             since: Some(received(10)),
             ..Default::default()
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn searches_store_what_the_mailbox_finds_where_it_belongs() {
+        let (base, seen) = stand_in(searchable).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = searched_store();
+        let state = searchable_state(&base);
 
         let query = Query::parse("Invoice from:ana@contoso.com");
         let stored = graph
@@ -3190,7 +3278,8 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
     /// for it (`m7.pdf`) and every 25th is a meeting request. Answers about
     /// every third message take longer, so they come back out of order.
     /// m13's attachments are throttled for a second once, m40's are gone
-    /// and m41's fail. Asked for alone, m3 is gone and m5 fails once.
+    /// and m41's are listed unreadably. Asked for alone, m3 is gone and m5
+    /// fails once.
     fn attached(asked: &Asked, attempt: usize) -> Answer {
         let route = asked.path.split('?').next().unwrap();
         let Some(rest) = route.strip_prefix("/me/messages/") else {
@@ -3214,7 +3303,10 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
                 };
             }
             ("attachments", 40) | ("", 3) => Answer::status(404),
-            ("attachments", 41) => Answer::status(500),
+            ("attachments", 41) => Answer {
+                body: "{\"value\": [".into(),
+                ..Answer::json(Value::Null)
+            },
             ("", 5) if attempt == 0 => Answer::status(500),
             ("attachments", _) => Answer::json(json!({ "value": [
                 { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
@@ -3297,7 +3389,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
                 .map(|a| a.name.as_str())
                 .collect();
             match number(remote) {
-                // Gone since it was listed, or failing: stored without.
+                // Gone since it was listed, or unreadable: stored without.
                 40 | 41 => assert!(names.is_empty(), "{remote}"),
                 _ => assert_eq!(names, [format!("{remote}.pdf")], "its own: {remote}"),
             }
@@ -3542,10 +3634,10 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
     }
 
     /// The `attached` stand-in, with Graph throttling m0's attachments for
-    /// a minute, answered at once, while other attachment listings take
-    /// their time.
+    /// a minute the first time, answered at once, while other attachment
+    /// listings take their time.
     fn throttled_for_a_minute(asked: &Asked, attempt: usize) -> Answer {
-        if asked.path.starts_with("/me/messages/m0/attachments") {
+        if asked.path.starts_with("/me/messages/m0/attachments") && attempt == 0 {
             return Answer {
                 retry_after: Some(60),
                 ..Answer::status(429)
@@ -3569,12 +3661,14 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
             limit: Some(STORE_BATCH),
             ..Default::default()
         };
+        let unsynced = state.clone();
 
         // 50 new messages: m0's attachments are throttled while m1's to
-        // m3's are under way, and nothing more goes out.
+        // m3's are under way, and nothing more goes out. The folder fails
+        // as busy, and none of them is stored without its attachments.
         let started = std::time::Instant::now();
-        let changed = graph.sync_folder(&store, &folder, &mut state).await;
-        assert_eq!(changed.unwrap(), Some(50));
+        let failed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert!(matches!(failed, Err(Error::Network { .. })), "{failed:?}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "not waited out"
@@ -3584,32 +3678,225 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         attachments.sort_unstable();
         assert_eq!(attachments, [0, 1, 2, 3]);
         assert_eq!(asked.len(), 2 + 4, "the listing, its bodies and those four");
-        // Stored all the same; those held back without their attachments.
-        {
-            let s = lock(&store);
-            let members = s.folder_member_ids(folder.id).unwrap();
-            assert_eq!(members.len(), 50);
-            for id in members {
-                let subject = s.message(id).unwrap().unwrap().subject;
-                let remote = subject.strip_prefix("Message ").unwrap();
-                let content = s.content(id).unwrap().unwrap();
-                let has_files = !content.attachments.is_empty();
-                assert_eq!(has_files, (1..=3).contains(&number(remote)), "{remote}");
-            }
-        }
+        assert!(lock(&store).messages().unwrap().is_empty());
+        assert!(
+            lock(&store)
+                .folder_member_ids(folder.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state, unsynced);
 
         // Every request fails as busy without going out, until the end is near.
         let held = graph.sync_folder(&store, &folder, &mut state).await;
         assert!(matches!(held, Err(Error::Network { .. })), "{held:?}");
         assert!(seen.take().is_empty());
+        assert!(lock(&store).messages().unwrap().is_empty());
 
-        // Then it waits for the end.
+        // Then it waits for the end, and all 50 come whole.
         let end = tokio::time::Instant::now() + Duration::from_millis(300);
         *graph.paused_until.lock().unwrap() = Some(end);
         let synced = graph.sync_folder(&store, &folder, &mut state).await;
-        assert_eq!(synced.unwrap(), Some(0));
+        assert_eq!(synced.unwrap(), Some(50));
         let asked = seen.take();
-        assert_eq!(asked.len(), 1, "the listing: nothing is new");
         assert!(asked[0].at >= end.into_std());
+        // The listings, 50 attachment listings (m13's twice) and two
+        // meetings' MIME.
+        assert_eq!(asked.len(), 2 + 51 + 2);
+        let s = lock(&store);
+        let members = s.folder_member_ids(folder.id).unwrap();
+        assert_eq!(members.len(), 50);
+        for id in members {
+            let subject = s.message(id).unwrap().unwrap().subject;
+            let n = number(subject.strip_prefix("Message ").unwrap());
+            let content = s.content(id).unwrap().unwrap();
+            // m40's are gone and m41's unreadable, which doesn't hold it up.
+            assert_eq!(content.attachments.is_empty(), matches!(n, 40 | 41), "m{n}");
+            assert_eq!(content.invite.is_some(), n.is_multiple_of(25), "m{n}");
+        }
+    }
+
+    /// The `delta` stand-in, with Graph throttling n2's attachments for a
+    /// minute the first time.
+    fn delta_throttled(asked: &Asked, attempt: usize) -> Answer {
+        if asked.path.starts_with("/me/messages/n2/attachments") && attempt == 0 {
+            return Answer {
+                retry_after: Some(60),
+                ..Answer::status(429)
+            };
+        }
+        delta(&asked.path).map_or_else(|| Answer::status(404), Answer::json)
+    }
+
+    /// The store's message with `subject`.
+    fn titled(store: &Mutex<Store>, subject: &str) -> Option<spark_store::Message> {
+        let messages = lock(store).messages().unwrap();
+        messages.into_iter().find(|m| m.subject == subject)
+    }
+
+    /// The `delta` stand-in's s3, stored unread; returns its id.
+    fn unread_s3(store: &Mutex<Store>, account_id: i64) -> i64 {
+        let s3 = Incoming {
+            account_id,
+            remote_id: Some("s3".into()),
+            unread: true,
+            date: NEWEST,
+            ..Default::default()
+        };
+        let Added::New(id) = lock(store).add_incoming(&s3, false).unwrap() else {
+            panic!("s3 is new");
+        };
+        id
+    }
+
+    #[tokio::test]
+    async fn a_long_throttle_leaves_the_inbox_page_for_a_later_round() {
+        let (base, seen) = serve(delta_throttled).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let s3 = unread_s3(&store, account_id);
+        let mut state = SyncState {
+            delta_link: Some("/delta1".into()),
+            reply_to_selected: true,
+            ..Default::default()
+        };
+
+        // The first page is stored. The second, with n2, isn't: the sync
+        // fails as busy and keeps its delta link.
+        let failed = graph.sync_inbox(&store, account_id, &mut state).await;
+        assert!(matches!(failed, Err(Error::Network { .. })), "{failed:?}");
+        assert_eq!(state.delta_link.as_deref(), Some("/delta1"));
+        assert!(titled(&store, "Message n1").is_some());
+        assert!(titled(&store, "Message n2").is_none());
+        assert!(lock(&store).message(s3).unwrap().unwrap().unread);
+        seen.take();
+
+        // Once the pause is over, the next sync gets the page again and
+        // stores it whole.
+        *graph.paused_until.lock().unwrap() = None;
+        let report = graph.sync_inbox(&store, account_id, &mut state).await;
+        assert_eq!(report.unwrap().new.len(), 1, "n2; n1 came before");
+        assert_eq!(state.delta_link.as_deref(), Some("/delta3"));
+        let n2 = titled(&store, "Message n2").unwrap();
+        assert_eq!(n2.attachment.as_deref(), Some("plan.pdf"));
+        assert!(!lock(&store).message(s3).unwrap().unwrap().unread);
+        assert_eq!(completing(&seen.take(), "attachments"), [2]);
+    }
+
+    #[tokio::test]
+    async fn files_gone_since_the_listing_dont_hold_up_the_inbox() {
+        // n2's attachments were deleted since the delta query listed it.
+        let (base, seen) = stand_in(|path| {
+            if path.starts_with("/me/messages/n2/attachments") {
+                return None;
+            }
+            delta(path)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let s3 = unread_s3(&store, account_id);
+        let mut state = SyncState {
+            delta_link: Some("/delta1".into()),
+            reply_to_selected: true,
+            ..Default::default()
+        };
+
+        // n2 is stored without them, along with the rest of its page.
+        let report = graph.sync_inbox(&store, account_id, &mut state).await;
+        assert_eq!(report.unwrap().new.len(), 2, "n1 and n2");
+        assert_eq!(state.delta_link.as_deref(), Some("/delta3"));
+        let n2 = titled(&store, "Message n2").unwrap();
+        assert!(n2.attachment.is_none());
+        let content = lock(&store).content(n2.id).unwrap().unwrap();
+        assert!(content.attachments.is_empty());
+        assert!(!lock(&store).message(s3).unwrap().unwrap().unread);
+        let paths = seen.lock().unwrap().clone();
+        let asked = paths.iter().filter(|p| p.contains("/attachments"));
+        assert_eq!(asked.count(), 1, "{paths:?}");
+    }
+
+    /// The `attached` stand-in, where i300's MIME fails the first time.
+    fn invite_fails_once(asked: &Asked, attempt: usize) -> Answer {
+        if asked.path == "/me/messages/i300/$value" && attempt == 0 {
+            return Answer::status(500);
+        }
+        attached(asked, attempt)
+    }
+
+    #[tokio::test]
+    async fn reaching_back_stores_no_meeting_without_its_invite() {
+        let (base, _) = serve(invite_fails_once).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        // The delta window ends between i249 and i250.
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(250) + 1_800_000),
+            ..Default::default()
+        };
+        let before = state.clone();
+
+        // i300's invite fails: none of the page is stored, and the next
+        // round reaches back from the same place.
+        let failed = graph.older_inbox(&store, account_id, &mut state).await;
+        assert!(matches!(failed, Err(Error::Server(_))), "{failed:?}");
+        assert_eq!(state, before);
+        assert!(lock(&store).messages().unwrap().is_empty());
+
+        let stored = graph.older_inbox(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 100);
+        assert_eq!(state.older_than, Some(received(349)));
+        let s = lock(&store);
+        for m in s.messages().unwrap() {
+            let n = number(m.subject.strip_prefix("Message ").unwrap());
+            let content = s.content(m.id).unwrap().unwrap();
+            assert_eq!(content.invite.is_some(), n.is_multiple_of(25), "i{n}");
+            assert_eq!(content.attachments.len(), 1, "i{n}");
+        }
+    }
+
+    /// The `searchable` stand-in, where a8 is a meeting request whose MIME
+    /// is cut off the first time.
+    fn searchable_meeting(asked: &Asked, attempt: usize) -> Answer {
+        if asked.path == "/me/messages/a8/$value" {
+            return match attempt {
+                0 => Answer::status(0),
+                _ => Answer {
+                    body: MEETING.into(),
+                    ..Answer::json(Value::Null)
+                },
+            };
+        }
+        let Some(mut reply) = searchable(&asked.path) else {
+            return Answer::status(404);
+        };
+        if asked.path.starts_with("/me/messages/a8?") {
+            reply["@odata.type"] = json!("#microsoft.graph.eventMessageRequest");
+        }
+        Answer::json(reply)
+    }
+
+    #[tokio::test]
+    async fn a_search_stores_nothing_until_its_invites_come() {
+        let (base, _) = serve(searchable_meeting).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = searched_store();
+        let state = searchable_state(&base);
+        let query = Query::parse("invoice");
+
+        let failed = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert!(matches!(failed, Err(Error::Network { .. })), "{failed:?}");
+        assert_eq!(lock(&store).messages().unwrap().len(), 1, "k4 alone");
+
+        let stored = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert_eq!(stored.unwrap(), 3);
+        let a8 = titled(&store, "Invoice a8").unwrap();
+        let content = lock(&store).content(a8.id).unwrap().unwrap();
+        assert!(content.invite.is_some());
     }
 }
