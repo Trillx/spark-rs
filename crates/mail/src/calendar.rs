@@ -202,6 +202,10 @@ pub enum Scope {
 pub struct Zone<'a> {
     pub name: &'a str,
     pub wall: fn(i64) -> String,
+    /// Minutes this zone's clock is ahead of `wall`'s: a series' own zone
+    /// (`name`), told from the user's clock by how far apart the two are at
+    /// one of its occurrences. 0 for the user's own.
+    pub shift: i64,
 }
 
 impl Zone<'_> {
@@ -209,7 +213,17 @@ impl Zone<'_> {
     pub const UTC: Zone<'static> = Zone {
         name: "UTC",
         wall: utc_wall,
+        shift: 0,
     };
+
+    /// `ms` on this zone's clock, without the zone: "2026-10-27T09:30:00".
+    pub fn wall_at(&self, ms: i64) -> String {
+        let wall = (self.wall)(ms);
+        if self.shift == 0 {
+            return wall;
+        }
+        parse_iso_date(&format!("{wall}Z")).map_or(wall, |t| utc_wall(t + self.shift * 60_000))
+    }
 
     /// Graph's time for `ms`; an all-day event's day (a UTC midnight)
     /// starts at midnight on the user's clock.
@@ -217,7 +231,7 @@ impl Zone<'_> {
         let wall = if all_day {
             utc_wall(ms)
         } else {
-            (self.wall)(ms)
+            self.wall_at(ms)
         };
         json!({ "dateTime": wall, "timeZone": self.name })
     }
@@ -321,7 +335,7 @@ pub fn date_in(zone: Zone, ms: i64, all_day: bool) -> String {
     let wall = if all_day {
         utc_wall(ms)
     } else {
-        (zone.wall)(ms)
+        zone.wall_at(ms)
     };
     wall.get(..10).unwrap_or_default().to_owned()
 }
@@ -357,7 +371,7 @@ pub fn changed_event_body(
                 zone.time(series + (now - was), true)
             } else {
                 // Clock times, counted as if they were UTC's.
-                let clock = |t: i64| parse_iso_date(&format!("{}Z", (zone.wall)(t))).unwrap_or(t);
+                let clock = |t: i64| parse_iso_date(&format!("{}Z", zone.wall_at(t))).unwrap_or(t);
                 let at = clock(series) + (clock(now) - clock(was));
                 json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
             }
@@ -1221,6 +1235,7 @@ mod tests {
     const PACIFIC: Zone<'static> = Zone {
         name: "Pacific Standard Time",
         wall: pacific,
+        shift: 0,
     };
 
     fn person(name: &str, address: &str) -> Person {
@@ -1730,6 +1745,54 @@ mod tests {
     }
 
     #[test]
+    fn a_series_from_another_zone_moves_on_its_own_clock() {
+        // A Wednesday 00:30 meeting in Tokyo, a Tuesday 8:30 in a zone 7
+        // hours behind UTC, moved a day later there for every occurrence.
+        let tokyo = Zone {
+            name: "Tokyo Standard Time",
+            wall: pacific,
+            shift: 16 * 60,
+        };
+        let occurrence = parse_iso_date("2026-10-27T15:30:00Z").unwrap();
+        let before = EventDraft {
+            title: "Sync".into(),
+            start: occurrence,
+            end: occurrence + 1_800_000,
+            ..Default::default()
+        };
+        let draft = EventDraft {
+            start: occurrence + DAY_MS,
+            end: occurrence + DAY_MS + 1_800_000,
+            ..before.clone()
+        };
+        let series_start = parse_iso_date("2026-10-13T15:30:00Z").unwrap();
+        let details = EventDetails {
+            start: series_start,
+            end: series_start + 1_800_000,
+            recurrence: json!({
+                "pattern": { "type": "weekly", "interval": 1, "daysOfWeek": ["wednesday"], "firstDayOfWeek": "sunday" },
+                "range": { "type": "noEnd", "startDate": "2026-10-14", "recurrenceTimeZone": "Tokyo Standard Time" }
+            }),
+            ..Default::default()
+        };
+        assert_eq!(tokyo.wall_at(occurrence), "2026-10-28T00:30:00");
+        let body = changed_event_body(&draft, &before, &details, tokyo, true);
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-15T00:30:00", "timeZone": "Tokyo Standard Time" })
+        );
+        assert_eq!(
+            body["recurrence"]["pattern"]["daysOfWeek"],
+            json!(["thursday"])
+        );
+        assert_eq!(
+            body["recurrence"]["range"]["recurrenceTimeZone"],
+            "Tokyo Standard Time"
+        );
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-10-15");
+    }
+
+    #[test]
     fn all_future_keeps_a_zoom_calls_joining_details() {
         let start = parse_iso_date("2026-11-03T16:30:00Z").unwrap();
         let zoom = format!(
@@ -1803,6 +1866,7 @@ mod tests {
         const EASTERN: Zone<'static> = Zone {
             name: "Eastern Standard Time",
             wall: eastern,
+            shift: 0,
         };
         // Weekly 9:00 to 10:00 from October 5; the November 2 one, after the
         // clocks went back, is moved to October 26 at 9:00, for all of them.

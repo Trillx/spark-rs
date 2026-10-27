@@ -191,6 +191,7 @@ pub async fn save_event(
     let zone = Zone {
         name: &name,
         wall: local_wall,
+        shift: 0,
     };
     match id {
         Some(id) => engine
@@ -223,6 +224,7 @@ pub async fn delete_event(
     let zone = Zone {
         name: &name,
         wall: local_wall,
+        shift: 0,
     };
     engine
         .delete_event(id, scope.unwrap_or_default(), zone)

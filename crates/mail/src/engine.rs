@@ -1627,8 +1627,30 @@ impl Engine {
         let (target, event, graph) = self.event_target(event_id, scope).await?;
         let details = graph.event_details(&target).await?;
         let series = scope == Scope::All && event.series.as_deref() == Some(target.as_str());
-        let stored = EventDraft::of(&event, draft.calendar);
-        let before = before.unwrap_or(&stored);
+        let opened = EventDraft::of(&event, draft.calendar);
+        let before = before.unwrap_or(&opened);
+        // A series is written on its own clock, where its days are.
+        let clock = if series {
+            let stored = self
+                .store()
+                .event(event_id)?
+                .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
+            let master = serde_json::json!({ "recurrence": details.recurrence });
+            Some(
+                series_clock(
+                    &graph,
+                    &stored.remote_id,
+                    stored.start,
+                    event.all_day,
+                    &master,
+                    zone,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let zone = clock.as_ref().map_or(zone, |c| c.zone(zone));
         let body = calendar::changed_event_body(draft, before, &details, zone, series);
         if body.as_object().is_some_and(|b| b.is_empty()) {
             return Ok(());
@@ -1667,12 +1689,24 @@ impl Engine {
         let master = graph.event_json(&series, calendar::MASTER_SELECT).await?;
         let old = master["recurrence"].clone();
         let first = old["range"]["startDate"].as_str().unwrap_or_default();
-        let split = occurrence_day(&graph, &stored.remote_id, &master, zone).await?;
+        let clock = series_clock(
+            &graph,
+            &stored.remote_id,
+            stored.start,
+            event.all_day,
+            &master,
+            zone,
+        )
+        .await?;
+        let split = clock.day.clone();
         if split.is_empty() || split.as_str() <= first {
             return self
                 .update_scoped(event_id, draft, Some(before), Scope::All, zone)
                 .await;
         }
+        // From here on, the series' own clock: the new series is written
+        // there, as the old one was, so its days and dates mean the same.
+        let zone = clock.zone(zone);
         let from = calendar::date_in(zone, draft.start, draft.all_day);
         // How far the user moved it, and the series' days as the user's
         // clock has them: a Wednesday 00:30 in Tokyo is a Tuesday in
@@ -1767,7 +1801,17 @@ impl Engine {
             .await?;
         let old = &master["recurrence"];
         let first = old["range"]["startDate"].as_str().unwrap_or_default();
-        let split = occurrence_day(&graph, &stored.remote_id, &master, zone).await?;
+        let all_day = Event::from_json(&stored.data).all_day;
+        let split = series_clock(
+            &graph,
+            &stored.remote_id,
+            stored.start,
+            all_day,
+            &master,
+            zone,
+        )
+        .await?
+        .day;
         if old.is_null() || split.is_empty() || split.as_str() <= first {
             return graph.delete_event(&series).await;
         }
@@ -2425,22 +2469,57 @@ impl Engine {
     }
 }
 
-/// The day ("2026-10-27") occurrence `id` of series `master` is on, as the
-/// series counts its days: in its own time zone, where its range's dates
-/// are, which can be another than the user's (`zone`).
-async fn occurrence_day(
+/// A series' own clock: its time zone, where its range's dates are, which
+/// can be another than the user's.
+struct SeriesClock {
+    name: String,
+    /// Minutes it's ahead of the user's clock, at the occurrence it was
+    /// read from.
+    shift: i64,
+    /// The day ("2026-10-27") that occurrence is on there.
+    day: String,
+}
+
+impl SeriesClock {
+    /// The user's `zone`, told on this clock.
+    fn zone<'a>(&'a self, zone: Zone<'_>) -> Zone<'a> {
+        Zone {
+            name: &self.name,
+            wall: zone.wall,
+            shift: self.shift,
+        }
+    }
+}
+
+/// Series `master`'s clock, read from its occurrence `id`, which starts at
+/// `start` (Unix ms), against the user's `zone`. An all-day occurrence's
+/// day is its date anywhere.
+async fn series_clock(
     graph: &Graph,
     id: &str,
+    start: i64,
+    all_day: bool,
     master: &serde_json::Value,
     zone: Zone<'_>,
-) -> Result<String> {
-    let series_zone = master["recurrence"]["range"]["recurrenceTimeZone"]
+) -> Result<SeriesClock> {
+    let name = master["recurrence"]["range"]["recurrenceTimeZone"]
         .as_str()
         .or_else(|| master["originalStartTimeZone"].as_str())
         .filter(|z| !z.is_empty())
-        .unwrap_or(zone.name);
-    let start = graph.start_in(id, series_zone).await?;
-    Ok(start.get(..10).unwrap_or_default().to_owned())
+        .unwrap_or(zone.name)
+        .to_owned();
+    let wall = graph.start_in(id, &name).await?;
+    let day = wall.get(..10).unwrap_or_default().to_owned();
+    let shift = if all_day || name == zone.name {
+        0
+    } else {
+        let at = |w: &str| graph::parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
+        match (at(&wall), at(&(zone.wall)(start))) {
+            (Some(there), Some(here)) => (there - here) / 60_000,
+            _ => 0,
+        }
+    };
+    Ok(SeriesClock { name, shift, day })
 }
 
 pub fn config(account: &Account) -> Result<AccountConfig> {

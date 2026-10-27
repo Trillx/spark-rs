@@ -45,6 +45,7 @@ import {
   minutesOf,
   newDraft,
   newEventStart,
+  followStart,
   repeatText,
   toUtcDate,
   type DragOutcome,
@@ -591,10 +592,15 @@ export default function CalendarScreen({
    * is saved). A repeating event asks which occurrences first, as Spark does: a changed rule is for
    * all of them or those from here on, none at all for all of them. False to go on editing.
    */
-  const saveDraft = async (event: CalendarEvent | undefined, draft: EventDraft, before: EventDraft | null) => {
+  const saveDraft = async (event: CalendarEvent | undefined, given: EventDraft, before: EventDraft | null) => {
+    // A preset rule that only followed the event to a new day isn't a new rule: the occurrence
+    // moved, and the series' days go with it for All or All Future (Only This Event moves just it).
+    const followed = before && followStart(before.repeat, before, given);
+    const same = (a: EventDraft["repeat"], b: EventDraft["repeat"] | undefined) => JSON.stringify(a) === JSON.stringify(b);
+    const ruleChanged = before !== null && !same(given.repeat, before.repeat) && !same(given.repeat, followed);
+    const draft = before && !ruleChanged ? { ...given, repeat: before.repeat } : given;
     let scope: EventScope = "one";
     if (event?.repeats) {
-      const ruleChanged = before !== null && JSON.stringify(draft.repeat) !== JSON.stringify(before.repeat);
       const choice = await ask(
         !ruleChanged
           ? {
