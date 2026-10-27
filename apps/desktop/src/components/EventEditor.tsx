@@ -1,6 +1,6 @@
 import { ChevronLeft, ChevronRight, FileText, MapPin, Users, Video, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type MutableRefObject, type ReactNode } from "react";
-import { parseEntry } from "../lib/addresses";
+import { parseEntry, splitAddresses } from "../lib/addresses";
 import { addMonths, formatTime, startOfMonth, viewDays } from "../lib/calendar";
 import {
   QUARTERS,
@@ -141,16 +141,22 @@ export default function EventEditor({
     if (closeRef) closeRef.current = closeSoon;
     // Like a backdrop: the press that closes it doesn't also act on what's under it (another
     // event, the calendar's close button, the sidebar).
-    const swallow = (e: MouseEvent) => {
+    const swallow = (e: Event) => {
       e.stopPropagation();
       e.preventDefault();
     };
     const onPointer = (e: PointerEvent) => {
       if (asked() || ref.current?.contains(e.target as Node)) return;
-      window.addEventListener("click", swallow, { capture: true, once: true });
+      // Nor does it start anything there (a drag on the grid), or a right-click menu.
+      e.stopPropagation();
+      e.preventDefault();
+      for (const type of ["click", "contextmenu"]) window.addEventListener(type, swallow, { capture: true, once: true });
       window.addEventListener(
         "pointerup",
-        () => window.setTimeout(() => window.removeEventListener("click", swallow, true)),
+        () =>
+          window.setTimeout(() => {
+            for (const type of ["click", "contextmenu"]) window.removeEventListener(type, swallow, true);
+          }),
         { capture: true, once: true },
       );
       closeSoon();
@@ -626,14 +632,30 @@ function Attendees({
   const suggestions = useSuggestions(focused ? typed : "", 6);
   const shown = suggestions.list;
 
-  const add = (person: { name: string; address: string }) => {
-    const address = person.address.trim();
-    if (!/^[^\s@]+@[^\s@]+$/.test(address)) return false;
-    if (!people.some((p) => p.address.toLowerCase() === address.toLowerCase())) {
-      onChange([...people, { name: person.name.trim(), address }]);
+  const isAddress = (p: { address: string }) => /^[^\s@]+@[^\s@]+$/.test(p.address.trim());
+  /** People added at once, each once. */
+  const addPeople = (list: { name: string; address: string }[]) => {
+    const next = [...people];
+    for (const p of list) {
+      const address = p.address.trim();
+      if (!next.some((x) => x.address.toLowerCase() === address.toLowerCase())) next.push({ name: p.name.trim(), address });
     }
-    setTyped("");
+    onChange(next);
     suggestions.clear();
+  };
+  const add = (person: { name: string; address: string }) => {
+    if (!isAddress(person)) return false;
+    addPeople([person]);
+    setTyped("");
+    return true;
+  };
+  /** What's typed (or pasted), as people: every address in it, a list too; what isn't one stays typed. */
+  const addTyped = (text: string) => {
+    const entries = splitAddresses(text);
+    const found = entries.map(parseEntry).filter(isAddress);
+    if (!found.length) return false;
+    addPeople(found);
+    setTyped(entries.filter((e) => !isAddress(parseEntry(e))).join("; "));
     return true;
   };
 
@@ -663,9 +685,16 @@ function Attendees({
           onFocus={() => setFocused(true)}
           onBlur={() => {
             setFocused(false);
-            if (typed.trim()) add(parseEntry(typed));
+            if (typed.trim()) addTyped(typed);
           }}
           onChange={(e) => setTyped(e.target.value)}
+          onPaste={(e) => {
+            const pasted = e.clipboardData.getData("text");
+            if (!/[,;\n]/.test(pasted)) return;
+            e.preventDefault();
+            const text = typed + pasted;
+            if (!addTyped(text)) setTyped(text);
+          }}
           onKeyDown={(e) => {
             if (shown.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
               e.preventDefault();
@@ -673,7 +702,7 @@ function Attendees({
             } else if (e.key === "Enter" || e.key === "Tab" || e.key === "," || e.key === ";") {
               const picked = shown[suggestions.active];
               if (!typed.trim()) return;
-              if (picked ? add(picked) : add(parseEntry(typed))) e.preventDefault();
+              if (picked ? add(picked) : addTyped(typed)) e.preventDefault();
             } else if (e.key === "Backspace" && !typed && people.length) {
               onChange(people.slice(0, -1));
             } else if (e.key === "Escape" && shown.length) {
