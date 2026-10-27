@@ -1644,7 +1644,7 @@ impl Engine {
         zone: Zone<'_>,
     ) -> Result<()> {
         let (target, event, graph) = self.event_target(event_id, scope).await?;
-        let details = graph.event_details(&target).await?;
+        let mut details = graph.event_details(&target).await?;
         let series = scope == Scope::All && event.series.as_deref() == Some(target.as_str());
         let opened = EventDraft::of(&event, draft.calendar);
         let before = before.unwrap_or(&opened);
@@ -1660,6 +1660,28 @@ impl Engine {
             None
         };
         let zone = clock.as_ref().map_or(zone, |c| c.zone(zone));
+        // A monthly or yearly series moved to another date lines up from its
+        // first occurrence, which can be weeks after its range starts (the
+        // 15th, from January 30).
+        let day = |t: i64, all_day: bool| calendar::date_in(zone, t, all_day);
+        if series
+            && recurrence::by_date(&details.recurrence)
+            && day(draft.start, draft.all_day) != day(before.start, before.all_day)
+        {
+            let range = details.recurrence["range"]["startDate"].as_str();
+            if let Some(from) = range.and_then(|d| graph::parse_iso_date(&format!("{d}T00:00:00Z")))
+            {
+                details.first = graph
+                    .occurrence_span(
+                        &target,
+                        from - 86_400_000,
+                        before.start + 2 * 86_400_000,
+                        zone.name,
+                    )
+                    .await?
+                    .map(|(first, _)| first);
+            }
+        }
         let body = calendar::changed_event_body(draft, before, &details, zone, series);
         if body.as_object().is_some_and(|b| b.is_empty()) {
             return Ok(());

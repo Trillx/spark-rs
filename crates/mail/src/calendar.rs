@@ -183,6 +183,10 @@ pub struct EventDetails {
     pub body: String,
     /// A series' Graph `recurrence`; null for an event that isn't one.
     pub recurrence: serde_json::Value,
+    /// A series' first occurrence's day ("2026-10-27") on its own clock,
+    /// where that was looked up: its range can start days or weeks before.
+    /// Else its own start's.
+    pub first: Option<String>,
 }
 
 /// Which occurrences of a repeating event a change is for.
@@ -376,14 +380,14 @@ pub fn changed_event_body(
         // The series' own first time moves by as much as this occurrence's
         // did on the clock (days and hours), so its own length stays and a
         // DST change between them doesn't move it an hour.
+        // Clock times, counted as if they were UTC's.
+        let clock = |t: i64| parse_iso_date(&format!("{}Z", zone.wall_at(t))).unwrap_or(t);
         let moved = |series: i64, was: i64, now: i64| {
             if !shift {
                 zone.time(now, draft.all_day)
             } else if draft.all_day {
                 zone.time(series + (now - was), true)
             } else {
-                // Clock times, counted as if they were UTC's.
-                let clock = |t: i64| parse_iso_date(&format!("{}Z", zone.wall_at(t))).unwrap_or(t);
                 let at = clock(series) + (clock(now) - clock(was));
                 json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
             }
@@ -393,13 +397,22 @@ pub fn changed_event_body(
         if by_date {
             let first = recurrence::aligned_first(
                 &details.recurrence,
-                &date_in(zone, details.start, before.all_day),
+                details
+                    .first
+                    .as_deref()
+                    .unwrap_or(&date_in(zone, details.start, before.all_day)),
                 &date_in(zone, before.start, before.all_day),
                 &date_in(zone, draft.start, draft.all_day),
             );
             let wall = start["dateTime"].as_str().unwrap_or_default();
             let at = format!("{first}{}", wall.get(10..).unwrap_or_default());
-            let length = draft.end - draft.start;
+            // As long on the clock as the event is: 00:00 to 04:00 on the
+            // day the clocks go back stays four hours, not five.
+            let length = if draft.all_day {
+                draft.end - draft.start
+            } else {
+                clock(draft.end) - clock(draft.start)
+            };
             let ends = parse_iso_date(&format!("{at}Z")).map(|t| utc_wall(t + length));
             start["dateTime"] = json!(at);
             end["dateTime"] = json!(ends.unwrap_or_default());
@@ -563,6 +576,7 @@ pub fn series_from(
         attendees: attendees.clone(),
         body: String::new(),
         recurrence: serde_json::Value::Null,
+        first: None,
     };
     body.insert("attendees".into(), json!(attendees));
     let changes = changed_event_body(draft, before, &details, zone, false);
@@ -1162,6 +1176,7 @@ impl Graph {
             attendees: e.attendees,
             body: e.body.and_then(|b| b.content).unwrap_or_default(),
             recurrence: e.recurrence,
+            first: None,
         })
     }
 }
@@ -1617,6 +1632,7 @@ mod tests {
             ..Default::default()
         };
         let details = EventDetails {
+            first: None,
             start,
             end: start + 900_000,
             attendees: vec![
@@ -1716,6 +1732,7 @@ mod tests {
         );
         // Without a meeting in it, the notes are the description.
         let plain = EventDetails {
+            first: None,
             body: "<html><body><p>Old</p></body></html>".into(),
             ..details.clone()
         };
@@ -1728,6 +1745,7 @@ mod tests {
         // Every occurrence: the series moves from its own first time.
         let series_start = start - 7 * DAY_MS;
         let series = EventDetails {
+            first: None,
             start: series_start,
             end: series_start + 900_000,
             ..details.clone()
@@ -1744,6 +1762,7 @@ mod tests {
         // One occurrence was made shorter than the rest; moving it moves the
         // series' own start and end, which keep their length.
         let long_series = EventDetails {
+            first: None,
             start: series_start,
             end: series_start + 3_600_000,
             ..series.clone()
@@ -1778,6 +1797,7 @@ mod tests {
             ..Default::default()
         };
         let details = EventDetails {
+            first: None,
             start,
             end: start + 1_800_000,
             attendees: vec![
@@ -1829,6 +1849,7 @@ mod tests {
         };
         // Outlook moved the start to 9:30 meanwhile; the editor changes only the end.
         let details = EventDetails {
+            first: None,
             start: start + 1_800_000,
             end: start + 3_600_000,
             ..Default::default()
@@ -1894,6 +1915,7 @@ mod tests {
             ..draft.clone()
         };
         let details = EventDetails {
+            first: None,
             start,
             end: start + 900_000,
             ..Default::default()
@@ -1908,6 +1930,7 @@ mod tests {
         assert_eq!(body["recurrence"]["range"]["startDate"], "2026-10-27");
         // A series' rule changed from an occurrence: from the series' first day.
         let series = EventDetails {
+            first: None,
             start: start - 14 * DAY_MS,
             recurrence: weekly_rule().to_graph("2026-10-13", "Pacific Standard Time"),
             ..details.clone()
@@ -2054,6 +2077,7 @@ mod tests {
         };
         let series_start = parse_iso_date("2026-10-13T15:30:00Z").unwrap();
         let details = EventDetails {
+            first: None,
             start: series_start,
             end: series_start + 1_800_000,
             recurrence: json!({
@@ -2084,6 +2108,7 @@ mod tests {
         // On the 15th from January 15; February's moved to March 1, for all.
         let series_start = parse_iso_date("2027-01-15T17:00:00Z").unwrap();
         let details = EventDetails {
+            first: None,
             start: series_start,
             end: series_start + 3_600_000,
             recurrence: json!({
@@ -2472,6 +2497,7 @@ mod tests {
         // clocks went back, is moved to October 26 at 9:00, for all of them.
         let series_start = parse_iso_date("2026-10-05T13:00:00Z").unwrap();
         let details = EventDetails {
+            first: None,
             start: series_start,
             end: series_start + 3_600_000,
             ..Default::default()
@@ -2498,6 +2524,74 @@ mod tests {
             json!({ "dateTime": "2026-09-28T09:00:00", "timeZone": "Eastern Standard Time" })
         );
         assert_eq!(body["end"]["dateTime"], "2026-09-28T10:00:00");
+    }
+
+    #[test]
+    fn a_monthly_series_moved_keeps_its_hours_and_its_first_meeting() {
+        const EASTERN: Zone<'static> = Zone {
+            name: "Eastern Standard Time",
+            wall: eastern,
+            shift: 0,
+        };
+        // On the 2nd, 00:00 to 04:00 from October 2; November's moved to
+        // the 1st, the day the clocks go back, for all of them: still four
+        // hours on the clock, though five go by that day.
+        let series_start = parse_iso_date("2026-10-02T04:00:00Z").unwrap();
+        let details = EventDetails {
+            start: series_start,
+            end: series_start + 4 * 3_600_000,
+            recurrence: json!({
+                "pattern": { "type": "absoluteMonthly", "interval": 1, "dayOfMonth": 2 },
+                "range": { "type": "noEnd", "startDate": "2026-10-02", "recurrenceTimeZone": "Eastern Standard Time" }
+            }),
+            ..Default::default()
+        };
+        let occurrence = parse_iso_date("2026-11-02T05:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Backup".into(),
+            start: occurrence,
+            end: occurrence + 4 * 3_600_000,
+            ..Default::default()
+        };
+        let draft = EventDraft {
+            start: parse_iso_date("2026-11-01T04:00:00Z").unwrap(),
+            end: parse_iso_date("2026-11-01T09:00:00Z").unwrap(),
+            ..before.clone()
+        };
+        let body = changed_event_body(&draft, &before, &details, EASTERN, true);
+        assert_eq!(body["start"]["dateTime"], "2026-10-01T00:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-10-01T04:00:00");
+
+        // On the 15th, three times, its range from January 30: February
+        // 15 is its first. Moved to March 1, it's March, April and May 1.
+        let series_start = parse_iso_date("2027-01-30T17:00:00Z").unwrap();
+        let details = EventDetails {
+            start: series_start,
+            end: series_start + 3_600_000,
+            recurrence: json!({
+                "pattern": { "type": "absoluteMonthly", "interval": 1, "dayOfMonth": 15 },
+                "range": { "type": "numbered", "startDate": "2027-01-30", "numberOfOccurrences": 3, "recurrenceTimeZone": "Pacific Standard Time" }
+            }),
+            first: Some("2027-02-15".into()),
+            ..Default::default()
+        };
+        let occurrence = parse_iso_date("2027-02-15T17:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Review".into(),
+            start: occurrence,
+            end: occurrence + 3_600_000,
+            ..Default::default()
+        };
+        let to = parse_iso_date("2027-03-01T17:00:00Z").unwrap();
+        let draft = EventDraft {
+            start: to,
+            end: to + 3_600_000,
+            ..before.clone()
+        };
+        let body = changed_event_body(&draft, &before, &details, PACIFIC, true);
+        assert_eq!(body["start"]["dateTime"], "2027-03-01T10:00:00");
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2027-03-01");
+        assert_eq!(body["recurrence"]["pattern"]["dayOfMonth"], 1);
     }
 
     #[tokio::test]
