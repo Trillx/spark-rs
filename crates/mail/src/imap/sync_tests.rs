@@ -1190,6 +1190,7 @@ async fn a_broken_new_message_holds_back_only_itself() {
 
     let report = cached.sync().await.unwrap();
     assert_eq!(report.new.len(), 2, "{report:?}");
+    assert_eq!(report.skipped, 1);
     assert!(stored(&cached.store, ON_SERVER + 1).is_some());
     assert!(stored(&cached.store, ON_SERVER + 3).is_some());
     assert!(stored(&cached.store, broken).is_none());
@@ -1209,6 +1210,7 @@ async fn a_broken_new_message_holds_back_only_itself() {
     // Still new, and still broken: asked for once, alone.
     let report = cached.sync().await.unwrap();
     assert!(report.new.is_empty(), "{report:?}");
+    assert_eq!(report.skipped, 1);
     let tally = cached.stand_in.take_tally();
     assert_eq!(
         tally.commands.iter().filter(|c| **c == alone).count(),
@@ -1220,9 +1222,30 @@ async fn a_broken_new_message_holds_back_only_itself() {
     cached.stand_in.heal();
     let report = cached.sync().await.unwrap();
     assert_eq!(report.new.len(), 1, "{report:?}");
+    assert_eq!(report.skipped, 0);
     assert!(message(&cached.store, broken).unread);
     assert_eq!(cached.in_inbox(), TRACKED as usize - 1 + 3);
     assert_eq!(cached.state.floor, floor);
+}
+
+/// A lone new message (as IDLE reports one) that the server won't give,
+/// its size or its body, is counted as skipped, so the app asks again soon.
+#[tokio::test]
+async fn a_lone_new_message_refused_is_counted_as_skipped() {
+    for fetch in ["RFC822.SIZE", "BODY.PEEK[]"] {
+        let mut cached = Cached::synced(false).await;
+        let id = ON_SERVER + 1;
+        cached.stand_in.with(INBOX, |b| b.arrive(id));
+        cached.stand_in.break_message(id, fetch);
+        let report = cached.sync().await.unwrap();
+        assert!(report.new.is_empty(), "{fetch}: {report:?}");
+        assert_eq!(report.skipped, 1, "{fetch}");
+        assert!(stored(&cached.store, id).is_none(), "{fetch}");
+
+        cached.stand_in.heal();
+        let report = cached.sync().await.unwrap();
+        assert_eq!((report.new.len(), report.skipped), (1, 0), "{fetch}");
+    }
 }
 
 /// A message reaching back can't fetch is passed like the rest, but it's

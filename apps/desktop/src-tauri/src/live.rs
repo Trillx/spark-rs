@@ -40,7 +40,8 @@ const INBOX_EVERY: Duration = Duration::from_secs(30);
 const SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const SNOOZE_CHECK: Duration = Duration::from_secs(15);
-/// A wait this much longer than `TICK` means the computer slept.
+/// A wait this much longer than it should be, by the wall clock, means the
+/// computer slept.
 const SLEPT: Duration = Duration::from_secs(60);
 /// How long after IDLE fails it's tried again, doubling up to
 /// `IDLE_RETRY_MAX`. A server out of connections waits the most.
@@ -66,12 +67,15 @@ struct Worker {
     task: JoinHandle<()>,
     /// Keeps IDLE on the inbox (`watch`).
     watch: JoinHandle<()>,
+    /// Notices the computer waking from sleep (`notice_waking`).
+    waking: JoinHandle<()>,
 }
 
 impl Worker {
     fn abort(&self) {
         self.task.abort();
         self.watch.abort();
+        self.waking.abort();
     }
 }
 
@@ -106,6 +110,8 @@ struct Asks {
     /// The inbox, quietly, unless it was checked within `INBOX_EVERY`:
     /// the window came to the front.
     focus: AtomicBool,
+    /// A sweep, quietly: the computer woke from sleep.
+    woke: AtomicBool,
     list_folders: AtomicBool,
     /// Folders to sync on the next round, whatever the timer says.
     folders: Mutex<HashSet<i64>>,
@@ -228,12 +234,14 @@ impl Live {
         ));
         let watch =
             tauri::async_runtime::spawn(watch(self.engine.clone(), account_id, shared.clone()));
+        let waking = tauri::async_runtime::spawn(notice_waking(shared.clone(), TICK, now_ms));
         let old = self.workers.lock().unwrap().insert(
             account_id,
             Worker {
                 shared,
                 task,
                 watch,
+                waking,
             },
         );
         if let Some(old) = old {
@@ -474,6 +482,7 @@ async fn work(
         let requested = asks.fetch.swap(false, Ordering::Relaxed);
         let inbox_asked = asks.inbox.swap(false, Ordering::Relaxed);
         let focused = asks.focus.swap(false, Ordering::Relaxed);
+        let woke = asks.woke.swap(false, Ordering::Relaxed);
         let list_asked = asks.list_folders.swap(false, Ordering::Relaxed);
         let mut folders: HashSet<i64> = std::mem::take(&mut *asks.folders.lock().unwrap());
         let older_inbox = asks.older_inbox.swap(false, Ordering::Relaxed);
@@ -482,6 +491,7 @@ async fn work(
             sweep: requested,
             inbox: inbox_asked,
             focused,
+            woke,
             other: list_asked
                 || !folders.is_empty()
                 || older_inbox
@@ -517,7 +527,12 @@ async fn work(
             let folders_were = (!round.folders.is_empty() || !round.older_folders.is_empty())
                 .then(|| folder_reach(&engine, account_id));
             let result = engine.run_round(account_id, &round).await;
-            schedule.finished(Instant::now(), &plan, result.is_ok());
+            let ended = match &result {
+                Ok(report) if report.skipped > 0 => Ended::Short,
+                Ok(_) => Ended::Whole,
+                Err(_) => Ended::Failed,
+            };
+            schedule.finished(Instant::now(), &plan, ended);
             match result {
                 Ok(report) => {
                     if fetch {
@@ -569,31 +584,44 @@ async fn work(
             }
         }
 
-        let waited_from = now_ms();
         tokio::select! {
             _ = wake.notified() => {}
             _ = tokio::time::sleep(TICK) => {}
         }
-        // Waking from sleep: IDLE's connection is gone, and mail came in.
-        if now_ms() - waited_from > (TICK + SLEPT).as_millis() as i64 {
-            schedule.slept = true;
-            watcher.restart.notify_one();
+    }
+}
+
+/// Notices the computer waking from sleep: a wait of `tick` that took over
+/// `SLEPT` longer by `wall` (now, in ms). IDLE's connection is gone then,
+/// and mail came in, so IDLE is told to connect again and the worker to
+/// sweep. Beside the worker, not in its wait: a sleep during one of its
+/// rounds, which can take minutes, counts too. (Timers can't tell on their
+/// own: on Windows they count the time asleep, and elsewhere they don't.)
+async fn notice_waking(shared: Arc<Shared>, tick: Duration, wall: impl Fn() -> i64) {
+    loop {
+        let from = wall();
+        tokio::time::sleep(tick).await;
+        if wall() - from > (tick + SLEPT).as_millis() as i64 {
+            shared.asks.woke.store(true, Ordering::Relaxed);
+            shared.watcher.restart.notify_one();
+            shared.wake.notify_one();
         }
     }
 }
 
 /// A worker's timetable: when it last fetched the inbox and swept, and
-/// what a failed round left to do.
+/// what a failed or cut-short round left to do.
 #[derive(Default)]
 struct Schedule {
     last_fetch: Option<Instant>,
     last_sweep: Option<Instant>,
     /// After a failed round, rounds nothing asked for wait until then.
     retry_at: Option<Instant>,
-    /// A failed round's inbox fetch, which the next round makes up.
-    owed: bool,
-    /// The computer slept since the last round.
-    slept: bool,
+    /// An inbox fetch a round failed or the server cut short, which rounds
+    /// from then make up.
+    owed: Option<Instant>,
+    /// Inbox fetches in a row the server cut short.
+    short: u32,
 }
 
 /// What a round was asked for, besides the schedule.
@@ -605,8 +633,19 @@ struct Wanted {
     inbox: bool,
     /// The window came to the front.
     focused: bool,
+    /// The computer woke from sleep.
+    woke: bool,
     /// Folders, the folder list, older mail.
     other: bool,
+}
+
+/// How a round went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    Whole,
+    /// It worked, but the server wouldn't give some new inbox mail.
+    Short,
+    Failed,
 }
 
 /// What a round does besides pushing local changes.
@@ -621,32 +660,42 @@ impl Schedule {
     /// IDLE is on the inbox.
     fn plan(&mut self, now: Instant, watching: bool, wanted: &Wanted) -> Option<Plan> {
         let past = |at: Option<Instant>, every| at.is_none_or(|at| now - at >= every);
-        let woke = std::mem::take(&mut self.slept);
-        let sweep = wanted.sweep || woke || past(self.last_sweep, SWEEP_EVERY);
+        let sweep = wanted.sweep || wanted.woke || past(self.last_sweep, SWEEP_EVERY);
         // IDLE tells when the inbox changes, so then only the sweep checks it.
         let every = if watching { SWEEP_EVERY } else { INBOX_EVERY };
         let focus = wanted.focused && past(self.last_fetch, INBOX_EVERY);
-        let fetch = sweep || wanted.inbox || focus || self.owed || past(self.last_fetch, every);
-        let asked = wanted.sweep || woke || wanted.inbox || focus || wanted.other;
+        let owed = self.owed.is_some_and(|at| now >= at);
+        let fetch = sweep || wanted.inbox || focus || owed || past(self.last_fetch, every);
+        let asked = wanted.sweep || wanted.woke || wanted.inbox || focus || wanted.other;
         let waiting = self.retry_at.is_some_and(|at| now < at);
         (asked || !waiting).then_some(Plan { fetch, sweep })
     }
 
-    fn finished(&mut self, now: Instant, plan: &Plan, ok: bool) {
-        if ok {
+    fn finished(&mut self, now: Instant, plan: &Plan, ended: Ended) {
+        if ended == Ended::Failed {
+            self.retry_at = Some(now + RETRY_AFTER);
+            if plan.fetch {
+                self.owed = Some(now);
+            }
+        } else {
             self.retry_at = None;
             if plan.sweep {
                 self.last_sweep = Some(now);
             }
-            if plan.fetch {
-                self.owed = false;
+            if plan.fetch && ended == Ended::Short {
+                // The mail held back is asked for again `INBOX_EVERY` on,
+                // then half as often each time the server still won't give
+                // it, until the sweep's five minutes.
+                let wait = INBOX_EVERY.saturating_mul(2u32.saturating_pow(self.short));
+                self.owed = Some(now + wait.min(SWEEP_EVERY));
+                self.short = self.short.saturating_add(1);
+            } else if plan.fetch {
+                self.owed = None;
+                self.short = 0;
             }
-        } else {
-            self.retry_at = Some(now + RETRY_AFTER);
-            self.owed |= plan.fetch;
         }
         // A failed fetch waits as long as one that worked.
-        if plan.fetch || !ok {
+        if plan.fetch || ended == Ended::Failed {
             self.last_fetch = Some(now);
         }
     }
@@ -744,6 +793,8 @@ fn describe(e: &Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicI64;
+
     use super::*;
 
     /// A schedule that swept at `start`, and the time `n` seconds later.
@@ -760,7 +811,7 @@ mod tests {
             },
             "the first round sweeps"
         );
-        schedule.finished(at(0), &plan, true);
+        schedule.finished(at(0), &plan, Ended::Whole);
         (schedule, at)
     }
 
@@ -813,11 +864,11 @@ mod tests {
         };
         let plan = schedule.plan(at(10), true, &changed).unwrap();
         assert_eq!(plan, INBOX);
-        schedule.finished(at(10), &plan, false);
+        schedule.finished(at(10), &plan, Ended::Failed);
         assert_eq!(schedule.plan(at(20), true, &Wanted::default()), None);
         let plan = schedule.plan(at(40), true, &Wanted::default()).unwrap();
         assert_eq!(plan, INBOX);
-        schedule.finished(at(40), &plan, true);
+        schedule.finished(at(40), &plan, Ended::Whole);
         assert_eq!(schedule.plan(at(45), true, &Wanted::default()), Some(QUIET));
     }
 
@@ -825,12 +876,92 @@ mod tests {
     fn waking_from_sleep_sweeps_even_while_waiting() {
         let (mut schedule, at) = swept();
         let plan = schedule.plan(at(10), false, &Wanted::default()).unwrap();
-        schedule.finished(at(10), &plan, false);
-        schedule.slept = true;
-        assert_eq!(
-            schedule.plan(at(11), false, &Wanted::default()),
-            Some(SWEEP)
-        );
+        schedule.finished(at(10), &plan, Ended::Failed);
+        let woke = Wanted {
+            woke: true,
+            ..Default::default()
+        };
+        assert_eq!(schedule.plan(at(11), false, &woke), Some(SWEEP));
+    }
+
+    /// The computer sleeping during a round (here a sweep, past its inbox
+    /// fetch) is noticed though the round ends after it: IDLE connects
+    /// again, and the next round sweeps once more. The wall clock keeping
+    /// time with the timers, however long the round takes, isn't sleep.
+    #[tokio::test]
+    async fn sleeping_during_a_round_restarts_idle_and_sweeps_after_it() {
+        let shared = Arc::new(Shared::default());
+        let asleep = Arc::new(AtomicI64::new(0));
+        let wall = {
+            let asleep = asleep.clone();
+            move || now_ms() + asleep.load(Ordering::Relaxed)
+        };
+        let tick = Duration::from_millis(10);
+        let waking = tokio::spawn(notice_waking(shared.clone(), tick, wall));
+        let (mut schedule, at) = swept();
+        let plan = schedule.plan(at(300), true, &Wanted::default()).unwrap();
+        assert_eq!(plan, SWEEP);
+
+        tokio::time::sleep(tick * 20).await;
+        assert!(!shared.asks.woke.load(Ordering::Relaxed));
+        // An hour asleep.
+        asleep.store(60 * 60 * 1000, Ordering::Relaxed);
+        let restarted =
+            tokio::time::timeout(Duration::from_secs(5), shared.watcher.restart.notified()).await;
+        waking.abort();
+        assert!(restarted.is_ok(), "IDLE wasn't told to connect again");
+
+        schedule.finished(at(301), &plan, Ended::Whole);
+        let wanted = Wanted {
+            woke: shared.asks.woke.load(Ordering::Relaxed),
+            ..Default::default()
+        };
+        assert_eq!(schedule.plan(at(303), true, &wanted), Some(SWEEP));
+    }
+
+    /// New mail the server wouldn't give (as Gmail does for a while) is
+    /// asked for again 30 seconds on, not five minutes on with the sweep.
+    #[test]
+    fn an_inbox_cut_short_is_checked_again_after_30_seconds() {
+        let (mut schedule, at) = swept();
+        let changed = Wanted {
+            inbox: true,
+            ..Default::default()
+        };
+        let plan = schedule.plan(at(10), true, &changed).unwrap();
+        assert_eq!(plan, INBOX);
+        schedule.finished(at(10), &plan, Ended::Short);
+        let nothing = Wanted::default();
+        assert_eq!(schedule.plan(at(39), true, &nothing), Some(QUIET));
+        let plan = schedule.plan(at(40), true, &nothing).unwrap();
+        assert_eq!(plan, INBOX);
+        schedule.finished(at(40), &plan, Ended::Whole);
+        assert_eq!(schedule.plan(at(299), true, &nothing), Some(QUIET));
+    }
+
+    /// Mail the server never gives is asked for half as often each time,
+    /// then only with the sweep, every five minutes.
+    #[test]
+    fn mail_the_server_keeps_refusing_is_asked_for_less_and_less_often() {
+        let (mut schedule, at) = swept();
+        let changed = Wanted {
+            inbox: true,
+            ..Default::default()
+        };
+        let plan = schedule.plan(at(10), true, &changed).unwrap();
+        schedule.finished(at(10), &plan, Ended::Short);
+        let mut fetched = Vec::new();
+        for n in 11..=1000 {
+            let plan = schedule.plan(at(n), true, &Wanted::default()).unwrap();
+            let ended = if plan.fetch {
+                fetched.push(n);
+                Ended::Short
+            } else {
+                Ended::Whole
+            };
+            schedule.finished(at(n), &plan, ended);
+        }
+        assert_eq!(fetched, [40, 100, 220, 300, 600, 900]);
     }
 
     #[test]

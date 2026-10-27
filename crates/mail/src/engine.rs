@@ -131,6 +131,9 @@ pub struct Report {
     /// Mail stored without its attachments or invite, as Microsoft couldn't
     /// give them then, that has them now (`graph::Graph::repair`).
     pub repaired: usize,
+    /// New inbox mail an IMAP server wouldn't give this round, even
+    /// message by message: the next round that fetches asks for it again.
+    pub skipped: usize,
 }
 
 impl Report {
@@ -536,6 +539,7 @@ impl Engine {
                     self.store().set_sync_state(account_id, &to_json(&state))?;
                     let sync = sync?;
                     report.headers += sync.headers;
+                    report.skipped = sync.skipped;
                     report.synced(sync.new, sync.gone, sync.first);
                 }
                 if round.older_inbox {

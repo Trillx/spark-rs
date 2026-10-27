@@ -184,6 +184,9 @@ pub struct SyncReport {
     /// Cached messages whose Reply-To headers changed.
     pub headers: usize,
     pub first: bool,
+    /// New messages the server wouldn't give, even alone: the next sync
+    /// asks for them again.
+    pub skipped: usize,
 }
 
 #[derive(Debug)]
@@ -653,7 +656,7 @@ pub async fn sync_folder(
         }
         members.extend(add_to_folder(store, folder.id, &elsewhere)?);
         report.changed += elsewhere.len();
-        let mut fetched = fetch_messages(session, &unknown, &folder.remote_id).await?;
+        let (mut fetched, _) = fetch_messages(session, &unknown, &folder.remote_id).await?;
         for m in &mut fetched {
             m.account_id = folder.account_id;
         }
@@ -914,9 +917,9 @@ pub async fn sync_inbox(
         ..Default::default()
     };
     for batch in new.chunks(FETCH_BATCH) {
-        report
-            .new
-            .extend(fetch_new(session, store, account_id, batch, !first).await?);
+        let (new, skipped) = fetch_new(session, store, account_id, batch, !first).await?;
+        report.new.extend(new);
+        report.skipped += skipped;
     }
 
     if !state.reply_to_fetched {
@@ -1039,6 +1042,7 @@ pub async fn older_inbox(
             .collect();
         stored += fetch_new(session, store, account_id, &new, false)
             .await?
+            .0
             .len();
         // Mail a search stored brings its flags from then: the next sync
         // asks for every flag, not just the changes.
@@ -1315,6 +1319,7 @@ pub async fn search_server(
         for batch in hits.chunks(FETCH_BATCH) {
             stored += fetch_new(session, store, account.id, batch, false)
                 .await?
+                .0
                 .len();
         }
     }
@@ -1366,7 +1371,7 @@ pub async fn search_server(
                 }
             }
         }
-        let mut fetched = fetch_messages(session, &unknown, &folder.remote_id).await?;
+        let (mut fetched, _) = fetch_messages(session, &unknown, &folder.remote_id).await?;
         for m in &mut fetched {
             m.account_id = account.id;
         }
@@ -1392,20 +1397,20 @@ fn newest(found: HashSet<u32>, wanted: impl Fn(u32) -> bool) -> Vec<u32> {
 }
 
 /// Fetches inbox messages and stores them in one transaction; returns the
-/// ids of those that were new.
+/// ids of those that were new, and how many the server wouldn't give.
 async fn fetch_new(
     session: &mut Session,
     store: &Mutex<Store>,
     account_id: i64,
     uids: &[u32],
     screen_new_senders: bool,
-) -> Result<Vec<i64>> {
-    let mut fetched = fetch_messages(session, uids, INBOX).await?;
+) -> Result<(Vec<i64>, usize)> {
+    let (mut fetched, refused) = fetch_messages(session, uids, INBOX).await?;
     for m in &mut fetched {
         m.account_id = account_id;
     }
     // All of them are stored, or (if one fails) none.
-    Ok(lock(store).batch(|b| {
+    let added = lock(store).batch(|b| {
         let mut added = Vec::new();
         for m in &fetched {
             if let Added::New(id) = b.add_incoming(m, screen_new_senders)? {
@@ -1413,7 +1418,8 @@ async fn fetch_new(
             }
         }
         Ok(added)
-    })?)
+    })?;
+    Ok((added, refused.len()))
 }
 
 /// Fetches and parses messages from the selected `mailbox`, with their
@@ -1423,15 +1429,16 @@ async fn fetch_new(
 /// many messages are asked for. Those a NO held back are asked for one at
 /// a time, and any the server won't give even alone are left out: not
 /// stored, they're asked for again by the next sync that wants them.
+/// Returns the messages, and the UIDs left out.
 async fn fetch_messages(
     session: &mut Session,
     uids: &[u32],
     mailbox: &str,
-) -> Result<Vec<Incoming>> {
+) -> Result<(Vec<Incoming>, Vec<u32>)> {
     if uids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Default::default());
     }
-    let (sizes, _) = uid_fetch_each(session, mailbox, uids, "(UID RFC822.SIZE)").await?;
+    let (sizes, mut refused) = uid_fetch_each(session, mailbox, uids, "(UID RFC822.SIZE)").await?;
     let (small, large): (Vec<_>, Vec<_>) = sizes
         .iter()
         .filter_map(|f| Some((f.uid?, f.size.unwrap_or(0))))
@@ -1452,17 +1459,20 @@ async fn fetch_messages(
             .await?
             .inspect_ok(|f| came.extend(f.uid));
         let completion = parse_each(fetched, incoming, &mut messages).await?;
-        for uid in held_back(mailbox, &uids, &came, completion).0 {
+        let (again, left_out) = held_back(mailbox, &uids, &came, completion);
+        refused.extend(left_out);
+        for uid in again {
             let fetched = uid_fetch(session, uid.to_string(), query).await?;
             if let Completion::Partial(said) = parse_each(fetched, incoming, &mut messages).await? {
                 skipped(mailbox, &format!("message {uid}"), &said);
+                refused.push(uid);
             }
         }
     }
     for m in &mut messages {
         m.mailbox = Some(mailbox.into());
     }
-    Ok(messages)
+    Ok((messages, refused))
 }
 
 /// Splits messages (UID and size, in order) into fetches of at most
