@@ -912,6 +912,18 @@ impl Graph {
         }
     }
 
+    /// A message's MIME, as Outlook would export it.
+    pub async fn raw(&self, id: &str) -> Result<Vec<u8>> {
+        let response = self
+            .send(self.request(Method::GET, &format!("/me/messages/{}/$value", path(id))))
+            .await?;
+        Ok(response
+            .bytes()
+            .await
+            .map_err(|e| Error::network(HOST, e))?
+            .to_vec())
+    }
+
     /// The invite in a meeting message. Exchange keeps meeting messages as
     /// items of their own and writes the calendar part out only in their MIME.
     async fn invite(&self, id: &str) -> Option<Invite> {

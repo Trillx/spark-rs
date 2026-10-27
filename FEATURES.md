@@ -37,7 +37,7 @@ Last full check: 2026-10-26.
 | Swipe Actions | ➖ | An iOS feature in Spark; spark-rs is a desktop app |
 | Command Center | ✅ | `Ctrl+K` lists every action with its shortcut |
 | Quick Replies | ➖ | An iOS feature in Spark; the +AI quick replies below work |
-| Print Emails | ❌ | |
+| Print Emails | ✅ | An email or a whole conversation, through Windows' print dialog, which also saves as PDF; Save as .eml too |
 | Dark Mode | ✅ | Light, dark, or the same as Windows |
 
 ## Enhanced Productivity

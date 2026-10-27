@@ -476,9 +476,22 @@ export function emptyFolders(ids: number[]): Promise<number> {
 
 // ---- attachments ----
 
-/** Downloads attachment `index` and opens it in its default app. Program files are refused. */
-export function openAttachment(id: number, index: number): Promise<void> {
-  if (isTauri()) return invoke("open_attachment", { id, index });
+/**
+ * Downloads attachment `index` and opens it in its default app. A program file only opens
+ * `anyway`, once the user has said so: without, it comes back as risky.
+ */
+export function openAttachment(
+  id: number,
+  index: number,
+  anyway = false,
+): Promise<{ kind: "opened" } | { kind: "risky"; name: string }> {
+  if (isTauri()) return invoke("open_attachment", { id, index, anyway });
+  return Promise.reject(DEMO_FILES);
+}
+
+/** Asks where to save an email as an .eml file (named for `name`), then saves it. False if cancelled. */
+export function saveEml(id: number, name: string): Promise<boolean> {
+  if (isTauri()) return invoke("save_eml", { id, name });
   return Promise.reject(DEMO_FILES);
 }
 

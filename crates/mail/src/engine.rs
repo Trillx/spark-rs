@@ -1338,6 +1338,32 @@ impl Engine {
         }
     }
 
+    /// A stored message as its server has it, MIME and all: what Save as
+    /// .eml writes.
+    pub async fn raw_message(&self, message_id: i64) -> Result<Vec<u8>> {
+        let at = self
+            .store()
+            .location(message_id)?
+            .ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
+        let account = self.account(at.account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => self.fetch_raw(&account, &server, &username, &at).await,
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let remote = at.remote_id.ok_or(Error::Gone)?;
+                let token = self
+                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                    .await?;
+                Graph::new(&token).raw(&remote).await
+            }
+        }
+    }
+
     /// Unsubscribes from the mailing list a stored message came from, as its
     /// `List-Unsubscribe` header offers (see `unsubscribe`). The header is
     /// read from the server, so mail stored before this works too.

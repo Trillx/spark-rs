@@ -1,6 +1,6 @@
 import { Ellipsis, ImageOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
-import { openExternal } from "../api";
+import { openLink } from "../lib/links";
 import { cidKey } from "../lib/richText";
 import { useDarkTheme } from "../lib/theme";
 import type { InlineImages } from "../types";
@@ -16,21 +16,8 @@ import type { InlineImages } from "../types";
 // it's built to stay light, and otherwise with its colors adapted to the dark
 // card (`adaptColors`). A reply's quote of earlier mail folds behind "•••".
 
-const OPENABLE = new Set(["http:", "https:", "mailto:"]);
 /** A runaway layout (e.g. `100vh` content) stops growing here. */
 const MAX_FRAME_HEIGHT = 50_000;
-
-/** Opens an absolute http(s) or mailto link outside the app; anything else is ignored. */
-export function openLink(href: string | null | undefined) {
-  if (!href) return;
-  let url: URL;
-  try {
-    url = new URL(href.trim());
-  } catch {
-    return; // relative or malformed
-  }
-  if (OPENABLE.has(url.protocol)) void openExternal(url.href);
-}
 
 /** Whether the HTML loads anything from the network: img src/srcset, background="", CSS url(). */
 export function hasRemoteImages(html: string) {

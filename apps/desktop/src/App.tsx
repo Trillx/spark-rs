@@ -45,6 +45,7 @@ import {
   Sparkles,
   Tags,
   Text,
+  TextSearch,
   ThumbsDown,
   ThumbsUp,
   Trash2,
@@ -114,6 +115,7 @@ import {
   saveGatekeeperMode,
   sendMessage,
   openExternal,
+  saveEml,
   setBadge,
   setMuted,
   setReminder,
@@ -158,7 +160,7 @@ import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { joinAddresses, parseEntry, replyRecipients, splitAddresses } from "./lib/addresses";
 import { badgeIcon } from "./lib/badge";
-import { clearContent, loadContent } from "./lib/content";
+import { clearContent, loadContent, remoteImagesAllowed } from "./lib/content";
 import {
   asThread,
   conversationOf,
@@ -270,6 +272,9 @@ import {
   shortcutLabel,
   type ActionId,
 } from "./lib/shortcuts";
+import { setLinkHandlers } from "./lib/links";
+import { messageMarkdown, type MarkdownHeader } from "./lib/markdown";
+import { printEmails } from "./lib/print";
 import { parseMailto } from "./lib/mailto";
 import { dropPlaceholders, hasPlaceholders, htmlText, replaceText, resendHtml, textToHtml } from "./lib/richText";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
@@ -518,6 +523,8 @@ export default function App() {
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
   const summaryRun = useRef(0);
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null);
+  /** Goes up each time Find in Conversation is asked for. */
+  const [findRequest, setFindRequest] = useState(0);
   /** A template made from the open draft, for Settings → Templates to start with. */
   const [newTemplate, setNewTemplate] = useState<TemplateDraft | null>(null);
   const [gatekeeperMode, setGatekeeperMode] = useState<GatekeeperMode>("beforeInbox");
@@ -882,6 +889,34 @@ export default function App() {
   latestCompose.current = compose;
   const latestSend = useRef(send);
   latestSend.current = send;
+
+  // Links in email: mailto: starts a new email here, as in Spark; an app's link asks first.
+  useEffect(() => {
+    setLinkHandlers({
+      mailto: (link) => {
+        const m = parseMailto(link);
+        if (!m) return;
+        latestCompose.current({
+          to: m.to,
+          cc: m.cc,
+          showCc: m.cc !== "",
+          bcc: m.bcc,
+          showBcc: m.bcc !== "",
+          subject: m.subject,
+          body: m.body,
+        });
+      },
+      external: (url) => void openExternal(url).catch(fileError),
+      ask: (url, scheme) =>
+        setConfirm({
+          title: "Potentially Unsafe Link",
+          message: `spark-rs has detected a suspicious URL scheme: ${scheme} This link could expose your device and data to security risks, including unauthorized access, malicious code execution, or device compromise. Proceed only if you trust the source.`,
+          confirmLabel: "Open Anyway",
+          run: () => openExternal(url),
+        }),
+    });
+    return () => setLinkHandlers(null);
+  }, []);
 
   // A question about one email goes once its composer closes or another opens.
   const composing = draft !== null;
@@ -2915,6 +2950,9 @@ export default function App() {
         return toggleSidebar();
       case "command":
         return setPalette({ kind: "actions" });
+      case "findInThread":
+        if (openMessage) setFindRequest((n) => n + 1);
+        return;
       case "settings":
         return openSettings();
       case "toggleDone":
@@ -3273,6 +3311,18 @@ export default function App() {
                 },
               ]
             : []),
+          ...(openMessage
+            ? [
+                {
+                  id: "find-in-thread",
+                  label: "Find in Conversation",
+                  keywords: "search text words",
+                  Icon: TextSearch,
+                  shortcut: shortcutLabel("findInThread"),
+                  run: () => setFindRequest((n) => n + 1),
+                },
+              ]
+            : []),
           {
             id: "search-sender",
             label: "Search Emails by Sender",
@@ -3589,7 +3639,21 @@ export default function App() {
     quickReply,
     replyAll: (m) => void replyAll(m),
     forward: (m) => void forward(m),
-    openAttachment: (m, index) => openAttachment(m.id, index).catch(fileError),
+    openAttachment: async (m, index) => {
+      try {
+        const opened = await openAttachment(m.id, index);
+        if (opened.kind !== "risky") return;
+        // Spark's question before a file that could run a program.
+        setConfirm({
+          title: `Are you sure you want to open ${opened.name}?`,
+          message: "This file from an unidentified developer might harm your device.",
+          confirmLabel: "Open Anyway",
+          run: async () => void (await openAttachment(m.id, index, true)),
+        });
+      } catch (error) {
+        fileError(error);
+      }
+    },
     saveAttachment: async (m, index) => {
       try {
         if (await saveAttachment(m.id, index)) showToast("Attachment saved", undefined, ICONS.download);
@@ -3605,7 +3669,68 @@ export default function App() {
         fileError(error);
       }
     },
+    print: (m, all) =>
+      void readEmails(all ? conversation : [m]).then(
+        async (emails) =>
+          printEmails(
+            m.subject || "No subject",
+            await Promise.all(
+              emails.map(async ({ message: x, header, content }) => ({
+                header,
+                html: content.html,
+                text: content.text,
+                remoteImages: remoteImagesAllowed(x.id),
+                inlineImages:
+                  content.html && /["'=(]cid:/i.test(content.html) ? await getInlineImages(x.id).catch(() => null) : null,
+              })),
+            ),
+          ),
+        fileError,
+      ),
+    copyMarkdown: (m, all) =>
+      void readEmails(all ? conversation : [m])
+        .then((emails) =>
+          navigator.clipboard.writeText(
+            emails.map(({ header, content }) => messageMarkdown(header, content.html, content.text)).join("\n\n---\n\n"),
+          ),
+        )
+        .then(() => showToast("Copied as Markdown", undefined, ICONS.copy), fileError),
+    copyAddresses: (m) =>
+      void readEmails([m])
+        .then(([{ header }]) => {
+          // Everyone on it, as they'd go back in To: the sender, then To and Cc.
+          const people = [header.from, ...header.to, ...header.cc];
+          const seen = new Set<string>();
+          const unique = people.filter((p) => {
+            const address = parseEntry(p).address.toLowerCase();
+            return address && !seen.has(address) && seen.add(address);
+          });
+          return navigator.clipboard.writeText(unique.join(", "));
+        })
+        .then(() => showToast("Email addresses copied", undefined, ICONS.copy), fileError),
+    saveEml: (m) =>
+      void saveEml(m.id, m.subject || "Email").then(
+        (saved) => saved && showToast("Email saved", undefined, ICONS.download),
+        fileError,
+      ),
   };
+
+  /** Emails with their content, and who, when and what as Copy and Print show it. */
+  async function readEmails(list: Message[]) {
+    return Promise.all(
+      list.map(async (x) => {
+        const content = await loadContent(x.id);
+        const header: MarkdownHeader = {
+          from: x.from && x.from !== x.address ? `${x.from} <${x.address}>` : x.address,
+          to: (content.to ?? []).filter((r) => r !== "You"),
+          cc: (content.cc ?? []).filter((r) => r !== "You"),
+          date: formatFullDate(x.timestamp),
+          subject: x.subject || "No subject",
+        };
+        return { message: x, header, content };
+      }),
+    );
+  }
 
   function fileError(error: unknown) {
     showToast(String(error), undefined, ICONS.error, { duration: ERROR_TOAST_MS });
@@ -3713,6 +3838,7 @@ export default function App() {
                   aiProvider={aiProvider}
                   actions={threadActions}
                   scrollRef={readerScroll}
+                  findRequest={findRequest}
                 />
               </section>
             </div>
@@ -3796,6 +3922,7 @@ export default function App() {
                   aiProvider={aiProvider}
                   actions={threadActions}
                   scrollRef={readerScroll}
+                  findRequest={findRequest}
                 />
               ) : (
                 <EmptyReader />

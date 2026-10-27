@@ -273,13 +273,23 @@ signature's in the email.
 Agents' email gets the account's signature too, unless they leave it off.
 
 Attachments download when you open or save them, also from archived mail.
-Program files (`.exe`, `.js`, `.lnk` and the like) can only be saved, not
-opened, and downloaded files are marked as coming from the internet, so
-Office opens them in Protected View. Attach files with the paperclip,
+Program files (`.exe`, `.js`, `.lnk` and the like) ask first, as Spark's do
+("Open Anyway"), and downloaded files are marked as coming from the
+internet, so Windows checks them and Office opens them in Protected View. Attach files with the paperclip,
 Ctrl+Shift+A in the composer, or by dropping them on the window (pictures
 dropped on the message itself go in it); forwards keep
 the original's attachments. Messages over 10 MB are stored without their body
 or file list.
+
+Links in email open in your browser; `mailto:` links start a new email in
+spark-rs. A link to another app (`zoommtg:`, `slack:`) asks first, and
+script and file links (`javascript:`, `file:`) never open.
+
+Ctrl+Shift+F (or Find in Conversation in the ⋯ menu) searches the open
+conversation's emails, with Enter for the next match. The ⋯ menu also prints
+the conversation, and each email's own ⋯ prints it, saves it as an .eml file,
+copies it as Markdown, or copies everyone's addresses. Windows' print dialog
+saves as PDF too (Microsoft Print to PDF).
 
 Calendar invitations show as a card in place of the email: the date and time
 in your time zone, who's invited and how they answered, the call to join,

@@ -38,7 +38,8 @@ pub fn clear_opened() {
     let _ = fs::remove_dir_all(opened_dir());
 }
 
-/// Extensions that run code when opened. Those attachments can only be saved.
+/// Extensions that run code when opened. Those attachments open only after
+/// the user says Open Anyway.
 const RISKY: &[&str] = &[
     "exe",
     "com",

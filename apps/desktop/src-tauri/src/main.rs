@@ -155,6 +155,7 @@ fn main() {
             mailbox::pick_files,
             mailbox::describe_files,
             mailbox::read_image,
+            mailbox::save_eml,
             mailto::take_mailto,
             mailto::mail_app,
             mailto::make_default_mail_app,

@@ -939,25 +939,38 @@ async fn download(mailbox: &Mailbox, id: i64, index: usize) -> Result<Attachment
         .map_err(text)
 }
 
-/// Downloads an attachment and opens it in its default app.
+/// What opening an attachment did.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Opened {
+    Opened,
+    /// It could run a program: Spark asks first ("Open Anyway").
+    Risky {
+        name: String,
+    },
+}
+
+/// Downloads an attachment and opens it in its default app. One that could
+/// run a program only opens with `anyway`, once the user has said so; it's
+/// marked as downloaded from the internet either way, for Windows to check.
 #[tauri::command]
 pub async fn open_attachment(
     mailbox: State<'_, Mailbox>,
     id: i64,
     index: usize,
-) -> Result<(), String> {
+    anyway: Option<bool>,
+) -> Result<Opened, String> {
     let name = attachment_name(&mailbox, id, index)?;
-    if files::is_risky(&name) {
-        return Err(format!(
-            "{name} could run a program, so spark-rs won't open it. Save it and check it first."
-        ));
+    if files::is_risky(&name) && anyway != Some(true) {
+        return Ok(Opened::Risky { name });
     }
     let file = download(&mailbox, id, index).await?;
     let dir = files::opened_dir().join(format!("{id}-{index}"));
     std::fs::create_dir_all(&dir).map_err(text)?;
     let path = dir.join(files::safe_file_name(&file.name));
     files::write_downloaded(&path, &file.bytes)?;
-    open::that_detached(&path).map_err(|e| format!("Couldn't open {}: {e}", file.name))
+    open::that_detached(&path).map_err(|e| format!("Couldn't open {}: {e}", file.name))?;
+    Ok(Opened::Opened)
 }
 
 /// Asks where to save an attachment, then downloads it there. False if the
@@ -981,6 +994,33 @@ pub async fn save_attachment(
     };
     let file = download(&mailbox, id, index).await?;
     files::write_downloaded(target.path(), &file.bytes)?;
+    Ok(true)
+}
+
+/// Asks where to save an email, then writes it there as it is on the server
+/// (an .eml file other mail apps open). False if the user cancelled.
+#[tauri::command]
+pub async fn save_eml(
+    window: Window,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+    name: String,
+) -> Result<bool, String> {
+    if !mailbox.live() {
+        return Err(DEMO_FILES.into());
+    }
+    let Some(target) = rfd::AsyncFileDialog::new()
+        .set_parent(&window)
+        .set_title("Save email")
+        .add_filter("Email", &["eml"])
+        .set_file_name(files::safe_file_name(&format!("{}.eml", name.trim())))
+        .save_file()
+        .await
+    else {
+        return Ok(false);
+    };
+    let raw = mailbox.live.engine.raw_message(id).await.map_err(text)?;
+    files::write_downloaded(target.path(), &raw)?;
     Ok(true)
 }
 
@@ -1569,16 +1609,51 @@ pub fn discard_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<(), String>
 #[tauri::command]
 pub fn open_external(url: String) -> Result<(), String> {
     let parsed = url::Url::parse(&url).map_err(|_| "That link isn't valid.".to_owned())?;
-    if !matches!(parsed.scheme(), "http" | "https" | "mailto") {
+    if REFUSED_SCHEMES.contains(&parsed.scheme()) {
         return Err(format!("spark-rs doesn't open {} links.", parsed.scheme()));
     }
     open::that_detached(parsed.as_str()).map_err(text)
 }
 
+/// Links that never open, as in Spark (`lib/links.ts` asks before any other
+/// scheme that isn't the web's, mail's or a phone's), plus Windows handlers
+/// attackers have used to run code from a click.
+const REFUSED_SCHEMES: &[&str] = &[
+    "javascript",
+    "data",
+    "vbscript",
+    "file",
+    "sftp",
+    "about",
+    "blob",
+    "ms-msdt",
+    "search-ms",
+    "search",
+    "ms-officecmd",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use spark_store::{NewAccount, Store};
+
+    #[test]
+    fn script_file_and_attack_links_never_open() {
+        for url in [
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "data:text/html,<b>x</b>",
+            "ms-msdt:/id PCWDiagnostic",
+            "search-ms:query=x",
+        ] {
+            let err = open_external(url.into()).unwrap_err();
+            assert!(err.contains("doesn't open"), "{url}: {err}");
+        }
+        assert_eq!(
+            open_external("not a url".into()).unwrap_err(),
+            "That link isn't valid."
+        );
+    }
 
     fn attachment_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("spark-draft-{name}-{}", std::process::id()));

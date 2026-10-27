@@ -11,7 +11,9 @@ import {
   ChevronsUpDown,
   Circle,
   Clock,
+  Copy,
   Ellipsis,
+  FileDown,
   FolderInput,
   Forward,
   Group,
@@ -19,6 +21,7 @@ import {
   ListChecks,
   MailX,
   Pin,
+  Printer,
   Reply,
   ReplyAll,
   Search,
@@ -27,6 +30,7 @@ import {
   ShieldCheck,
   Tags,
   Text,
+  TextSearch,
   ThumbsDown,
   ThumbsUp,
   Trash2,
@@ -63,6 +67,7 @@ import OverlayScroll from "./OverlayScroll";
 import { AttachmentList } from "./Attachments";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
+import FindBar from "./FindBar";
 import InviteCard from "./InviteCard";
 import { BlockedImagesBar, HtmlBody, TextBody, hasInlineImages, hasRemoteImages } from "./MessageBody";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
@@ -124,6 +129,13 @@ export interface ThreadActions {
   acceptDomain: (m: Message) => void;
   block: (m: Message) => void;
   blockDomain: (m: Message) => void;
+  /** Prints the email, or with `all` its whole conversation. */
+  print: (m: Message, all: boolean) => void;
+  /** Copies the email, or with `all` its conversation, as Markdown. */
+  copyMarkdown: (m: Message, all: boolean) => void;
+  copyAddresses: (m: Message) => void;
+  /** Saves the email as an .eml file. */
+  saveEml: (m: Message) => void;
   /** Settle when done (errors are reported by the caller), so tiles can show progress. */
   openAttachment: (m: Message, index: number) => Promise<void>;
   saveAttachment: (m: Message, index: number) => Promise<void>;
@@ -153,6 +165,7 @@ export default function ThreadView({
   aiProvider,
   actions,
   scrollRef,
+  findRequest = 0,
 }: {
   /** The email opened from the list, with its conversation's flags. Toolbar actions act on its conversation. */
   message: Message;
@@ -169,6 +182,8 @@ export default function ThreadView({
   actions: ThreadActions;
   /** The element that scrolls, for keyboard paging. */
   scrollRef: RefObject<HTMLDivElement | null>;
+  /** Goes up each time Find in Conversation is asked for (Ctrl+Shift+F, the Command Center). */
+  findRequest?: number;
 }) {
   const screening = m.screening && m.state === "inbox";
   const blocked = m.state === "blocked";
@@ -204,6 +219,22 @@ export default function ThreadView({
     stopHolding.current();
     setCollapsed(new Set());
   };
+  /** Search in conversation: open, and asked for again (its field takes focus). */
+  const [finding, setFinding] = useState(false);
+  const [findFocus, setFindFocus] = useState(0);
+  const find = () => {
+    // It searches what shows: every email.
+    expandAll();
+    setFinding(true);
+    setFindFocus((n) => n + 1);
+  };
+  // A request made while this conversation is open; one from before it opened is done.
+  const findSeen = useRef(findRequest);
+  useEffect(() => {
+    if (findRequest === findSeen.current) return;
+    findSeen.current = findRequest;
+    find();
+  }, [findRequest]);
   /** Like Spark, the latest email stays open. */
   const collapseAll = () => {
     stopHolding.current();
@@ -259,6 +290,8 @@ export default function ThreadView({
           onJumpToSummary={jumpToSummary}
           onExpandAll={several ? expandAll : undefined}
           onCollapseAll={several ? collapseAll : undefined}
+          onFind={find}
+          several={several}
           actions={actions}
         />
       )}
@@ -300,6 +333,7 @@ export default function ThreadView({
         )}
       </div>
       {blocked && <BlockedSenderCard message={m} actions={actions} />}
+      {finding && <FindBar root={scrollRef} focus={findFocus} onClose={() => setFinding(false)} />}
       <OverlayScroll
         className="min-h-0 flex-1"
         viewportClassName="px-3 pb-8"
@@ -400,6 +434,8 @@ function Toolbar({
   onJumpToSummary,
   onExpandAll,
   onCollapseAll,
+  onFind,
+  several,
   actions,
 }: {
   message: Message;
@@ -409,6 +445,9 @@ function Toolbar({
   /** Only for a conversation of several emails. */
   onExpandAll?: () => void;
   onCollapseAll?: () => void;
+  onFind: () => void;
+  /** The conversation has more than this email. */
+  several: boolean;
   actions: ThreadActions;
 }) {
   const isDone = m.state === "done";
@@ -502,6 +541,23 @@ function Toolbar({
               <MenuItem label="Collapse all emails" icon={<ChevronsDownUp size={15} />} onSelect={onCollapseAll} />
             </>
           )}
+          <li role="none" className="my-0.5 h-px bg-hairline" />
+          <MenuItem
+            label="Find in Conversation"
+            detail={shortcutLabel("findInThread")}
+            icon={<TextSearch size={15} />}
+            onSelect={onFind}
+          />
+          <MenuItem
+            label={several ? "Print Conversation" : "Print"}
+            icon={<Printer size={15} />}
+            onSelect={() => actions.print(m, true)}
+          />
+          <MenuItem
+            label={several ? "Copy Conversation as Markdown" : "Copy as Markdown"}
+            icon={<Copy size={15} />}
+            onSelect={() => actions.copyMarkdown(m, true)}
+          />
         </Dropdown>
       </div>
     </div>
@@ -685,6 +741,15 @@ function MessageMenuItems({
           icon={<Zap size={15} />}
           onSelect={() => actions.prioritySender(m)}
         />
+      )}
+      {single && (
+        <>
+          <li role="none" className="my-0.5 h-px bg-hairline" />
+          <MenuItem label="Print Message" icon={<Printer size={15} />} onSelect={() => actions.print(m, false)} />
+          <MenuItem label="Save as .eml…" icon={<FileDown size={15} />} onSelect={() => actions.saveEml(m)} />
+          <MenuItem label="Copy as Markdown" icon={<Copy size={15} />} onSelect={() => actions.copyMarkdown(m, false)} />
+          <MenuItem label="Copy All Email Addresses" icon={<Copy size={15} />} onSelect={() => actions.copyAddresses(m)} />
+        </>
       )}
       <SenderMenuItems message={m} actions={actions} />
     </>

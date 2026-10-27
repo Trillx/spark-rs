@@ -46,7 +46,8 @@ export type ActionId =
   | "zoomIn"
   | "zoomOut"
   | "zoomReset"
-  | "move";
+  | "move"
+  | "findInThread";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -111,6 +112,8 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   zoomReset: [{ key: "0", mod: true }],
   /** Move to folder. */
   move: [{ key: "m" }],
+  /** Search in the open conversation. */
+  findInThread: [{ key: "f", mod: true, shift: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {
