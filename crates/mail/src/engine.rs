@@ -1811,15 +1811,23 @@ impl Engine {
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(&old, &split) });
         if let Err(e) = graph.update_event(&series, &ended).await {
             // Its answer may be all that was lost: if the series ends there
-            // now, it was ended.
-            let now = graph.event_json(&series, "recurrence").await;
+            // now, it was ended. If that can't be told, it's put back as it
+            // was (which changes nothing if it wasn't ended).
             let range = &ended["recurrence"]["range"];
-            let applied = now.is_ok_and(|m| {
-                m["recurrence"]["range"]["type"] == "endDate"
-                    && m["recurrence"]["range"]["endDate"] == range["endDate"]
-            });
-            if !applied {
-                return Err(e);
+            match graph.event_json(&series, "recurrence").await {
+                Ok(m)
+                    if m["recurrence"]["range"]["type"] == "endDate"
+                        && m["recurrence"]["range"]["endDate"] == range["endDate"] => {}
+                Ok(_) => return Err(e),
+                Err(_) => {
+                    if put_back(&graph, &series, &old).await {
+                        return Err(e);
+                    }
+                    return Err(Error::Config(format!(
+                        "Couldn't change the series ({e}), and couldn't tell whether its \
+                         meetings from {split} on are still there. Check it in Outlook."
+                    )));
+                }
             }
         }
         let mut made = Err(Error::Config("The new series wasn't made.".into()));
@@ -1833,18 +1841,8 @@ impl Engine {
         let created = match made {
             Ok(created) => created,
             Err(e) => {
-                // Put back as it was, waiting out Graph's pauses a while; if
-                // that fails too, say what's gone.
-                let restore = serde_json::json!({ "recurrence": old });
-                let mut restored = false;
-                for wait in [0, 10, 30, 60] {
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                    if graph.update_event(&series, &restore).await.is_ok() {
-                        restored = true;
-                        break;
-                    }
-                }
-                if restored {
+                // Put back as it was; if that fails too, say what's gone.
+                if put_back(&graph, &series, &old).await {
                     return Err(e);
                 }
                 return Err(Error::Config(format!(
@@ -2673,6 +2671,19 @@ async fn series_clock(
         current,
         day,
     })
+}
+
+/// Puts series `series` back to repeating by `old` (Graph's recurrence),
+/// waiting out Graph's pauses for a couple of minutes. Whether it took.
+async fn put_back(graph: &Graph, series: &str, old: &serde_json::Value) -> bool {
+    let restore = serde_json::json!({ "recurrence": old });
+    for wait in [0, 10, 30, 60] {
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        if graph.update_event(series, &restore).await.is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether series `series` (Graph's `old` recurrence) begins on `split`

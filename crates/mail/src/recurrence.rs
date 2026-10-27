@@ -327,36 +327,30 @@ pub fn changed(
     // The pattern is the user's only if they changed it from what the
     // editor opened with (`opened`); else Outlook's, which may have changed
     // since.
+    // So is its end; each is the user's only if they changed that one.
     let was = opened.cloned().or_else(|| Repeat::from_graph(old));
-    let own_pattern = match (rule, &was) {
-        (None, _) => true,
-        (Some(rule), Some(was)) => pattern(rule) == pattern(was),
-        (Some(_), None) => false,
+    let (new_pattern, new_end) = match (rule, &was) {
+        (None, _) => (false, false),
+        (Some(rule), Some(was)) => (pattern(rule) != pattern(was), rule.ends != was.ends),
+        (Some(_), None) => (true, true),
     };
-    let mut out = match rule {
-        Some(rule) if !own_pattern => {
-            let mut out = rule.to_graph(&first, &zone);
-            if let Some(day) = old["pattern"]
-                .get("firstDayOfWeek")
-                .filter(|_| rule.every == Every::Week)
-            {
-                out["pattern"]["firstDayOfWeek"] = day.clone();
+    let mut out = old.clone();
+    if let (Some(rule), true) = (rule, new_pattern || new_end) {
+        let graph = rule.to_graph(&first, &zone);
+        if new_pattern {
+            let week_start = old["pattern"].get("firstDayOfWeek").cloned();
+            out["pattern"] = graph["pattern"].clone();
+            if let Some(day) = week_start.filter(|_| rule.every == Every::Week) {
+                out["pattern"]["firstDayOfWeek"] = day;
             }
-            return out;
         }
-        Some(rule) => {
-            let mut out = old.clone();
-            out["range"] = rule.to_graph(&first, &zone)["range"].clone();
-            out
+        if new_end {
+            out["range"] = graph["range"].clone();
         }
-        None => {
-            let mut out = old.clone();
-            out["range"]["startDate"] = json!(first);
-            out["range"]["recurrenceTimeZone"] = json!(zone);
-            out
-        }
-    };
-    if days != 0 && start.is_some() {
+    }
+    out["range"]["startDate"] = json!(first);
+    out["range"]["recurrenceTimeZone"] = json!(zone);
+    if !new_pattern && days != 0 && start.is_some() {
         let p = &mut out["pattern"];
         match p["type"].as_str() {
             Some("weekly") => {
@@ -644,6 +638,37 @@ mod tests {
         let out = changed(&now, Some(&ends), Some(&opened), 0, None, "2026-10-27");
         assert_eq!(out["pattern"]["daysOfWeek"], json!(["tuesday", "thursday"]));
         assert_eq!(out["range"]["numberOfOccurrences"], 8);
+    }
+
+    #[test]
+    fn a_pattern_changed_here_keeps_an_end_moved_in_outlook() {
+        // Tuesdays to December 31 when the editor opened; to March 31 in
+        // Outlook now. Thursdays are added here.
+        let opened = Repeat {
+            every: Every::Week,
+            interval: 1,
+            weekdays: vec![2],
+            nth: None,
+            day: None,
+            month: None,
+            ends: Ends::On {
+                date: "2026-12-31".into(),
+            },
+        };
+        let now = Repeat {
+            ends: Ends::On {
+                date: "2027-03-31".into(),
+            },
+            ..opened.clone()
+        }
+        .to_graph("2026-10-27", "UTC");
+        let both = Repeat {
+            weekdays: vec![2, 4],
+            ..opened.clone()
+        };
+        let out = changed(&now, Some(&both), Some(&opened), 0, None, "2026-10-27");
+        assert_eq!(out["pattern"]["daysOfWeek"], json!(["tuesday", "thursday"]));
+        assert_eq!(out["range"]["endDate"], "2027-03-31");
     }
 
     #[test]

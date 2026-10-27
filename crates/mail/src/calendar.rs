@@ -25,7 +25,8 @@ const EVENT_PAGE: usize = 250;
 
 const EVENT_SELECT: &str = "id,subject,start,end,isAllDay,location,onlineMeeting,onlineMeetingUrl,\
      organizer,attendees,responseStatus,responseRequested,isCancelled,isOrganizer,showAs,sensitivity,\
-     type,body,webLink,isReminderOn,reminderMinutesBeforeStart,seriesMasterId,isOnlineMeeting";
+     type,body,webLink,isReminderOn,reminderMinutesBeforeStart,seriesMasterId,isOnlineMeeting,\
+     originalStartTimeZone";
 
 /// The user's answer to an event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +148,7 @@ struct GraphEvent {
     reminder_minutes_before_start: Option<i64>,
     series_master_id: Option<String>,
     is_online_meeting: bool,
+    original_start_time_zone: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1088,9 +1090,10 @@ fn to_event(e: GraphEvent) -> Option<Event> {
     let mut start = parse_iso_date(&e.start?.date_time)?;
     let mut end = parse_iso_date(&e.end?.date_time)?;
     if e.is_all_day {
-        // All-day events can come shifted by their own time zone's offset.
-        start = nearest_midnight(start);
-        end = nearest_midnight(end).max(start + DAY_MS);
+        // All-day events come shifted by their own time zone's offset.
+        let zone = e.original_start_time_zone.as_deref();
+        start = all_day_date(start, zone);
+        end = all_day_date(end, zone).max(start + DAY_MS);
     }
     let location = e
         .location
@@ -1204,6 +1207,39 @@ fn nearest_midnight(ms: i64) -> i64 {
     (ms + DAY_MS / 2).div_euclid(DAY_MS) * DAY_MS
 }
 
+/// Time zones 12 to 14 hours ahead of UTC, by Windows' and IANA's names:
+/// an all-day event made there starts more than half a day before its
+/// date's UTC midnight.
+const FAR_EAST: &[&str] = &[
+    "New Zealand Standard Time",
+    "Chatham Islands Standard Time",
+    "Tonga Standard Time",
+    "Samoa Standard Time",
+    "Line Islands Standard Time",
+    "Fiji Standard Time",
+    "Kamchatka Standard Time",
+    "Russia Time Zone 11",
+    "UTC+12",
+    "UTC+13",
+    "Pacific/Auckland",
+    "Pacific/Chatham",
+    "Pacific/Tongatapu",
+    "Pacific/Apia",
+    "Pacific/Kiritimati",
+    "Pacific/Fiji",
+];
+
+/// An all-day event's day (its date's UTC midnight) from its start in UTC,
+/// `ms`, and the time zone it was made in.
+fn all_day_date(ms: i64, zone: Option<&str>) -> i64 {
+    if zone.is_some_and(|z| FAR_EAST.contains(&z)) {
+        // Midnight there is 12 to 14 hours before midnight UTC.
+        (ms + 14 * 3_600_000).div_euclid(DAY_MS) * DAY_MS
+    } else {
+        nearest_midnight(ms)
+    }
+}
+
 /// Outlook's calendar color: its hex value, else its named preset; `None`
 /// ("auto") takes the account's color.
 fn calendar_color(hex: Option<&str>, preset: Option<&str>) -> Option<String> {
@@ -1313,6 +1349,25 @@ mod tests {
         assert_eq!(event.call_link, None);
         assert_eq!(event.reminder, None, "no reminder unless it's on");
         assert!(graph_event(json!({ "id": "x", "subject": "No times" })).is_none());
+        // Made in Auckland, 13 hours ahead in summer: November 1 starts on
+        // October 31 at 11:00 UTC.
+        let auckland = graph_event(json!({
+            "id": "AAMk3",
+            "subject": "Labour weekend",
+            "start": { "dateTime": "2026-10-31T11:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-11-01T11:00:00.0000000", "timeZone": "UTC" },
+            "isAllDay": true,
+            "originalStartTimeZone": "New Zealand Standard Time"
+        }))
+        .unwrap();
+        assert_eq!(
+            auckland.start,
+            parse_iso_date("2026-11-01T00:00:00Z").unwrap()
+        );
+        assert_eq!(
+            auckland.end,
+            parse_iso_date("2026-11-02T00:00:00Z").unwrap()
+        );
     }
 
     #[tokio::test]
