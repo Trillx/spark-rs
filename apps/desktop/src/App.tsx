@@ -53,7 +53,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   QUICK_REPLIES,
   cancelCompose,
@@ -457,7 +457,10 @@ export default function App() {
   const outbox = useRef(new Map<number, Draft>());
   const [messages, setMessages] = useState<Message[]>([]);
   const [view, setView] = useState<ListView>(() => ({ ...INITIAL_VIEW, mode: loadInboxMode("all") }));
-  /** Messages read during this visit to the list; they keep their Smart Inbox card until the list changes. */
+  /**
+   * Messages read during this visit to the list. They keep their place until the list changes, as
+   * in Spark: their Smart Inbox card, an `is:unread` search or smart folder, the Home Screen feed.
+   */
   const [sticky, setSticky] = useState<ReadonlySet<number>>(new Set());
   /** The list cursor. In split view it follows the open thread. */
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -643,8 +646,8 @@ export default function App() {
   );
   const homeNew = useMemo(() => homeCounts(inboxMail, newSince(homeSession)), [inboxMail, homeSession]);
   const homeItems = useMemo(
-    () => homeFeed(inboxMail, homeSession, homeSettings.filter),
-    [inboxMail, homeSession, homeSettings.filter],
+    () => homeFeed(inboxMail, homeSession, homeSettings.filter, sticky),
+    [inboxMail, homeSession, homeSettings.filter, sticky],
   );
   /** Writing or reading an email holds off the inactivity timeout. Split view always shows one, so only one column counts. */
   const homePaused = draft !== null || (openMessage !== null && !twoColumns);
@@ -736,6 +739,10 @@ export default function App() {
     setSelectedId(null);
     setPicked(new Set());
   }, [homeShown]);
+
+  // The Home Screen and the Inbox are separate visits: what was read in one goes where it belongs
+  // in the other. Before paint, so the first frame already shows it there.
+  useLayoutEffect(() => setSticky((s) => (s.size ? new Set() : s)), [homeShown]);
 
   /** The user is in the Inbox now: a list, a search or a notification opened. */
   function startHomeSession() {
@@ -1331,9 +1338,14 @@ export default function App() {
     const unread = m ? conversationOf(index, m).filter((x) => x.unread) : [];
     if (id !== openId) setOpenedUnread(new Set(unread.map((x) => x.id)));
     if (unread.length) {
-      setSticky((s) => new Set([...s, ...unread.map((x) => x.id)]));
+      holdRows(unread);
       for (const x of unread) void update(x.id, { unread: false });
     }
+  }
+
+  /** Mail being read stays where it shows for the rest of the visit (see `sticky`). */
+  function holdRows(read: Message[]) {
+    setSticky((s) => new Set([...s, ...read.map((m) => m.id)]));
   }
 
   /** Opens a message: a draft in the composer, other mail in the reader. */
@@ -1577,8 +1589,10 @@ export default function App() {
     /** Reading marks the whole conversation read; unread marks `m`. */
     read: (m: Message) => {
       const unread = threadOf(m).filter((x) => x.unread);
-      if (unread.length) act(unread, { unread: false }, "Marked as Read", ICONS.read);
-      else act([own(m)], { unread: true }, "Marked as Unread", ICONS.read);
+      if (unread.length) {
+        holdRows(unread);
+        act(unread, { unread: false }, "Marked as Read", ICONS.read);
+      } else act([own(m)], { unread: true }, "Marked as Unread", ICONS.read);
     },
     aside: (m: Message) =>
       m.state === "aside"
@@ -1793,8 +1807,10 @@ export default function App() {
     read: () =>
       batch((rows) => {
         const unread = rows.flatMap(threadOf).filter((x) => x.unread);
-        if (unread.length) act(unread, { unread: false }, `${conversationCount(rows)} marked as read`, ICONS.read);
-        else act(rows.map(own), { unread: true }, `${conversationCount(rows)} marked as unread`, ICONS.read);
+        if (unread.length) {
+          holdRows(unread);
+          act(unread, { unread: false }, `${conversationCount(rows)} marked as read`, ICONS.read);
+        } else act(rows.map(own), { unread: true }, `${conversationCount(rows)} marked as unread`, ICONS.read);
       }),
     pin: () =>
       batch((rows) =>

@@ -216,6 +216,14 @@ test("the feed shows new unread mail by the Preview filter, minus dismissed and 
   assert.deepEqual(ids("all"), [3]);
 });
 
+test("an email read from the feed keeps its place there", () => {
+  const s = endSession(startSession(firstSession(at(9)), at(9)), noSchedule, at(10));
+  const inbox = [mail(1, at(10, 30)), mail(2, at(11), { unread: false }), mail(3, at(11, 30), { unread: false })];
+  const ids = (read?: Set<number>) => feed(inbox, s, "all", read).map((m) => m.id);
+  assert.deepEqual(ids(), [1]);
+  assert.deepEqual(ids(new Set([2])), [2, 1]);
+});
+
 test("greetings follow the hour and use the first name", () => {
   assert.equal(greetingLine(3, "Ana Ruiz"), "Good Night, Ana!");
   assert.equal(greetingLine(4, "Ana Ruiz"), "Good Morning, Ana!");

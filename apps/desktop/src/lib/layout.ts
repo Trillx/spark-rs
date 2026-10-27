@@ -419,8 +419,16 @@ function listRows(messages: Message[], read: ReadonlySet<number>, ctx: ListConte
 /** Messages in any of these server folders. */
 const inFolders = (ids: number[]) => (m: Message) => m.folders?.some((id) => ids.includes(id)) ?? false;
 
-/** A list other than the Inbox, newest first (Recently Seen: most recently opened first). */
-export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, ctx: ListContext): Message[] {
+/**
+ * A list other than the Inbox, newest first (Recently Seen: most recently opened first).
+ * `read` holds emails read during this visit, which an `is:unread` smart folder keeps.
+ */
+export function listItems(
+  messages: Message[],
+  key: Exclude<ListKey, "inbox">,
+  ctx: ListContext,
+  read?: ReadonlySet<number>,
+): Message[] {
   const live = messages.filter(isLive);
   switch (key) {
     case "pins":
@@ -444,7 +452,7 @@ export function listItems(messages: Message[], key: Exclude<ListKey, "inbox">, c
   const smartId = smartIdOf(key);
   if (smartId !== undefined) {
     const smart = ctx.smartFolders.find((f) => f.id === smartId);
-    return smart ? live.filter((m) => matchesQuery(m, smart.query, ctx.hits)).sort(newestFirst) : [];
+    return smart ? live.filter((m) => matchesQuery(m, smart.query, ctx.hits, read)).sort(newestFirst) : [];
   }
   return live.filter(inFolders(listFolderIds(key, ctx.folders))).sort(newestFirst);
 }
@@ -462,13 +470,15 @@ export function buildList(
     // Narrowed to an account, a search looks in that account only.
     const inScope = (m: Message) => view.account === "all" || m.account === view.account;
     const hits = rows.of(
-      messages.filter((m) => isLive(m) && inScope(m) && matchesQuery(m, view.search!, ctx.hits)).sort(newestFirst),
+      messages
+        .filter((m) => isLive(m) && inScope(m) && matchesQuery(m, view.search!, ctx.hits, sticky))
+        .sort(newestFirst),
     );
     return { ...rows.model("Search", hits.map((m) => ({ kind: "row", message: m }))), found: hits.length };
   }
 
   if (view.folder !== "inbox") {
-    const all = listItems(messages, view.folder, ctx);
+    const all = listItems(messages, view.folder, ctx, sticky);
     const items = rows.of(view.account === "all" ? all : all.filter((m) => m.account === view.account));
     const label = listInfo(view.folder, ctx.folders, ctx.smartFolders)?.label ?? "Folder";
     const account = view.account !== "all" && accounts.find((a) => a.id === view.account)?.label;
@@ -619,13 +629,14 @@ export function searchesServers(query: string) {
 /**
  * Free text plus `from:`, `has:attachment`, `is:unread` and `date:today`. The free text
  * matches what the search index found for it, in `hits`, and until it answers, the
- * message's sender, subject and snippet.
+ * message's sender, subject and snippet. `is:unread` also keeps the emails in `read`,
+ * read during this visit, so they don't leave the list under the cursor.
  */
-export function matchesQuery(m: Message, query: string, hits?: SearchHits) {
+export function matchesQuery(m: Message, query: string, hits?: SearchHits, read?: ReadonlySet<number>) {
   const { from, hasAttachment, unreadOnly, todayOnly, text } = parseQuery(query);
   if (from && !`${m.from} ${m.address}`.toLowerCase().includes(from)) return false;
   if (hasAttachment && !m.attachment) return false;
-  if (unreadOnly && !m.unread) return false;
+  if (unreadOnly && !m.unread && !read?.has(m.id)) return false;
   if (todayOnly && m.timestamp < new Date().setHours(0, 0, 0, 0)) return false;
   if (!text) return true;
   const found = hits?.get(text);

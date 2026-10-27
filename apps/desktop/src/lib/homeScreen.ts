@@ -364,12 +364,21 @@ export function inFilter(m: Message, filter: PreviewFilter) {
   }
 }
 
-/** The feed: unread Inbox mail that came after the last session (or Clear All), newest first. */
-export function feed(inbox: Message[], s: HomeSession, filter: PreviewFilter): Message[] {
+/**
+ * The feed: unread Inbox mail that came after the last session (or Clear All), newest first.
+ * Emails in `read`, read while the Home Screen shows, keep their place until it closes.
+ */
+export function feed(
+  inbox: Message[],
+  s: HomeSession,
+  filter: PreviewFilter,
+  read: ReadonlySet<number> = new Set(),
+): Message[] {
   const since = Math.max(newSince(s), s.clearedAt ?? 0);
   const dismissed = new Set(s.dismissed);
+  const unread = (m: Message) => m.unread || read.has(m.id);
   return inbox
-    .filter((m) => m.state === "inbox" && m.unread && arrived(m) > since && !dismissed.has(m.id) && inFilter(m, filter))
+    .filter((m) => m.state === "inbox" && unread(m) && arrived(m) > since && !dismissed.has(m.id) && inFilter(m, filter))
     .sort((a, b) => arrived(b) - arrived(a));
 }
 
