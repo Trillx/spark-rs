@@ -107,7 +107,8 @@ async fn imap_round_trip() {
     .await;
 
     let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let secrets = Arc::new(MemorySecrets::default());
+    let engine = Engine::new(store.clone(), secrets.clone());
     let account = engine
         .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
         .await
@@ -358,6 +359,25 @@ async fn imap_round_trip() {
         engine.attachment(forwarded.id, 1).await.unwrap().bytes,
         b"notes"
     );
+
+    // Kept once fetched: the whole email comes, so both its files are kept.
+    let files = std::env::temp_dir().join(format!("spark-greenmail-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&files);
+    let cached = Engine::new(store.clone(), secrets.clone()).with_attachment_cache(files.clone());
+    assert_eq!(cached.prefetch_attachments(forwarded.id).await.unwrap(), 2);
+    assert_eq!(
+        cached.prefetch_attachments(forwarded.id).await.unwrap(),
+        0,
+        "both are kept"
+    );
+    assert_eq!(
+        cached.attachment(forwarded.id, 1).await.unwrap().bytes,
+        b"notes"
+    );
+    // Save as .eml: the email as the server has it.
+    let raw = cached.raw_message(forwarded.id).await.unwrap();
+    assert!(String::from_utf8_lossy(&raw).contains("Subject: Fwd: Quote 42"));
+    let _ = std::fs::remove_dir_all(&files);
 
     let _ = check.logout().await;
 }

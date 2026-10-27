@@ -231,6 +231,8 @@ export interface Prefs {
   meetingPopupSound: boolean;
   /** Suggest people from the user's mail while they type in To, Cc and Bcc. */
   suggestRecipients: boolean;
+  /** Spark's Auto-download attachments: an email's files are fetched as it's opened. */
+  autoDownloadAttachments: boolean;
   /** How long Undo can stop a message after Send, in seconds. */
   undoSendSeconds: number;
   /** Replies start with "Mark as Done after sending" on. */

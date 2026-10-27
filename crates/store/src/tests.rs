@@ -3280,3 +3280,31 @@ fn templates_keep_their_order_and_note_when_they_were_used() {
     assert!(!store.update_template(a.id, new("Gone")).unwrap());
     assert_eq!(names(&store), ["Follow up", "Introduction"]);
 }
+
+#[test]
+fn a_message_keeps_its_files_key_and_a_reused_id_gets_another() {
+    let (mut store, account) = store_with_account();
+    let first = arrive(&mut store, account, 1, "ana@x.com").id;
+    assert_eq!(
+        store.files_key(first, "aaa").unwrap().as_deref(),
+        Some("aaa")
+    );
+    assert_eq!(
+        store.files_key(first, "bbb").unwrap().as_deref(),
+        Some("aaa"),
+        "made once"
+    );
+    assert_eq!(
+        store.files_keys(account).unwrap(),
+        [(first, "aaa".to_owned())]
+    );
+    store.remove_messages(&[first]).unwrap();
+    assert_eq!(store.files_key(first, "ccc").unwrap(), None);
+    // SQLite gives the last id to the next row once it's free.
+    let next = arrive(&mut store, account, 2, "bo@x.com").id;
+    assert_eq!(next, first);
+    assert_eq!(
+        store.files_key(next, "ddd").unwrap().as_deref(),
+        Some("ddd")
+    );
+}

@@ -136,6 +136,8 @@ export interface ThreadActions {
   copyAddresses: (m: Message) => void;
   /** Saves the email as an .eml file. */
   saveEml: (m: Message) => void;
+  /** Spark's Auto-download: the email's files, fetched ahead as it shows (if that's on). */
+  prefetchAttachments: (m: Message) => void;
   /** Settle when done (errors are reported by the caller), so tiles can show progress. */
   openAttachment: (m: Message, index: number) => Promise<void>;
   saveAttachment: (m: Message, index: number) => Promise<void>;
@@ -975,6 +977,10 @@ function MessageCard({
   const account = useAccount(m.account);
   const [state, retry] = useMessageContent(m.id);
   const content = state.status === "ready" ? state.content : null;
+  const hasFiles = (content?.attachments.length ?? 0) > 0;
+  useEffect(() => {
+    if (hasFiles) actions.prefetchAttachments(m);
+  }, [hasFiles]);
   // As in Spark, quick replies are for personal email that someone else sent.
   const offerQuickReplies = quickReplies && m.category === "people" && !isFromYou(m, account);
   return (

@@ -115,6 +115,7 @@ import {
   saveGatekeeperMode,
   sendMessage,
   openExternal,
+  prefetchAttachments,
   saveEml,
   setBadge,
   setMuted,
@@ -354,7 +355,14 @@ interface PickTime {
 
 type AppPrefs = Pick<
   Prefs,
-  "badge" | "badgeExcluded" | "undoSendSeconds" | "sendAndDone" | "replyAttachments" | "autoCc" | "autoBcc"
+  | "badge"
+  | "badgeExcluded"
+  | "undoSendSeconds"
+  | "sendAndDone"
+  | "replyAttachments"
+  | "autoCc"
+  | "autoBcc"
+  | "autoDownloadAttachments"
 >;
 
 /** Until the saved settings load: the Rust side's defaults. */
@@ -366,6 +374,7 @@ const DEFAULT_APP_PREFS: AppPrefs = {
   replyAttachments: "never",
   autoCc: {},
   autoBcc: {},
+  autoDownloadAttachments: true,
 };
 
 /** What AI does in a composer (by `composerKey`), and its body (text and HTML) before AI started. */
@@ -872,8 +881,17 @@ export default function App() {
       () => {},
     );
     void getPrefs().then(
-      ({ badge, badgeExcluded, undoSendSeconds, sendAndDone, replyAttachments, autoCc, autoBcc }) =>
-        setAppPrefs({ badge, badgeExcluded, undoSendSeconds, sendAndDone, replyAttachments, autoCc, autoBcc }),
+      ({ badge, badgeExcluded, undoSendSeconds, sendAndDone, replyAttachments, autoCc, autoBcc, autoDownloadAttachments }) =>
+        setAppPrefs({
+          badge,
+          badgeExcluded,
+          undoSendSeconds,
+          sendAndDone,
+          replyAttachments,
+          autoCc,
+          autoBcc,
+          autoDownloadAttachments,
+        }),
       () => {},
     );
     reloadPlanned();
@@ -3708,6 +3726,9 @@ export default function App() {
           return navigator.clipboard.writeText(unique.join(", "));
         })
         .then(() => showToast("Email addresses copied", undefined, ICONS.copy), fileError),
+    prefetchAttachments: (m) => {
+      if (appPrefs.autoDownloadAttachments) void prefetchAttachments(m.id).catch(() => {});
+    },
     saveEml: (m) =>
       void saveEml(m.id, m.subject || "Email").then(
         (saved) => saved && showToast("Email saved", undefined, ICONS.download),

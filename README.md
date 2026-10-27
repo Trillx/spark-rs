@@ -273,7 +273,11 @@ goes out as HTML as well as plain text, with its pictures and the
 signature's in the email.
 Agents' email gets the account's signature too, unless they leave it off.
 
-Attachments download when you open or save them, also from archived mail.
+Attachments download as you open an email (Settings → Appearance →
+Auto-download attachments; off, when you open or save one), also from
+archived mail, and stay on this computer so they open at once next time:
+up to 1 GB, the least recently used going first, and an account's going
+with it.
 Program files (`.exe`, `.js`, `.lnk` and the like) ask first, as Spark's do
 ("Open Anyway"), and downloaded files are marked as coming from the
 internet, so Windows checks them and Office opens them in Protected View. Attach files with the paperclip,

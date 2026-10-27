@@ -91,6 +91,9 @@ pub struct Prefs {
     pub meeting_popup_sound: bool,
     /// Suggest people from the user's mail while they type in To, Cc and Bcc.
     pub suggest_recipients: bool,
+    /// Spark's Auto-download attachments: an email's files are fetched as
+    /// it's opened, so they open at once.
+    pub auto_download_attachments: bool,
     /// The "still running" notice has been shown, on the first close.
     pub told_keep_running: bool,
     /// What agents may do in each account, by account id; absent is none.
@@ -119,6 +122,7 @@ impl Default for Prefs {
             meeting_popup_guests_only: true,
             meeting_popup_sound: true,
             suggest_recipients: true,
+            auto_download_attachments: true,
             told_keep_running: false,
             agent_access: BTreeMap::new(),
         }

@@ -973,6 +973,21 @@ pub async fn open_attachment(
     Ok(Opened::Opened)
 }
 
+/// Spark's Auto-download: fetches an email's attachments ahead, into the
+/// cache, so they open at once. Returns how many it fetched.
+#[tauri::command]
+pub async fn prefetch_attachments(mailbox: State<'_, Mailbox>, id: i64) -> Result<usize, String> {
+    if !mailbox.live() {
+        return Ok(0);
+    }
+    mailbox
+        .live
+        .engine
+        .prefetch_attachments(id)
+        .await
+        .map_err(text)
+}
+
 /// Asks where to save an attachment, then downloads it there. False if the
 /// user cancelled.
 #[tauri::command]

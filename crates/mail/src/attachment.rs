@@ -188,6 +188,30 @@ pub fn extract(raw: &[u8], index: usize, name: &str) -> Option<AttachmentData> {
     })
 }
 
+/// Every attachment `names` lists (as `describe` does, in order) out of a
+/// raw message, parsing it once: what `extract` gives for each.
+pub fn extract_all(raw: &[u8], names: &[&str]) -> Vec<Option<AttachmentData>> {
+    let Some(m) = MessageParser::default().parse(raw) else {
+        return names.iter().map(|_| None).collect();
+    };
+    let list: Vec<_> = listed(&m).collect();
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, &name)| {
+            let (name, mime, part) = list
+                .get(index)
+                .filter(|(n, ..)| n == name)
+                .or_else(|| list.iter().find(|(n, ..)| n == name))?;
+            Some(AttachmentData {
+                name: name.clone(),
+                mime: mime.clone(),
+                bytes: part.contents().to_vec(),
+            })
+        })
+        .collect()
+}
+
 /// (name, MIME type, part) for each part shown as an attachment. Inline
 /// images the HTML refers to aren't attachments; nor are unnamed text parts,
 /// which are pieces of the body.

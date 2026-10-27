@@ -495,6 +495,12 @@ export function saveEml(id: number, name: string): Promise<boolean> {
   return Promise.reject(DEMO_FILES);
 }
 
+/** Spark's Auto-download: fetches an email's attachments ahead so they open at once. */
+export function prefetchAttachments(id: number): Promise<number> {
+  if (isTauri()) return invoke("prefetch_attachments", { id });
+  return Promise.resolve(0);
+}
+
 /** Asks where to save, then downloads. False if the user cancelled the dialog. */
 export function saveAttachment(id: number, index: number): Promise<boolean> {
   if (isTauri()) return invoke("save_attachment", { id, index });
@@ -1215,6 +1221,7 @@ let browserPrefs: Prefs = {
   meetingPopupGuestsOnly: true,
   meetingPopupSound: true,
   suggestRecipients: true,
+  autoDownloadAttachments: true,
   undoSendSeconds: 5,
   sendAndDone: false,
   replyAttachments: "never",

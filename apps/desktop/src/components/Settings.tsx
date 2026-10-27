@@ -1932,6 +1932,7 @@ function AppearancePage({
 }) {
   // Priority's size is Settings → Priority's; People always shows.
   const sized = (key: CardKey) => key !== "priority";
+  const { prefs, change } = usePrefs();
   return (
     <>
       <section className="mb-7">
@@ -1965,6 +1966,19 @@ function AppearancePage({
         >
           <Switch id="minimize-old" on={minimize} onToggle={() => onMinimize(!minimize)} />
         </Row>
+        {prefs && (
+          <Row
+            label="Auto-download attachments"
+            description="An email's files download as you open it, so they open at once. Off, they download when you open or save one."
+            htmlFor="auto-download"
+          >
+            <Switch
+              id="auto-download"
+              on={prefs.autoDownloadAttachments}
+              onToggle={() => void change({ autoDownloadAttachments: !prefs.autoDownloadAttachments })}
+            />
+          </Row>
+        )}
       </Group>
 
       <Group title="Unread cards" note="A card that's off gives its emails to People.">

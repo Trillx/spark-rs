@@ -757,6 +757,16 @@ impl Store {
             tx.pragma_update(None, "user_version", 20)?;
             tx.commit()?;
         }
+        if version < 21 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "-- Names the email's attachments kept on this computer: a stored id
+                 -- can be another email's once the first is gone, this can't.
+                 ALTER TABLE messages ADD COLUMN files_key TEXT;",
+            )?;
+            tx.pragma_update(None, "user_version", 21)?;
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -1096,6 +1106,29 @@ impl Store {
                 },
             )
             .optional()
+    }
+
+    /// The key a message's kept attachments are under, made `fresh` the
+    /// first time. `None` if the message is gone.
+    pub fn files_key(&self, id: i64, fresh: &str) -> Result<Option<String>> {
+        self.conn.execute(
+            "UPDATE messages SET files_key = ?2 WHERE id = ?1 AND files_key IS NULL",
+            params![id, fresh],
+        )?;
+        self.conn
+            .query_row("SELECT files_key FROM messages WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+    }
+
+    /// An account's messages with kept attachments: their ids and keys.
+    pub fn files_keys(&self, account_id: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, files_key FROM messages WHERE account_id = ?1 AND files_key IS NOT NULL",
+        )?;
+        stmt.query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
     }
 
     pub fn headers(&self, id: i64) -> Result<Option<Headers>> {

@@ -3,6 +3,7 @@
 //! store. `engine` ties them together for the apps.
 
 pub mod attachment;
+pub mod cache;
 pub mod calendar;
 pub mod draft;
 pub mod drafts;

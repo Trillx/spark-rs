@@ -105,10 +105,13 @@ impl Live {
             .requeue_interrupted_sends()
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            engine: Arc::new(Engine::new(
-                Arc::new(Mutex::new(store)),
-                Arc::new(MailSecrets::platform()),
-            )),
+            engine: Arc::new(
+                Engine::new(
+                    Arc::new(Mutex::new(store)),
+                    Arc::new(MailSecrets::platform()),
+                )
+                .with_attachment_cache(data_dir.join("attachments")),
+            ),
             workers: Mutex::new(HashMap::new()),
             status: Arc::new(Mutex::new(HashMap::new())),
             sign_in: Mutex::new(None),

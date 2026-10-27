@@ -16,6 +16,7 @@ use spark_store::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::attachment::{self, AttachmentData, InlineImage};
+use crate::cache::AttachmentCache;
 use crate::calendar::{Event, Response};
 use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::drafts::{self, DraftsReport};
@@ -174,6 +175,9 @@ pub enum CalendarStatus {
 /// The longest stretch of calendar fetched at once.
 const CALENDAR_STRETCH_MS: i64 = 400 * 86_400_000;
 
+/// Auto-download leaves alone an email whose attachments add up to more.
+pub const PREFETCH_MAX_BYTES: u64 = 30 * 1024 * 1024;
+
 pub struct Engine {
     store: Arc<Mutex<Store>>,
     secrets: Arc<dyn Secrets>,
@@ -189,6 +193,8 @@ pub struct Engine {
     /// Senders waiting in an account's Gatekeeper that its Sent folder
     /// didn't have, by account and lowercased address, with when it was asked.
     not_written_to: Mutex<HashMap<(i64, String), i64>>,
+    /// Downloaded attachments kept on this computer, if they're kept.
+    files: Option<AttachmentCache>,
 }
 
 impl Engine {
@@ -200,7 +206,43 @@ impl Engine {
             calendars: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             not_written_to: Mutex::new(HashMap::new()),
+            files: None,
         }
+    }
+
+    /// Keeps downloaded attachments in `dir` (see `cache`), taking out
+    /// those of emails that went while the app was closed.
+    pub fn with_attachment_cache(mut self, dir: std::path::PathBuf) -> Self {
+        self.files = Some(AttachmentCache::new(dir));
+        self.sweep_files();
+        if let Some(files) = &self.files {
+            files.prune();
+        }
+        self
+    }
+
+    /// Takes the kept attachments of emails and accounts the store no
+    /// longer has off this computer.
+    pub fn sweep_files(&self) {
+        let Some(files) = &self.files else {
+            return;
+        };
+        let keep = {
+            let store = self.store();
+            let Ok(accounts) = store.accounts() else {
+                return;
+            };
+            let mut keep = HashMap::new();
+            for account in accounts {
+                let Ok(keys) = store.files_keys(account.id) else {
+                    return;
+                };
+                let names = keys.into_iter().map(|(id, key)| format!("{id}-{key}"));
+                keep.insert(account.id, names.collect());
+            }
+            keep
+        };
+        files.sweep(&keep);
     }
 
     pub fn store(&self) -> MutexGuard<'_, Store> {
@@ -382,6 +424,10 @@ impl Engine {
     /// Removes the account, its mail and its saved password or sign-in.
     pub fn remove_account(&self, account_id: i64) -> Result<()> {
         self.store().remove_account(account_id)?;
+        // After the store: a download finishing now finds the account gone.
+        if let Some(files) = &self.files {
+            files.forget_account(account_id);
+        }
         self.tokens_lock().remove(&account_id);
         let _ = self.secrets.set(&password_key(account_id), "");
         let _ = self.secrets.set(&token_key(account_id), "");
@@ -880,6 +926,8 @@ impl Engine {
                 }
             };
         }
+        // Their kept attachments go with them.
+        self.sweep_files();
         Ok(removed)
     }
 
@@ -933,6 +981,7 @@ impl Engine {
             }
         };
         self.store().forget_emptied(folder_id)?;
+        self.sweep_files();
         Ok(emptied)
     }
 
@@ -1298,19 +1347,21 @@ impl Engine {
         Ok(files)
     }
 
-    /// Downloads attachment `index` of a stored message from its server.
+    /// Attachment `index` of a stored message: the one kept here, else
+    /// downloaded from its server (and kept).
     pub async fn attachment(&self, message_id: i64, index: usize) -> Result<AttachmentData> {
-        let (at, wanted) = {
-            let store = self.store();
-            let gone = || Error::Config("That email is no longer here.".into());
-            let at = store.location(message_id)?.ok_or_else(gone)?;
-            let content = store.content(message_id)?.ok_or_else(gone)?;
-            let wanted =
-                content.attachments.get(index).cloned().ok_or_else(|| {
-                    Error::Config("That attachment isn't part of the email.".into())
-                })?;
-            (at, wanted)
-        };
+        let (at, all, key) = self.attachments_of(message_id)?;
+        let wanted = all
+            .get(index)
+            .cloned()
+            .ok_or_else(|| Error::Config("That attachment isn't part of the email.".into()))?;
+        if let Some(kept) = self
+            .files
+            .as_ref()
+            .and_then(|files| files.get(at.account_id, &key, index, &wanted.name, &wanted.mime))
+        {
+            return Ok(kept);
+        }
         let account = self.account(at.account_id)?;
         match config(&account)? {
             AccountConfig::Imap {
@@ -1319,7 +1370,9 @@ impl Engine {
                 ..
             } => {
                 let raw = self.fetch_raw(&account, &server, &username, &at).await?;
-                attachment::extract(&raw, index, &wanted.name).ok_or_else(|| {
+                // The whole email came: its other files are kept too.
+                let mut found = self.keep_all(at.account_id, &key, &raw, &all);
+                found.get_mut(index).and_then(Option::take).ok_or_else(|| {
                     Error::Server(format!(
                         "{} wasn't in the email on the server.",
                         wanted.name
@@ -1333,9 +1386,112 @@ impl Engine {
                 let token = self
                     .access_token(account.id, &App::new(&client_id, &tenant)?)
                     .await?;
-                Graph::new(&token).attachment(&remote, index, &wanted).await
+                let file = Graph::new(&token)
+                    .attachment(&remote, index, &wanted)
+                    .await?;
+                self.keep(at.account_id, &key, &[(index, &file.bytes)]);
+                Ok(file)
             }
         }
+    }
+
+    /// Spark's Auto-download: fetches the attachments of a stored message
+    /// that aren't kept yet, unless there's no cache or they add up to more
+    /// than `PREFETCH_MAX_BYTES`. Returns how many it fetched.
+    pub async fn prefetch_attachments(&self, message_id: i64) -> Result<usize> {
+        let Some(files) = &self.files else {
+            return Ok(0);
+        };
+        let (at, all, key) = self.attachments_of(message_id)?;
+        let missing: Vec<usize> = (0..all.len())
+            .filter(|&i| !files.has(at.account_id, &key, i))
+            .collect();
+        let size: u64 = all.iter().map(|a| a.size).sum();
+        if missing.is_empty() || size > PREFETCH_MAX_BYTES {
+            return Ok(0);
+        }
+        let account = self.account(at.account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let raw = self.fetch_raw(&account, &server, &username, &at).await?;
+                let found = self.keep_all(at.account_id, &key, &raw, &all);
+                Ok(found.iter().flatten().count())
+            }
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let remote = at.remote_id.ok_or(Error::Gone)?;
+                let token = self
+                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                    .await?;
+                let graph = Graph::new(&token);
+                for &i in &missing {
+                    let file = graph.attachment(&remote, i, &all[i]).await?;
+                    self.keep(at.account_id, &key, &[(i, &file.bytes)]);
+                }
+                Ok(missing.len())
+            }
+        }
+    }
+
+    /// Where a stored message is, its attachments, and its name in the
+    /// cache: its id and `files_key`, as a stored id can be another email's
+    /// once the first is gone.
+    fn attachments_of(
+        &self,
+        message_id: i64,
+    ) -> Result<(Location, Vec<spark_store::Attachment>, String)> {
+        let store = self.store();
+        let gone = || Error::Config("That email is no longer here.".into());
+        let at = store.location(message_id)?.ok_or_else(gone)?;
+        let content = store.content(message_id)?.ok_or_else(gone)?;
+        let mut fresh = [0u8; 12];
+        getrandom::fill(&mut fresh).map_err(|e| Error::Config(e.to_string()))?;
+        let fresh: String = fresh.iter().map(|b| format!("{b:02x}")).collect();
+        let key = store.files_key(message_id, &fresh)?.ok_or_else(gone)?;
+        Ok((at, content.attachments, format!("{message_id}-{key}")))
+    }
+
+    /// Keeps downloaded attachments (index and bytes) of an account's email,
+    /// unless the account went meanwhile; then makes room.
+    fn keep(&self, account: i64, key: &str, found: &[(usize, &[u8])]) {
+        let Some(files) = &self.files else {
+            return;
+        };
+        {
+            let _held = files.lock();
+            if !matches!(self.store().account(account), Ok(Some(_))) {
+                return;
+            }
+            for (index, bytes) in found {
+                files.put(account, key, *index, bytes);
+            }
+        }
+        files.prune();
+    }
+
+    /// Every attachment of a fetched email, from one reading of it, kept;
+    /// by index as the email lists them, `None` for one that wasn't there.
+    fn keep_all(
+        &self,
+        account: i64,
+        key: &str,
+        raw: &[u8],
+        all: &[spark_store::Attachment],
+    ) -> Vec<Option<AttachmentData>> {
+        let names: Vec<&str> = all.iter().map(|a| a.name.as_str()).collect();
+        let found = attachment::extract_all(raw, &names);
+        let kept: Vec<(usize, &[u8])> = found
+            .iter()
+            .enumerate()
+            .filter_map(|(i, file)| Some((i, file.as_ref()?.bytes.as_slice())))
+            .collect();
+        self.keep(account, key, &kept);
+        found
     }
 
     /// A stored message as its server has it, MIME and all: what Save as
