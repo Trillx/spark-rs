@@ -1714,6 +1714,61 @@ fn locations_say_where_the_server_keeps_a_message() {
 }
 
 #[test]
+fn a_blocked_senders_archived_mail_moved_into_the_inbox_goes_to_blocked() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[RemoteFolder {
+                remote_id: "Archive".into(),
+                parent: None,
+                name: "Archive".into(),
+                role: Some(FolderRole::Archive),
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    let archive = store.folders().unwrap()[0].id;
+    // An Archive sync stored it first; then its sender was blocked.
+    let archived = Incoming {
+        remote_id: Some("AAMk-9".into()),
+        mailbox: None,
+        uid: None,
+        ..incoming(account, 9, "spam@junk.biz")
+    };
+    let id = new_id(store.add_folder_message(archive, &archived).unwrap());
+    decide(
+        &mut store,
+        sender("spam@junk.biz"),
+        Some(Decision::Blocked),
+        1_000,
+    );
+    assert_eq!(
+        store.message(id).unwrap().unwrap().state,
+        MessageState::Done
+    );
+
+    // Moved into the inbox elsewhere, the inbox's reconcile lists it by its
+    // id and flags alone: it's its sender's mail all the same.
+    let listed = Incoming {
+        account_id: account,
+        remote_id: Some("AAMk-9".into()),
+        unread: true,
+        ..Default::default()
+    };
+    assert!(store.batch(|b| b.observe_listed(&listed)).unwrap());
+    let m = store.message(id).unwrap().unwrap();
+    assert_eq!((m.state, m.screening), (MessageState::Blocked, false));
+    let pending = store.pending(account, i64::MAX, 0).unwrap();
+    assert_eq!(pending.iter().map(|p| p.id).collect::<Vec<_>>(), [id]);
+    assert_eq!(
+        pending[0].place,
+        Place::Blocked,
+        "it moves to Blocked there"
+    );
+}
+
+#[test]
 fn whole_mail_says_if_it_fills_in_a_body_and_message_ids_find_one() {
     let (mut store, account) = store_with_account();
     let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());

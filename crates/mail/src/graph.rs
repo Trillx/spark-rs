@@ -150,6 +150,11 @@ pub struct SyncState {
     /// Nothing older is left in the inbox.
     #[serde(default)]
     pub complete: bool,
+    /// Where reaching back goes on from: the next page's link, when the
+    /// last page was all of one second and more of it is left. Listing from
+    /// before that second again would list the same page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_next: Option<String>,
     /// New mail stored without its attachments or invite, as Graph couldn't
     /// give them yet, in the order a round fetches them (`Graph::repair`).
     /// Rounds and searches add to it side by side, so it's only changed
@@ -161,6 +166,10 @@ pub struct SyncState {
     /// query's window, which the delta doesn't see (`Graph::reconcile_inbox`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconcile: Option<Reconcile>,
+    /// Where the pass's listing goes on from within the second it's at
+    /// (`Reconcile::before`), when that second held more mail than a page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile_next: Option<String>,
 }
 
 /// Where a pass over the stored inbox mail older than the delta query's
@@ -1100,9 +1109,14 @@ impl Graph {
             "/me/mailFolders/inbox/messages?$filter=receivedDateTime+lt+{}&$orderby=receivedDateTime+desc",
             iso_date(before)
         );
-        let mut next = Some(format!(
-            "{messages}&$top={OLDER_STEP}&$select={HEAD_SELECT}"
-        ));
+        // A link that fails is left: listing from before that second again
+        // gives it anew.
+        let mut next = Some(
+            state
+                .older_next
+                .take()
+                .unwrap_or_else(|| format!("{messages}&$top={OLDER_STEP}&$select={HEAD_SELECT}")),
+        );
         let mut stored = 0;
         while let Some(url) = next.take() {
             let request = self
@@ -1122,14 +1136,23 @@ impl Graph {
                 }
                 Ok(new)
             })?;
-            if let Some(oldest) = page
+            let received: Vec<i64> = page
                 .value
                 .iter()
                 .filter_map(|m| m.received_date_time.as_deref().and_then(parse_iso_date))
-                .min()
-            {
+                .collect();
+            if let Some(&oldest) = received.iter().min() {
                 state.older_than = Some(state.older_than.map_or(oldest, |o| o.min(oldest)));
             }
+            // A page all of one second, which goes on: the next goes on from
+            // its link, as listing from before that second gives it again.
+            let one_second = received
+                .iter()
+                .map(|ms| whole_second(*ms))
+                .collect::<HashSet<_>>()
+                .len()
+                == 1;
+            state.older_next = page.next_link.clone().filter(|_| one_second);
             pages -= 1;
             match page.next_link {
                 // Mail already stored doesn't count: an account whose
@@ -1155,7 +1178,9 @@ impl Graph {
     /// (`observe_gone_remote`, which leaves what the user changed), unless
     /// it was stored after the listing went out. The stretch ends at the
     /// page's oldest second, which may go on into the next page, unless
-    /// the page is the last. A pass starts if none is under way, from the
+    /// the page is the last; a page all of one second goes on from its link
+    /// (`SyncState::reconcile_next`). It all goes by whole seconds, as
+    /// Graph's filter does. A pass starts if none is under way, from the
     /// delta's window down to the oldest mail reached back for then.
     pub async fn reconcile_inbox(
         &self,
@@ -1167,6 +1192,7 @@ impl Graph {
             done: true,
             ..Default::default()
         };
+        let link = state.reconcile_next.take();
         let (Some(_), Some(since)) = (&state.delta_link, state.since) else {
             state.reconcile = None;
             return Ok(ended);
@@ -1175,19 +1201,36 @@ impl Graph {
             before: since,
             until: state.older_than.unwrap_or(since),
         });
-        if pass.before <= pass.until {
+        // Graph's filter has whole seconds (`iso_date`), and so has all of
+        // the pass: what's judged by what it lists is what it asked for.
+        let pass = Reconcile {
+            before: whole_second(pass.before),
+            until: whole_second(pass.until),
+        };
+        // Down to its last second, but for the rest of that one.
+        let link = link.filter(|_| state.reconcile.is_some());
+        if pass.before <= pass.until && link.is_none() {
             state.reconcile = None;
             return Ok(ended);
         }
-        // Mail stored after this can't be taken for gone: the listing may
-        // have gone out before it came into the inbox.
-        let stored_before = lock(store).newest_message_id()?;
-        let url = format!(
-            "/me/mailFolders/inbox/messages?$filter=receivedDateTime+lt+{}+and+receivedDateTime+ge+{}\
-             &$orderby=receivedDateTime+desc&$top={MAX_PAGE}&$select={RECONCILE_SELECT}",
-            iso_date(pass.before),
-            iso_date(pass.until)
-        );
+        // Only mail stored before the listing goes out can be taken for
+        // gone: mail a search stores meanwhile may have come into the inbox
+        // since.
+        let stored: HashSet<String> = lock(store)
+            .inbox_remote_ids(account_id, pass.until, pass.before)?
+            .into_iter()
+            .collect();
+        // Within a second that held more than a page, from where its last
+        // page ended. A link that fails is left, and the rest of that
+        // second with it.
+        let url = link.unwrap_or_else(|| {
+            format!(
+                "/me/mailFolders/inbox/messages?$filter=receivedDateTime+lt+{}+and+receivedDateTime+ge+{}\
+                 &$orderby=receivedDateTime+desc&$top={MAX_PAGE}&$select={RECONCILE_SELECT}",
+                iso_date(pass.before),
+                iso_date(pass.until)
+            )
+        });
         let request = self
             .request(Method::GET, &url)
             .timeout(BACKGROUND_REQUEST_TIME);
@@ -1196,15 +1239,21 @@ impl Graph {
             .value
             .iter()
             .filter_map(|m| m.received_date_time.as_deref().and_then(parse_iso_date))
-            .min();
+            .min()
+            .map(whole_second);
         let full = page.next_link.is_some() || page.value.len() >= MAX_PAGE;
         // The stretch the page covers, from `from` to `pass.before`, and
         // where the next page starts.
         let (from, next) = match oldest {
             _ if !full => (pass.until, None),
             Some(oldest) if oldest + 1000 < pass.before => (oldest + 1000, Some(oldest + 1000)),
-            // A whole page of one second: the rest of it is passed.
-            Some(oldest) => (pass.before, Some(oldest)),
+            // A whole page of one second: the next goes on from its link,
+            // as listing from before that second gives it again. Nothing
+            // of that second can be taken for gone: it's listed in parts.
+            Some(oldest) => {
+                state.reconcile_next.clone_from(&page.next_link);
+                (pass.before, Some(oldest))
+            }
             None => (pass.before, None),
         };
 
@@ -1244,8 +1293,8 @@ impl Graph {
                 changed += usize::from(b.observe_listed(&flags)?);
             }
             let listed: HashSet<&str> = page.value.iter().map(|m| m.id.as_str()).collect();
-            for remote_id in b.inbox_remote_ids(account_id, from, pass.before, stored_before)? {
-                if !listed.contains(remote_id.as_str()) {
+            for remote_id in b.inbox_remote_ids(account_id, from, pass.before)? {
+                if stored.contains(&remote_id) && !listed.contains(remote_id.as_str()) {
                     changed += b.observe_gone_remote(account_id, &remote_id)?;
                 }
             }
@@ -2980,6 +3029,11 @@ fn repaired(store: &mut Store, account_id: i64, asked: &Repair, parts: Parts, no
     came && stored
 }
 
+/// Unix ms `ms` down to its whole second, as `iso_date` writes it.
+fn whole_second(ms: i64) -> i64 {
+    ms.div_euclid(1000) * 1000
+}
+
 /// `2026-10-21T14:00:00Z` (Graph's format) from Unix ms.
 pub(crate) fn iso_date(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
@@ -4537,7 +4591,8 @@ pub(crate) mod tests {
 
     /// A stand-in inbox for its reconcile: what `inbox` holds now, listed
     /// by when it came (`lt` and `ge`), newest first, `page` at a time with
-    /// a link to more. One message alone comes as reaching back lists it.
+    /// a link to more (`$skip`). One message alone comes as reaching back
+    /// lists it.
     fn reconciling(
         inbox: Arc<Mutex<Vec<InInbox>>>,
         page: usize,
@@ -4568,7 +4623,9 @@ pub(crate) mod tests {
                 .filter(|(id, ..)| (from..before).contains(&received_by_id(id)))
                 .collect();
             listed.sort_by_key(|(id, ..)| (-received_by_id(id), *id));
-            let more = listed.len() > page;
+            let skip: usize = q.get("$skip").map_or(0, |s| s.parse().unwrap());
+            let more = listed.len() > skip + page;
+            listed.drain(..skip.min(listed.len()));
             listed.truncate(page);
             let value: Vec<Value> = listed
                 .iter()
@@ -4580,11 +4637,16 @@ pub(crate) mod tests {
                     })
                 })
                 .collect();
-            let mut page = json!({ "value": value });
+            let mut listing = json!({ "value": value });
             if more {
-                page["@odata.nextLink"] = json!("https://graph.microsoft.com/v1.0/more");
+                let rest: Vec<&str> = query
+                    .split('&')
+                    .filter(|p| !p.starts_with("$skip="))
+                    .collect();
+                listing["@odata.nextLink"] =
+                    json!(format!("{route}?{}&$skip={}", rest.join("&"), skip + page));
             }
-            Answer::json(page)
+            Answer::json(listing)
         }
     }
 
@@ -4745,6 +4807,217 @@ pub(crate) mod tests {
         assert_eq!((steps, passed.reconcile), (4, None));
         assert_eq!(message("i12").state, Done, "gone since the last pass");
         assert_eq!(titled(&store, "Message i25").unwrap().state, Inbox);
+    }
+
+    /// Stores the `reconciling` stand-in's `ids` as reaching back stores
+    /// them, unread; returns their message ids.
+    fn store_older(
+        store: &Mutex<Store>,
+        account_id: i64,
+        ids: &[&'static str],
+    ) -> HashMap<&'static str, i64> {
+        let mut s = lock(store);
+        ids.iter()
+            .map(|id| {
+                let m = Incoming {
+                    account_id,
+                    remote_id: Some((*id).into()),
+                    subject: format!("Message {id}"),
+                    date: received_by_id(id),
+                    unread: true,
+                    body: Body::Missing,
+                    ..Default::default()
+                };
+                let Added::New(stored) = s.add_incoming(&m, false).unwrap() else {
+                    panic!("{id} stored before");
+                };
+                (*id, stored)
+            })
+            .collect()
+    }
+
+    /// Steps `state`'s pass to its end; returns how many steps it took.
+    async fn whole_pass(
+        graph: &Graph,
+        store: &Mutex<Store>,
+        account_id: i64,
+        state: &mut SyncState,
+    ) -> usize {
+        for steps in 1..50 {
+            let step = graph.reconcile_inbox(store, account_id, state).await;
+            if step.unwrap().done {
+                return steps;
+            }
+        }
+        panic!("the pass doesn't end: {state:?}");
+    }
+
+    #[tokio::test]
+    async fn a_pass_goes_by_the_whole_seconds_it_asks_for() {
+        let (store, account_id) = microsoft_store();
+        let all = ["i10", "i11", "i12", "i13", "i14"];
+        let ids = store_older(&store, account_id, &all);
+        let inbox: Vec<InInbox> = all.iter().map(|id| (*id, false, false)).collect();
+        let (base, seen) = serve(reconciling(Arc::new(Mutex::new(inbox)), 2)).await;
+        let graph = Graph::with_base(&base, "token");
+        // The delta's window starts a quarter of a second into i10's second,
+        // as the first sync had it (to the ms), and reaching back ended half
+        // a second into i14's: the delta has all of i10's second.
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(10) + 250),
+            older_than: Some(received(14) + 500),
+            ..Default::default()
+        };
+        assert_eq!(whole_pass(&graph, &store, account_id, &mut state).await, 3);
+        for id in all {
+            let m = lock(&store).message(ids[id]).unwrap().unwrap();
+            assert_eq!(m.state, spark_store::MessageState::Inbox, "{id}");
+        }
+        let asked = seen.take();
+        assert!(
+            asked[0].path.contains(&format!(
+                "receivedDateTime+lt+{}+and+receivedDateTime+ge+{}",
+                iso_date(received(10)),
+                iso_date(received(14))
+            )),
+            "{}",
+            asked[0].path
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_stored_while_a_pass_lists_isnt_taken_for_gone() {
+        let (store, account_id) = microsoft_store();
+        let store = Arc::new(store);
+        let ids = store_older(&store, account_id, &["i11", "i12"]);
+        // The newest stored, which goes while the listing is out.
+        let newest = store_older(&store, account_id, &["n1"])["n1"];
+        let inbox: Vec<InInbox> = vec![("i11", false, false), ("i12", false, false)];
+        let answer = reconciling(Arc::new(Mutex::new(inbox)), 10);
+        let during = store.clone();
+        let (base, _) = serve(move |asked, attempt| {
+            // Meanwhile a search stores i13, just moved into the inbox,
+            // where the one that went was: the listing went out before.
+            if asked.path.starts_with("/me/mailFolders/inbox/messages") && attempt == 0 {
+                lock(&during).remove_messages(&[newest]).unwrap();
+                let i13 = store_older(&during, account_id, &["i13"]);
+                assert_eq!(i13["i13"], newest, "its id again");
+            }
+            answer(asked, attempt)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(10)),
+            older_than: Some(received(20)),
+            ..Default::default()
+        };
+        whole_pass(&graph, &store, account_id, &mut state).await;
+        let state_of = |id: i64| lock(&store).message(id).unwrap().unwrap().state;
+        assert_eq!(state_of(newest), spark_store::MessageState::Inbox, "i13");
+        assert_eq!(state_of(ids["i11"]), spark_store::MessageState::Inbox);
+    }
+
+    #[tokio::test]
+    async fn a_pass_goes_through_a_second_with_more_than_a_page() {
+        // i18, j18 and k18 came the same second, more than a page of two.
+        let all = ["i17", "i18", "j18", "k18", "i19"];
+        let (store, account_id) = microsoft_store();
+        let ids = store_older(&store, account_id, &all);
+        // Read elsewhere, all of them.
+        let inbox: Vec<InInbox> = all.iter().map(|id| (*id, true, false)).collect();
+        let (base, seen) = serve(reconciling(Arc::new(Mutex::new(inbox)), 2)).await;
+        let graph = Graph::with_base(&base, "token");
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(16)),
+            older_than: Some(received(19)),
+            ..Default::default()
+        };
+        // i17 and i18; j18 and k18 from i18's link; i19.
+        assert_eq!(whole_pass(&graph, &store, account_id, &mut state).await, 3);
+        for id in all {
+            assert!(
+                !lock(&store).message(ids[id]).unwrap().unwrap().unread,
+                "{id}"
+            );
+        }
+        let asked = seen.take();
+        assert!(asked[2].path.ends_with("&$skip=2"), "{}", asked[2].path);
+        assert!(state.reconcile_next.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_background_download_goes_past_a_second_with_more_than_a_page() {
+        // An import: t0…t149 came the same second; t150…t199 hours before.
+        fn when(n: usize) -> i64 {
+            if n < 150 {
+                received(10)
+            } else {
+                received(n - 139)
+            }
+        }
+        let (base, seen) = serve(|asked, _| {
+            let (route, query) = asked.path.split_once('?').unwrap();
+            assert_eq!(route, "/me/mailFolders/inbox/messages");
+            let q: HashMap<&str, &str> =
+                query.split('&').filter_map(|p| p.split_once('=')).collect();
+            let before = q["$filter"]
+                .strip_prefix("receivedDateTime+lt+")
+                .and_then(parse_iso_date)
+                .unwrap();
+            let skip: usize = q.get("$skip").map_or(0, |s| s.parse().unwrap());
+            let matching: Vec<usize> = (0..200).filter(|n| when(*n) < before).collect();
+            let value: Vec<Value> = matching
+                .iter()
+                .skip(skip)
+                .take(OLDER_STEP)
+                .map(|n| {
+                    json!({
+                        "id": format!("t{n}"), "subject": format!("Message t{n}"),
+                        "receivedDateTime": iso_date(when(*n)), "isRead": true,
+                        "from": { "emailAddress": { "address": "ana@contoso.com" } },
+                        "bodyPreview": "Hi",
+                    })
+                })
+                .collect();
+            let mut page = json!({ "value": value });
+            if skip + OLDER_STEP < matching.len() {
+                let rest: Vec<&str> = query
+                    .split('&')
+                    .filter(|p| !p.starts_with("$skip="))
+                    .collect();
+                page["@odata.nextLink"] = json!(format!(
+                    "{route}?{}&$skip={}",
+                    rest.join("&"),
+                    skip + OLDER_STEP
+                ));
+            }
+            Answer::json(page)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(10) + 1000),
+            ..Default::default()
+        };
+        let stored = graph.older_inbox_step(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), OLDER_STEP);
+        assert_eq!(state.older_than, Some(received(10)));
+        assert!(state.older_next.is_some(), "the rest of that second");
+        // Saved and read again, it goes on from there.
+        let mut state: SyncState = serde_json::from_str(&state_json(&state)).unwrap();
+        let stored = graph.older_inbox_step(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 100);
+        assert!(state.complete && state.older_next.is_none());
+        assert_eq!(lock(&store).messages().unwrap().len(), 200);
+        let asked = seen.take();
+        assert_eq!(asked.len(), 2, "one listing a step");
+        assert!(asked[1].path.ends_with("&$skip=100"), "{}", asked[1].path);
     }
 
     #[tokio::test]

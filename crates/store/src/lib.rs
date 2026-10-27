@@ -1127,12 +1127,10 @@ impl Store {
         Ok(true)
     }
 
-    /// The id of the message stored last: messages stored later have
-    /// higher ones. 0 with none.
-    pub fn newest_message_id(&self) -> Result<i64> {
-        self.conn
-            .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM messages")?
-            .query_row([], |r| r.get(0))
+    /// The Graph ids of account `account_id`'s mail the server had in its
+    /// inbox when last told, received from `from` up to `to` (Unix ms).
+    pub fn inbox_remote_ids(&self, account_id: i64, from: i64, to: i64) -> Result<Vec<String>> {
+        inbox_remote_ids_in(&self.conn, account_id, from, to)
     }
 
     /// Whether message `id` is stored without its body (`Body::Missing`).
@@ -2147,24 +2145,9 @@ impl Batch<'_> {
         Ok(self.conn.total_changes() != before)
     }
 
-    /// The Graph ids of account `account_id`'s mail the server had in its
-    /// inbox when last told, received from `from` up to `to` (Unix ms), of
-    /// those stored up to message `newest` (`Store::newest_message_id`).
-    pub fn inbox_remote_ids(
-        &self,
-        account_id: i64,
-        from: i64,
-        to: i64,
-        newest: i64,
-    ) -> Result<Vec<String>> {
-        self.conn
-            .prepare_cached(
-                "SELECT remote_id FROM messages
-                 WHERE date >= ?2 AND date < ?3 AND account_id = ?1 AND remote_place = 'inbox'
-                   AND remote_id IS NOT NULL AND id <= ?4",
-            )?
-            .query_map(params![account_id, from, to, newest], |r| r.get(0))?
-            .collect()
+    /// `Store::inbox_remote_ids`, in the batch.
+    pub fn inbox_remote_ids(&self, account_id: i64, from: i64, to: i64) -> Result<Vec<String>> {
+        inbox_remote_ids_in(self.conn, account_id, from, to)
     }
 
     /// `Store::observe_gone_remote`, in the batch.
@@ -2200,13 +2183,26 @@ fn add_incoming_in(conn: &Connection, m: &Incoming, screen_new_senders: bool) ->
     if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
         fill_in_body_in(conn, id, m)?;
-        let (dirty, folder_only): (bool, bool) = conn
-            .prepare_cached("SELECT changed_at != 0, folder_only FROM messages WHERE id = ?1")?
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (dirty, folder_only, from_address): (bool, bool, String) = conn
+            .prepare_cached(
+                "SELECT changed_at != 0, folder_only, from_address FROM messages WHERE id = ?1",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         // First seen by a folder sync (Gmail's All Mail has inbox mail
-        // too): it arrives now, as if it were new.
+        // too): it arrives now, as if it were new. By its stored sender
+        // when `m` is only its flags, as the inbox reconcile lists it.
         if folder_only && !dirty {
-            let (state, screening) = gatekeeper::arrival(conn, m, screen_new_senders)?;
+            let sender;
+            let arriving = if m.from_address.is_empty() {
+                sender = Incoming {
+                    from_address,
+                    ..Default::default()
+                };
+                &sender
+            } else {
+                m
+            };
+            let (state, screening) = gatekeeper::arrival(conn, arriving, screen_new_senders)?;
             conn.prepare_cached(
                 "UPDATE messages SET
                     remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
@@ -2459,6 +2455,22 @@ fn arrival_change(state: MessageState) -> i64 {
     } else {
         0
     }
+}
+
+/// `Store::inbox_remote_ids`, in the caller's transaction.
+fn inbox_remote_ids_in(
+    conn: &Connection,
+    account_id: i64,
+    from: i64,
+    to: i64,
+) -> Result<Vec<String>> {
+    conn.prepare_cached(
+        "SELECT remote_id FROM messages
+         WHERE date >= ?2 AND date < ?3 AND account_id = ?1 AND remote_place = 'inbox'
+           AND remote_id IS NOT NULL",
+    )?
+    .query_map(params![account_id, from, to], |r| r.get(0))?
+    .collect()
 }
 
 /// `Store::has_remote_id`, in the caller's transaction.
