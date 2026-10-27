@@ -601,6 +601,10 @@ ALTER TABLE messages ADD COLUMN invite TEXT;
 ALTER TABLE messages ADD COLUMN rsvp TEXT;
 ";
 
+/// A message with no change waiting to be pushed, not snoozed and not set
+/// aside: nothing about it is the user's alone but its priority.
+const SETTLED: &str = "changed_at = 0 AND state NOT IN ('snoozed', 'aside')";
+
 /// A message a pending local change takes out of folder `?1` (its server
 /// folder): until the change is pushed, syncs of that folder don't list it.
 const LEAVING: &str = "changed_at != 0 AND remote_place = 'folder' AND remote_folder_id = ?1
@@ -987,6 +991,84 @@ impl Store {
             params![account_id, remote_id],
             |r| r.get(0),
         )
+    }
+
+    /// The Graph ids of `account_id`'s messages, with their row ids, but for
+    /// those with a change waiting to be pushed, snoozed or set aside: the
+    /// ones settled enough to be keyed anew (`rekey_remote`).
+    pub fn settled_remote_ids(&self, account_id: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, remote_id FROM messages
+             WHERE account_id = ?1 AND remote_id IS NOT NULL AND {SETTLED}"
+        ))?;
+        stmt.query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect()
+    }
+
+    /// Keys message `id` of `account_id` by Graph id `remote_id` from now
+    /// on. If another message has that id already, it's the same mail
+    /// stored twice: `id` goes, its reminders and priority (which only
+    /// spark-rs keeps) moving to the other, whose state is the server's.
+    /// With `None`, the server has no mail by the id it has, and it goes.
+    /// Does nothing unless it's still settled (`settled_remote_ids`);
+    /// returns whether it did something.
+    pub fn rekey_remote(
+        &mut self,
+        account_id: i64,
+        id: i64,
+        remote_id: Option<&str>,
+    ) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let settled: bool = tx
+            .query_row(
+                &format!("SELECT {SETTLED} FROM messages WHERE id = ?1 AND account_id = ?2"),
+                params![id, account_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !settled {
+            return Ok(false);
+        }
+        let twin: Option<i64> = match remote_id {
+            Some(remote_id) => tx
+                .query_row(
+                    "SELECT id FROM messages WHERE account_id = ?1 AND remote_id = ?2 AND id != ?3",
+                    params![account_id, remote_id, id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        match (remote_id, twin) {
+            (Some(remote_id), None) => {
+                tx.execute(
+                    "UPDATE messages SET remote_id = ?2 WHERE id = ?1",
+                    params![id, remote_id],
+                )?;
+            }
+            (_, Some(twin)) => {
+                tx.execute(
+                    "UPDATE messages SET priority = MAX(priority, (SELECT priority FROM messages WHERE id = ?2))
+                     WHERE id = ?1",
+                    params![twin, id],
+                )?;
+                tx.execute(
+                    "UPDATE reminders SET reply_to = ?1 WHERE reply_to = ?2",
+                    params![twin, id],
+                )?;
+                tx.execute(
+                    "UPDATE reminders SET message_row = ?1 WHERE message_row = ?2",
+                    params![twin, id],
+                )?;
+                tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+            }
+            (None, None) => {
+                tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// UIDs stored for an IMAP mailbox.

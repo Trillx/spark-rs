@@ -3953,3 +3953,93 @@ fn batched_observations_keep_pending_local_changes() {
         .collect();
     assert_eq!(pending, [ids[0], ids[1]]);
 }
+
+#[test]
+fn graph_mail_keyed_anew_is_stored_once() {
+    let (mut store, account_id) = store_with_account();
+    let graph = |remote_id: &str, n: u32| Incoming {
+        mailbox: None,
+        uid: None,
+        remote_id: Some(remote_id.into()),
+        ..incoming(account_id, n, "ana@example.com")
+    };
+    let add = |store: &mut Store, remote_id: &str, n: u32| {
+        new_id(store.add_incoming(&graph(remote_id, n), false).unwrap())
+    };
+    // A sync's copy of mail 1, and a search's under another id; mail 2, 3
+    // and 4 only a search's.
+    let synced = add(&mut store, "immutable-1", 1);
+    let twin = add(&mut store, "rest-1", 1);
+    let alone = add(&mut store, "rest-2", 2);
+    let gone = add(&mut store, "rest-3", 3);
+    let busy = add(&mut store, "rest-4", 4);
+    let priority = Patch {
+        priority: Some(true),
+        ..Default::default()
+    };
+    store.update(twin, &priority, 10).unwrap();
+    let reminder = store
+        .add_reminder(&NewReminder {
+            account_id,
+            message_id: None,
+            reply_to: Some(twin),
+            subject: "Re: Message 1",
+            to: "ana@example.com",
+            sent_at: 10,
+            remind_at: 20,
+            if_no_reply: true,
+        })
+        .unwrap();
+    let read = Patch {
+        unread: Some(false),
+        ..Default::default()
+    };
+    store.update(busy, &read, 10).unwrap();
+    let settled: Vec<i64> = store
+        .settled_remote_ids(account_id)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        settled,
+        [synced, twin, alone, gone],
+        "busy has a change to push"
+    );
+
+    // The search's copy goes, its priority and reminder kept on the sync's.
+    assert!(
+        store
+            .rekey_remote(account_id, twin, Some("immutable-1"))
+            .unwrap()
+    );
+    assert!(store.message(twin).unwrap().is_none());
+    assert!(store.message(synced).unwrap().unwrap().priority);
+    let reply_to: Option<i64> = store
+        .conn
+        .query_row(
+            "SELECT reply_to FROM reminders WHERE id = ?1",
+            [reminder],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reply_to, Some(synced));
+
+    // Mail stored once takes its new id; mail the server lost goes.
+    assert!(
+        store
+            .rekey_remote(account_id, alone, Some("immutable-2"))
+            .unwrap()
+    );
+    assert_eq!(
+        store.location(alone).unwrap().unwrap().remote_id.as_deref(),
+        Some("immutable-2")
+    );
+    assert!(store.rekey_remote(account_id, gone, None).unwrap());
+    assert!(store.message(gone).unwrap().is_none());
+
+    // A change waiting to be pushed keeps it as it is.
+    assert!(!store.rekey_remote(account_id, busy, None).unwrap());
+    assert!(store.message(busy).unwrap().is_some());
+    assert!(store.has_remote_id(account_id, "rest-4").unwrap());
+}

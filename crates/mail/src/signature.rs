@@ -499,6 +499,23 @@ pub fn embed_images(html: &str) -> (String, Vec<InlineImage>) {
 /// `data:` URLs from its parts, `images`, as a draft from the server goes
 /// back in the editor. Ones that aren't among them stay as they are.
 pub fn inline_parts(html: &str, images: &[InlineImage]) -> String {
+    replace_cid_urls(html, |key| {
+        images
+            .iter()
+            .find(|i| i.cid == key)
+            .map(InlineImage::data_url)
+    })
+}
+
+/// `html` showing another part where it showed one `renamed` names: by
+/// Content-ID (as `cid_key` gives it), the Content-ID of the part to show.
+pub fn renamed_cids(html: &str, renamed: &HashMap<String, String>) -> String {
+    replace_cid_urls(html, |key| renamed.get(key).map(|cid| format!("cid:{cid}")))
+}
+
+/// `html` with each `cid:` URL that `replace` gives another for, by its
+/// Content-ID (as `cid_key` gives it), replaced with that.
+fn replace_cid_urls(html: &str, replace: impl Fn(&str) -> Option<String>) -> String {
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
     let mut last = 0;
@@ -519,9 +536,9 @@ pub fn inline_parts(html: &str, images: &[InlineImage]) -> String {
         let key = attachment::cid_key(&attachment::percent_decode(
             &rest[..end].replace("&amp;", "&"),
         ));
-        if let Some(image) = images.iter().find(|i| i.cid == key) {
+        if let Some(url) = replace(&key) {
             out.push_str(&html[last..at]);
-            out.push_str(&image.data_url());
+            out.push_str(&url);
             last = at + 4 + end;
         }
     }

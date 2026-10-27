@@ -23,14 +23,14 @@ use spark_store::{
 };
 
 use crate::attachment::{
-    AttachmentData, INLINE_IMAGE_MAX, INLINE_TOTAL_MAX, InlineImage, cid_key, mime_for,
+    AttachmentData, INLINE_IMAGE_MAX, INLINE_TOTAL_MAX, InlineImage, cid_key, cid_refs, mime_for,
 };
 use crate::draft::{Bodies, Draft, recipients};
 use crate::invite::Invite;
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::search::{self, SERVER_HITS};
-use crate::trackers;
 use crate::{BLOCKED, Error, OLDER_STEP, Result};
+use crate::{signature, trackers};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
 /// How far back the first sync of a Microsoft account reaches.
@@ -362,6 +362,15 @@ impl Attachments {
             })
             .collect()
     }
+}
+
+/// An image a message shows by `cid:` (`Graph::pictures`).
+struct Picture {
+    /// The attachment it is.
+    attachment: String,
+    /// Its Content-ID as the message has it, without angle brackets.
+    content_id: String,
+    image: InlineImage,
 }
 
 /// What a delta page says about one message, ready to store.
@@ -1116,12 +1125,12 @@ impl Graph {
         let ids: Vec<&str> = listing.value.iter().map(|m| m.id.as_str()).collect();
         let immutable = self.immutable_ids(&ids).await?;
         listing.value.retain_mut(|m| match immutable.get(&m.id) {
-            Some(id) => {
+            Some(Some(id)) => {
                 m.id = id.clone();
                 true
             }
-            // Gone since it was found.
-            None => false,
+            // Gone since it was found, or not translated.
+            _ => false,
         });
         // Where each new one goes: the inbox (`None`) or a stored folder.
         let mut wanted: Vec<(&Listed, Option<&Folder>)> = Vec::new();
@@ -1151,7 +1160,7 @@ impl Graph {
                 )
                 .await?;
             full.extend(page.value.into_iter().filter_map(|mut m| {
-                m.id = immutable.get(&m.id)?.clone();
+                m.id = immutable.get(&m.id)?.clone()?;
                 Some((m.id.clone(), m))
             }));
         } else {
@@ -1188,15 +1197,21 @@ impl Graph {
         })?)
     }
 
-    /// The immutable ids of the messages with REST ids `ids`, by REST id.
-    /// Ones Graph can't translate, such as messages gone since, are left
-    /// out. Graph refuses the lot if any is immutable already.
-    async fn immutable_ids(&self, ids: &[&str]) -> Result<HashMap<String, String>> {
+    /// The immutable ids of the messages with REST ids `ids`, by REST id:
+    /// `None` where Graph has no message by that id, as for one moved since
+    /// (a move gives it another). Ones it fails to translate otherwise are
+    /// left out. Graph refuses the lot if any is immutable already.
+    async fn immutable_ids(&self, ids: &[&str]) -> Result<HashMap<String, Option<String>>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Translated {
             source_id: Option<String>,
             target_id: Option<String>,
+            error_details: Option<Failure>,
+        }
+        #[derive(Deserialize)]
+        struct Failure {
+            code: Option<String>,
         }
         let mut immutable = HashMap::new();
         // Graph translates up to 1,000 at a time.
@@ -1211,13 +1226,46 @@ impl Graph {
                         })),
                 )
                 .await?;
-            immutable.extend(
-                page.value
-                    .into_iter()
-                    .filter_map(|t| Some((t.source_id?, t.target_id?))),
-            );
+            immutable.extend(page.value.into_iter().filter_map(|t| {
+                let source = t.source_id?;
+                match (t.target_id, t.error_details.and_then(|e| e.code)) {
+                    (Some(target), _) => Some((source, Some(target))),
+                    (None, Some(code)) if code == "NotFound" => Some((source, None)),
+                    (None, _) => None,
+                }
+            }));
         }
         Ok(immutable)
+    }
+
+    /// Keys anew the mail of `account_id` stored by REST id, as searches
+    /// stored what they found before they translated it (`search_server`):
+    /// each takes its immutable id, or goes if it's stored by that already
+    /// (the syncs keep that copy up to date) or Graph has no mail by its
+    /// REST id any more. Mail that isn't settled waits for a later round
+    /// (`Store::rekey_remote`). Asks Graph nothing when there's none, so
+    /// it's cheap to call every sweep. Returns how many changed.
+    pub async fn rekey_rest_ids(&self, store: &Mutex<Store>, account_id: i64) -> Result<usize> {
+        let rest: Vec<(i64, String)> = lock(store)
+            .settled_remote_ids(account_id)?
+            .into_iter()
+            .filter(|(_, id)| is_rest_id(id))
+            .collect();
+        if rest.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<&str> = rest.iter().map(|(_, id)| id.as_str()).collect();
+        let immutable = self.immutable_ids(&ids).await?;
+        let mut store = lock(store);
+        let mut changed = 0;
+        for (row, id) in &rest {
+            if let Some(immutable) = immutable.get(id)
+                && store.rekey_remote(account_id, *row, immutable.as_deref())?
+            {
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     /// Creates a folder, in `parent` (a folder id) or at the top; returns its id.
@@ -1588,6 +1636,12 @@ impl Graph {
     /// them) are in `wanted`. Inline attachments are tried first; other
     /// images only if some are still missing, as a few mailers send them so.
     pub async fn inline_images(&self, id: &str, wanted: &[String]) -> Result<Vec<InlineImage>> {
+        let pictures = self.pictures(id, wanted).await?;
+        Ok(pictures.into_iter().map(|p| p.image).collect())
+    }
+
+    /// `inline_images`, with the attachment each is and its Content-ID.
+    async fn pictures(&self, id: &str, wanted: &[String]) -> Result<Vec<Picture>> {
         #[derive(Deserialize)]
         struct Page {
             value: Vec<Listed>,
@@ -1631,10 +1685,10 @@ impl Graph {
             .collect();
         candidates.sort_by_key(|a| a.is_inline != Some(true));
 
-        let mut images: Vec<InlineImage> = Vec::new();
+        let mut pictures: Vec<Picture> = Vec::new();
         let mut total = 0;
         for listed in candidates {
-            if images.len() == wanted.len() {
+            if pictures.len() == wanted.len() {
                 break;
             }
             let full: Full = match self
@@ -1649,10 +1703,11 @@ impl Graph {
                 Err(Error::Gone) => continue,
                 Err(e) => return Err(e),
             };
-            let Some(cid) = full.content_id.as_deref().map(cid_key) else {
+            let Some(content_id) = full.content_id else {
                 continue;
             };
-            if !wanted.contains(&cid) || images.iter().any(|i| i.cid == cid) {
+            let cid = cid_key(&content_id);
+            if !wanted.contains(&cid) || pictures.iter().any(|p| p.image.cid == cid) {
                 continue;
             }
             let Some(mime) = InlineImage::image_type(
@@ -1671,9 +1726,17 @@ impl Graph {
                 continue;
             }
             total += bytes.len();
-            images.push(InlineImage { cid, mime, bytes });
+            pictures.push(Picture {
+                attachment: listed.id,
+                content_id: content_id
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_owned(),
+                image: InlineImage { cid, mime, bytes },
+            });
         }
-        Ok(images)
+        Ok(pictures)
     }
 
     /// Downloads `wanted`, attachment `index` of message `id` as the store
@@ -1878,17 +1941,77 @@ impl Graph {
             .html
             .clone()
             .unwrap_or_else(|| text_to_html(&draft.body));
+        let (html, images) = self
+            .each_picture_once(&reply.id, reply_html(&ours, &quoted), &bodies.images)
+            .await;
         let update = json!({
             "subject": draft.subject.trim(),
-            "body": { "contentType": "HTML", "content": reply_html(&ours, &quoted) },
+            "body": { "contentType": "HTML", "content": html },
             "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
         });
         let draft_path = format!("/me/messages/{}", path(&reply.id));
         self.send(self.request(Method::PATCH, &draft_path).json(&update))
             .await?;
-        self.attach_and_send(&draft_path, files, &bodies.images)
-            .await?;
+        self.attach_and_send(&draft_path, files, &images).await?;
         Ok(reply.internet_message_id.as_deref().map(bare_id))
+    }
+
+    /// Reply draft `id`'s `html`, and which of the body's and signature's
+    /// `images` are still to attach, once each picture it shows is in it
+    /// once. Outlook copies the original's pictures into a reply under the
+    /// Content-IDs they came with, and the signature's are named anew each
+    /// time, so a logo quoted back and forth would go out once more with
+    /// every reply; some mailers (Front) send each copy back as a file. The
+    /// first copy of a picture stays and `html` shows it in place of the
+    /// rest, which go. Asks nothing unless `html` quotes pictures; if the
+    /// draft's can't be read, the reply goes as it is.
+    async fn each_picture_once(
+        &self,
+        id: &str,
+        html: String,
+        images: &[InlineImage],
+    ) -> (String, Vec<InlineImage>) {
+        // Only the original's are in the draft yet.
+        let copied: Vec<String> = cid_refs(&html)
+            .into_iter()
+            .filter(|cid| images.iter().all(|i| &i.cid != cid))
+            .collect();
+        if copied.is_empty() {
+            return (html, images.to_vec());
+        }
+        let Ok(copied) = self.pictures(id, &copied).await else {
+            return (html, images.to_vec());
+        };
+        let mut kept: Vec<&Picture> = Vec::new();
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        for picture in &copied {
+            let Some(first) = kept.iter().find(|k| k.image.bytes == picture.image.bytes) else {
+                kept.push(picture);
+                continue;
+            };
+            let url = format!(
+                "/me/messages/{}/attachments/{}",
+                path(id),
+                path(&picture.attachment)
+            );
+            // One that stays shows where it was, as before.
+            if let Ok(_) | Err(Error::Gone) = self
+                .send_patiently(|| self.request(Method::DELETE, &url))
+                .await
+            {
+                renamed.insert(picture.image.cid.clone(), first.content_id.clone());
+            }
+        }
+        let mut attach = Vec::new();
+        for image in images {
+            match kept.iter().find(|k| k.image.bytes == image.bytes) {
+                Some(first) => {
+                    renamed.insert(image.cid.clone(), first.content_id.clone());
+                }
+                None => attach.push(image.clone()),
+            }
+        }
+        (signature::renamed_cids(&html, &renamed), attach)
     }
 
     /// Adds `files` and the body's and signature's `images` to a draft and
@@ -2320,6 +2443,25 @@ fn reply_html(ours: &str, quoted: &str) -> String {
 /// Graph ids can contain `/`, `+` and `=`; immutable ids are URL-safe base64.
 pub(crate) fn path(id: &str) -> String {
     url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
+}
+
+/// Whether Graph id `id` is a REST id, not an immutable one. Its second
+/// byte, once decoded, is the kind of id Exchange made: 3 (by mailbox
+/// GUID) for REST ids, 9 for immutable ones. It's what Graph checks when
+/// it refuses to translate ids of the wrong kind.
+fn is_rest_id(id: &str) -> bool {
+    let head: String = id
+        .chars()
+        .take(4)
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
+    STANDARD
+        .decode(head)
+        .is_ok_and(|bytes| bytes.get(1) == Some(&3))
 }
 
 /// Where message `id`'s attachments are listed (`Attachments`).
@@ -3790,6 +3932,160 @@ pub(crate) mod tests {
             .await;
         assert_eq!(stored.unwrap(), 2, "a8 and i20");
         assert_eq!(remote_ids(&store), ["a8", "i20", "k4", "m5"]);
+    }
+
+    /// The bytes of a logo and of a screenshot.
+    const LOGO: &[u8] = b"\x89PNG logo";
+    const SHOT: &[u8] = b"\x89PNG screenshot";
+
+    /// A stand-in where createReply on `orig` makes draft `r1`, quoting a
+    /// reply from a mailer that sent the logo back under each Content-ID
+    /// it had come with (`Logo1@x`, `logo2@x`, `logo3@x`), and a screenshot.
+    fn quoting_a_logo(asked: &Asked, _: usize) -> Answer {
+        let picture = |cid: &str, bytes: &[u8]| {
+            json!({ "contentId": format!("<{cid}>"), "contentType": "image/png",
+                    "contentBytes": STANDARD.encode(bytes) })
+        };
+        let route = asked.path.split('?').next().unwrap();
+        Answer::json(match (asked.method.as_str(), route) {
+            ("POST", "/me/messages/orig/createReply") => json!({
+                "id": "r1", "internetMessageId": "<r1@x>",
+                "body": { "contentType": "html", "content": "<p>See this:</p>\
+                    <img src=\"cid:Logo1@x\"><img src=\"cid:shot@x\">\
+                    <p>Was: <img src=\"cid:logo2@x\"> <img src=\"cid:logo3@x\"></p>" },
+            }),
+            ("GET", "/me/messages/r1/attachments") => json!({ "value": [
+                { "id": "a1", "contentType": "image/png", "size": 100, "isInline": true },
+                { "id": "a2", "contentType": "image/png", "size": 100, "isInline": false },
+                { "id": "a3", "contentType": "image/png", "size": 100, "isInline": true },
+                { "id": "a4", "contentType": "image/png", "size": 100, "isInline": false },
+            ] }),
+            ("GET", "/me/messages/r1/attachments/a1") => picture("Logo1@x", LOGO),
+            ("GET", "/me/messages/r1/attachments/a2") => picture("logo2@x", LOGO),
+            ("GET", "/me/messages/r1/attachments/a3") => picture("shot@x", SHOT),
+            ("GET", "/me/messages/r1/attachments/a4") => picture("logo3@x", LOGO),
+            ("DELETE", _) | ("PATCH", "/me/messages/r1") => json!({}),
+            ("POST", "/me/messages/r1/attachments" | "/me/messages/r1/send") => json!({}),
+            _ => return Answer::status(404),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_reply_sends_each_picture_once() {
+        let (base, seen) = serve(quoting_a_logo).await;
+        let graph = Graph::with_base(&base, "token");
+        let draft = Draft {
+            to: "jack@example.com".into(),
+            subject: "Re: Users".into(),
+            body: "Still not working".into(),
+            signature: Some(format!(
+                "<p>Michael</p><img src=\"data:image/png;base64,{}\">",
+                STANDARD.encode(LOGO)
+            )),
+            ..Default::default()
+        };
+
+        graph.send_draft(&draft, Some("orig"), &[]).await.unwrap();
+        let asked = seen.take();
+        let deleted: Vec<&str> = asked
+            .iter()
+            .filter(|a| a.method == "DELETE")
+            .map(|a| a.path.as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            [
+                "/me/messages/r1/attachments/a2",
+                "/me/messages/r1/attachments/a4"
+            ]
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|a| a.path == "/me/messages/r1/attachments" && a.method == "POST"),
+            "the signature's logo is the one quoted: {asked:?}"
+        );
+        let patched = asked.iter().find(|a| a.method == "PATCH").unwrap();
+        let html: Value = serde_json::from_str(&patched.body).unwrap();
+        let html = html["body"]["content"].as_str().unwrap();
+        assert_eq!(html.matches("cid:Logo1@x").count(), 4, "{html}");
+        assert_eq!(html.matches("cid:shot@x").count(), 1, "{html}");
+        assert_eq!(html.matches("cid:").count(), 5, "{html}");
+        assert_eq!(asked.last().unwrap().path, "/me/messages/r1/send");
+    }
+
+    #[test]
+    fn rest_ids_are_told_from_immutable_ones() {
+        // The ways the ids of one Microsoft 365 mailbox began.
+        assert!(is_rest_id("AAMkADk3ODEx"));
+        assert!(is_rest_id("AQMkADk3ODEx"));
+        assert!(!is_rest_id("AAkALgAAAAAA"));
+        assert!(!is_rest_id("rest-i3"));
+        assert!(!is_rest_id(""));
+    }
+
+    #[tokio::test]
+    async fn mail_searches_stored_by_rest_id_is_keyed_anew() {
+        // Graph's answers for mail 1 and 2, gone 3 and failing 5.
+        let (base, seen) = serve(|asked, _| {
+            if asked.path != "/me/translateExchangeIds" {
+                return Answer::status(404);
+            }
+            let asked: Value = serde_json::from_str(&asked.body).unwrap();
+            let value: Vec<Value> = asked["inputIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| match id.as_str().unwrap() {
+                    "AAMk-1" => json!({ "sourceId": id, "targetId": "AAkA-1" }),
+                    "AAMk-2" => json!({ "sourceId": id, "targetId": "AAkA-2" }),
+                    "AAMk-3" => json!({ "sourceId": id, "errorDetails": { "code": "NotFound" } }),
+                    other => {
+                        assert_eq!(other, "AAMk-5", "only settled REST ids are asked about");
+                        json!({ "sourceId": id, "errorDetails": { "code": "ErrorInternalServerError" } })
+                    }
+                })
+                .collect();
+            Answer::json(json!({ "value": value }))
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        // Mail 1 as its sync stored it and as a search did; the rest as
+        // searches did, 4 with a change waiting to be pushed.
+        let ids: Vec<i64> = ["AAkA-1", "AAMk-1", "AAMk-2", "AAMk-3", "AAMk-4", "AAMk-5"]
+            .iter()
+            .map(|remote_id| {
+                let m = Incoming {
+                    account_id,
+                    remote_id: Some((*remote_id).into()),
+                    subject: format!("Mail {}", &remote_id[5..]),
+                    ..Default::default()
+                };
+                match lock(&store).add_incoming(&m, false).unwrap() {
+                    Added::New(id) => id,
+                    other => panic!("{other:?}"),
+                }
+            })
+            .collect();
+        let read = spark_store::Patch {
+            unread: Some(true),
+            ..Default::default()
+        };
+        lock(&store).update(ids[4], &read, 1).unwrap();
+
+        let changed = graph.rekey_rest_ids(&store, account_id).await.unwrap();
+        assert_eq!(
+            changed, 3,
+            "1 went to its sync's copy, 2 took its id, 3 went"
+        );
+        assert_eq!(remote_ids(&store), ["AAMk-4", "AAMk-5", "AAkA-1", "AAkA-2"]);
+        assert_eq!(seen.take().len(), 1, "one request for them all");
+
+        // With only immutable ids left, it asks nothing.
+        lock(&store).remove_messages(&ids[4..]).unwrap();
+        assert_eq!(graph.rekey_rest_ids(&store, account_id).await.unwrap(), 0);
+        assert!(seen.take().is_empty());
     }
 
     /// The `searchable` stand-in as `serve` asks it.

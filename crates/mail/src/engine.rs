@@ -668,6 +668,9 @@ impl Engine {
                 // minute of repairs would hold up what they're for.
                 if round.fetch && round.repair {
                     report.repaired = graph.repair(&self.store, account_id, now_ms()).await;
+                    // Mail searches stored by REST id before they translated
+                    // what they found; a failure is tried again next sweep.
+                    let _ = graph.rekey_rest_ids(&self.store, account_id).await;
                 }
             }
         }
