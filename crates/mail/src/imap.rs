@@ -695,9 +695,9 @@ async fn delimiter(session: &mut Session, mailbox: &str) -> Result<Option<String
 }
 
 /// Of `senders`, the ones the user has written to: the Sent mailbox has
-/// mail to them. SEARCH matches parts of addresses (ann@ in joann@), so the
-/// newest candidates' recipients are checked. Addresses that can't be
-/// searched for are left out.
+/// mail to them. SEARCH matches parts of addresses (ann@ in joann@), so
+/// what it finds is checked for the exact address (the newest
+/// `SENT_CANDIDATES`). Addresses that can't be searched for are left out.
 pub async fn written_to(
     session: &mut Session,
     sent: &str,
@@ -739,8 +739,9 @@ pub async fn written_to(
     Ok(found)
 }
 
-/// How many of the Sent mail a search found are checked for the exact address.
-const SENT_CANDIDATES: usize = 10;
+/// How many of the Sent mail a search found are checked for the exact
+/// address, at most: headers only, in one fetch.
+const SENT_CANDIDATES: usize = 500;
 
 /// Brings the inbox into the store: new messages, flag changes, and
 /// messages that left the inbox elsewhere.

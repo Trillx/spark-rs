@@ -529,9 +529,11 @@ pub(crate) fn sent(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// A new account's colleagues (at its domain, unless anyone can have an
-/// address there) waiting in the Gatekeeper get through, as in Spark.
+/// Mail waiting in the Gatekeeper from a new account's own address, and
+/// from its colleagues (at its domain, unless anyone can have an address
+/// there), gets through, as in Spark.
 pub(crate) fn welcome_colleagues(conn: &Connection, email: &str, now: i64) -> Result<()> {
+    release(conn, email)?;
     let Some(domain) = domain_of(email).filter(|d| !is_public_domain(d)) else {
         return Ok(());
     };
@@ -571,11 +573,6 @@ fn resettle(conn: &Connection, address: &str, now: i64) -> Result<()> {
                 moved("blocked")
             ),
             params![address, now],
-        )?;
-        // Their mail elsewhere (snoozed, say) isn't waiting for a decision either.
-        conn.execute(
-            "UPDATE messages SET screening = 0 WHERE from_address = ?1 AND screening = 1",
-            [address],
         )?;
         return Ok(());
     }

@@ -850,31 +850,29 @@ impl Graph {
     }
 
     /// Of `senders`, the ones the user has written to: Sent Items has mail
-    /// to them. Search matches more than the exact address, so the
-    /// candidates' recipients are checked.
+    /// to them. Search matches more than the exact address, so what it finds
+    /// is checked for it (`SENT_CANDIDATES` at most).
     pub async fn written_to(&self, senders: &[String]) -> Result<Vec<String>> {
         let mut found = Vec::new();
         for address in senders.iter().filter(|a| !a.contains(['"', '\\'])) {
             let search = format!("\"recipients:{address}\"");
-            let page: Page<Value> = self
-                .json(self.request(
-                    Method::GET,
-                    &format!(
-                        "/me/mailFolders/sentitems/messages?$search={}&$top=10\
-                         &$select=toRecipients,ccRecipients,bccRecipients",
-                        path(&search)
-                    ),
-                ))
-                .await?;
-            let to = |m: &Value| {
-                ["toRecipients", "ccRecipients", "bccRecipients"]
-                    .iter()
-                    .filter_map(|field| m[field].as_array())
-                    .flatten()
-                    .filter_map(|r| r["emailAddress"]["address"].as_str())
-                    .any(|a| a.eq_ignore_ascii_case(address))
-            };
-            if page.value.iter().any(to) {
+            let mut next = Some(format!(
+                "/me/mailFolders/sentitems/messages?$search={}&$top=250\
+                 &$select=toRecipients,ccRecipients,bccRecipients",
+                path(&search)
+            ));
+            let mut checked = 0;
+            let mut sent = false;
+            while let Some(url) = next.take()
+                && !sent
+                && checked < SENT_CANDIDATES
+            {
+                let page: Page<Value> = self.json(self.request(Method::GET, &url)).await?;
+                checked += page.value.len();
+                sent = page.value.iter().any(|m| addressed_to(m, address));
+                next = page.next_link;
+            }
+            if sent {
                 found.push(address.clone());
             }
         }
@@ -1338,6 +1336,19 @@ impl Graph {
         }
         Ok(())
     }
+}
+
+/// How many Sent Items a search found are checked for the exact address, at most.
+const SENT_CANDIDATES: usize = 1000;
+
+/// Whether a listed message is to `address` (To, Cc or Bcc).
+fn addressed_to(m: &Value, address: &str) -> bool {
+    ["toRecipients", "ccRecipients", "bccRecipients"]
+        .iter()
+        .filter_map(|field| m[field].as_array())
+        .flatten()
+        .filter_map(|r| r["emailAddress"]["address"].as_str())
+        .any(|a| a.eq_ignore_ascii_case(address))
 }
 
 /// Where a pending change moves a message: a well-known folder name, or the
@@ -2102,13 +2113,21 @@ pub(crate) mod tests {
         assert!(lock(&store).pending(account, 2, 0).unwrap().is_empty());
     }
 
+    /// A search that matches parts of addresses: the mail to Ann is on the
+    /// second page, after mail to Jo Ann.
     fn sent_items(path: &str) -> Option<Value> {
-        path.starts_with("/me/mailFolders/sentitems/messages?")
-            .then(|| {
-                json!({ "value": [{ "toRecipients": [
-                { "emailAddress": { "name": "Jo Ann", "address": "JoAnn@vendor.org" } }
-            ], "ccRecipients": [] }] })
-            })
+        let to =
+            |address: &str| json!({ "toRecipients": [{ "emailAddress": { "address": address } }] });
+        if path.starts_with("/me/mailFolders/sentitems/messages?$search=") {
+            Some(json!({
+                "value": [to("JoAnn@vendor.org")],
+                "@odata.nextLink": "/me/mailFolders/sentitems/messages?page=2",
+            }))
+        } else if path == "/me/mailFolders/sentitems/messages?page=2" {
+            Some(json!({ "value": [to("ann@vendor.org")] }))
+        } else {
+            None
+        }
     }
 
     #[tokio::test]
@@ -2116,8 +2135,18 @@ pub(crate) mod tests {
         let (base, _) = stand_in(sent_items).await;
         let graph = Graph::with_base(&base, "token");
         let senders = ["ann@vendor.org".to_owned(), "joann@vendor.org".to_owned()];
+        assert_eq!(graph.written_to(&senders).await.unwrap(), senders);
+        // Without the second page, only Jo Ann.
+        let (base, _) = stand_in(|path| {
+            sent_items(path).map(|mut page| {
+                page.as_object_mut().unwrap().remove("@odata.nextLink");
+                page
+            })
+        })
+        .await;
+        let first_page = Graph::with_base(&base, "token");
         assert_eq!(
-            graph.written_to(&senders).await.unwrap(),
+            first_page.written_to(&senders).await.unwrap(),
             ["joann@vendor.org"]
         );
     }

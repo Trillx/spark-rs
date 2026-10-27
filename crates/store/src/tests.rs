@@ -3121,3 +3121,47 @@ fn messages_say_what_kind_of_invite_they_carry() {
     );
     assert_eq!(store.message(plain).unwrap().unwrap().invite_kind, None);
 }
+
+#[test]
+fn undoing_a_block_keeps_a_new_senders_snoozed_mail_waiting() {
+    let (mut store, account) = store_with_account();
+    let snoozed = arrive(&mut store, account, 1, "new@x.com").id;
+    let later = Patch {
+        state: Some(MessageState::Snoozed),
+        snoozed_until: Some(100),
+        ..Default::default()
+    };
+    store.update(snoozed, &later, 1).unwrap();
+    let undo = decide(&mut store, sender("new@x.com"), Some(Decision::Blocked), 2);
+    store.decide(&undo, 3).unwrap();
+    store.wake_snoozed(101).unwrap();
+    let woke = store.message(snoozed).unwrap().unwrap();
+    assert_eq!((woke.state, woke.screening), (MessageState::Inbox, true));
+}
+
+#[test]
+fn a_new_accounts_own_address_leaves_the_gatekeeper() {
+    let mut store = Store::open_in_memory().unwrap();
+    let work = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: "me@contoso.com",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let from_home = arrive(&mut store, work, 1, "me.at.home@gmail.com").id;
+    assert!(store.message(from_home).unwrap().unwrap().screening);
+    store
+        .add_account(&NewAccount {
+            kind: AccountKind::Gmail,
+            email: "Me.At.Home@gmail.com",
+            name: "Me",
+            label: "Home",
+            config: "{}",
+        })
+        .unwrap();
+    assert!(!store.message(from_home).unwrap().unwrap().screening);
+}

@@ -1215,6 +1215,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "UPDATE messages SET
                 state = CASE WHEN {blocked} THEN 'blocked' ELSE 'inbox' END,
+                screening = CASE WHEN {blocked} THEN 0 ELSE screening END,
                 returned_at = CASE WHEN {blocked} THEN NULL ELSE snoozed_until END,
                 snoozed_until = NULL, unread = 1,
                 changed_at = CASE WHEN remote_unread = 1 AND NOT {blocked} THEN changed_at ELSE ?1 END

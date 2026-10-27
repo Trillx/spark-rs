@@ -541,3 +541,110 @@ async fn draft_cleanup_without_identity_preserves_remote_messages_and_queue() {
             .any(|c| c.starts_with("UID STORE ") || c.contains("EXPUNGE"))
     );
 }
+
+/// A Sent mailbox, UIDs from 1, on a server whose SEARCH matches parts of
+/// addresses as real ones do ("ann@vendor.org" finds mail to joann@).
+async fn substring_sent(
+    recipients: &'static [&'static str],
+) -> (Server, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        security: Security::Plain,
+        trusted_cert: None,
+    };
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(b"* OK synthetic server\r\n").await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let (tag, command) = line.split_once(' ').unwrap();
+            let upper = command.to_ascii_uppercase();
+            let data = if upper.starts_with("LOGIN ") {
+                String::new()
+            } else if upper == "CAPABILITY" {
+                "* CAPABILITY IMAP4rev1\r\n".into()
+            } else if upper.starts_with("EXAMINE ") {
+                format!(
+                    "* {} EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n",
+                    recipients.len()
+                )
+            } else if upper.starts_with("UID SEARCH ") {
+                let needle = command.split('"').nth(1).unwrap().to_lowercase();
+                let hits: Vec<String> = (1..)
+                    .zip(recipients)
+                    .filter(|(_, to)| to.contains(needle.as_str()))
+                    .map(|(uid, _)| uid.to_string())
+                    .collect();
+                format!("* SEARCH {}\r\n", hits.join(" "))
+            } else if upper.starts_with("UID FETCH ") {
+                let set = command.split_whitespace().nth(2).unwrap();
+                let wanted = |uid: u32| {
+                    set.split(',').any(|part| match part.split_once(':') {
+                        Some((a, b)) => (a.parse().unwrap()..=b.parse().unwrap()).contains(&uid),
+                        None => part.parse::<u32>().unwrap() == uid,
+                    })
+                };
+                let mut data = String::new();
+                for (uid, to) in (1..).zip(recipients).filter(|(uid, _)| wanted(*uid)) {
+                    let header = format!("To: {to}\r\n\r\n");
+                    data.push_str(&format!(
+                        "* {uid} FETCH (UID {uid} BODY[HEADER.FIELDS (TO CC BCC)] {{{}}}\r\n{header})\r\n",
+                        header.len()
+                    ));
+                }
+                data
+            } else if upper == "LOGOUT" {
+                "* BYE\r\n".into()
+            } else {
+                panic!("unexpected command: {command}");
+            };
+            write
+                .write_all(format!("{data}{tag} OK complete\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    (server, task)
+}
+
+#[tokio::test]
+async fn sent_searches_check_every_match_for_the_exact_address() {
+    // Mail to Ann, then more to Jo Ann than a few newest would cover.
+    const OLDER: &[&str] = &[
+        "ann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+        "joann@vendor.org",
+    ];
+    let (server, task) = substring_sent(OLDER).await;
+    let mut session = imap::login(&server, "me", "pw").await.unwrap();
+    let senders = ["ann@vendor.org".to_owned()];
+    assert_eq!(
+        imap::written_to(&mut session, "Sent", &senders)
+            .await
+            .unwrap(),
+        senders
+    );
+    task.abort();
+
+    // Only Jo Ann: Ann isn't someone the user wrote to.
+    let (server, task) = substring_sent(&["joann@vendor.org"]).await;
+    let mut session = imap::login(&server, "me", "pw").await.unwrap();
+    assert!(
+        imap::written_to(&mut session, "Sent", &senders)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    task.abort();
+}
