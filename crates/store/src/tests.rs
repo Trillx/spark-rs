@@ -159,14 +159,7 @@ fn search_looks_in_senders_subjects_and_bodies() {
             .add_incoming(&incoming(account, 2, "billing@vendor.com"), false)
             .unwrap(),
     );
-    let ids = |text: &str| -> Vec<i64> {
-        store
-            .search(text)
-            .unwrap()
-            .into_iter()
-            .map(|m| m.id)
-            .collect()
-    };
+    let ids = |text: &str| found(&store, text);
     assert_eq!(ids("STEEL"), [quote]);
     assert_eq!(ids("vendor.com"), [invoice]);
     assert_eq!(ids("message 2"), [invoice]);
@@ -179,13 +172,21 @@ fn search_looks_in_senders_subjects_and_bodies() {
     assert!(ids("_").is_empty());
 }
 
+/// The ids `search` finds, newest first, after checking that `search_ids`
+/// finds the same ones.
 fn found(store: &Store, text: &str) -> Vec<i64> {
-    store
+    let found: Vec<i64> = store
         .search(text)
         .unwrap()
         .into_iter()
         .map(|m| m.id)
-        .collect()
+        .collect();
+    let mut ids = store.search_ids(text).unwrap();
+    ids.sort_unstable();
+    let mut sorted = found.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "search_ids({text:?})");
+    found
 }
 
 /// Fails unless the search index agrees with the messages table.
@@ -287,6 +288,57 @@ fn search_forgets_removed_mail() {
     store.remove_account(account).unwrap();
     assert!(found(&store, "bracket").is_empty());
     check_search_index(&store);
+}
+
+#[test]
+fn search_ids_come_from_the_index_alone() {
+    let (store, account) = store_with_account();
+    // A big mailbox where a short word finds nearly everything, one
+    // message has a word only in its text, and one is a draft being sent.
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000)
+             INSERT INTO messages (account_id, remote_id, from_name, from_address, to_list,
+                 cc_list, subject, snippet, date, text_body, attachments, category, state,
+                 unread, pinned, remote_place, remote_unread, remote_pinned)
+             SELECT ?1, 'r' || i, 'Sender', 'sender@example.test', '[]', '[]',
+                 'Weekly report ' || i, '', i,
+                 CASE WHEN i = 7 THEN 'The bracket ships Friday.' ELSE '' END,
+                 '[]', 'people', 'inbox', 0, 0, 'inbox', 0, 0 FROM n",
+            [account],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO outbox (account_id, draft, send_at, draft_message)
+             VALUES (?1, '{}', 0, 9)",
+            [account],
+        )
+        .unwrap();
+    assert_eq!(found(&store, "bracket"), [7]);
+    // Every hit, not a page of them.
+    let mut weekly = store.search_ids("we").unwrap();
+    weekly.sort_unstable();
+    assert_eq!(weekly, (1..=50_000).filter(|&i| i != 9).collect::<Vec<_>>());
+    assert_eq!(found(&store, "we").len(), 49_999);
+
+    // No sorting by date, and no folder lookups or columns per message:
+    // each hit is one look-up of its id.
+    let query = search::fts_query("we").unwrap();
+    let (plan, _, sorts, steps) = run_counted(&store, search::SEARCH_IDS, &[query.as_str()]);
+    assert!(
+        plan.contains("SEARCH messages USING INTEGER PRIMARY KEY (rowid=?)"),
+        "{plan}"
+    );
+    assert!(
+        !plan.contains("TEMP B-TREE") && !plan.contains("CORRELATED"),
+        "{plan}"
+    );
+    assert_eq!(sorts, 0, "{plan}");
+    // About 20 per hit; with the columns and the date sort it was 90.
+    assert!(steps < 30 * 50_000, "{steps} VM steps: {plan}");
 }
 
 #[test]
@@ -893,7 +945,11 @@ fn snoozed_mail_comes_back_unread_when_its_time_comes() {
 
 /// How SQLite runs `sql` with `params`: its query plan, and the rows it
 /// stepped through in full scans, its sorts and its VM steps.
-fn run_counted(store: &Store, sql: &str, params: &[i64]) -> (String, i32, i32, i32) {
+fn run_counted<T: rusqlite::ToSql>(
+    store: &Store,
+    sql: &str,
+    params: &[T],
+) -> (String, i32, i32, i32) {
     use rusqlite::StatementStatus::{FullscanStep, Sort, VmStep};
     let params = rusqlite::params_from_iter(params);
     let plan = store

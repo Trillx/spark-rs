@@ -2,34 +2,28 @@ import { useEffect, useRef, useState } from "react";
 import { searchMessages, searchServers } from "../api";
 import type { AccountId, Message } from "../types";
 import { searchesServers, searchText, type SearchHits } from "./layout";
+import { indexSearches } from "./searchIndex";
 
 /** How long a search rests before it goes to the mail servers, as in Spark. */
 const SERVER_DELAY_MS = 1000;
+/** How long search texts and mail rest before the search index is asked: a word typed fast is asked once. */
+const LOCAL_DELAY_MS = 150;
 
 /**
  * The search index's answers for the free text of `queries`, asked again when the mail
- * changes. Until a new text is answered the old answers stay, and outside the app, where
- * there's no index, there are none: searches then match the loaded messages.
+ * changes what it finds (new mail, a draft saved), not when it's only read or pinned. Until
+ * a new text is answered the old answers stay, and outside the app, where there's no index,
+ * there are none: searches then match the loaded messages.
  */
 export function useSearchHits(queries: string[], messages: Message[]): SearchHits {
   const [hits, setHits] = useState<SearchHits>(() => new Map());
+  const [searches] = useState(() => indexSearches({ ask: searchMessages, show: setHits, delay: LOCAL_DELAY_MS }));
   const texts = [...new Set(queries.map(searchText).filter(Boolean))].join("\n");
 
   useEffect(() => {
-    if (!texts) return;
-    const asked = texts.split("\n");
-    let live = true;
-    Promise.all(asked.map(searchMessages)).then(
-      (answers) => {
-        if (!live) return;
-        setHits(new Map(asked.flatMap((text, i) => (answers[i] ? [[text, new Set(answers[i])] as const] : []))));
-      },
-      () => {},
-    );
-    return () => {
-      live = false;
-    };
-  }, [texts, messages]);
+    searches.want(texts ? texts.split("\n") : [], messages);
+  }, [searches, texts, messages]);
+  useEffect(() => () => searches.stop(), [searches]);
 
   return hits;
 }

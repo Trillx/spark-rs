@@ -175,8 +175,8 @@ export function listMessages(): Promise<Message[]> {
 }
 
 /**
- * Ids of the stored messages whose words start with those of `query`, newest first, from the
- * search index. Null outside the app, where the caller matches the messages it has.
+ * Ids of all the stored messages whose words start with those of `query`, in no particular order,
+ * from the search index. Null outside the app, where the caller matches the messages it has.
  */
 export function searchMessages(query: string): Promise<number[] | null> {
   if (isTauri()) return invoke("search_messages", { query });

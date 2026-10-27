@@ -116,7 +116,24 @@ impl Store {
         ))?;
         stmt.query_map([query], message_row)?.collect()
     }
+
+    /// The ids of the messages `search` finds, all of them, in no
+    /// particular order: for the UI, which filters the messages it has,
+    /// it's the index alone, without reading or sorting the messages.
+    pub fn search_ids(&self, text: &str) -> Result<Vec<i64>> {
+        let Some(query) = fts_query(text) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare_cached(SEARCH_IDS)?;
+        stmt.query_map([query], |r| r.get(0))?.collect()
+    }
 }
+
+/// `Store::search_ids` for the FTS query `?1`: what `search` asks, but only
+/// the ids, unsorted.
+pub(crate) const SEARCH_IDS: &str = "SELECT id FROM messages
+     WHERE id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1)
+       AND id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)";
 
 /// The FTS5 query for what the user typed: each word as a prefix, each
 /// quoted part as a phrase, all of them required. Every term is an FTS5

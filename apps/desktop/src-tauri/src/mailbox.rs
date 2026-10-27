@@ -404,18 +404,24 @@ pub fn list_messages(mailbox: State<'_, Mailbox>) -> Result<Vec<Message>, String
     Ok(messages.into_iter().map(from_store).collect())
 }
 
-/// The stored messages whose words start with those of `query`, newest
-/// first. None in the demo, where the UI matches the messages it has.
+/// The ids of the stored messages whose words start with those of `query`,
+/// in no particular order. None in the demo, where the UI matches the
+/// messages it has. A short word can find most of the mail, so it's looked
+/// up off the main thread.
 #[tauri::command]
-pub fn search_messages(
+pub async fn search_messages(
     mailbox: State<'_, Mailbox>,
     query: String,
 ) -> Result<Option<Vec<i64>>, String> {
     if !mailbox.live() {
         return Ok(None);
     }
-    let found = mailbox.live.engine.store().search(&query).map_err(text)?;
-    Ok(Some(found.into_iter().map(|m| m.id).collect()))
+    let engine = mailbox.live.engine.clone();
+    let found = tauri::async_runtime::spawn_blocking(move || engine.store().search_ids(&query))
+        .await
+        .map_err(text)?
+        .map_err(text)?;
+    Ok(Some(found))
 }
 
 /// How many people a recipient field suggests at most.
