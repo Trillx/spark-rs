@@ -3897,6 +3897,8 @@ mod tests {
     #[derive(Default)]
     struct BeforeBody {
         then: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// It hangs up instead, part way into the message.
+        hang_up: AtomicBool,
     }
 
     /// A local IMAP server for any number of sessions, counting sign-ins
@@ -3953,6 +3955,12 @@ mod tests {
         /// Runs `then` as the next whole message is about to go out.
         fn before_body(&self, then: impl FnOnce() + Send + 'static) {
             *self.before_body.then.lock().unwrap() = Some(Box::new(then));
+        }
+
+        /// Hangs up part way into the next whole message, as a connection
+        /// that drops does.
+        fn hang_up_in_body(&self) {
+            self.before_body.hang_up.store(true, SeqCst);
         }
 
         fn hold(&self, mailbox: &str, validity: u32, mail: Vec<(u32, Vec<u8>)>) {
@@ -4100,6 +4108,11 @@ mod tests {
                             then();
                         }
                         let head = format!("* {seq} FETCH (UID {uid} BODY[] {{{}}}\r\n", raw.len());
+                        if before_body.hang_up.swap(false, SeqCst) {
+                            write.write_all(head.as_bytes()).await?;
+                            write.write_all(&raw[..raw.len() / 2]).await?;
+                            return Ok(());
+                        }
                         write.write_all(head.as_bytes()).await?;
                         raw
                     };
@@ -4752,6 +4765,58 @@ mod tests {
         imap.hold(imap::INBOX, 7, vec![(60, moved.clone())]);
         let found = imap::fetch_raw(&mut session, &state, &at).await.unwrap();
         assert_eq!(found, Some(moved));
+    }
+
+    #[tokio::test]
+    async fn an_imap_reply_waits_when_the_connection_drops_as_its_original_downloads() {
+        // The IMAP server hangs up part way into the original; the SMTP
+        // server would take the reply.
+        let raw = big_message("older@example.com", 1, 1024);
+        let imap = ImapStandIn::start(7, vec![(42, raw.clone())]).await;
+        imap.hang_up_in_body();
+        let (smtp, delivery) = smtp_delivery(250).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Test",
+                config: &to_json(&AccountConfig::Imap {
+                    username: "me@example.com".into(),
+                    imap: imap.server.clone(),
+                    smtp,
+                }),
+            })
+            .unwrap();
+        let original = store_head(&mut store, account.id, 42, &raw);
+        let draft = Draft {
+            account: account.id,
+            to: "ana@example.com".into(),
+            subject: "Re: Files".into(),
+            body: "Thanks".into(),
+            reply_to: Some(original),
+            ..Default::default()
+        };
+        let id = store
+            .queue_send(account.id, &to_json(&draft), 0, &[])
+            .unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let fetched = engine.fetch_body(original).await;
+        assert!(matches!(fetched, Err(Error::Network { .. })), "{fetched:?}");
+
+        imap.hang_up_in_body();
+        let outcomes = engine.send_due(account.id).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].result, Ok(false)),
+            "kept to send with its quote: {:?}",
+            outcomes[0].result
+        );
+        let store = engine.store();
+        assert!(store.content(original).unwrap().unwrap().body_missing);
+        assert!(store.cancel_send(id).unwrap(), "still queued");
+        delivery.abort();
     }
 
     #[tokio::test]

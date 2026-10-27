@@ -110,13 +110,19 @@ impl Error {
     }
 }
 
+/// The IMAP server, where an error doesn't know its name.
+const MAIL_SERVER: &str = "the mail server";
+
+/// A connection lost, reset or timed out is a network failure, as being
+/// offline makes one: what needed it is tried again later, as when the
+/// server can't be reached at all. An answer that can't be read isn't.
 impl From<async_imap::error::Error> for Error {
     fn from(e: async_imap::error::Error) -> Self {
         use async_imap::error::Error as E;
         match e {
             E::No(text) | E::Bad(text) => Self::Server(format!("The mail server said: {text}")),
-            E::ConnectionLost => Self::Server("The mail server closed the connection.".into()),
-            E::Io(e) => Self::Server(format!("Connection problem: {e}")),
+            E::ConnectionLost => Self::network(MAIL_SERVER, "it closed the connection"),
+            E::Io(e) => e.into(),
             other => Self::Server(format!(
                 "The mail server sent something unexpected ({other})."
             )),
@@ -126,6 +132,10 @@ impl From<async_imap::error::Error> for Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Self::Server(format!("Connection problem: {e}"))
+        // How async-imap fails on an answer it can't read (`imap::cannot_read`).
+        if e.kind() == std::io::ErrorKind::Other {
+            return Self::Server(format!("Connection problem: {e}"));
+        }
+        Self::network(MAIL_SERVER, e)
     }
 }

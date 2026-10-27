@@ -325,12 +325,13 @@ pub async fn login(server: &Server, username: &str, password: &str) -> Result<Se
     .map_err(|_| Error::network(&server.host, "timed out"))?
     .map_err(|e| Error::network(&server.host, e))?;
     let client = match server.security {
-        Security::Plain => greeted(Client::new(Stream::Plain(tcp))).await?,
+        Security::Plain => greeted(server, Client::new(Stream::Plain(tcp))).await?,
         Security::Tls => {
-            greeted(Client::new(Stream::Tls(Box::new(tls(server, tcp).await?)))).await?
+            let stream = Stream::Tls(Box::new(tls(server, tcp).await?));
+            greeted(server, Client::new(stream)).await?
         }
         Security::StartTls => {
-            let mut client = greeted(Client::new(Stream::Plain(tcp))).await?;
+            let mut client = greeted(server, Client::new(Stream::Plain(tcp))).await?;
             client.run_command_and_check_ok("STARTTLS", None).await?;
             let Stream::Plain(tcp) = client.into_inner() else {
                 unreachable!("STARTTLS starts from a plain stream")
@@ -350,12 +351,12 @@ pub async fn login(server: &Server, username: &str, password: &str) -> Result<Se
     })
 }
 
-async fn greeted(mut client: Client<Stream>) -> Result<Client<Stream>> {
+async fn greeted(server: &Server, mut client: Client<Stream>) -> Result<Client<Stream>> {
     match timeout(NETWORK_TIMEOUT, client.read_response()).await {
         Ok(Ok(Some(_))) => Ok(client),
-        Ok(Ok(None)) => Err(Error::Server("The server closed the connection.".into())),
+        Ok(Ok(None)) => Err(Error::network(&server.host, "it closed the connection")),
         Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(Error::Server("The server didn't greet us.".into())),
+        Err(_) => Err(Error::network(&server.host, "it didn't greet us")),
     }
 }
 
