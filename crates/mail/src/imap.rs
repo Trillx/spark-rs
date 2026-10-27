@@ -17,9 +17,15 @@
 //! FETCH and UID SEARCH go through `fetch`, `uid_fetch` and `uid_search`
 //! here, not async-imap's: a server's NO or BAD fails them, where
 //! async-imap's take it for an answer with nothing (or only part) in it.
+//! Where part of an answer is still good (the bodies, headers and flags of
+//! the messages that came), a NO is read as `Completion::Partial` instead,
+//! and a sync goes on without what it held back: a message the server
+//! can't fetch (Gmail: "Some messages could not be FETCHed") holds back
+//! only itself, and is asked for again by later syncs.
 
 use std::collections::HashSet;
 use std::io;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -127,6 +133,7 @@ pub struct SyncState {
     pub blocked: Option<String>,
     /// The Reply-To of the inbox mail stored has been fetched. Caches from
     /// before Reply-To was kept fetch it once; mail fetched since has it.
+    /// Mail whose headers the server wouldn't give, even alone, is passed.
     #[serde(default)]
     pub reply_to_fetched: bool,
     /// On servers with CONDSTORE, the inbox's HIGHESTMODSEQ when the flags
@@ -535,21 +542,28 @@ pub async fn sync_folder(
     }
 
     // The newest messages by sequence number. Of the mail it lists
-    // already, the flags are stored as they come.
+    // already, the flags are stored as they come. A list the server cut
+    // short (NO) may leave out mail still there, so then nothing leaves
+    // the folder, and Reply-To waits for a whole one.
     let limit = state.limit.unwrap_or(FOLDER_LIMIT);
     state.complete = mailbox.exists <= limit;
     let known = lock(store).folder_uids(folder.id)?;
     let mut window: Vec<u32> = Vec::new();
+    let mut whole = true;
     if mailbox.exists > 0 {
         let first = mailbox.exists.saturating_sub(limit) + 1;
         let fetched = fetch(session, format!("{first}:*"), "(UID FLAGS)").await?;
-        flags_in_chunks(fetched, |chunk| {
+        let completion = flags_in_chunks(fetched, |chunk| {
             window.extend(chunk.iter().map(|(uid, ..)| *uid));
             store_flags(store, folder.account_id, &folder.remote_id, chunk, |uid| {
                 known.contains_key(&uid)
             })
         })
         .await?;
+        if let Completion::Partial(said) = completion {
+            skipped(&folder.remote_id, "part of the list", &said);
+            whole = false;
+        }
     }
 
     let listed: Vec<u32> = window
@@ -558,7 +572,7 @@ pub async fn sync_folder(
         .filter(|uid| known.contains_key(uid))
         .collect();
     let mut report = FolderReport::default();
-    if !state.reply_to_fetched {
+    if !state.reply_to_fetched && whole {
         report.changed += fetch_reply_to(
             session,
             store,
@@ -578,13 +592,12 @@ pub async fn sync_folder(
         .filter(|uid| !known.contains_key(uid))
         .collect();
     for batch in new.chunks(FETCH_BATCH * 4) {
-        let heads: Vec<Fetched> = uid_fetch(
+        let heads = uid_fetch_each(
             session,
-            uid_set(batch),
-            format!("(UID FLAGS {REPLY_TO_HEADERS})"),
+            &folder.remote_id,
+            batch,
+            &format!("(UID FLAGS {REPLY_TO_HEADERS})"),
         )
-        .await?
-        .try_collect()
         .await?;
         let heads: Vec<Incoming> = heads
             .iter()
@@ -629,7 +642,9 @@ pub async fn sync_folder(
         members.extend(add_to_folder(store, folder.id, &fetched)?);
         report.changed += fetched.len();
     }
-    report.changed += lock(store).set_folder_members(folder.id, &members)?;
+    if whole {
+        report.changed += lock(store).set_folder_members(folder.id, &members)?;
+    }
     Ok(report)
 }
 
@@ -892,26 +907,35 @@ pub async fn sync_inbox(
         state.reply_to_fetched = true;
     }
 
+    // Only from a SELECT that turned CONDSTORE on: a server that sends
+    // HIGHESTMODSEQ without CHANGEDSINCE would fail every sync.
+    let mut modseq = mailbox.highest_modseq.filter(|_| condstore);
     // Flags of everything else we track in the inbox: with CONDSTORE, of
     // what changed since the last sync.
     let tracked = |uid: u32| uid >= floor && known.contains(&uid);
     if known.iter().any(|uid| tracked(*uid)) {
-        let query = match (state.modseq, mailbox.highest_modseq) {
+        let since = match (state.modseq, mailbox.highest_modseq) {
             // Lower than before (a server that rebuilt its index): all of them.
-            (Some(since), Some(now)) if now >= since => {
-                format!("(UID FLAGS) (CHANGEDSINCE {since})")
-            }
-            _ => "(UID FLAGS)".into(),
+            (Some(since), Some(now)) if now >= since => Some(since),
+            _ => None,
+        };
+        let query = match since {
+            Some(since) => format!("(UID FLAGS) (CHANGEDSINCE {since})"),
+            None => "(UID FLAGS)".into(),
         };
         let fetched = uid_fetch(session, format!("{floor}:*"), query).await?;
-        flags_in_chunks(fetched, |chunk| {
+        let completion = flags_in_chunks(fetched, |chunk| {
             store_flags(store, account_id, INBOX, chunk, tracked)
         })
         .await?;
+        // The flags that came are good. The next sync asks for the rest
+        // again: from the same modseq, or all of them.
+        if let Completion::Partial(said) = completion {
+            skipped(INBOX, "some flags", &said);
+            modseq = since;
+        }
     }
-    // Only from a SELECT that turned CONDSTORE on: a server that sends
-    // HIGHESTMODSEQ without CHANGEDSINCE would fail every sync.
-    state.modseq = mailbox.highest_modseq.filter(|_| condstore);
+    state.modseq = modseq;
 
     // Mail a search brought in from below the floor isn't tracked until
     // reaching back gets to it.
@@ -1018,15 +1042,20 @@ async fn lowest_uid(session: &mut Session, exists: u32) -> Result<Option<u32>> {
 /// messages at a time, handing each chunk to `each` as it arrives, so the
 /// responses held stay bounded however many come back. If `each` fails,
 /// the rest is read (to leave the session ready for its next command)
-/// and the failure returned.
+/// and the failure returned. Returns how the fetch ended: after a NO, the
+/// flags that came were handed on, and are good.
 async fn flags_in_chunks(
     fetched: impl futures_util::Stream<Item = async_imap::error::Result<Fetched>>,
     mut each: impl FnMut(&[(u32, bool, bool)]) -> Result<()>,
-) -> Result<()> {
+) -> Result<Completion> {
     let mut fetched = std::pin::pin!(fetched);
     let mut chunk = Vec::with_capacity(OBSERVE_BATCH);
     let mut handed = Ok(());
-    while let Some(fetch) = fetched.try_next().await? {
+    let completion = loop {
+        let fetch = match next_record(&mut fetched).await? {
+            ControlFlow::Continue(fetch) => fetch,
+            ControlFlow::Break(completion) => break completion,
+        };
         let Some(uid) = fetch.uid.filter(|_| handed.is_ok()) else {
             continue;
         };
@@ -1036,12 +1065,12 @@ async fn flags_in_chunks(
             handed = each(&chunk);
             chunk.clear();
         }
-    }
+    };
     handed?;
     if !chunk.is_empty() {
         each(&chunk)?;
     }
-    Ok(())
+    Ok(completion)
 }
 
 /// Stores the server's flags for the UIDs in `mailbox` that `wanted` keeps,
@@ -1064,7 +1093,10 @@ fn store_flags(
 /// Fetches the Message-ID and Reply-To of stored mail at `uids` in the
 /// selected `mailbox`, `OBSERVE_BATCH` at a time, and brings the stored
 /// Reply-To up to date. Caches from before Reply-To was kept do this once.
-/// Returns how many changed.
+/// Returns how many changed. Mail whose headers the server won't give,
+/// even alone, keeps the Reply-To it has: done once, this asks for it
+/// once, where trying again each round would mean asking for every stored
+/// message's headers each round.
 async fn fetch_reply_to(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -1074,11 +1106,13 @@ async fn fetch_reply_to(
 ) -> Result<usize> {
     let mut changed = 0;
     for chunk in uids.chunks(OBSERVE_BATCH) {
-        let fetched: Vec<Fetched> =
-            uid_fetch(session, uid_set(chunk), format!("(UID {REPLY_TO_HEADERS})"))
-                .await?
-                .try_collect()
-                .await?;
+        let fetched = uid_fetch_each(
+            session,
+            mailbox,
+            chunk,
+            &format!("(UID {REPLY_TO_HEADERS})"),
+        )
+        .await?;
         let headers: Vec<Incoming> = fetched
             .iter()
             .filter_map(|f| {
@@ -1167,13 +1201,12 @@ pub async fn search_server(
     });
     for batch in hits.chunks(FETCH_BATCH) {
         // Mail stored from elsewhere (the inbox, another label) is left as it is.
-        let heads: Vec<Fetched> = uid_fetch(
+        let heads = uid_fetch_each(
             session,
-            uid_set(batch),
+            &folder.remote_id,
+            batch,
             "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
         )
-        .await?
-        .try_collect()
         .await?;
         let heads: Vec<(u32, Option<String>)> = heads
             .iter()
@@ -1246,7 +1279,9 @@ async fn fetch_new(
 /// location, flags and arrival time; big ones without their body. The
 /// account is left for the caller. Bodies come `FETCH_BYTES` at a time and
 /// are parsed as they arrive, so the raw mail held stays bounded however
-/// many messages are asked for; all of them or none come back.
+/// many messages are asked for. Those a NO held back are asked for one at
+/// a time, and any the server won't give even alone are left out: not
+/// stored, they're asked for again by the next sync that wants them.
 async fn fetch_messages(
     session: &mut Session,
     uids: &[u32],
@@ -1255,10 +1290,7 @@ async fn fetch_messages(
     if uids.is_empty() {
         return Ok(Vec::new());
     }
-    let sizes: Vec<Fetched> = uid_fetch(session, uid_set(uids), "(UID RFC822.SIZE)")
-        .await?
-        .try_collect()
-        .await?;
+    let sizes = uid_fetch_each(session, mailbox, uids, "(UID RFC822.SIZE)").await?;
     let (small, large): (Vec<_>, Vec<_>) = sizes
         .iter()
         .filter_map(|f| Some((f.uid?, f.size.unwrap_or(0))))
@@ -1274,8 +1306,17 @@ async fn fetch_messages(
     }
     let mut messages = Vec::new();
     for (uids, query) in fetches {
-        let fetched = uid_fetch(session, uid_set(&uids), query).await?;
-        parse_each(fetched, incoming, &mut messages).await?;
+        let mut came = HashSet::new();
+        let fetched = uid_fetch(session, uid_set(&uids), query)
+            .await?
+            .inspect_ok(|f| came.extend(f.uid));
+        let completion = parse_each(fetched, incoming, &mut messages).await?;
+        for uid in held_back(mailbox, &uids, &came, completion) {
+            let fetched = uid_fetch(session, uid.to_string(), query).await?;
+            if let Completion::Partial(said) = parse_each(fetched, incoming, &mut messages).await? {
+                skipped(mailbox, &format!("message {uid}"), &said);
+            }
+        }
     }
     for m in &mut messages {
         m.mailbox = Some(mailbox.into());
@@ -1309,24 +1350,29 @@ fn batches(sized: &[(u32, u32)]) -> Vec<Vec<u32>> {
 /// time, reading the next meanwhile: at most two raw messages are held, the
 /// one being parsed and the one being read (for a moment twice, as
 /// `Fetched` copies it out of its response). Messages that can't be parsed
-/// are left out; a failed read (or a refused fetch) fails the lot.
+/// are left out. Returns how the fetch ended: after a NO, the messages that
+/// came are good. A failed read (or a BAD) fails the lot.
 async fn parse_each<T: Send + 'static>(
     fetched: impl futures_util::Stream<Item = async_imap::error::Result<T>>,
     parse: fn(T) -> Option<Incoming>,
     messages: &mut Vec<Incoming>,
-) -> Result<()> {
+) -> Result<Completion> {
     let mut fetched = std::pin::pin!(fetched);
     let mut parsing = None;
-    while let Some(fetch) = fetched.try_next().await? {
+    let completion = loop {
+        let fetch = match next_record(&mut fetched).await? {
+            ControlFlow::Continue(fetch) => fetch,
+            ControlFlow::Break(completion) => break completion,
+        };
         if let Some(previous) = parsing.take() {
             messages.extend(parsed(previous).await?);
         }
         parsing = Some(spawn_blocking(move || parse(fetch)));
-    }
+    };
     if let Some(last) = parsing {
         messages.extend(parsed(last).await?);
     }
-    Ok(())
+    Ok(completion)
 }
 
 /// A parse's result; a panic in it carries on here as it would have inline.
@@ -1339,10 +1385,12 @@ async fn parsed(parse: JoinHandle<Option<Incoming>>) -> Result<Option<Incoming>>
 }
 
 /// A fetched message with its UID, flags and arrival time; `None` if it
-/// can't be parsed. A big one, fetched without its body, says so instead.
+/// can't be parsed, or came without the body or header asked for (stored
+/// empty, it would never be asked for again). A big one, fetched without
+/// its body, says so instead.
 fn incoming(fetch: Fetched) -> Option<Incoming> {
     let uid = fetch.uid?;
-    let raw = fetch.body().or_else(|| fetch.header()).unwrap_or_default();
+    let raw = fetch.body().or_else(|| fetch.header())?;
     let mut m = parse::parse_message(raw)?;
     if fetch.body().is_none() {
         m.text = "This message is too large to show here.".into();
@@ -1989,10 +2037,11 @@ async fn uid_fetch(
 /// Sends a FETCH and reads what each response says as it comes, up to the
 /// command's tagged completion. A NO or BAD there fails the stream: what
 /// came before it may be only part of the answer, or none of it, and taken
-/// for all of it would lose mail and flag changes for good. Responses that
-/// aren't FETCH (EXISTS, EXPUNGE) are passed over, as the next SELECT
-/// brings the same news. Read to its end, it leaves the session ready for
-/// the next command.
+/// for all of it would lose mail and flag changes for good. Readers that
+/// can make do with part of it take a NO as `Completion::Partial`
+/// (`next_record`). Responses that aren't FETCH (EXISTS, EXPUNGE) are
+/// passed over, as the next SELECT brings the same news. Read to its end,
+/// NO included, it leaves the session ready for the next command.
 async fn run_fetch(
     session: &mut Session,
     command: String,
@@ -2019,6 +2068,95 @@ async fn run_fetch(
             }
         }
     }))
+}
+
+/// How a FETCH ended, for readers that can make do with part of an answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Completion {
+    /// OK: all of it came.
+    Whole,
+    /// NO, with what the server said: it couldn't fetch some of the
+    /// messages, or any (Gmail: "Some messages could not be FETCHed").
+    /// What came is good, but may not be all there is.
+    Partial(String),
+}
+
+/// A fetch's next record, or (`Break`) how it ended: a NO ends it
+/// `Partial`. A BAD, a failed read or a lost connection fails it.
+async fn next_record<T>(
+    fetched: &mut (impl futures_util::Stream<Item = async_imap::error::Result<T>> + Unpin),
+) -> Result<ControlFlow<Completion, T>> {
+    Ok(match fetched.try_next().await {
+        Ok(Some(record)) => ControlFlow::Continue(record),
+        Ok(None) => ControlFlow::Break(Completion::Whole),
+        Err(async_imap::error::Error::No(said)) => ControlFlow::Break(Completion::Partial(said)),
+        Err(e) => return Err(e.into()),
+    })
+}
+
+/// Reads a fetch to its end: what came, and how it ended.
+async fn read_fetch(
+    fetched: impl futures_util::Stream<Item = async_imap::error::Result<Fetched>>,
+) -> Result<(Vec<Fetched>, Completion)> {
+    let mut fetched = std::pin::pin!(fetched);
+    let mut records = Vec::new();
+    loop {
+        match next_record(&mut fetched).await? {
+            ControlFlow::Continue(record) => records.push(record),
+            ControlFlow::Break(completion) => return Ok((records, completion)),
+        }
+    }
+}
+
+/// UID FETCH of `uids` in the selected `mailbox`, which a NO holds back
+/// only the messages the server couldn't fetch: what came is kept, the
+/// rest asked for one at a time, and any it won't give even alone left
+/// out. For answers read whole (sizes, headers); a BAD fails it.
+async fn uid_fetch_each(
+    session: &mut Session,
+    mailbox: &str,
+    uids: &[u32],
+    query: &str,
+) -> Result<Vec<Fetched>> {
+    let (mut fetched, completion) =
+        read_fetch(uid_fetch(session, uid_set(uids), query).await?).await?;
+    let came = fetched.iter().filter_map(|f| f.uid).collect();
+    for uid in held_back(mailbox, uids, &came, completion) {
+        let (alone, completion) =
+            read_fetch(uid_fetch(session, uid.to_string(), query).await?).await?;
+        if let Completion::Partial(said) = completion {
+            skipped(mailbox, &format!("message {uid}"), &said);
+        }
+        fetched.extend(alone);
+    }
+    Ok(fetched)
+}
+
+/// Of the `uids` a fetch asked for, with those in `came` back, the ones to
+/// ask for again one at a time: after a NO, those that didn't come. (After
+/// an OK, mail that didn't come was expunged meanwhile.) A fetch of one was
+/// that already, so its message is left out this round instead.
+fn held_back(mailbox: &str, uids: &[u32], came: &HashSet<u32>, completion: Completion) -> Vec<u32> {
+    let Completion::Partial(said) = completion else {
+        return Vec::new();
+    };
+    let held: Vec<u32> = uids
+        .iter()
+        .copied()
+        .filter(|uid| !came.contains(uid))
+        .collect();
+    match held[..] {
+        [uid] if uids.len() == 1 => {
+            skipped(mailbox, &format!("message {uid}"), &said);
+            Vec::new()
+        }
+        _ => held,
+    }
+}
+
+/// Notes what a server's NO kept from this round, which goes on without it.
+fn skipped(mailbox: &str, what: &str, said: &str) {
+    eprintln!("spark-rs: {mailbox}: {what} skipped this round; the server said: {said}");
 }
 
 /// UID SEARCH. A NO or BAD fails it, where async-imap's search finds
@@ -2189,9 +2327,10 @@ mod tests {
         let counts = Arc::new(Counts::default());
         let fetched = futures_util::stream::iter((1..=20).map(|n| Ok(Held::new(n, &counts))));
         let mut messages = Vec::new();
-        parse_each(fetched, parse_held, &mut messages)
+        let completion = parse_each(fetched, parse_held, &mut messages)
             .await
             .unwrap();
+        assert_eq!(completion, Completion::Whole);
         let uids: Vec<u32> = messages.iter().filter_map(|m| m.uid).collect();
         let readable: Vec<u32> = (1..=20u32).filter(|n| !n.is_multiple_of(3)).collect();
         assert_eq!(uids, readable);
@@ -2227,6 +2366,39 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(counts.most_held.load(SeqCst) <= 2);
+    }
+
+    /// A NO keeps the messages that came before it; a BAD fails them all.
+    #[tokio::test]
+    async fn a_no_mid_fetch_keeps_what_came_and_a_bad_fails_it() {
+        let counts = Arc::new(Counts::default());
+        let said = "Some messages could not be FETCHed (Failure)";
+        let fetched = |end: fn(String) -> async_imap::error::Error| {
+            let counts = counts.clone();
+            futures_util::stream::iter((1..=5).map(move |n| match n {
+                5 => Err(end(said.into())),
+                n => Ok(Held::new(n, &counts)),
+            }))
+        };
+        let mut messages = Vec::new();
+        let completion = parse_each(
+            fetched(async_imap::error::Error::No),
+            parse_held,
+            &mut messages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion, Completion::Partial(said.into()));
+        let uids: Vec<u32> = messages.iter().filter_map(|m| m.uid).collect();
+        assert_eq!(uids, [1, 2, 4]);
+        let bad = parse_each(
+            fetched(async_imap::error::Error::Bad),
+            parse_held,
+            &mut messages,
+        )
+        .await;
+        assert!(bad.is_err());
         assert!(counts.most_held.load(SeqCst) <= 2);
     }
 

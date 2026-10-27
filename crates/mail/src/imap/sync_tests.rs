@@ -120,6 +120,9 @@ struct Shared {
     /// Commands containing the first get the first half of their answer,
     /// then the second (NO or BAD) as their completion.
     refuse: Option<(&'static str, &'static str)>,
+    /// Messages (by id) left out of FETCHes containing their text, which
+    /// then end in NO: as Gmail answers for mail it can't fetch.
+    broken: HashMap<u32, &'static str>,
     tally: Tally,
 }
 
@@ -148,6 +151,7 @@ impl StandIn {
             mailboxes,
             condstore,
             refuse: None,
+            broken: HashMap::new(),
             tally: Tally::default(),
         }));
         let shared = state.clone();
@@ -184,8 +188,16 @@ impl StandIn {
         self.state.lock().unwrap().refuse = Some((command, status));
     }
 
+    /// Leaves message `id` out of FETCHes containing `fetch` from now on,
+    /// even of it alone, and ends them in NO.
+    fn break_message(&self, id: u32, fetch: &'static str) {
+        self.state.lock().unwrap().broken.insert(id, fetch);
+    }
+
     fn heal(&self) {
-        self.state.lock().unwrap().refuse = None;
+        let mut state = self.state.lock().unwrap();
+        state.refuse = None;
+        state.broken.clear();
     }
 }
 
@@ -258,7 +270,7 @@ fn respond(
         .refuse
         .filter(|(refused, _)| command.contains(refused))
         .map(|(_, status)| status);
-    let status = refused.unwrap_or("OK");
+    let mut status = refused.unwrap_or("OK");
     let mailbox = &state.mailboxes[selected.as_deref().expect("a mailbox is selected")];
     let max_uid = mailbox.by_uid.keys().last().copied().unwrap_or(0);
     let exists = mailbox.by_uid.len() as u32;
@@ -301,6 +313,10 @@ fn respond(
             in_set(set, seq, exists)
         };
         if !wanted || changed_since.is_some_and(|since| m.modseq <= since) {
+            continue;
+        }
+        if state.broken.get(&m.id).is_some_and(|f| command.contains(f)) {
+            status = "NO";
             continue;
         }
         let raw = raw(m.id);
@@ -410,13 +426,16 @@ fn cache(
 }
 
 fn message(store: &Mutex<Store>, id: u32) -> Message {
+    stored(store, id).unwrap()
+}
+
+fn stored(store: &Mutex<Store>, id: u32) -> Option<Message> {
     let subject = format!("Message {id}");
     lock(store)
         .messages()
         .unwrap()
         .into_iter()
         .find(|m| m.subject == subject)
-        .unwrap()
 }
 
 /// Server messages, the newest of them tracked, and how many.
@@ -788,9 +807,12 @@ async fn reaching_back_past_searched_mail_checks_its_flags() {
     assert!(state.modseq.is_some());
 }
 
-#[tokio::test]
-async fn folder_polls() {
-    const PROJECTS: &str = "Projects";
+const PROJECTS: &str = "Projects";
+
+/// A stand-in whose inbox is empty and whose Projects folder has
+/// `FOLDER_LIMIT + 100` messages, their ids from 100,001; a store that
+/// has the folder; and a session.
+async fn projects() -> (StandIn, Mutex<Store>, Folder, Session) {
     let mut projects = Remote::new(FOLDER_LIMIT + 100, 1);
     // Their own ids, apart from the inbox's.
     projects.by_uid = projects
@@ -828,17 +850,26 @@ async fn folder_polls() {
         )
         .unwrap();
     let folder = lock(&store).folders().unwrap().remove(0);
-    let members = || {
-        lock(&store)
-            .messages()
-            .unwrap()
-            .into_iter()
-            .filter(|m| m.folders.contains(&folder.id))
-            .count()
-    };
-    let mut session = login(&stand_in.server, "me", "pw").await.unwrap();
-    let mut state = FolderState::default();
+    let session = login(&stand_in.server, "me", "pw").await.unwrap();
     stand_in.take_tally();
+    (stand_in, store, folder, session)
+}
+
+/// How many messages `folder` lists.
+fn listed_in(store: &Mutex<Store>, folder: &Folder) -> usize {
+    lock(store)
+        .messages()
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.folders.contains(&folder.id))
+        .count()
+}
+
+#[tokio::test]
+async fn folder_polls() {
+    let (stand_in, store, folder, mut session) = projects().await;
+    let members = || listed_in(&store, &folder);
+    let mut state = FolderState::default();
     let mut tallies = Vec::new();
 
     let report = sync_folder(&mut session, &store, &folder, &mut state)
@@ -1003,10 +1034,12 @@ async fn a_refused_changedsince_keeps_the_modseq() {
 }
 
 /// A refused fetch of stored mail's headers leaves Reply-To to fetch.
+/// (Refused with BAD: a NO holds back only the messages it left out, as
+/// `a_broken_message_in_the_reply_to_backfill_is_passed` shows.)
 #[tokio::test]
 async fn a_refused_header_fetch_leaves_reply_to_to_fetch() {
     let mut cached = Cached::old(false).await;
-    cached.refused("HEADER.FIELDS", "NO", false).await;
+    cached.refused("HEADER.FIELDS", "BAD", false).await;
     let report = cached.sync().await.unwrap();
     assert_eq!(report.headers, TRACKED as usize);
     assert!(cached.state.reply_to_fetched);
@@ -1032,10 +1065,12 @@ async fn a_refused_search_below_the_floor_reaches_back_no_further() {
 }
 
 /// Mail whose body fetch is refused isn't passed by reaching back.
+/// (Refused with BAD: for a NO, see
+/// `a_broken_message_reaching_back_is_left_to_the_inbox_sync`.)
 #[tokio::test]
 async fn a_refused_body_fetch_drops_no_mail() {
     let mut cached = Cached::synced(false).await;
-    cached.refused("BODY.PEEK[]", "NO", true).await;
+    cached.refused("BODY.PEEK[]", "BAD", true).await;
     assert_eq!(cached.older().await.unwrap(), OLDER_STEP);
     assert_eq!(cached.in_inbox(), TRACKED as usize + OLDER_STEP);
     let oldest_tracked = ON_SERVER - TRACKED + 1;
@@ -1043,4 +1078,247 @@ async fn a_refused_body_fetch_drops_no_mail() {
         cached.state.floor,
         Some((oldest_tracked - OLDER_STEP as u32) * SPACING)
     );
+}
+
+/// One new message the server can't fetch holds back only itself: the
+/// rest is stored, the round goes on to flags and gone mail, and each
+/// round after asks for it again, until it comes.
+#[tokio::test]
+async fn a_broken_new_message_holds_back_only_itself() {
+    let mut cached = Cached::synced(true).await;
+    let arrivals = ON_SERVER + 1..=ON_SERVER + 3;
+    let broken = ON_SERVER + 2;
+    let (flagged, expunged) = (ON_SERVER - 10, ON_SERVER - 20);
+    cached.stand_in.with(INBOX, |b| {
+        for id in arrivals.clone() {
+            b.arrive(id);
+        }
+        b.set_flags(flagged, false, true);
+        b.expunge(expunged);
+    });
+    cached.stand_in.break_message(broken, "BODY.PEEK[]");
+    let floor = cached.state.floor;
+    let alone = format!(
+        "UID FETCH {} (UID FLAGS INTERNALDATE BODY.PEEK[])",
+        cached.stand_in.with(INBOX, |b| b.uid_of(broken))
+    );
+
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.new.len(), 2, "{report:?}");
+    assert!(stored(&cached.store, ON_SERVER + 1).is_some());
+    assert!(stored(&cached.store, ON_SERVER + 3).is_some());
+    assert!(stored(&cached.store, broken).is_none());
+    assert_eq!(report.gone, 1);
+    assert!(message(&cached.store, flagged).pinned);
+    let modseq = cached.stand_in.with(INBOX, |b| b.modseq);
+    assert_eq!(cached.state.modseq, Some(modseq));
+    assert_eq!(cached.state.floor, floor);
+    let tally = cached.stand_in.take_tally();
+    assert_eq!(
+        tally.commands.iter().filter(|c| **c == alone).count(),
+        1,
+        "{:?}",
+        tally.commands
+    );
+
+    // Still new, and still broken: asked for once, alone.
+    let report = cached.sync().await.unwrap();
+    assert!(report.new.is_empty(), "{report:?}");
+    let tally = cached.stand_in.take_tally();
+    assert_eq!(
+        tally.commands.iter().filter(|c| **c == alone).count(),
+        1,
+        "{:?}",
+        tally.commands
+    );
+
+    cached.stand_in.heal();
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.new.len(), 1, "{report:?}");
+    assert!(message(&cached.store, broken).unread);
+    assert_eq!(cached.in_inbox(), TRACKED as usize - 1 + 3);
+    assert_eq!(cached.state.floor, floor);
+}
+
+/// A message reaching back can't fetch is passed like the rest, but it's
+/// above the new floor: the inbox sync asks for it from then on, as new
+/// mail, until it comes. (As before IM-1, which didn't notice the NO.)
+#[tokio::test]
+async fn a_broken_message_reaching_back_is_left_to_the_inbox_sync() {
+    let mut cached = Cached::synced(false).await;
+    let oldest_tracked = ON_SERVER - TRACKED + 1;
+    let broken = oldest_tracked - 3;
+    cached.stand_in.break_message(broken, "BODY.PEEK[]");
+    assert_eq!(cached.older().await.unwrap(), OLDER_STEP - 1);
+    let floor = (oldest_tracked - OLDER_STEP as u32) * SPACING;
+    assert_eq!(cached.state.floor, Some(floor));
+    assert!(!cached.state.complete);
+    assert!(stored(&cached.store, broken).is_none());
+    let alone = format!(
+        "UID FETCH {} (UID FLAGS INTERNALDATE BODY.PEEK[])",
+        broken * SPACING
+    );
+    assert!(cached.stand_in.take_tally().commands.contains(&alone));
+
+    let report = cached.sync().await.unwrap();
+    assert!(report.new.is_empty(), "{report:?}");
+    assert!(cached.stand_in.take_tally().commands.contains(&alone));
+
+    cached.stand_in.heal();
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.new.len(), 1, "{report:?}");
+    assert_eq!(cached.in_inbox(), TRACKED as usize + OLDER_STEP);
+    assert_eq!(cached.state.floor, Some(floor));
+}
+
+/// A message whose headers the server can't fetch doesn't hold up the
+/// Reply-To backfill, or the round: it's asked for once alone, then
+/// passed for good, keeping the Reply-To it had (none).
+#[tokio::test]
+async fn a_broken_message_in_the_reply_to_backfill_is_passed() {
+    let mut cached = Cached::old(false).await;
+    let broken = ON_SERVER - 5;
+    let flagged = ON_SERVER - 10;
+    cached
+        .stand_in
+        .with(INBOX, |b| b.set_flags(flagged, false, true));
+    cached.stand_in.break_message(broken, "HEADER.FIELDS");
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.headers, TRACKED as usize - 1);
+    assert!(cached.state.reply_to_fetched);
+    assert!(message(&cached.store, broken).reply_to.is_empty());
+    assert_eq!(
+        message(&cached.store, ON_SERVER).reply_to,
+        [format!("Desk <desk{ON_SERVER}@x.test>")]
+    );
+    assert!(message(&cached.store, flagged).pinned);
+    let alone = format!("UID FETCH {} (UID {REPLY_TO_HEADERS})", broken * SPACING);
+    assert!(cached.stand_in.take_tally().commands.contains(&alone));
+
+    cached.sync().await.unwrap();
+    assert!(!cached.stand_in.take_tally().asked("HEADER.FIELDS"));
+}
+
+/// A flags fetch the server cuts short keeps the flags that came, and
+/// reads nothing into the ones that didn't: no mail gone, no flag changed.
+#[tokio::test]
+async fn a_flags_fetch_cut_short_keeps_the_flags_that_came() {
+    let mut cached = Cached::synced(false).await;
+    let (came, broken) = (ON_SERVER - 10, ON_SERVER - 20);
+    for id in [came, broken] {
+        cached
+            .stand_in
+            .with(INBOX, |b| b.set_flags(id, false, true));
+    }
+    cached.stand_in.break_message(broken, "(UID FLAGS)");
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report, SyncReport::default());
+    assert!(message(&cached.store, came).pinned);
+    let m = message(&cached.store, broken);
+    assert!(!m.unread && !m.pinned);
+    assert_eq!(cached.in_inbox(), TRACKED as usize);
+
+    cached.stand_in.heal();
+    cached.sync().await.unwrap();
+    let m = message(&cached.store, broken);
+    assert!(m.unread && m.pinned);
+}
+
+/// A folder's list the server cuts short keeps the flags that came, and
+/// takes nothing out of the folder for what didn't.
+#[tokio::test]
+async fn a_folder_list_cut_short_takes_nothing_out_of_it() {
+    let (stand_in, store, folder, mut session) = projects().await;
+    let mut state = FolderState::default();
+    sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    let newest = 100_000 + FOLDER_LIMIT + 100;
+    let (flagged, expunged, broken) = (newest, newest - 1, newest - 2);
+    stand_in.with(PROJECTS, |b| {
+        b.set_flags(flagged, false, true);
+        b.expunge(expunged);
+    });
+    stand_in.break_message(broken, "(UID FLAGS)");
+    let report = sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    // The next older one joins the window; the expunged one stays listed.
+    assert_eq!(report.changed, 1, "{report:?}");
+    assert_eq!(listed_in(&store, &folder), FOLDER_LIMIT as usize + 1);
+    assert!(message(&store, flagged).pinned);
+    assert!(message(&store, broken).folders.contains(&folder.id));
+
+    stand_in.heal();
+    let report = sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(report.changed, 1, "{report:?}");
+    assert_eq!(listed_in(&store, &folder), FOLDER_LIMIT as usize);
+    assert!(!message(&store, expunged).folders.contains(&folder.id));
+}
+
+/// A CHANGEDSINCE the server cuts short keeps the flags that came, but not
+/// the modseq: the next sync asks from the same one, and gets the rest.
+#[tokio::test]
+async fn a_changedsince_cut_short_keeps_the_modseq() {
+    let mut cached = Cached::synced(true).await;
+    let since = cached.state.modseq.unwrap();
+    let (came, broken) = (ON_SERVER - 10, ON_SERVER - 20);
+    for id in [came, broken] {
+        cached
+            .stand_in
+            .with(INBOX, |b| b.set_flags(id, false, true));
+    }
+    cached.stand_in.break_message(broken, "CHANGEDSINCE");
+    cached.sync().await.unwrap();
+    assert!(message(&cached.store, came).pinned);
+    assert!(!message(&cached.store, broken).pinned);
+    assert_eq!(cached.state.modseq, Some(since));
+
+    cached.stand_in.heal();
+    cached.stand_in.take_tally();
+    cached.sync().await.unwrap();
+    assert!(
+        cached
+            .stand_in
+            .take_tally()
+            .asked(&format!("(CHANGEDSINCE {since})"))
+    );
+    assert!(message(&cached.store, broken).pinned);
+    let modseq = cached.stand_in.with(INBOX, |b| b.modseq);
+    assert_eq!(cached.state.modseq, Some(modseq));
+}
+
+/// A NO for one message still fails the fetches taken for all there is:
+/// the first sync's UIDs (`FETCH 1:*`) and the lowest UID.
+#[tokio::test]
+async fn a_broken_message_still_fails_the_uid_fetches() {
+    let stand_in = StandIn::start(
+        HashMap::from([(INBOX.to_owned(), Remote::new(100, 1))]),
+        false,
+    )
+    .await;
+    let (store, account_id) = cached(&stand_in, std::iter::empty());
+    let mut state = SyncState::default();
+    let mut session = login(&stand_in.server, "me", "pw").await.unwrap();
+    stand_in.break_message(1, "FETCH 1:* (UID)");
+    let refused = sync_inbox(&mut session, &store, account_id, &mut state).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!((state.floor, state.complete), (None, false));
+    assert!(lock(&store).messages().unwrap().is_empty());
+    stand_in.heal();
+    let report = sync_inbox(&mut session, &store, account_id, &mut state)
+        .await
+        .unwrap();
+    assert!(report.first && report.new.len() == 100, "{report:?}");
+
+    let mut cached = Cached::synced(false).await;
+    let before = cached.state.clone();
+    let inbox = cached.in_inbox();
+    cached.stand_in.break_message(1, "FETCH 1 (UID)");
+    let refused = cached.sync().await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(cached.state, before);
+    assert_eq!(cached.in_inbox(), inbox);
 }
