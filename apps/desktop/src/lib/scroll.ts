@@ -10,6 +10,21 @@ function topIn(scroller: HTMLElement, el: Element) {
   return el.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
 }
 
+/** Lists that render only the rows near the screen, by the element that scrolls: each renders a stretch of itself when asked. */
+const partial = new WeakMap<HTMLElement, (from: number, to: number) => void>();
+
+/**
+ * A list that renders only the rows near the screen lets paging render the
+ * ones it lines up, from `from` to `to` px down its scroller's content.
+ * Returns the undo.
+ */
+export function renderForPaging(scroller: HTMLElement, render: (from: number, to: number) => void) {
+  partial.set(scroller, render);
+  return () => {
+    if (partial.get(scroller) === render) partial.delete(scroller);
+  };
+}
+
 /**
  * Page Down puts the last row that shows (even partly) at the top. Page Up
  * goes back about as far, to the first row that starts within the screen
@@ -17,6 +32,8 @@ function topIn(scroller: HTMLElement, el: Element) {
  */
 export function pageList(scroller: HTMLElement, dir: 1 | -1) {
   const { scrollTop, clientHeight } = scroller;
+  // A screen either way of this one, and so the one paging goes to.
+  partial.get(scroller)?.(scrollTop - clientHeight, scrollTop + 2 * clientHeight);
   const tops = [...scroller.querySelectorAll(LIST_ITEMS)].map((el) => topIn(scroller, el));
   let target: number | undefined;
   if (dir === 1) {

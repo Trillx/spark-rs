@@ -1,5 +1,5 @@
 import { Check, ChevronRight, Ellipsis, Mail, Minus, Plus, ThumbsDown, ThumbsUp, Zap } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import type { Message } from "../types";
 import { CARDS, GATEKEEPER, groupInfo, type CardKey, type GroupKey } from "../lib/layout";
 import Avatar from "./Avatar";
@@ -322,7 +322,8 @@ const OWN_GROUP_TINT = "bg-primary/10 text-primary";
 
 /**
  * Composite row: Focused's notifications, newsletters or invitations, or a
- * sender or domain the user grouped, opening as a sub-list.
+ * sender or domain the user grouped, opening as a sub-list. Like rows, the
+ * list scrolls it into view when the cursor moves to it.
  */
 export function GroupRow({
   groupKey,
@@ -342,11 +343,6 @@ export function GroupRow({
   onPick?: (range: boolean) => void;
 }) {
   const { label, Icon } = groupInfo(groupKey, items);
-  const ref = useRef<HTMLDivElement>(null);
-  // Like rows, it scrolls into view when the cursor moves to it.
-  useEffect(() => {
-    if (selected && !ref.current?.matches(":hover")) ref.current?.scrollIntoView({ block: "nearest" });
-  }, [selected]);
   const unread = items.filter((m) => m.unread).length;
   const senders = new Map<string, { count: number; unread: boolean }>();
   for (const m of items) {
@@ -355,7 +351,6 @@ export function GroupRow({
   }
   return (
     <div
-      ref={ref}
       role="button"
       tabIndex={-1}
       aria-pressed={selected || picked}

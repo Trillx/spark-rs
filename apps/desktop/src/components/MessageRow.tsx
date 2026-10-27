@@ -13,7 +13,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { memo, useEffect, useRef } from "react";
+import { memo } from "react";
 import type { Message } from "../types";
 import { dragMessage } from "../lib/drag";
 import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
@@ -37,13 +37,17 @@ export interface RowActions {
   more: (m: Message) => void;
 }
 
+/** Every row's height: the list places rows it hasn't rendered by it. */
+export const ROW_HEIGHT = 70;
+
 /**
- * Split-view row, about 70px: unread dot, 26px avatar with the
+ * Split-view row, 70px: unread dot, 26px avatar with the
  * account ring, sender / subject / snippet. A row stands for a conversation:
  * its newest email in the list, with who wrote in it and a count badge.
  * Hover shows a Done circle in the leading column and swaps the date for the
  * row actions. Rows picked for a batch action show a check there instead.
- * Memoized: a list has thousands, and most renders change none of them.
+ * The list scrolls the cursor's row into view.
+ * Memoized: most of the list's renders change none of its rows.
  */
 export default memo(MessageRow);
 
@@ -71,18 +75,6 @@ function MessageRow({
   /** Sent and Drafts rows name who it's to, and show the first recipient's avatar. */
   recipients?: boolean;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const wasSelected = useRef(selected);
-  // Like Spark, only a row the cursor moves to scrolls into view: not one
-  // that was clicked (it's under the pointer), nor one already selected when
-  // its list opens, which keeps the list's place.
-  useEffect(() => {
-    if (selected && !wasSelected.current && !ref.current?.matches(":hover")) {
-      ref.current?.scrollIntoView({ block: "nearest" });
-    }
-    wasSelected.current = selected;
-  }, [selected]);
-
   const done = m.state === "done";
   const deleted = m.state === "deleted";
   const snoozed = m.state === "snoozed" && m.snoozedUntil !== undefined;
@@ -95,7 +87,6 @@ function MessageRow({
   const weight = m.unread ? "font-semibold" : "font-medium";
   return (
     <div
-      ref={ref}
       role="option"
       data-row={m.id}
       aria-selected={selected || picked}
@@ -105,7 +96,8 @@ function MessageRow({
       }}
       // Onto a sidebar list: a folder, Inbox, Archive, Trash, Spam or Pins.
       onPointerDown={(e) => dragMessage(e, m)}
-      className={`group grid h-[70px] cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 ${
+      style={{ height: ROW_HEIGHT }}
+      className={`group grid cursor-default grid-cols-[28px_26px_minmax(0,1fr)] rounded-lg py-[5px] pr-2.5 ${
         selected || picked ? "bg-row-selected" : hover
       }`}
     >

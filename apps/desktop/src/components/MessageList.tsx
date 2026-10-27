@@ -13,7 +13,18 @@ import {
   ThumbsUp,
   X,
 } from "lucide-react";
-import { useLayoutEffect, useRef, type KeyboardEvent, type RefObject, type UIEvent } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+  type UIEvent,
+} from "react";
+import { flushSync } from "react-dom";
 import type { Message } from "../types";
 import { plural } from "../lib/format";
 import {
@@ -21,14 +32,27 @@ import {
   type CardKey,
   type GroupKey,
   type InboxMode,
+  type ListBlock,
   type ListModel,
   type ListView,
 } from "../lib/layout";
 import { LIST_MAX, LIST_MIN, startHorizontalDrag } from "../lib/panes";
-import { LIST_ITEMS } from "../lib/scroll";
+import { LIST_ITEMS, renderForPaging } from "../lib/scroll";
 import { hint, shortcutLabel } from "../lib/shortcuts";
+import {
+  anchoredTop,
+  blockOffsets,
+  blocksBetween,
+  covers,
+  gaps,
+  joinSpans,
+  reaches,
+  stretchAround,
+  type Span,
+  type Stretch,
+} from "../lib/virtualList";
 import Dropdown, { MenuItem } from "./Dropdown";
-import MessageRow, { type RowActions } from "./MessageRow";
+import MessageRow, { ROW_HEIGHT, type RowActions } from "./MessageRow";
 import OverlayScroll from "./OverlayScroll";
 import { GatekeeperCard, GroupRow, SmartInboxCard, type CardSettings } from "./SmartInboxCard";
 import { tipAttrs } from "../lib/tooltip";
@@ -102,8 +126,10 @@ export default function MessageList(props: Props) {
   const selectedRow = selectedId === null ? null : (model.rowOf.get(selectedId) ?? selectedId);
   const listId = listIdOf(view);
   useScrollPlace(scrollRef, listId, view);
-  useRowSlide(scrollRef, listId, model.order);
+  const blocks = useBlockViewport(scrollRef, listId, model.blocks);
+  useRowSlide(scrollRef, blocks, listId, model.order);
   const reachAtEnd = useOlderAtEnd(scrollRef, listId, model, older);
+  useCursorInView(scrollRef, blocks, selectedRow, model.order);
   const row = (m: Message, inPriorityCard = false) => (
     <MessageRow
       key={m.id}
@@ -117,6 +143,72 @@ export default function MessageList(props: Props) {
       recipients={model.recipients}
     />
   );
+  /** A block other than a row, in a box that holds its margins, so it can be measured. */
+  const boxed = (b: Exclude<ListBlock, { kind: "row" }>, key: string, content: ReactNode) => {
+    const size = sizeKey(b);
+    return (
+      <div key={key} ref={blocks.measure(size)} data-size={size} className="flow-root">
+        {content}
+      </div>
+    );
+  };
+  const block = (b: ListBlock, i: number) => {
+    switch (b.kind) {
+      case "row":
+        return row(b.message);
+      case "period":
+        return boxed(
+          b,
+          `p-${b.title}`,
+          <div data-period={b.title} className="flex h-10 items-end px-3 pb-2 text-[13px] text-text-2">
+            {b.title}
+          </div>,
+        );
+      case "card":
+        return boxed(
+          b,
+          b.key,
+          <SmartInboxCard
+            cardKey={b.key}
+            items={b.items}
+            shown={b.shown}
+            renderRow={row}
+            onCompleteAll={() => props.onDoneAll(b.items)}
+            onShowAll={() => props.onShowAll(b.key)}
+            settings={props.cardSettings(b.key)}
+          />,
+        );
+      case "gatekeeper":
+        return boxed(
+          b,
+          "gatekeeper",
+          <GatekeeperCard
+            items={b.items}
+            layout={b.layout}
+            openId={props.openId}
+            onOpen={rows.open}
+            onShowAll={props.onOpenGatekeeper}
+            onAccept={props.gatekeeper.acceptSender}
+            onBlock={props.gatekeeper.blockSender}
+            onAcceptAll={() => props.gatekeeper.acceptAll(b.items)}
+            onBlockAll={() => props.gatekeeper.blockAll(b.items)}
+          />,
+        );
+      case "group":
+        return boxed(
+          b,
+          `g-${b.key}-${i}`,
+          <GroupRow
+            groupKey={b.key}
+            items={b.items}
+            selected={b.items[0].id === selectedRow}
+            picked={props.picked.has(b.items[0].id)}
+            onOpen={() => props.onOpenGroup(b.key)}
+            onPick={(range) => rows.pick(b.items[0].id, range)}
+          />,
+        );
+    }
+  };
 
   return (
     <>
@@ -161,62 +253,7 @@ export default function MessageList(props: Props) {
                 )}
               </div>
             )}
-            {model.blocks.map((block, i) => {
-              switch (block.kind) {
-                case "row":
-                  return row(block.message);
-                case "period":
-                  return (
-                    <div
-                      key={`p-${block.title}`}
-                      data-period={block.title}
-                      className="flex h-10 items-end px-3 pb-2 text-[13px] text-text-2"
-                    >
-                      {block.title}
-                    </div>
-                  );
-                case "card":
-                  return (
-                    <SmartInboxCard
-                      key={block.key}
-                      cardKey={block.key}
-                      items={block.items}
-                      shown={block.shown}
-                      renderRow={row}
-                      onCompleteAll={() => props.onDoneAll(block.items)}
-                      onShowAll={() => props.onShowAll(block.key)}
-                      settings={props.cardSettings(block.key)}
-                    />
-                  );
-                case "gatekeeper":
-                  return (
-                    <GatekeeperCard
-                      key="gatekeeper"
-                      items={block.items}
-                      layout={block.layout}
-                      openId={props.openId}
-                      onOpen={rows.open}
-                      onShowAll={props.onOpenGatekeeper}
-                      onAccept={props.gatekeeper.acceptSender}
-                      onBlock={props.gatekeeper.blockSender}
-                      onAcceptAll={() => props.gatekeeper.acceptAll(block.items)}
-                      onBlockAll={() => props.gatekeeper.blockAll(block.items)}
-                    />
-                  );
-                case "group":
-                  return (
-                    <GroupRow
-                      key={`g-${block.key}-${i}`}
-                      groupKey={block.key}
-                      items={block.items}
-                      selected={block.items[0].id === selectedRow}
-                      picked={props.picked.has(block.items[0].id)}
-                      onOpen={() => props.onOpenGroup(block.key)}
-                      onPick={(range) => rows.pick(block.items[0].id, range)}
-                    />
-                  );
-              }
-            })}
+            <div ref={blocks.container}>{rendered(blocks, block)}</div>
             {!searching && model.blocks.length === 0 && (
               <EmptyList inbox={view.folder === "inbox"} loading={props.loading} />
             )}
@@ -272,52 +309,323 @@ function useScrollPlace(scrollRef: RefObject<HTMLDivElement | null>, listId: str
   }, [listId]);
 }
 
-/** A row by its message id, a group row or a date header by what it shows. */
-function itemKey(el: HTMLElement) {
-  const { row, group, period } = el.dataset;
-  return row !== undefined ? `row:${row}` : group !== undefined ? `group:${group}` : `period:${period}`;
+/** A block by what it shows: a row by its message id, the others by their kind and key. */
+type BlockKey = number | string;
+
+function blockKey(block: ListBlock): BlockKey {
+  switch (block.kind) {
+    case "row":
+      return block.message.id;
+    case "period":
+      return `period:${block.title}`;
+    case "group":
+      return `group:${block.key}`;
+    case "card":
+      return `card:${block.key}`;
+    case "gatekeeper":
+      return "gatekeeper";
+  }
 }
 
-/** Where each row, group row and date header is on screen. */
+/** Blocks that look alike share a measured height: date headers, group rows, cards with as many rows. */
+function sizeKey(block: Exclude<ListBlock, { kind: "row" }>) {
+  switch (block.kind) {
+    case "period":
+    case "group":
+      return block.kind;
+    case "card": {
+      const rows = Math.min(block.shown, block.items.length);
+      return `card:${block.key}:${rows}:${rows < block.items.length}`;
+    }
+    case "gatekeeper":
+      return `gatekeeper:${block.layout}`;
+  }
+}
+
+/**
+ * A block's height until it has been measured, from its classes: a card's
+ * header, rows, "Show all" and margin (the Priority card has no border, and
+ * "Show all" only when rows are left out); New senders' cards are 138px.
+ */
+function estimate(block: Exclude<ListBlock, { kind: "row" }>) {
+  switch (block.kind) {
+    case "period":
+      return 40;
+    case "group":
+      return 60;
+    case "card": {
+      const shown = Math.min(block.shown, block.items.length);
+      const rows = shown * ROW_HEIGHT;
+      if (block.key !== "priority") return 2 + 52 + rows + 40 + 10;
+      return 44 + 5 + rows + (shown < block.items.length ? 40 : 5) + 10;
+    }
+    case "gatekeeper":
+      return block.layout === "strip" ? 40 + 138 + 4 + 10 : 8 + Math.ceil(block.items.length / 2) * 146;
+  }
+}
+
+/** Where a list's blocks go. */
+interface Layout {
+  blocks: ListBlock[];
+  /** Where each block starts, then where the last one ends. */
+  offsets: number[];
+  /** Each block's index by `blockKey`; a card's rows give the card's, a group row's id in `order` the group's. */
+  index: Map<BlockKey, number>;
+  /** The heights given to blocks that get measured, by `sizeKey`. */
+  sized: Map<string, number>;
+}
+
+function layoutOf(blocks: ListBlock[], measured: ReadonlyMap<string, number>): Layout {
+  const heights = new Array<number>(blocks.length);
+  const index = new Map<BlockKey, number>();
+  const sized = new Map<string, number>();
+  blocks.forEach((block, i) => {
+    index.set(blockKey(block), i);
+    if (block.kind === "row") {
+      heights[i] = ROW_HEIGHT;
+      return;
+    }
+    if (block.kind === "card") for (const m of block.items.slice(0, block.shown)) index.set(m.id, i);
+    if (block.kind === "group") index.set(block.items[0].id, i);
+    const size = sizeKey(block);
+    heights[i] = measured.get(size) ?? estimate(block);
+    sized.set(size, heights[i]);
+  });
+  return { blocks, offsets: blockOffsets(heights), index, sized };
+}
+
+const totalOf = (layout: Layout) => layout.offsets[layout.offsets.length - 1];
+
+interface BlockViewport {
+  layout: Layout;
+  /** The layout on screen: the last one, until this render commits. */
+  committed: () => Layout;
+  /** Holds the blocks: where it starts in the scroller is where they do. */
+  container: RefObject<HTMLDivElement | null>;
+  /** The blocks rendered. */
+  spans: Span[];
+  /** The ref that measures a block of this `sizeKey`. */
+  measure: (size: string) => (el: HTMLDivElement | null) => (() => void) | undefined;
+  /** A row rendered wherever it is, for the cursor to scroll to. */
+  pinned: number | null;
+  pin: (id: number | null) => void;
+  /** Renders around the screen again if it's near the edge of what's rendered. */
+  ensure: () => void;
+}
+
+/**
+ * Renders the blocks within a screen of the one that shows, with empty space
+ * as tall as the rest, so a long list costs no more than a short one to show
+ * or change. Rows are 70px; the other blocks are measured once rendered.
+ */
+function useBlockViewport(
+  scrollRef: RefObject<HTMLDivElement | null>,
+  listId: string,
+  blocks: ListBlock[],
+): BlockViewport {
+  const sizes = useRef(new Map<string, number>());
+  const [measured, setMeasured] = useState(0);
+  const layout = useMemo(() => layoutOf(blocks, sizes.current), [blocks, measured]);
+  const [stretch, setStretch] = useState<Stretch>(() => stretchAround(0, window.innerHeight));
+  const [pinned, pin] = useState<number | null>(null);
+  const container = useRef<HTMLDivElement>(null);
+  /** What's on screen, as of the last commit. */
+  const shown = useRef({ layout, stretch, listId });
+
+  // When blocks come or go above the screen, the browser keeps the first one
+  // that shows in its place (scroll anchoring), as long as it's still
+  // rendered: so it is, with what will show around it.
+  let anchored: Span | undefined;
+  const before = shown.current;
+  const scroller = scrollRef.current;
+  if (before.layout !== layout && before.listId === listId && scroller && container.current) {
+    const top = scroller.scrollTop - container.current.offsetTop;
+    const at = anchoredTop(before.layout.offsets, layout.offsets, top, (i) => {
+      const key = blockKey(before.layout.blocks[i]);
+      const j = layout.index.get(key);
+      return j !== undefined && blockKey(layout.blocks[j]) === key ? j : undefined;
+    });
+    if (at !== undefined) {
+      const around = stretchAround(at, scroller.clientHeight);
+      anchored = blocksBetween(layout.offsets, around.from, around.to);
+    }
+  }
+  const single = (i: number | undefined) => (i === undefined ? [] : [{ start: i, end: i + 1 }]);
+  const spans = joinSpans([
+    blocksBetween(layout.offsets, stretch.from, stretch.to),
+    ...(anchored ? [anchored] : []),
+    // New senders stay rendered, so they stay collapsed if they were.
+    ...single(layout.index.get("gatekeeper")),
+    ...single(pinned === null ? undefined : layout.index.get(pinned)),
+  ]);
+
+  useLayoutEffect(() => {
+    shown.current = { layout, stretch, listId };
+  });
+
+  const ensure = useCallback(
+    (now = false) => {
+      const el = scrollRef.current;
+      const box = container.current;
+      if (!el || !box) return;
+      const { layout, stretch } = shown.current;
+      const top = el.scrollTop - box.offsetTop;
+      if (covers(stretch, top, el.clientHeight, totalOf(layout))) return;
+      const next = stretchAround(top, el.clientHeight);
+      // Scrolling renders before the screen is painted.
+      if (now) flushSync(() => setStretch(next));
+      else setStretch(next);
+    },
+    [scrollRef],
+  );
+
+  const observer = useRef<ResizeObserver | null>(null);
+  const resizes = () =>
+    (observer.current ??= new ResizeObserver((entries) => {
+      let changed = false;
+      for (const { target } of entries) {
+        if (!(target instanceof HTMLElement) || target === scrollRef.current) continue;
+        const size = target.dataset.size!;
+        sizes.current.set(size, target.offsetHeight);
+        if (shown.current.layout.sized.get(size) !== target.offsetHeight) changed = true;
+      }
+      if (changed) setMeasured((n) => n + 1);
+      else ensure();
+    }));
+  // One ref per size key: a block whose rows change is measured again.
+  const refs = useRef(new Map<string, (el: HTMLDivElement | null) => (() => void) | undefined>());
+  const measure = (size: string) => {
+    let ref = refs.current.get(size);
+    if (!ref) {
+      ref = (el) => {
+        if (!el) return;
+        const ro = resizes();
+        ro.observe(el);
+        return () => ro.unobserve(el);
+      };
+      refs.current.set(size, ref);
+    }
+    return ref;
+  };
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => ensure(true);
+    el.addEventListener("scroll", onScroll, { passive: true });
+    // A taller screen needs more rendered.
+    resizes().observe(el);
+    const stopPaging = renderForPaging(el, (from, to) => {
+      const box = container.current;
+      if (!box) return;
+      const { layout, stretch } = shown.current;
+      const wanted = { from: from - box.offsetTop, to: to - box.offsetTop };
+      if (!reaches(stretch, wanted.from, wanted.to, totalOf(layout))) flushSync(() => setStretch(wanted));
+    });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      stopPaging();
+      observer.current?.disconnect();
+      observer.current = null;
+    };
+  }, [scrollRef]);
+
+  // A list that opened at its place, or blocks that changed under the screen.
+  useLayoutEffect(() => ensure(), [listId, layout]);
+
+  return { layout, committed: () => shown.current.layout, container, spans, measure, pinned, pin, ensure };
+}
+
+/** The rendered blocks, with empty space standing in for the others. */
+function rendered({ layout, spans }: BlockViewport, block: (b: ListBlock, i: number) => ReactNode) {
+  const space = gaps(layout.offsets, spans);
+  const out: ReactNode[] = [];
+  spans.forEach(({ start, end }, k) => {
+    out.push(<Gap key={`gap-${k}`} height={space[k]} />);
+    for (let i = start; i < end; i++) out.push(block(layout.blocks[i], i));
+  });
+  out.push(<Gap key="gap-end" height={space[spans.length]} />);
+  return out;
+}
+
+/** Room for blocks that aren't rendered; never what the browser keeps in place as content changes. */
+function Gap({ height }: { height: number }) {
+  return <div aria-hidden className="[overflow-anchor:none]" style={{ height }} />;
+}
+
+/** A row by its message id, a group row or a date header by what it shows, as `blockKey` has them. */
+function itemKey(el: HTMLElement): BlockKey {
+  const { row, group, period } = el.dataset;
+  return row !== undefined ? Number(row) : group !== undefined ? `group:${group}` : `period:${period}`;
+}
+
+/** Where each rendered row, group row and date header is on screen. */
 function itemTops(scroller: HTMLElement) {
-  const tops = new Map<string, number>();
+  const tops = new Map<BlockKey, number>();
   for (const el of scroller.querySelectorAll<HTMLElement>(LIST_ITEMS)) {
     tops.set(itemKey(el), el.getBoundingClientRect().top);
   }
   return tops;
 }
 
-const rowKeys = (tops: Map<string, number>) => [...tops.keys()].filter((key) => key.startsWith("row:"));
-
 /** Spark moves rows in 200ms. */
 const SLIDE_MS = 200;
+
+/** The list before a change: where its rendered items were on screen, and the layout for the rest. */
+interface Before {
+  tops: Map<BlockKey, number>;
+  layout: Layout;
+  /** Where the blocks started on screen. */
+  origin: number;
+}
+
+/** Where a row, group row or date header that wasn't rendered was on screen; not a row in a card. */
+function placeBefore(was: Before, key: BlockKey) {
+  const i = was.layout.index.get(key);
+  if (i === undefined || blockKey(was.layout.blocks[i]) !== key) return undefined;
+  return was.origin + was.layout.offsets[i];
+}
 
 /**
  * When rows leave the list (Done, Delete, Snooze…) and none arrive, what's
  * after them slides up into place instead of jumping. Where things were is
- * read while rendering, before React changes the DOM.
+ * read while rendering, before React changes the DOM, and what wasn't
+ * rendered was where the layout had it.
  */
-function useRowSlide(scrollRef: RefObject<HTMLDivElement | null>, listId: string, order: number[]) {
+function useRowSlide(
+  scrollRef: RefObject<HTMLDivElement | null>,
+  blocks: BlockViewport,
+  listId: string,
+  order: number[],
+) {
   const committed = useRef({ order, listId });
-  const before = useRef<Map<string, number> | null>(null);
+  const before = useRef<Before | null>(null);
   if (committed.current.order !== order && before.current === null && scrollRef.current) {
-    before.current = itemTops(scrollRef.current);
+    before.current = {
+      tops: itemTops(scrollRef.current),
+      layout: blocks.committed(),
+      origin: blocks.container.current?.getBoundingClientRect().top ?? 0,
+    };
   }
+  const { index } = blocks.layout;
   useLayoutEffect(() => {
     const was = before.current;
     const sameList = committed.current.listId === listId;
+    const gone = committed.current.order;
     before.current = null;
     committed.current = { order, listId };
     const el = scrollRef.current;
     if (!was || !el || !sameList) return;
-    const now = itemTops(el);
-    const removed = rowKeys(was).some((key) => !now.has(key));
-    const added = rowKeys(now).some((key) => !was.has(key));
+    // Rows, a card's included, as the DOM had them when every row was rendered.
+    const removed = gone.some((id) => !index.has(id));
+    const added = order.some((id) => !was.layout.index.has(id));
     if (!removed || added) return;
+    const now = itemTops(el);
     const box = el.getBoundingClientRect();
     for (const item of el.querySelectorAll<HTMLElement>(LIST_ITEMS)) {
-      const from = was.get(itemKey(item));
-      const to = now.get(itemKey(item))!;
+      const key = itemKey(item);
+      const from = was.tops.get(key) ?? placeBefore(was, key);
+      const to = now.get(key)!;
       if (from === undefined || Math.abs(from - to) < 1) continue;
       // Only what's on screen before or after.
       if (Math.max(from, to) < box.top - 100 || Math.min(from, to) > box.bottom) continue;
@@ -358,6 +666,41 @@ function useOlderAtEnd(
     if (scrollRef.current) reach(scrollRef.current, false);
   }, [model, listId, older !== null, loading]);
   return (e: UIEvent<HTMLElement>) => reach(e.currentTarget, true);
+}
+
+/**
+ * Like Spark, only a row the cursor moves to scrolls into view: not one that
+ * was clicked (it's under the pointer), nor one already selected when its
+ * list opens, which keeps the list's place, nor one that's new to the list.
+ * Group rows, which the cursor reaches by their newest email, go by the same
+ * rule. A row that isn't rendered is rendered first.
+ */
+function useCursorInView(
+  scrollRef: RefObject<HTMLDivElement | null>,
+  blocks: BlockViewport,
+  selectedRow: number | null,
+  order: number[],
+) {
+  const { layout, pinned, pin, ensure } = blocks;
+  const shown = useRef({ row: selectedRow, order });
+  const reveal = (id: number) => {
+    const i = layout.index.get(id);
+    const b = i === undefined ? undefined : layout.blocks[i];
+    const selector = b?.kind === "group" ? `[data-group="${CSS.escape(b.key)}"]` : `[data-row="${id}"]`;
+    const el = scrollRef.current?.querySelector<HTMLElement>(selector);
+    if (!el) return pin(id !== pinned && layout.index.has(id) ? id : null);
+    if (!el.matches(":hover")) el.scrollIntoView({ block: "nearest" });
+    pin(null);
+    ensure();
+  };
+  useLayoutEffect(() => {
+    const was = shown.current;
+    shown.current = { row: selectedRow, order };
+    if (selectedRow !== null && selectedRow !== was.row && was.order.includes(selectedRow)) reveal(selectedRow);
+  });
+  useLayoutEffect(() => {
+    if (pinned !== null) reveal(pinned);
+  }, [pinned]);
 }
 
 function Toolbar({
