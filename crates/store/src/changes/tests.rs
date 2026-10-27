@@ -519,6 +519,25 @@ fn every_kind_of_change_follows_from_the_log() {
     assert_eq!(copy.follow(&store, "work flags"), 1);
     store.observe_gone_remote(work, "r2").unwrap();
     assert_eq!(copy.follow(&store, "work mail archived"), 1);
+    // Its attachments and invite, fetched in a later round.
+    let plan = Attachment {
+        name: "plan.pdf".into(),
+        ..Default::default()
+    };
+    let invite = r#"{"kind":"invitation"}"#;
+    store
+        .fill_in_remote(work, "r3", &[plan], Some(invite))
+        .unwrap();
+    assert_eq!(copy.follow(&store, "work mail filled in"), 1);
+    let r3 = copy
+        .messages
+        .iter()
+        .find(|m| m.account_id == work && m.subject == "Message 3");
+    let r3 = r3.unwrap();
+    assert_eq!(r3.attachment.as_deref(), Some("plan.pdf"));
+    assert_eq!(r3.invite_kind.as_deref(), Some("invitation"));
+    store.fill_in_remote(work, "r3", &[], None).unwrap();
+    assert_eq!(copy.follow(&store, "nothing to fill in"), 0);
     store.remove_account(work).unwrap();
     assert_eq!(copy.follow(&store, "account removed"), 3);
     assert!(copy.messages.iter().all(|m| m.account_id != work));

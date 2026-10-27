@@ -1369,6 +1369,79 @@ fn attachments_stored_as_bare_names_still_read() {
 }
 
 #[test]
+fn what_a_sync_couldnt_fetch_is_filled_in_later_and_nothing_else() {
+    let mut store = Store::open_in_memory().unwrap();
+    let account = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: "me@contoso.com",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let graph = |n: u32| Incoming {
+        remote_id: Some(format!("r{n}")),
+        mailbox: None,
+        uid: None,
+        ..incoming(account, n, "ana@contoso.com")
+    };
+    let id = new_id(store.add_incoming(&graph(1), false).unwrap());
+    // Read, flagged and Done here, not sent yet.
+    let changed = Patch {
+        unread: Some(false),
+        pinned: Some(true),
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    store.update(id, &changed, 5_000).unwrap();
+    let before = store.message(id).unwrap().unwrap();
+
+    let plan = Attachment {
+        name: "plan.pdf".into(),
+        mime: "application/pdf".into(),
+        size: 10,
+        remote_id: Some("a1".into()),
+    };
+    let invite = r#"{"kind":"invitation"}"#;
+    assert!(
+        store
+            .fill_in_remote(account, "r1", std::slice::from_ref(&plan), Some(invite))
+            .unwrap()
+    );
+    let content = store.content(id).unwrap().unwrap();
+    assert_eq!(content.attachments, std::slice::from_ref(&plan));
+    assert_eq!(content.invite.as_deref(), Some(invite));
+    let after = store.message(id).unwrap().unwrap();
+    assert_eq!(after.attachment.as_deref(), Some("plan.pdf"));
+    assert_eq!(after.invite_kind.as_deref(), Some("invitation"));
+    assert_eq!(
+        (after.unread, after.pinned, after.state),
+        (before.unread, before.pinned, before.state),
+        "the user's changes stay"
+    );
+    assert_eq!(store.pending_for(id).unwrap().map(|p| p.id), Some(id));
+
+    // Nothing to fill in leaves what's there; another account's or a
+    // message not stored isn't.
+    assert!(store.fill_in_remote(account, "r1", &[], None).unwrap());
+    let content = store.content(id).unwrap().unwrap();
+    assert_eq!(content.attachments, std::slice::from_ref(&plan));
+    assert_eq!(content.invite.as_deref(), Some(invite));
+    assert!(
+        !store
+            .fill_in_remote(account, "r9", std::slice::from_ref(&plan), None)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .fill_in_remote(account + 1, "r1", &[plan], None)
+            .unwrap()
+    );
+}
+
+#[test]
 fn locations_say_where_the_server_keeps_a_message() {
     let (mut store, account) = store_with_account();
     let id = new_id(

@@ -1082,6 +1082,36 @@ impl Store {
             .optional()
     }
 
+    /// Fills in what a sync stored message `remote_id` of `account_id`
+    /// without, as the server couldn't give it then: its `attachments`,
+    /// unless there are none, and the `invite` it carries, if any. Nothing
+    /// else of it changes, so what the user changed stays as it is. Returns
+    /// whether the message is stored.
+    pub fn fill_in_remote(
+        &self,
+        account_id: i64,
+        remote_id: &str,
+        attachments: &[Attachment],
+        invite: Option<&str>,
+    ) -> Result<bool> {
+        let stored = self
+            .conn
+            .prepare_cached(
+                "UPDATE messages SET
+                    attachments = CASE WHEN ?3 THEN attachments ELSE ?4 END,
+                    invite = COALESCE(?5, invite)
+                 WHERE account_id = ?1 AND remote_id = ?2",
+            )?
+            .execute(params![
+                account_id,
+                remote_id,
+                attachments.is_empty(),
+                json(attachments),
+                invite
+            ])?;
+        Ok(stored > 0)
+    }
+
     /// Records the answer sent to the invite message `id` carries.
     pub fn set_rsvp(&self, id: i64, answer: &str) -> Result<()> {
         self.conn.execute(

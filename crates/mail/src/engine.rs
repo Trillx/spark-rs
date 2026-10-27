@@ -115,6 +115,9 @@ pub struct Report {
     /// Senders waiting in the Gatekeeper that the Sent folder showed the
     /// user had written to: they're accepted, so their mail moved.
     pub accepted: usize,
+    /// Mail stored without its attachments or invite, as Microsoft couldn't
+    /// give them then, that has them now (`graph::Graph::repair`).
+    pub repaired: usize,
 }
 
 impl Report {
@@ -127,6 +130,7 @@ impl Report {
             + self.drafts
             + self.headers
             + self.accepted
+            + self.repaired
             > 0
     }
 
@@ -577,19 +581,21 @@ impl Engine {
                     let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await?;
                     report.drafts_pushed(pushed);
                 }
+                // Its repair list is the store's: syncs and searches add to
+                // it as they go, and `save_state` leaves it be.
                 let mut state: graph::SyncState = from_json(&account.sync_state);
                 if round.fetch {
                     let sync = graph
                         .sync_inbox(&self.store, account_id, &mut state)
                         .await?;
-                    self.store().set_sync_state(account_id, &to_json(&state))?;
+                    graph::save_state(&self.store(), account_id, &state)?;
                     report.headers += sync.headers;
                     report.synced(sync.new, sync.gone, sync.first);
                 }
                 if round.older_inbox {
                     let older = graph.older_inbox(&self.store, account_id, &mut state).await;
                     // Keep how far it got even if part of it failed.
-                    self.store().set_sync_state(account_id, &to_json(&state))?;
+                    graph::save_state(&self.store(), account_id, &state)?;
                     report.older = older?;
                 }
                 let mut listed = false;
@@ -628,6 +634,11 @@ impl Engine {
                     && let Ok(found) = graph.written_to(&waiting).await
                 {
                     report.accepted += self.written_to(account_id, &waiting, &found)?;
+                }
+                // Last, and on rounds that fetch: ones that only push come
+                // with every change the user makes.
+                if round.fetch {
+                    report.repaired = graph.repair(&self.store, account_id, now_ms()).await;
                 }
             }
         }
@@ -714,7 +725,8 @@ impl Engine {
     /// and stores the mail it finds that isn't stored yet, so the store's
     /// search has it (see the `search` module). Returns how many messages
     /// were new. It runs beside the account's rounds, on a connection of
-    /// its own.
+    /// its own; on a Microsoft account, they fetch what Graph couldn't give
+    /// of the mail it stores yet, such as its attachments.
     pub async fn search_server(&self, account_id: i64, query: &str) -> Result<usize> {
         let query = Query::parse(query);
         if !search::worth_asking(&query) {
@@ -2083,7 +2095,7 @@ fn from_json<T: for<'de> Deserialize<'de> + Default>(text: &str) -> T {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::SeqCst};
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
@@ -2966,7 +2978,11 @@ mod tests {
     /// An engine with a Microsoft account signed in to the Graph stand-in
     /// at `base`.
     fn microsoft_engine(base: String) -> (Engine, i64) {
-        let store = Store::open_in_memory().unwrap();
+        microsoft_engine_in(Store::open_in_memory().unwrap(), base)
+    }
+
+    /// `microsoft_engine`, keeping its mail in `store`.
+    fn microsoft_engine_in(store: Store, base: String) -> (Engine, i64) {
         let account = store
             .add_account(&NewAccount {
                 kind: AccountKind::Microsoft,
@@ -2980,17 +2996,23 @@ mod tests {
                 }),
             })
             .unwrap();
+        (signed_in(store, base, account.id), account.id)
+    }
+
+    /// An engine for `store`, its Microsoft account `account_id` signed in
+    /// to the Graph stand-in at `base`.
+    fn signed_in(store: Store, base: String, account_id: i64) -> Engine {
         let mut engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
         engine.graph_base = base;
         engine.cache_token(
-            account.id,
+            account_id,
             &oauth::Tokens {
                 access_token: "token".into(),
                 refresh_token: None,
                 expires_at: now_ms() + 3_600_000,
             },
         );
-        (engine, account.id)
+        engine
     }
 
     /// A Microsoft account signed in to the Graph stand-in at `base`, with
@@ -3125,41 +3147,95 @@ mod tests {
         from_json::<graph::SyncState>(&account.sync_state).delta_link
     }
 
-    /// A Graph stand-in whose inbox delta (`/delta1`) has four new messages
-    /// with a file each, n1 to n4, named for them (`n1.pdf`). Listing n2's
-    /// attachments fails every time.
-    fn n2_broken(asked: &Asked, _: usize) -> Answer {
+    /// A Graph stand-in for a synced account's inbox: `/delta1` has four
+    /// new messages, n1 to n4, and `/delta2` a fifth, n5, each with a file
+    /// named for it (`n1.pdf`); `/delta3` has nothing new. `failing` gives
+    /// Graph's answer to listing message `id`'s attachments when it fails.
+    fn inbox(
+        failing: impl Fn(&str) -> Option<Answer> + Send + Sync + 'static,
+    ) -> impl Fn(&Asked, usize) -> Answer + Send + Sync + 'static {
         use serde_json::json;
-        let route = asked.path.split('?').next().unwrap();
-        if route == "/delta1" {
-            let new: Vec<_> = (1..=4)
-                .map(|n| {
-                    json!({
-                        "id": format!("n{n}"), "subject": format!("Message n{n}"),
-                        "isRead": false, "receivedDateTime": "2026-10-27T09:00:00Z",
-                        "hasAttachments": true,
-                        "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
-                        "body": { "contentType": "text", "content": "Hi" },
+        move |asked, _| {
+            let route = asked.path.split('?').next().unwrap();
+            let new = |numbers: &[usize], next: &str| {
+                let value: Vec<_> = numbers
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": format!("n{n}"), "subject": format!("Message n{n}"),
+                            "isRead": false, "receivedDateTime": "2026-10-27T09:00:00Z",
+                            "hasAttachments": true,
+                            "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
+                            "body": { "contentType": "text", "content": "Hi" },
+                        })
                     })
-                })
-                .collect();
-            return Answer::json(json!({ "value": new, "@odata.deltaLink": "/delta2" }));
-        }
-        let listed = route
-            .strip_prefix("/me/messages/")
-            .and_then(|rest| rest.strip_suffix("/attachments"));
-        match listed {
-            Some("n2") => Answer::status(500),
-            Some(id) => Answer::json(json!({ "value": [
-                { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
-            ] })),
-            None => Answer::status(404),
+                    .collect();
+                Answer::json(json!({ "value": value, "@odata.deltaLink": next }))
+            };
+            match route {
+                "/delta1" => return new(&[1, 2, 3, 4], "/delta2"),
+                "/delta2" => return new(&[5], "/delta3"),
+                "/delta3" => return new(&[], "/delta3"),
+                _ => {}
+            }
+            let listed = route
+                .strip_prefix("/me/messages/")
+                .and_then(|rest| rest.strip_suffix("/attachments"));
+            match listed {
+                Some(id) => failing(id).unwrap_or_else(|| {
+                    Answer::json(json!({ "value": [
+                        { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
+                    ] }))
+                }),
+                None => Answer::status(404),
+            }
         }
     }
 
+    /// The account's list of mail to fetch what's missing of.
+    fn repair_list(engine: &Engine, account_id: i64) -> Vec<graph::Repair> {
+        let account = engine.account(account_id).unwrap();
+        from_json::<graph::SyncState>(&account.sync_state).repair
+    }
+
+    /// The stored messages' subjects with the names of their files.
+    fn files(engine: &Engine) -> Vec<(String, Vec<String>)> {
+        let store = engine.store();
+        let mut files: Vec<_> = store
+            .messages()
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                let content = store.content(m.id).unwrap().unwrap();
+                let names = content.attachments.into_iter().map(|a| a.name);
+                (m.subject, names.collect())
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// `files` for the `inbox` stand-in's messages `numbers`, each with its
+    /// file but those `missing` theirs.
+    fn whole(
+        numbers: std::ops::RangeInclusive<usize>,
+        missing: &[usize],
+    ) -> Vec<(String, Vec<String>)> {
+        numbers
+            .map(|n| {
+                let files = match missing.contains(&n) {
+                    true => Vec::new(),
+                    false => vec![format!("n{n}.pdf")],
+                };
+                (format!("Message n{n}"), files)
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_broken_message_holds_up_the_inbox_for_three_rounds_at_most() {
-        let (base, seen) = graph::tests::serve(n2_broken).await;
+    async fn a_message_graph_keeps_failing_never_holds_up_the_inbox() {
+        let n2 = |id: &str| (id == "n2").then(|| Answer::status(500));
+        let (base, seen) = graph::tests::serve(inbox(n2)).await;
         let (engine, account_id) = microsoft_engine(base);
         engine
             .store()
@@ -3172,35 +3248,149 @@ mod tests {
             n2.count()
         };
 
-        // Two rounds fail on n2: none of the page is stored, and the delta
-        // query stays where it was.
-        for round in 1..=2 {
-            let failed = engine.run(account_id, true).await;
-            assert!(matches!(failed, Err(Error::Server(_))), "{failed:?}");
-            assert_eq!(n2_listings(seen.take()), 1, "round {round}");
-            assert!(
-                engine.store().messages().unwrap().is_empty(),
-                "round {round}"
-            );
-            assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta1"));
+        // The first round stores n2 without its file and the others with
+        // theirs, and moves on. n2 is listed, and tried again at its end.
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!((report.new, report.repaired), (4, 0));
+        assert_eq!(n2_listings(seen.take()), 2);
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta2"));
+        assert_eq!(files(&engine), whole(1..=4, &[2]));
+        let listed = repair_list(&engine, account_id);
+        assert_eq!(
+            (listed.len(), listed[0].id.as_str(), listed[0].tries),
+            (1, "n2", 1)
+        );
+
+        // New mail keeps coming, and every round tries n2 once more.
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!(report.new, 1);
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta3"));
+        assert_eq!(files(&engine), whole(1..=5, &[2]));
+        for tries in 2..=graph::REPAIR_TRIES + 2 {
+            if tries > 2 {
+                engine.run(account_id, true).await.unwrap();
+            }
+            assert_eq!(n2_listings(seen.take()), 1, "try {tries}");
+            assert_eq!(repair_list(&engine, account_id)[0].tries, tries);
         }
 
-        // The third stores n2 without its file and the others with theirs,
-        // and moves on.
-        let report = engine.run(account_id, true).await.unwrap();
-        assert_eq!(report.new, 4);
+        // Once it's been failing for a week too, it's given up on.
+        let mut state: graph::SyncState =
+            from_json(&engine.account(account_id).unwrap().sync_state);
+        state.repair[0].since -= graph::REPAIR_FOR_MS;
+        engine
+            .store()
+            .set_sync_state(account_id, &to_json(&state))
+            .unwrap();
+        engine.run(account_id, true).await.unwrap();
         assert_eq!(n2_listings(seen.take()), 1);
-        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta2"));
-        let store = engine.store();
-        for m in store.messages().unwrap() {
-            let id = m.subject.strip_prefix("Message ").unwrap();
-            let files = store.content(m.id).unwrap().unwrap().attachments;
-            let names: Vec<&str> = files.iter().map(|a| a.name.as_str()).collect();
-            match id {
-                "n2" => assert!(names.is_empty()),
-                _ => assert_eq!(names, [format!("{id}.pdf")], "{id}"),
-            }
+        assert!(repair_list(&engine, account_id).is_empty());
+        engine.run(account_id, true).await.unwrap();
+        assert_eq!(n2_listings(seen.take()), 0);
+        assert_eq!(files(&engine), whole(1..=5, &[2]));
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta3"));
+    }
+
+    #[tokio::test]
+    async fn an_outage_over_three_rounds_loses_no_files() {
+        // Graph answers every attachment listing 503 while it's down,
+        // asking to be tried again at once.
+        let down = Arc::new(AtomicBool::new(true));
+        let unavailable = down.clone();
+        let failing = move |_: &str| {
+            let down = unavailable.load(SeqCst);
+            down.then(|| Answer::status(503).with_retry_after(0))
+        };
+        let (base, _) = graph::tests::serve(inbox(failing)).await;
+        let (engine, account_id) = microsoft_engine(base);
+        engine
+            .store()
+            .set_sync_state(account_id, AT_DELTA1)
+            .unwrap();
+
+        // Three rounds store the mail without them, and list it.
+        for (round, new) in [(1, 4), (2, 1), (3, 0)] {
+            let report = engine.run(account_id, true).await.unwrap();
+            assert_eq!((report.new, report.repaired), (new, 0), "round {round}");
         }
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta3"));
+        assert_eq!(files(&engine), whole(1..=5, &[1, 2, 3, 4, 5]));
+        let listed = repair_list(&engine, account_id);
+        let mut ids: Vec<&str> = listed.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["n1", "n2", "n3", "n4", "n5"]);
+        assert!(
+            listed.iter().all(|r| r.tries == 0),
+            "Graph being unavailable isn't the messages' doing"
+        );
+
+        // The first round once it's back fetches them all.
+        down.store(false, SeqCst);
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!((report.new, report.repaired), (0, 5));
+        assert!(report.changed());
+        assert_eq!(files(&engine), whole(1..=5, &[]));
+        assert!(repair_list(&engine, account_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mail_listed_before_a_restart_gets_its_files_after() {
+        let path = std::env::temp_dir().join(format!(
+            "spark-graph-repair-{}.sqlite",
+            drafts::new_message_id("test")
+        ));
+        let n2 = |id: &str| (id == "n2").then(|| Answer::status(500));
+        let (base, _) = graph::tests::serve(inbox(n2)).await;
+        let account_id = {
+            let (engine, account_id) = microsoft_engine_in(Store::open(&path).unwrap(), base);
+            engine
+                .store()
+                .set_sync_state(account_id, AT_DELTA1)
+                .unwrap();
+            engine.run(account_id, true).await.unwrap();
+            assert_eq!(repair_list(&engine, account_id).len(), 1);
+            account_id
+        };
+
+        // Opened again, with Graph giving n2's file now.
+        let (base, _) = graph::tests::serve(inbox(|_| None)).await;
+        let engine = signed_in(Store::open(&path).unwrap(), base, account_id);
+        let listed = repair_list(&engine, account_id);
+        assert_eq!((listed.len(), listed[0].id.as_str()), (1, "n2"));
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!((report.new, report.repaired), (1, 1));
+        assert_eq!(files(&engine), whole(1..=5, &[]));
+        assert!(repair_list(&engine, account_id).is_empty());
+        drop(engine);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    #[tokio::test]
+    async fn repaired_mail_reaches_the_message_list() {
+        let down = Arc::new(AtomicBool::new(true));
+        let failing = down.clone();
+        let n2 = move |id: &str| (id == "n2" && failing.load(SeqCst)).then(|| Answer::status(500));
+        let (base, _) = graph::tests::serve(inbox(n2)).await;
+        let (engine, account_id) = microsoft_engine(base);
+        engine
+            .store()
+            .set_sync_state(account_id, AT_DELTA1)
+            .unwrap();
+        engine.run(account_id, true).await.unwrap();
+        let (_, mark) = engine.store().messages_marked().unwrap();
+
+        down.store(false, SeqCst);
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!(report.repaired, 1);
+        assert!(report.changed(), "the app reads the list's changes");
+        let changes = engine.store().message_changes(&mark.unwrap()).unwrap();
+        let changed = changes.unwrap().messages;
+        let n2 = changed.iter().find(|m| m.subject == "Message n2").unwrap();
+        assert_eq!(n2.attachment.as_deref(), Some("n2.pdf"));
     }
 
     /// A Graph stand-in whose inbox delta (`/delta1`) has nothing new.
