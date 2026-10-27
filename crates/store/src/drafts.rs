@@ -4,6 +4,7 @@
 //! had there. Server copies that were replaced, discarded or sent wait in
 //! `draft_removals` to be deleted. Both survive restarts and being offline.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -500,6 +501,33 @@ impl Store {
                               AND u.message_id NOT IN
                                   (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL))",
             params![account_id, settled_before],
+            |r| r.get(0),
+        )
+    }
+
+    /// Whether the account has draft work a sync round hasn't tried yet:
+    /// drafts saved after `saved_after` (Unix ms) to upload, or server
+    /// copies to delete other than those in `tried` (`DraftRemoval::id`).
+    pub fn has_draft_work_since(
+        &self,
+        account_id: i64,
+        saved_after: i64,
+        tried: &HashSet<i64>,
+    ) -> Result<bool> {
+        let removals: Vec<i64> = self
+            .conn
+            .prepare_cached("SELECT id FROM draft_removals WHERE account_id = ?1")?
+            .query_map([account_id], |r| r.get(0))?
+            .collect::<Result<_>>()?;
+        if removals.iter().any(|id| !tried.contains(id)) {
+            return Ok(true);
+        }
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM draft_uploads u JOIN messages m ON m.id = u.message_id
+                            WHERE m.account_id = ?1 AND u.saved_at > ?2
+                              AND u.message_id NOT IN
+                                  (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL))",
+            params![account_id, saved_after],
             |r| r.get(0),
         )
     }

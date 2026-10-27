@@ -1598,13 +1598,15 @@ impl Store {
             .collect()
     }
 
-    /// Whether the account has local changes to push, settled or not.
-    pub fn has_pending(&self, account_id: i64) -> Result<bool> {
+    /// Whether the account has local changes to push made after `after`
+    /// (Unix ms), settled or not.
+    pub fn has_pending_after(&self, account_id: i64, after: i64) -> Result<bool> {
         self.conn
             .prepare_cached(
-                "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND changed_at != 0)",
+                "SELECT EXISTS (SELECT 1 FROM messages
+                     WHERE account_id = ?1 AND changed_at != 0 AND changed_at > ?2)",
             )?
-            .query_row([account_id], |r| r.get(0))
+            .query_row(params![account_id, after], |r| r.get(0))
     }
 
     /// A message as `pending` describes it, changed or not: for finding it

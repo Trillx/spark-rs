@@ -6,7 +6,7 @@
 //! download brings in a year of older inbox mail a step at a time, without
 //! bodies; a body downloads when its email is opened.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -253,6 +253,21 @@ struct Pace {
     /// When the account's last pass over older inbox mail ended
     /// (`graph::Graph::reconcile_inbox`): none since the app started.
     reconciled: Option<Instant>,
+    /// What the account's rounds have tried to push (`Engine::work_waits`).
+    tried: Tried,
+}
+
+/// What an account's rounds have tried to push since the app started:
+/// what's still there of it failed, and waits for a round to try it again,
+/// not holding up the background download meanwhile.
+#[derive(Clone, Debug, Default)]
+struct Tried {
+    /// Local changes made by then (Unix ms).
+    changes: Option<i64>,
+    /// Drafts saved by then.
+    drafts: Option<i64>,
+    /// Deletions of drafts' server copies (`DraftRemoval::id`).
+    removals: HashSet<i64>,
 }
 
 impl Pace {
@@ -564,11 +579,30 @@ impl Engine {
         let turn = self.turn(account_id);
         let _turn = turn.lock().await;
         let account = self.account(account_id)?;
-        let pending = self.store().pending(account_id, now_ms(), SETTLE_MS)?;
+        let now = now_ms();
+        let pending = self.store().pending(account_id, now, SETTLE_MS)?;
         // Saves settle like other changes, so a burst of them goes up once.
-        let settled = now_ms() - SETTLE_MS;
+        let settled = now - SETTLE_MS;
         let draft_work = self.store().has_draft_work(account_id, settled)?;
         let label_work = self.store().has_label_work(account_id)?;
+        let removals: HashSet<i64> = if draft_work {
+            let removals = self.store().draft_removals(account_id)?;
+            removals.iter().map(|r| r.id).collect()
+        } else {
+            HashSet::new()
+        };
+        let tried_drafts = |tried: &mut Tried| {
+            tried.drafts = Some(settled);
+            tried.removals = removals.clone();
+        };
+        // A round the server stops at its changes doesn't get to its drafts,
+        // which wait for one that does as the changes do.
+        let tried_changes = |tried: &mut Tried, failed: bool| {
+            tried.changes = Some(settled);
+            if failed {
+                tried_drafts(tried);
+            }
+        };
         let folders: Vec<Folder> = self
             .store()
             .folders()?
@@ -600,12 +634,17 @@ impl Engine {
                 let mut state: imap::SyncState = from_json(&account.sync_state);
                 let mut session = imap::login(&server, &username, &password).await?;
                 imap::find_folders(&mut session, &mut state).await?;
-                report.pushed = imap::push(&mut session, &self.store, &mut state, pending).await?;
+                let pushed = imap::push(&mut session, &self.store, &mut state, pending).await;
+                self.tried(account_id, &pushed, |t| tried_changes(t, pushed.is_err()));
+                report.pushed = pushed?;
                 if draft_work {
                     let pushed =
                         drafts::push_imap(&mut session, &self.store, &account, &state, settled)
-                            .await?;
-                    report.drafts_pushed(pushed);
+                            .await;
+                    self.tried(account_id, &pushed, tried_drafts);
+                    report.drafts_pushed(pushed?);
+                } else {
+                    self.tried(account_id, &Ok(()), tried_drafts);
                 }
                 if label_work {
                     labels::push_imap(&mut session, &self.store, &state, account_id).await?;
@@ -672,10 +711,15 @@ impl Engine {
                 client_id, tenant, ..
             } => {
                 let graph = self.syncing_graph(account_id, &client_id, &tenant).await?;
-                report.pushed = graph.push(&self.store, pending).await?;
+                let pushed = graph.push(&self.store, pending).await;
+                self.tried(account_id, &pushed, |t| tried_changes(t, pushed.is_err()));
+                report.pushed = pushed?;
                 if draft_work {
-                    let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await?;
-                    report.drafts_pushed(pushed);
+                    let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await;
+                    self.tried(account_id, &pushed, tried_drafts);
+                    report.drafts_pushed(pushed?);
+                } else {
+                    self.tried(account_id, &Ok(()), tried_drafts);
                 }
                 if label_work {
                     labels::push_graph(&graph, &self.store, account_id).await?;
@@ -794,16 +838,38 @@ impl Engine {
 
     /// Whether something the user did waits for the account, which goes
     /// before the background download: a local change or a saved draft to
-    /// push, even one still in its undo window, or mail to send.
+    /// push, even one still in its undo window, or mail to send. What a
+    /// round tried and couldn't push waits for the next round instead
+    /// (`Tried`), so a change the server won't take (Done where it can't
+    /// move mail) doesn't hold up the download for good.
     fn work_waits(&self, account_id: i64) -> bool {
+        let tried = self
+            .paces_lock()
+            .get(&account_id)
+            .map(|pace| pace.tried.clone())
+            .unwrap_or_default();
         let store = self.store();
-        !store.has_pending(account_id).is_ok_and(|any| !any)
+        !store
+            .has_pending_after(account_id, tried.changes.unwrap_or(i64::MIN))
+            .is_ok_and(|any| !any)
             || !store
-                .has_draft_work(account_id, i64::MAX)
+                .has_draft_work_since(
+                    account_id,
+                    tried.drafts.unwrap_or(i64::MIN),
+                    &tried.removals,
+                )
                 .is_ok_and(|work| !work)
             || !store
                 .has_due_sends(account_id, now_ms())
                 .is_ok_and(|due| !due)
+    }
+
+    /// Notes what a round tried to push, given how it went (`Tried`): not
+    /// if it couldn't reach the server, as then it's to be tried first.
+    fn tried<T>(&self, account_id: i64, pushed: &Result<T>, note: impl FnOnce(&mut Tried)) {
+        if !matches!(pushed, Err(Error::Network { .. })) {
+            note(&mut self.paces_lock().entry(account_id).or_default().tried);
+        }
     }
 
     /// One step of the account's background download of older inbox mail:
@@ -4428,6 +4494,82 @@ mod tests {
         imap.hold(imap::INBOX, 7, vec![(50, original), (51, resent)]);
         assert!(engine.fetch_body(id).await.unwrap());
         assert_eq!(content(&store).text.trim(), "The figures.");
+    }
+
+    #[tokio::test]
+    async fn what_a_round_couldnt_push_doesnt_hold_up_the_background_download() {
+        let raw = b"Message-ID: <a@x>\r\n\r\n".to_vec();
+        let imap = ImapStandIn::start(7, vec![(42, raw.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let id = store_imap(&mut store, account.id, imap::INBOX, 42, &raw);
+        // Older mail is left to download; there's an Archive to move to.
+        let state = imap::SyncState {
+            uid_validity: Some(7),
+            floor: Some(500),
+            window: Some(100),
+            archive: Some("Archive".into()),
+            trash: Some("Trash".into()),
+            ..Default::default()
+        };
+        store.set_sync_state(account.id, &to_json(&state)).unwrap();
+        // Done, which this server can't move (no MOVE or UIDPLUS).
+        let done = spark_store::Patch {
+            state: Some(spark_store::MessageState::Done),
+            ..Default::default()
+        };
+        store.update(id, &done, now_ms() - 60_000).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+        assert!(!engine.backfill_due(account.id), "till a round tries it");
+
+        let round = engine.run(account.id, false).await;
+        assert!(matches!(round, Err(Error::Server(_))), "{round:?}");
+        let pending = |store: &Mutex<Store>| {
+            store
+                .lock()
+                .unwrap()
+                .pending(account.id, i64::MAX, 0)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(pending(&store), 1, "it waits to be pushed");
+        assert!(engine.backfill_due(account.id), "for the next round");
+
+        // A change made since waits for a round, which tries that too.
+        let other = store_imap(
+            &mut store.lock().unwrap(),
+            account.id,
+            imap::INBOX,
+            43,
+            b"Message-ID: <b@x>\r\n\r\n",
+        );
+        let since_tried = || engine.paces_lock()[&account.id].tried.changes.unwrap() + 1;
+        let pin = spark_store::Patch {
+            pinned: Some(true),
+            ..Default::default()
+        };
+        let at = since_tried();
+        store.lock().unwrap().update(other, &pin, at).unwrap();
+        assert!(!engine.backfill_due(account.id));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(engine.run(account.id, false).await.is_err());
+        assert!(engine.backfill_due(account.id));
+
+        // Not a round that didn't reach the server.
+        let third = store_imap(
+            &mut store.lock().unwrap(),
+            account.id,
+            imap::INBOX,
+            44,
+            b"Message-ID: <c@x>\r\n\r\n",
+        );
+        let at = since_tried();
+        store.lock().unwrap().update(third, &pin, at).unwrap();
+        drop(imap);
+        let round = engine.run(account.id, false).await;
+        assert!(matches!(round, Err(Error::Network { .. })), "{round:?}");
+        assert!(!engine.backfill_due(account.id));
     }
 
     #[tokio::test]
