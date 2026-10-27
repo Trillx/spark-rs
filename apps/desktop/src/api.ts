@@ -598,10 +598,27 @@ export function onWindowClose(before: () => Promise<boolean>): () => void {
   const stop = getCurrentWindow().onCloseRequested(async (event) => {
     if (await before()) return;
     event.preventDefault();
-    // If it was asked to close for quitting, spark-rs stays open with it.
-    void invoke("kept_open").catch(() => {});
+    keptOpen();
   });
   return () => void stop.then((unlisten) => unlisten());
+}
+
+/**
+ * For the main window: spark-rs is quitting (`settle` says if what it has is saved). Quitting
+ * waits for it, and stops if it isn't. Returns the unsubscribe.
+ */
+export function onQuitting(settle: () => Promise<boolean>): () => void {
+  return on("quitting", () => {
+    void settle().then(
+      (saved) => (saved ? void invoke("settled_for_quit").catch(() => {}) : keptOpen()),
+      () => keptOpen(),
+    );
+  });
+}
+
+/** This window didn't close, or quit, as asked: if spark-rs was quitting, it stays open with it. */
+function keptOpen() {
+  void invoke("kept_open").catch(() => {});
 }
 
 /** Has the main window search (from a conversation's own window, which has no list), and come forward. */

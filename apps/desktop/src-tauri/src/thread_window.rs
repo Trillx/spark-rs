@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window,
@@ -14,8 +15,15 @@ use tauri::{
 
 use crate::background;
 
-/// Set while quitting waits for the conversations' windows to close.
+/// Set while quitting waits for the app's windows to save their drafts.
 static QUITTING: AtomicBool = AtomicBool::new(false);
+/// Set, while quitting, once the main window has saved its draft.
+static MAIN_SETTLED: AtomicBool = AtomicBool::new(false);
+/// Counts quits asked for, so a wait that gives up is the latest one's.
+static QUITS: AtomicU64 = AtomicU64::new(0);
+/// How long quitting waits for windows that don't answer (one still
+/// loading, or stuck); saving a draft takes a moment, as it's saved here.
+const QUIT_WAIT: Duration = Duration::from_secs(15);
 
 fn is_thread_window(label: &str) -> bool {
     label.starts_with("thread-")
@@ -28,28 +36,53 @@ fn others_open(app: &AppHandle, but: &str) -> bool {
         .any(|label| is_thread_window(label) && label != but)
 }
 
-/// Quits spark-rs once the conversations' windows have closed. Each saves
-/// its draft and queues its sends as it does for its own close button; one
-/// that can't stays open (its error says why), and so does spark-rs.
+/// Quits spark-rs once its windows have saved their drafts and queued
+/// their sends: the main window when asked to ("quitting"), the
+/// conversations' windows as they close, as for their own close buttons.
+/// One that can't stays open (its error says why), and so does spark-rs.
 pub fn quit(app: &AppHandle) {
-    let windows: Vec<_> = app
-        .webview_windows()
-        .into_iter()
-        .filter(|(label, _)| is_thread_window(label))
-        .map(|(_, window)| window)
-        .collect();
-    if windows.is_empty() {
-        app.exit(0);
-        return;
-    }
+    let run = QUITS.fetch_add(1, Ordering::SeqCst) + 1;
     QUITTING.store(true, Ordering::SeqCst);
-    for window in windows {
-        let _ = window.close();
+    let main = app.get_webview_window("main").is_some();
+    MAIN_SETTLED.store(!main, Ordering::SeqCst);
+    if main {
+        let _ = app.emit_to("main", "quitting", ());
+    }
+    for (label, window) in app.webview_windows() {
+        if is_thread_window(&label) {
+            let _ = window.close();
+        }
+    }
+    finish_quit(app, "");
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(QUIT_WAIT).await;
+        if QUITTING.load(Ordering::SeqCst) && QUITS.load(Ordering::SeqCst) == run {
+            app.exit(0);
+        }
+    });
+}
+
+/// Quits if quitting waits for nothing more: the main window has saved, and
+/// no conversation's window is open but `closing`.
+fn finish_quit(app: &AppHandle, closing: &str) {
+    if QUITTING.load(Ordering::SeqCst)
+        && MAIN_SETTLED.load(Ordering::SeqCst)
+        && !others_open(app, closing)
+    {
+        app.exit(0);
     }
 }
 
+/// The main window, asked as spark-rs quits, has saved its draft.
+#[tauri::command]
+pub fn settled_for_quit(app: AppHandle) {
+    MAIN_SETTLED.store(true, Ordering::SeqCst);
+    finish_quit(&app, "");
+}
+
 /// A window closing gives up the draft it had open. The last conversation's
-/// window closing finishes a quit that waited for it.
+/// window closing can finish a quit that waited for it.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if !matches!(event, WindowEvent::Destroyed) {
         return;
@@ -57,11 +90,8 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if let Some(editing) = window.try_state::<Editing>() {
         editing.0.lock().unwrap().remove(window.label());
     }
-    if is_thread_window(window.label())
-        && QUITTING.load(Ordering::SeqCst)
-        && !others_open(window.app_handle(), window.label())
-    {
-        window.app_handle().exit(0);
+    if is_thread_window(window.label()) {
+        finish_quit(window.app_handle(), window.label());
     }
 }
 
@@ -103,11 +133,15 @@ pub fn draft_open_elsewhere(window: WebviewWindow, editing: State<'_, Editing>, 
     true
 }
 
-/// A conversation's window stayed open when asked to close (its draft
-/// didn't save): a quit waiting for it stops.
+/// A window kept its draft when asked to close or quit, as it didn't save:
+/// a quit waiting for it stops. The main window, maybe hidden in the
+/// background, comes forward with its error.
 #[tauri::command]
-pub fn kept_open() {
+pub fn kept_open(window: WebviewWindow) {
     QUITTING.store(false, Ordering::SeqCst);
+    if window.label() == "main" {
+        background::show(window.app_handle());
+    }
 }
 
 /// What a conversation's window can be asked to do as it opens: an +AI

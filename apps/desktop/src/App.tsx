@@ -114,6 +114,7 @@ import {
   onSettingsChanged,
   onThreadThen,
   onWindowClose,
+  onQuitting,
   searchInMain,
   openDraft,
   patched,
@@ -1118,6 +1119,12 @@ export default function App() {
   useEffect(() => {
     if (THREAD_WINDOW === null) return;
     return onWindowClose(() => latestSettle.current(true));
+  }, []);
+
+  // Quitting, the main window does the same; a draft it couldn't save keeps spark-rs open.
+  useEffect(() => {
+    if (THREAD_WINDOW !== null) return;
+    return onQuitting(() => latestSettle.current(true));
   }, []);
 
   /** Another window changed mail: read the changes, coalesced. */

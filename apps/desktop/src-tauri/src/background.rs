@@ -94,8 +94,8 @@ pub fn in_front(app: &AppHandle) -> bool {
 
 /// Closing the window hides it when Settings → Notifications says to keep
 /// running. The first time, a notification says where the app went.
-/// Otherwise it quits, even with the meeting pop-up open, once the
-/// conversations' windows have saved their drafts and closed.
+/// Otherwise it quits, even with the meeting pop-up open, once the app's
+/// windows have saved their drafts (`thread_window::quit`).
 ///
 /// Any spark-rs window gaining or losing focus (the meeting pop-up too)
 /// tells the main window, whose Home Screen counts time away from all of

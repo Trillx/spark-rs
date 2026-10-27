@@ -165,6 +165,7 @@ fn main() {
             thread_window::open_thread_window,
             thread_window::search_in_main,
             thread_window::kept_open,
+            thread_window::settled_for_quit,
             thread_window::editing_draft,
             thread_window::draft_open_elsewhere,
             mailbox::prefetch_attachments,
