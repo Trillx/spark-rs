@@ -20,6 +20,7 @@ import {
   Copy,
   Ellipsis,
   Eye,
+  House,
   Inbox,
   Info,
   KeyRound,
@@ -86,6 +87,15 @@ import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo, plural } from "../lib/format";
 import { PRIORITY_LINE_CHOICES } from "../lib/priority";
 import { CARDS, CARD_LIMIT, CARD_ORDER, type CardKey, type CardPrefs } from "../lib/layout";
+import {
+  DEFAULT_SETTINGS as HOME_DEFAULTS,
+  TIMEOUT_MAX,
+  TIMEOUT_MIN,
+  addFocusTime,
+  focusLabel,
+  type FocusTime,
+  type HomeSettings,
+} from "../lib/homeScreen";
 import type { ThemePref } from "../lib/theme";
 import { signatureLabel } from "../lib/signatures";
 import type {
@@ -116,6 +126,7 @@ export type SettingsPage =
   | "signatures"
   | "ai"
   | "agents"
+  | "home"
   | "gatekeeper"
   | "priority"
   | "notifications"
@@ -132,6 +143,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
     { key: "agents", label: "Agents", Icon: Bot },
   ],
   [
+    { key: "home", label: "Home Screen", Icon: House },
     { key: "gatekeeper", label: "Gatekeeper", Icon: UserCheck },
     { key: "priority", label: "Priority", Icon: Zap },
     { key: "notifications", label: "Notifications", Icon: Bell },
@@ -163,6 +175,8 @@ export default function Settings({
   onAccountsChanged,
   gatekeeper,
   onGatekeeper,
+  home,
+  onHome,
   updates,
 }: {
   page: SettingsPage;
@@ -186,6 +200,8 @@ export default function Settings({
   onAccountsChanged: () => void;
   gatekeeper: GatekeeperMode;
   onGatekeeper: (mode: GatekeeperMode) => void;
+  home: HomeSettings;
+  onHome: (settings: HomeSettings) => void;
   updates: Updates;
 }) {
   const tabRefs = useRef<Partial<Record<SettingsPage, HTMLButtonElement | null>>>({});
@@ -270,6 +286,7 @@ export default function Settings({
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "about" && <About updates={updates} />}
+              {page === "home" && <HomeScreenPage settings={home} onChange={onHome} />}
               {page === "gatekeeper" && <GatekeeperPage mode={gatekeeper} onMode={onGatekeeper} />}
               {page === "priority" && (
                 <PriorityPage
@@ -1386,6 +1403,150 @@ function usePrefs() {
   }
 
   return { prefs, status, setStatus, change };
+}
+
+// ---- Home Screen ----
+
+/** Seconds after midnight as an `<input type="time">` value. */
+const timeValue = (at: number) =>
+  `${String(Math.floor(at / 3600)).padStart(2, "0")}:${String(Math.floor((at % 3600) / 60)).padStart(2, "0")}`;
+
+function HomeScreenPage({ settings, onChange }: { settings: HomeSettings; onChange: (settings: HomeSettings) => void }) {
+  const set = (patch: Partial<HomeSettings>) => onChange({ ...settings, ...patch });
+  const setTime = (index: number, patch: Partial<FocusTime>) =>
+    set({ focusTimes: settings.focusTimes.map((f, i) => (i === index ? { ...f, ...patch } : f)) });
+  const minutes = Math.round(settings.timeout / 60);
+  /** The minutes field as typed; it saves once it holds 1 to 99. */
+  const [typed, setTyped] = useState(String(minutes));
+  useEffect(() => setTyped(String(minutes)), [minutes]);
+  const on = settings.enabled;
+
+  function typeMinutes(text: string) {
+    setTyped(text);
+    const n = Number(text);
+    if (Number.isInteger(n) && n >= TIMEOUT_MIN && n <= TIMEOUT_MAX && n !== minutes) set({ timeout: n * 60 });
+  }
+
+  return (
+    <>
+      <Group>
+        <Row
+          label="Enable Home Screen"
+          description="Between visits to your Inbox, a calm screen greets you with what came while you were away."
+          htmlFor="home-enabled"
+        >
+          <Switch id="home-enabled" on={on} onToggle={() => set({ enabled: !on })} />
+        </Row>
+        <div className="flex min-h-[52px] items-center gap-4 px-4 py-2.5">
+          <div className="min-w-0 flex-1">
+            <div className={`flex flex-wrap items-baseline gap-x-2 text-[13px] font-medium leading-8 ${on ? "" : "opacity-40"}`}>
+              <label htmlFor="home-timeout-on">Show Home Screen after</label>
+              <input
+                type="number"
+                min={TIMEOUT_MIN}
+                max={TIMEOUT_MAX}
+                value={typed}
+                disabled={!on || !settings.timeoutEnabled}
+                onChange={(e) => typeMinutes(e.target.value)}
+                onBlur={() => setTyped(String(minutes))}
+                aria-label="Minutes of inactivity"
+                className="input input-sm h-8 w-16 rounded-lg border-hairline px-2 text-center text-[13px]"
+              />
+              <span>min inactivity</span>
+            </div>
+            <div className="text-xs leading-[18px] text-text-2">
+              The Home Screen comes back when spark-rs has been in the background this long, except while you write or
+              read an email.
+            </div>
+          </div>
+          <Switch
+            id="home-timeout-on"
+            on={settings.timeoutEnabled}
+            disabled={!on}
+            onToggle={() => set({ timeoutEnabled: !settings.timeoutEnabled })}
+          />
+        </div>
+      </Group>
+
+      <Group
+        title="Email Focus"
+        note={
+          on && settings.focusScheduleEnabled
+            ? "Remind me sends a notification at that time, unless spark-rs is in front."
+            : undefined
+        }
+      >
+        <Row
+          label="Set Email Focus Schedule"
+          description="Choose the times you plan to check your email. In between, the Home Screen says when the next one is."
+          htmlFor="home-schedule"
+        >
+          <Switch
+            id="home-schedule"
+            on={settings.focusScheduleEnabled}
+            disabled={!on}
+            onToggle={() => set({ focusScheduleEnabled: !settings.focusScheduleEnabled })}
+          />
+        </Row>
+        {on &&
+          settings.focusScheduleEnabled &&
+          settings.focusTimes.map((f, i) => {
+            const label = focusLabel(f.name);
+            return (
+              <div key={`${f.name}`} className="flex min-h-[52px] flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2.5">
+                <Switch id={`focus-${i}`} on={f.enabled} onToggle={() => setTime(i, { enabled: !f.enabled })} />
+                <label htmlFor={`focus-${i}`} className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                  {label}
+                </label>
+                <input
+                  type="time"
+                  value={timeValue(f.at)}
+                  disabled={!f.enabled}
+                  onChange={(e) => {
+                    const [h, m] = e.target.value.split(":").map(Number);
+                    if (Number.isInteger(h) && Number.isInteger(m)) setTime(i, { at: h * 3600 + m * 60 });
+                  }}
+                  aria-label={`${label} time`}
+                  className="input input-sm h-8 w-32 rounded-lg border-hairline text-[13px] disabled:opacity-40"
+                />
+                <label className={`flex items-center gap-1.5 text-[13px] ${f.enabled ? "" : "opacity-40"}`}>
+                  <input
+                    type="checkbox"
+                    className="checkbox checkbox-xs rounded"
+                    checked={f.remindMe}
+                    disabled={!f.enabled}
+                    onChange={() => setTime(i, { remindMe: !f.remindMe })}
+                  />
+                  Remind me
+                </label>
+                <button
+                  className="btn btn-circle btn-ghost btn-sm text-text-2"
+                  aria-label={`Delete ${label}`}
+                  {...tipAttrs("Delete")}
+                  onClick={() => set({ focusTimes: settings.focusTimes.filter((_, j) => j !== i) })}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            );
+          })}
+      </Group>
+
+      {on && settings.focusScheduleEnabled && (
+        <div className="flex gap-2">
+          <button className="btn btn-sm h-8 rounded-lg" onClick={() => set({ focusTimes: addFocusTime(settings.focusTimes) })}>
+            <Plus size={14} /> Add Email Focus Time
+          </button>
+          <button
+            className="btn btn-ghost btn-sm h-8 rounded-lg text-error"
+            onClick={() => onChange({ ...HOME_DEFAULTS, filter: settings.filter })}
+          >
+            Reset Settings
+          </button>
+        </div>
+      )}
+    </>
+  );
 }
 
 function NotificationsPage() {

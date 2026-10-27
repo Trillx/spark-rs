@@ -6,6 +6,8 @@
 //! toasts show: `register` writes its name and icon under
 //! `HKCU\Software\Classes\AppUserModelId\<identifier>`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use spark_mail::Engine;
 use spark_store::{Category, GatekeeperMode, Message, MessageState, Reminder};
 use tauri::{AppHandle, Emitter, Manager};
@@ -228,6 +230,56 @@ pub fn agent_sending(app: &AppHandle, agent: &str, to: &str, subject: &str) {
     }
 }
 
+/// The Email Focus reminder's tag: a new one replaces the last, and coming
+/// back takes it down.
+const FOCUS_TAG: &str = "email-focus";
+
+/// An Email Focus reminder is up and hasn't been taken down.
+static FOCUS_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// An Email Focus time with Remind me came while spark-rs isn't in front
+/// (Settings → Home Screen). Clicking it brings back the window, on the Home
+/// Screen.
+#[tauri::command]
+pub fn focus_reminder(app: AppHandle, new_emails: u32) -> Result<(), String> {
+    if background::in_front(&app) {
+        return Ok(());
+    }
+    let sound = app.state::<PrefsState>().get().sound;
+    show_tagged(&app, &focus_alert(new_emails), sound, Some(FOCUS_TAG))?;
+    FOCUS_SHOWN.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// spark-rs is back in front, so the Email Focus reminder has done its job:
+/// take it down, as Spark does.
+pub fn withdraw_focus_reminder(app: &AppHandle) {
+    if !FOCUS_SHOWN.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(windows)]
+    if let Err(e) = toast::remove(app, FOCUS_TAG) {
+        eprintln!("spark-rs: couldn't take down the Email Focus reminder: {e}");
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
+/// Spark's wording for the Email Focus reminder.
+pub fn focus_alert(new_emails: u32) -> Alert {
+    let line = match new_emails {
+        0 => "There are no new emails".to_string(),
+        1 => "You've got 1 new email".to_string(),
+        n => format!("You've got {n} new emails"),
+    };
+    Alert {
+        title: "It's time for Email Focus!".into(),
+        lines: vec![line],
+        attribution: None,
+        message: None,
+    }
+}
+
 /// Settings → Notifications → Send a test notification.
 #[tauri::command]
 pub fn test_notification(app: AppHandle) -> Result<(), String> {
@@ -368,9 +420,14 @@ pub struct Click {
 }
 
 fn show(app: &AppHandle, alert: &Alert, sound: bool) -> Result<(), String> {
+    show_tagged(app, alert, sound, None)
+}
+
+/// Shows an alert; one with a `tag` replaces the last with it, and can be taken down.
+fn show_tagged(app: &AppHandle, alert: &Alert, sound: bool, tag: Option<&str>) -> Result<(), String> {
     let message = alert.message;
     let clicked = app.clone();
-    show_xml(app, &toast_xml(alert, sound), None, move |_| {
+    show_xml_tagged(app, &toast_xml(alert, sound), None, tag, move |_| {
         background::show(&clicked);
         if let Some(id) = message {
             let _ = clicked.emit("open-message", id);
@@ -387,11 +444,21 @@ pub fn show_xml(
     expires: Option<i64>,
     on_click: impl Fn(Click) + Send + 'static,
 ) -> Result<(), String> {
+    show_xml_tagged(app, xml, expires, None, on_click)
+}
+
+fn show_xml_tagged(
+    app: &AppHandle,
+    xml: &str,
+    expires: Option<i64>,
+    tag: Option<&str>,
+    on_click: impl Fn(Click) + Send + 'static,
+) -> Result<(), String> {
     #[cfg(windows)]
-    return toast::show(app, xml, expires, on_click);
+    return toast::show(app, xml, expires, tag, on_click);
     #[cfg(not(windows))]
     {
-        let _ = (app, xml, expires, on_click);
+        let _ = (app, xml, expires, tag, on_click);
         Err("Notifications are only available on Windows for now.".into())
     }
 }
@@ -443,10 +510,14 @@ mod toast {
     /// 100 ns ticks between 1601-01-01 (Windows' epoch) and 1970-01-01.
     const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
 
+    /// Toasts with a tag are in this group, so they can be found again.
+    const GROUP: &str = "spark-rs";
+
     pub fn show(
         app: &AppHandle,
         xml: &str,
         expires: Option<i64>,
+        tag: Option<&str>,
         on_click: impl Fn(Click) + Send + 'static,
     ) -> Result<(), String> {
         let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
@@ -476,6 +547,12 @@ mod toast {
                 .map_err(|e| e.to_string())?;
             toast
                 .SetExpirationTime(&expiry)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(tag) = tag {
+            toast
+                .SetTag(&HSTRING::from(tag))
+                .and_then(|()| toast.SetGroup(&HSTRING::from(GROUP)))
                 .map_err(|e| e.to_string())?;
         }
         toast
@@ -512,6 +589,19 @@ mod toast {
             Some(value.Value().ok()?.to_string_lossy())
         });
         Click { button, choice }
+    }
+
+    /// Takes the toast with `tag` out of the notification center.
+    pub fn remove(app: &AppHandle, tag: &str) -> Result<(), String> {
+        ToastNotificationManager::History()
+            .and_then(|history| {
+                history.RemoveGroupedTagWithId(
+                    &HSTRING::from(tag),
+                    &HSTRING::from(GROUP),
+                    &HSTRING::from(&app.config().identifier),
+                )
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -668,6 +758,16 @@ mod tests {
         let alert = &alerts(&arrived, NotifyFor::People, None)[0];
         assert_eq!(alert.title, "ana@x.com");
         assert_eq!(alert.lines, ["(no subject)"]);
+    }
+
+    #[test]
+    fn the_focus_reminder_counts_new_mail() {
+        assert_eq!(focus_alert(0).lines, vec!["There are no new emails"]);
+        assert_eq!(focus_alert(1).lines, vec!["You've got 1 new email"]);
+        let alert = focus_alert(12);
+        assert_eq!(alert.title, "It's time for Email Focus!");
+        assert_eq!(alert.lines, vec!["You've got 12 new emails"]);
+        assert_eq!(alert.message, None);
     }
 
     #[test]

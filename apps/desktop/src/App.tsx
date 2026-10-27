@@ -20,6 +20,7 @@ import {
   FolderSearch,
   Forward,
   Group,
+  House,
   Inbox,
   LayoutGrid,
   List,
@@ -76,7 +77,10 @@ import {
   deleteForever,
   discardDraft,
   emptyFolders,
+  focusReminder,
   getPrefs,
+  onWindowFocus,
+  otherWindowFocused,
   getPrioritySenders,
   listAccounts,
   listFolders,
@@ -126,6 +130,7 @@ import PlannedList, { type ReminderActions, type ScheduledActions } from "./comp
 import type { AiRequest } from "./components/AiMenu";
 import CalendarScreen from "./components/CalendarScreen";
 import CommandCenter, { type Command } from "./components/CommandCenter";
+import HomeScreen from "./components/HomeScreen";
 import Composer, {
   draftHasContent,
   draftKey,
@@ -159,6 +164,28 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
+import {
+  activate as activateHome,
+  clearAll as clearHomeFeed,
+  deactivate as deactivateHome,
+  dismiss as dismissFromHome,
+  endSession,
+  feed as homeFeed,
+  homeCounts,
+  homeShows,
+  launch as launchHome,
+  loadHomeSession,
+  loadHomeSettings,
+  newSince,
+  reconfigure as reconfigureHome,
+  saveHomeSession,
+  saveHomeSettings,
+  startSession,
+  tick as tickHome,
+  type HomeSession,
+  type HomeSettings,
+  type PreviewFilter,
+} from "./lib/homeScreen";
 import { decidableDomain, domain, forSenders, predict } from "./lib/gatekeeper";
 import { loadPriorityLines, savePriorityLines } from "./lib/priority";
 import {
@@ -177,6 +204,7 @@ import {
   INBOX_MODES,
   badgeCount,
   buildList,
+  inboxMessages,
   loadCardPrefs,
   loadGrouped,
   loadInboxMode,
@@ -370,6 +398,28 @@ const ICONS = {
   agent: { Icon: Bot, className: "text-primary" },
 } satisfies Record<string, ToastIcon>;
 
+/** How often the Home Screen's timers run: the inactivity timeout, focus times, a new day. */
+const HOME_TICK_MS = 15_000;
+/** Spark waits this long after a window loses focus before calling spark-rs inactive. */
+const BLUR_SETTLE_MS = 150;
+/** On the Home Screen, with no email open over it, only these shortcuts act. */
+const HOME_KEYS = new Set<ActionId>(["compose", "search", "sidebar", "command", "settings", "close"]);
+/** Shortcuts that move around the list, which the Home Screen hides. */
+const LIST_KEYS = new Set<ActionId>([
+  "next",
+  "prev",
+  "open",
+  "toggleDone",
+  "modeFocused",
+  "modeCards",
+  "modeSimple",
+  "selectAll",
+  "selectNext",
+  "selectPrev",
+  "acceptAll",
+  "blockAll",
+]);
+
 /** Failures stay up longer than undo toasts. */
 const ERROR_TOAST_MS = 10_000;
 /** The composer saves its draft after this long without typing. */
@@ -457,6 +507,14 @@ export default function App() {
   const [calendarOpen, setCalendarOpen] = useState(false);
   /** A day and event the calendar was asked to show, by a calendar alert or the meeting pop-up. */
   const [calendarFocus, setCalendarFocus] = useState<{ at: number; event?: number } | undefined>();
+  /** Settings → Home Screen, and the Home Screen's Preview Emails filter. */
+  const [homeSettings, setHomeSettings] = useState<HomeSettings>(loadHomeSettings);
+  /** Whether the user is in a session (the Inbox) or on the Home Screen, from launch on. */
+  const [homeSession, setHomeSession] = useState<HomeSession>(() =>
+    launchHome(loadHomeSession(), loadHomeSettings(), Date.now()),
+  );
+  /** The session as last changed, for listeners and timers that outlive a render. */
+  const homeRef = useRef(homeSession);
   const lastSettingsPage = useRef<SettingsPage>("accounts");
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
   /** Settings → Appearance → Minimize old emails. */
@@ -535,8 +593,10 @@ export default function App() {
   /** The list row an email shows in, or the email itself if none does. */
   const rowOf = (id: number) => model.rowOf.get(id) ?? id;
   const selected = messages.find((m) => m.id === selectedId && model.order.includes(rowOf(m.id))) ?? null;
-  /** What message shortcuts and commands act on. */
-  const current = openMessage ?? selected;
+  /** The Home Screen shows in place of the list and the reader; the calendar covers it. */
+  const homeShown = homeShows(homeSettings, homeSession) && !calendarOpen;
+  /** What message shortcuts and commands act on. The Home Screen hides the list's cursor. */
+  const current = openMessage ?? (homeShown ? null : selected);
   const searching = view.search !== null;
   const syncing = accounts.some((a) => a.sync.status === "syncing");
   const demo = isDemoMode(accounts);
@@ -559,6 +619,145 @@ export default function App() {
     [demo, listed, appPrefs, gatekeeperMode],
   );
 
+  // ---- Home Screen ----
+
+  /** The Inbox's mail, New Senders left out: what the Home Screen counts and previews. */
+  const inboxMail = useMemo(
+    () => (homeShown ? inboxMessages(listed, "all", false, gatekeeperMode).mail : []),
+    [homeShown, listed, gatekeeperMode],
+  );
+  const homeNew = useMemo(() => homeCounts(inboxMail, newSince(homeSession)), [inboxMail, homeSession]);
+  const homeItems = useMemo(
+    () => homeFeed(inboxMail, homeSession, homeSettings.filter),
+    [inboxMail, homeSession, homeSettings.filter],
+  );
+  /** Writing or reading an email holds off the inactivity timeout. Split view always shows one, so only one column counts. */
+  const homePaused = draft !== null || (openMessage !== null && !twoColumns);
+  /** What the focus listeners and the timer need from the latest render. */
+  const homeLatest = useRef({ settings: homeSettings, paused: homePaused, listed, gatekeeperMode });
+  homeLatest.current = { settings: homeSettings, paused: homePaused, listed, gatekeeperMode };
+
+  /** Changes the session, and saves it. Only its last-seen time changing doesn't re-render. */
+  function updateHome(change: (s: HomeSession) => HomeSession) {
+    const before = homeRef.current;
+    const after = change(before);
+    if (after === before) return;
+    homeRef.current = after;
+    saveHomeSession(after);
+    if (JSON.stringify({ ...after, lastSeen: 0 }) !== JSON.stringify({ ...before, lastSeen: 0 })) setHomeSession(after);
+  }
+  const homeUpdates = useRef(updateHome);
+  homeUpdates.current = updateHome;
+
+  useEffect(() => saveHomeSession(homeRef.current), []);
+
+  // spark-rs is active while one of its windows has focus (Spark's
+  // SparkFocusMonitor): a change counts once it still holds 150 ms later, so
+  // a click into a message's frame doesn't. The backend reports focus
+  // changes of every window, the meeting pop-up's too. While inactive, the
+  // timers run the timeout.
+  useEffect(() => {
+    const here = () => document.visibilityState === "visible" && document.hasFocus();
+    let active = here();
+    if (!active) homeUpdates.current((s) => deactivateHome(s, Date.now()));
+    let settle: number | undefined;
+    let disposed = false;
+    /** Counts focus changes: an answer only applies if none came after the change it was asked for. */
+    let checks = 0;
+    /** A focus change is being looked into: the timers wait for the answer. */
+    let checking = false;
+    const evaluate = async (check: number) => {
+      const now = here() || (await otherWindowFocused());
+      if (disposed || check !== checks) return;
+      checking = false;
+      if (now === active) return;
+      active = now;
+      const { settings, paused } = homeLatest.current;
+      homeUpdates.current((s) => (now ? activateHome(s, settings, Date.now(), paused) : deactivateHome(s, Date.now())));
+    };
+    const check = () => {
+      if (disposed) return;
+      const id = ++checks;
+      checking = true;
+      window.clearTimeout(settle);
+      settle = window.setTimeout(() => void evaluate(id), BLUR_SETTLE_MS);
+    };
+    const run = () => {
+      if (checking) return;
+      const { settings, paused, listed, gatekeeperMode } = homeLatest.current;
+      let remind = false;
+      homeUpdates.current((s) => {
+        const result = tickHome(s, settings, Date.now(), { active, paused });
+        remind = result.remind;
+        return result.session;
+      });
+      if (!remind) return;
+      const mail = inboxMessages(listed, "all", false, gatekeeperMode).mail;
+      const n = homeCounts(mail, newSince(homeRef.current));
+      void focusReminder(n.people + n.notifications + n.newsletters).catch(() => {});
+    };
+    window.addEventListener("focus", check);
+    window.addEventListener("blur", check);
+    document.addEventListener("visibilitychange", check);
+    // Once the backend's focus reports are heard, and right away: the pop-up may have focus already.
+    const stopWindowFocus = onWindowFocus(check, check);
+    check();
+    const timer = window.setInterval(run, HOME_TICK_MS);
+    return () => {
+      disposed = true;
+      window.clearTimeout(settle);
+      window.clearInterval(timer);
+      window.removeEventListener("focus", check);
+      window.removeEventListener("blur", check);
+      document.removeEventListener("visibilitychange", check);
+      stopWindowFocus();
+    };
+  }, []);
+
+  // Arriving on the Home Screen closes what was open in the Inbox, and drops its cursor.
+  useEffect(() => {
+    if (!homeShown) return;
+    setOpenId(null);
+    setSelectedId(null);
+    setPicked(new Set());
+  }, [homeShown]);
+
+  /** The user is in the Inbox now: a list, a search or a notification opened. */
+  function startHomeSession() {
+    if (homeRef.current.state !== "sessionActive") updateHome((s) => startSession(s, Date.now()));
+  }
+
+  /** The sidebar's Home Screen: the session ends. */
+  function goHome() {
+    setCalendarOpen(false);
+    setSettingsPage(null);
+    setPalette(null);
+    closeSidebar();
+    updateHome((s) => endSession(s, homeSettings, Date.now()));
+  }
+
+  /** Check Inbox and Open Inbox. */
+  function checkInbox() {
+    startHomeSession();
+    selectList("inbox", "all");
+  }
+
+  /** New emails only: the Inbox narrowed to what came while away. */
+  function showNewEmails() {
+    const since = newSince(homeRef.current);
+    startHomeSession();
+    setCalendarOpen(false);
+    changeView({ folder: "inbox", account: "all", mode: loadInboxMode("all"), sub: { kind: "new", since }, search: null });
+  }
+
+  function changeHomeSettings(next: HomeSettings) {
+    saveHomeSettings(next);
+    updateHome((s) => reconfigureHome(s, homeSettings, next, Date.now()));
+    setHomeSettings(next);
+  }
+
+  const changeHomeFilter = (filter: PreviewFilter) => changeHomeSettings({ ...homeSettings, filter });
+
   useEffect(() => {
     void reloadFolders();
     void getGatekeeperMode().then(setGatekeeperMode, () => {});
@@ -569,7 +768,9 @@ export default function App() {
         setAccounts(loadedAccountList);
         setMessages(loaded);
         const first = buildList(loaded, { ...INITIAL_VIEW, mode: loadInboxMode("all") }, new Set()).order[0];
-        if (first !== undefined && twoColumns) openThread(first, loaded);
+        // Not on the Home Screen: opening an email there would show it over it, and read it.
+        const home = homeShows(homeSettings, homeRef.current);
+        if (first !== undefined && twoColumns && !home) openThread(first, loaded);
       },
       (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
     );
@@ -619,9 +820,10 @@ export default function App() {
     return () => stops.forEach((stop) => stop());
   }, []);
 
+  // Also when the list comes back from behind the Home Screen with a search open.
   useEffect(() => {
-    if (searching) searchRef.current?.focus();
-  }, [searching]);
+    if (searching && !homeShown) searchRef.current?.focus();
+  }, [searching, homeShown]);
 
   useEffect(() => saveLayout(layout), [layout]);
   useEffect(() => saveCardPrefs(cardPrefs), [cardPrefs]);
@@ -1049,7 +1251,8 @@ export default function App() {
             .reverse()
             .find((id) => !gone.has(id)) ??
           null);
-    if (twoColumns && openId !== null && next !== null) follow(next);
+    // Over the Home Screen, the email closes rather than opening the next one.
+    if (twoColumns && openId !== null && next !== null && !homeShown) follow(next);
     else {
       setOpenId(null);
       setSelectedId(next);
@@ -1106,6 +1309,7 @@ export default function App() {
         setPalette(null);
         setCalendarOpen(false);
         closeSidebar();
+        startHomeSession();
         const account = view.account === m.account ? m.account : "all";
         changeView({ folder: "inbox", mode: loadInboxMode(account), sub: null, search: null, account }, true);
         openThread(id, loaded);
@@ -1141,6 +1345,7 @@ export default function App() {
   /** Opens a list, narrowed to an account if it has account rows. Server-backed lists sync now. */
   function selectList(folder: ListKey, account: AccountFilter = "all") {
     setCalendarOpen(false);
+    startHomeSession();
     const narrowed = hasAccountRows(folder) ? account : "all";
     // Each account keeps the Inbox mode it was last shown in.
     const mode = folder === "inbox" ? loadInboxMode(narrowed) : view.mode;
@@ -1234,6 +1439,7 @@ export default function App() {
   }
 
   function openSearch() {
+    startHomeSession();
     if (searching) searchRef.current?.select();
     else changeView({ search: "", sub: null }, true);
   }
@@ -1970,6 +2176,7 @@ export default function App() {
 
   /** Opens a search for `query`, keeping the thread open; it counts as a recent search. */
   function searchFor(query: string) {
+    startHomeSession();
     setRecentSearches((r) => rememberSearch(r, query));
     changeView({ search: query, sub: null }, true);
   }
@@ -2560,7 +2767,7 @@ export default function App() {
       case "zoomReset":
         return zoom(0);
     }
-    if (batchRows.length) {
+    if (batchRows.length && !homeShown) {
       switch (action) {
         case "done":
         case "trash":
@@ -2641,6 +2848,8 @@ export default function App() {
       }
       const action = matchShortcut(e);
       if (!action) return;
+      // The Home Screen hides the list: only its own keys, or the open email's, act.
+      if (homeShown && (openId === null ? !HOME_KEYS.has(action) : LIST_KEYS.has(action))) return;
       // Cmd/Ctrl+K, +F and +, also work from the search field; single keys never fire while typing.
       if (typing && action !== "command" && action !== "search" && action !== "settings") return;
       // Let Enter activate a focused button instead of opening the selected row.
@@ -2962,8 +3171,9 @@ export default function App() {
     return [
       ...messageCommands,
       ...(m ? gatekeeperCommands(m) : []),
-      ...selectionCommands,
-      ...(waiting.length
+      // The Home Screen hides the list, so nothing acts on all of it, or on a selection in it.
+      ...(homeShown ? [] : selectionCommands),
+      ...(waiting.length && !homeShown
         ? [
             {
               id: "accept-all",
@@ -2993,17 +3203,21 @@ export default function App() {
       },
       { id: "search", label: "Search", keywords: "find", Icon: Search, shortcut: shortcutLabel("search"), run: openSearch },
       { id: "sync", label: "Check for new mail", keywords: "sync refresh fetch receive", Icon: RefreshCw, run: checkMail },
-      {
-        id: "select-all",
-        label: "Select All",
-        keywords: "pick choose emails batch",
-        Icon: CheckCheck,
-        shortcut: shortcutLabel("selectAll"),
-        run: () => setPicked(new Set(model.order)),
-      },
-      { id: "mark-all-read", label: "Mark All as Read", keywords: "seen", Icon: MailOpen, run: () => markAll(false) },
-      { id: "mark-all-unread", label: "Mark All as Unread", keywords: "seen", Icon: Mail, run: () => markAll(true) },
-      ...(emptiable(view.folder, view.account).length && !searching
+      ...(homeShown
+        ? []
+        : [
+            {
+              id: "select-all",
+              label: "Select All",
+              keywords: "pick choose emails batch",
+              Icon: CheckCheck,
+              shortcut: shortcutLabel("selectAll"),
+              run: () => setPicked(new Set(model.order)),
+            },
+            { id: "mark-all-read", label: "Mark All as Read", keywords: "seen", Icon: MailOpen, run: () => markAll(false) },
+            { id: "mark-all-unread", label: "Mark All as Unread", keywords: "seen", Icon: Mail, run: () => markAll(true) },
+          ]),
+      ...(emptiable(view.folder, view.account).length && !searching && !homeShown
         ? [
             {
               id: "empty",
@@ -3015,6 +3229,13 @@ export default function App() {
           ]
         : []),
       { id: "go-inbox", label: "Go to Inbox", keywords: "folder", Icon: Inbox, run: () => selectList("inbox") },
+      ...(homeSettings.enabled
+        ? [
+            homeShown
+              ? { id: "check-inbox", label: "Check Inbox", keywords: "home screen session", Icon: Inbox, run: checkInbox }
+              : { id: "home-screen", label: "Home Screen", keywords: "home focus away welcome", Icon: House, run: goHome },
+          ]
+        : []),
       ...SYSTEM_ORDER.map((key) => ({
         id: `go-${key}`,
         label: `Go to ${SYSTEM_LISTS[key].label}`,
@@ -3037,22 +3258,27 @@ export default function App() {
         Icon: FolderSearch,
         run: newSmartFolder,
       },
-      ...INBOX_MODES.map(({ key, label, action }) => ({
-        id: `mode-${key}`,
-        label: `Switch to ${label}`,
-        keywords: "inbox mode view",
-        Icon: MODE_ICONS[key],
-        shortcut: shortcutLabel(action),
-        run: () => setMode(key),
-      })),
-      {
-        id: "toggle-done",
-        label: view.showDone ? "Hide emails marked as Done" : "Show emails marked as Done",
-        keywords: "done archive toggle",
-        Icon: CircleCheck,
-        shortcut: shortcutLabel("toggleDone"),
-        run: toggleDone,
-      },
+      // The list's own views, which the Home Screen hides.
+      ...(homeShown
+        ? []
+        : [
+            ...INBOX_MODES.map(({ key, label, action }) => ({
+              id: `mode-${key}`,
+              label: `Switch to ${label}`,
+              keywords: "inbox mode view",
+              Icon: MODE_ICONS[key],
+              shortcut: shortcutLabel(action),
+              run: () => setMode(key),
+            })),
+            {
+              id: "toggle-done",
+              label: view.showDone ? "Hide emails marked as Done" : "Show emails marked as Done",
+              keywords: "done archive toggle",
+              Icon: CircleCheck,
+              shortcut: shortcutLabel("toggleDone"),
+              run: toggleDone,
+            },
+          ]),
       {
         id: "settings",
         label: "Settings",
@@ -3067,6 +3293,13 @@ export default function App() {
         keywords: "accounts gmail google microsoft outlook office 365 exchange imap sign in login",
         Icon: UserPlus,
         run: () => openSettings("accounts"),
+      },
+      {
+        id: "home-settings",
+        label: "Home Screen settings",
+        keywords: "home focus schedule inactivity timeout away",
+        Icon: House,
+        run: () => openSettings("home"),
       },
       {
         id: "notification-settings",
@@ -3223,11 +3456,12 @@ export default function App() {
       setCalendarOpen(true);
       closeSidebar();
     },
+    home: goHome,
   };
 
   const showList = twoColumns || !openMessage;
   const showReader = twoColumns || openMessage !== null;
-  const readerLeft = sidebarSpace + (twoColumns ? listWidthUsed : 0);
+  const readerLeft = sidebarSpace + (twoColumns && !homeShown ? listWidthUsed : 0);
 
   return (
     <AccountsContext value={accounts}>
@@ -3245,6 +3479,7 @@ export default function App() {
           pickerOpen={pickerOpen}
           demo={demo}
           calendarOpen={calendarOpen}
+          home={homeSettings.enabled ? { open: homeShown } : null}
           actions={sidebarActions}
         />
 
@@ -3254,7 +3489,55 @@ export default function App() {
           {calendarOpen && (
             <CalendarScreen demo={isDemoMode(accounts)} focus={calendarFocus} onClose={() => setCalendarOpen(false)} />
           )}
-          {showList && !calendarOpen && (
+          {homeShown && (
+            <HomeScreen
+              settings={homeSettings}
+              session={homeSession}
+              name={accounts.find((a) => !a.demo)?.name ?? accounts[0]?.name ?? ""}
+              counts={homeNew}
+              items={homeItems}
+              onCheckInbox={checkInbox}
+              onNewEmails={showNewEmails}
+              onFilter={changeHomeFilter}
+              onOpen={(m) => {
+                setPicked(new Set());
+                openThread(m.id);
+              }}
+              onDismiss={(m) => updateHome((s) => dismissFromHome(s, m.id))}
+              onClearAll={() => updateHome((s) => clearHomeFeed(s, Date.now()))}
+              onSearch={openSearch}
+              onCompose={() => compose()}
+            />
+          )}
+          {homeShown && openMessage && (
+            // An email from the feed opens over the Home Screen, as in Spark.
+            <div
+              // Under the composer (z-50), so Reply and Forward write over it.
+              className="absolute inset-0 z-40 flex justify-center bg-black/30 px-6 pb-6 pt-10"
+              onClick={() => setOpenId(null)}
+            >
+              <section
+                aria-label="Conversation"
+                className="flex w-full max-w-[920px] flex-col overflow-hidden rounded-2xl bg-base-100 shadow-popup"
+                onClick={(e) => e.stopPropagation()}
+                onPointerDownCapture={() => (scrollPane.current = "reader")}
+              >
+                <ThreadView
+                  key={openMessage.id}
+                  message={asThread(openMessage, conversation)}
+                  conversation={conversation}
+                  unread={openedUnread}
+                  minimize={minimize}
+                  singleColumn
+                  summary={summaries.get(openMessage.id)}
+                  aiProvider={aiProvider}
+                  actions={threadActions}
+                  scrollRef={readerScroll}
+                />
+              </section>
+            </div>
+          )}
+          {showList && !calendarOpen && !homeShown && (
             <section
               aria-label="Message list"
               className={`relative flex min-w-0 flex-col pt-8 ${twoColumns ? "shrink-0 border-r border-hairline" : "flex-1"}`}
@@ -3313,7 +3596,7 @@ export default function App() {
               )}
             </section>
           )}
-          {showReader && !calendarOpen && (
+          {showReader && !calendarOpen && !homeShown && (
             <section
               aria-label="Conversation"
               className="flex min-w-0 flex-1 flex-col pt-8"
@@ -3448,6 +3731,8 @@ export default function App() {
             onAccountsChanged={() => void reloadAccounts()}
             gatekeeper={gatekeeperMode}
             onGatekeeper={changeGatekeeper}
+            home={homeSettings}
+            onHome={changeHomeSettings}
           />
         )}
 
@@ -3533,7 +3818,7 @@ const accountOf = (account: AccountFilter) => (account === "all" ? undefined : a
 function olderSources(view: ListView, accounts: AccountView[], folders: FolderView[]) {
   if (view.search !== null) return null;
   if (view.folder === "inbox") {
-    if ((view.mode === "cards" && !view.sub) || view.sub?.kind === "gatekeeper") return null;
+    if ((view.mode === "cards" && !view.sub) || view.sub?.kind === "gatekeeper" || view.sub?.kind === "new") return null;
     const ids = accounts
       .filter((a) => a.hasOlder && (view.account === "all" || a.id === view.account))
       .map((a) => a.id);

@@ -5,7 +5,7 @@
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, WebviewWindow, Window, WindowEvent};
+use tauri::{App, AppHandle, Emitter, Manager, WebviewWindow, Window, WindowEvent};
 
 use crate::mailbox::Mailbox;
 use crate::notify;
@@ -93,7 +93,19 @@ pub fn in_front(app: &AppHandle) -> bool {
 /// Closing the window hides it when Settings → Notifications says to keep
 /// running. The first time, a notification says where the app went.
 /// Otherwise it quits, even with the meeting pop-up open.
+///
+/// Any spark-rs window gaining or losing focus (the meeting pop-up too)
+/// tells the main window, whose Home Screen counts time away from all of
+/// them, as Spark does; coming back to any of them takes down the Email
+/// Focus reminder.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
+    if let WindowEvent::Focused(focused) = event {
+        let _ = window.app_handle().emit_to("main", "window-focus", *focused);
+        if *focused {
+            notify::withdraw_focus_reminder(window.app_handle());
+        }
+        return;
+    }
     if window.label() != "main" {
         return;
     }

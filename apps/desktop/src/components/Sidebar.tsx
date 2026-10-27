@@ -3,6 +3,7 @@ import {
   ChevronRight,
   CircleAlert,
   Ellipsis,
+  House,
   Inbox,
   Menu,
   PanelLeft,
@@ -81,6 +82,8 @@ export interface SidebarActions {
   /** Asks, then deletes all of a list's mail for good. */
   empty: (key: ListKey) => void;
   calendar: () => void;
+  /** Ends the session: the Home Screen shows. */
+  home: () => void;
 }
 
 interface Props {
@@ -100,6 +103,8 @@ interface Props {
   demo: boolean;
   /** The calendar shows in place of the lists: no list is current. */
   calendarOpen: boolean;
+  /** The Home Screen row, while Settings has it on; `open` while it shows (no list is current then). */
+  home: { open: boolean } | null;
   actions: SidebarActions;
 }
 
@@ -123,8 +128,9 @@ export default function Sidebar(props: Props) {
     e.preventDefault();
     setMenu({ key, section, x: e.clientX, y: e.clientY });
   };
-  // While the calendar shows, no list is current.
-  const view = { ...props, current: props.calendarOpen ? NO_LIST : props.current, onMenu: openMenu };
+  // While the calendar or the Home Screen shows, no list is current.
+  const elsewhere = props.calendarOpen || props.home?.open;
+  const view = { ...props, current: elsewhere ? NO_LIST : props.current, onMenu: openMenu };
   useMessageDrop((m, target) => actions.drop(m, target.key, target.account));
 
   return (
@@ -160,7 +166,7 @@ export default function Sidebar(props: Props) {
 
 type ViewProps = Props & { onMenu: (key: ListKey, section: Section, e: MouseEvent) => void };
 
-/** `current` while the calendar is open: a smart folder that can't exist, so nothing matches it. */
+/** `current` while the calendar or Home Screen is open: a smart folder that can't exist, so nothing matches it. */
 const NO_LIST: ListKey = "smart:";
 
 /** While a message is dragged: whether a row takes it (`target`), and whether it's under the pointer. */
@@ -198,6 +204,11 @@ function Rail(props: ViewProps) {
     <nav aria-label="Sidebar" className="flex h-full w-[72px] shrink-0 flex-col bg-neutral pb-3 text-neutral-content">
       <div data-tauri-drag-region className="h-8 w-full shrink-0" />
       <div className="flex min-h-0 shrink flex-col items-center gap-2 overflow-y-auto overflow-x-hidden">
+        {props.home && (
+          <RailButton title="Home Screen" active={props.home.open} onClick={actions.home}>
+            <House size={18} />
+          </RailButton>
+        )}
         <RailInbox {...props} />
         <RailButton title="Calendar" active={props.calendarOpen} onClick={actions.calendar}>
           <CalendarIcon active={props.calendarOpen} />
@@ -474,7 +485,16 @@ function Expanded(props: ViewProps) {
       </div>
 
       <div ref={scroller} className="flex-1 overflow-y-auto px-2 pb-2 pt-1">
-        {/* The Inbox stays first; other lists can be dragged around it. */}
+        {props.home && (
+          <SidebarRow
+            icon={<House size={18} />}
+            label="Home Screen"
+            count={0}
+            active={props.home.open}
+            onClick={actions.home}
+          />
+        )}
+        {/* The Inbox stays first among the lists; others can be dragged around it. */}
         <SidebarRow
           icon={<Inbox size={18} />}
           label="Inbox"

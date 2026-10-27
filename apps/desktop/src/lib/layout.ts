@@ -32,7 +32,12 @@ export type CardKey =
   | "seen";
 /** A composite row: Focused's notifications, newsletters and invitations, or a sender or domain the user grouped. */
 export type GroupKey = "notifications" | "newsletters" | "invitations" | `sender:${string}` | `domain:${string}`;
-export type SubList = { kind: "card"; key: CardKey } | { kind: "group"; key: GroupKey } | { kind: "gatekeeper" };
+export type SubList =
+  | { kind: "card"; key: CardKey }
+  | { kind: "group"; key: GroupKey }
+  | { kind: "gatekeeper" }
+  /** The Home Screen's "New emails only": Inbox mail that came after `since`. */
+  | { kind: "new"; since: number };
 
 export interface ListView {
   folder: ListKey;
@@ -43,7 +48,7 @@ export interface ListView {
    */
   account: AccountFilter;
   mode: InboxMode;
-  /** A card's "Show all" or a Focused group row opened as its own list. */
+  /** A card's "Show all", a Focused group row, or the Home Screen's new emails, as its own list. */
   sub: SubList | null;
   /** null while the search field is closed. */
   search: string | null;
@@ -535,6 +540,10 @@ export function buildList(
     view.mode === "cards" ? mail.filter(grouped) : focused ? mail.filter((m) => !priority.has(m)) : mail;
 
   const sub = view.sub;
+  if (sub?.kind === "new") {
+    const items = mail.filter((m) => inboxTime(m) > sub.since);
+    return rows.model("New Emails", withPeriods(items, inboxTime), items.filter((m) => m.state !== "done"));
+  }
   if (sub) {
     const items = sub.kind === "card" ? cards[sub.key] : groupMail.filter((m) => groupKey(m) === sub.key);
     const label = sub.kind === "card" ? CARDS[sub.key].label : groupInfo(sub.key, items).label;

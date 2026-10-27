@@ -51,7 +51,7 @@ Last full check: 2026-10-26.
 | Mute Threads | ✅ | New mail in a muted conversation doesn't notify |
 | Templates | ❌ | |
 | Productivity Integrations | ❌ | |
-| Home Screen | ❌ | |
+| Home Screen | ✅ | Opens at launch and after 15 minutes in the background (adjustable), with what came in while you were away, a Priority, People or All preview, and Email Focus times with reminders. Wallpapers are gradients, not photos |
 | CRM Integrations | ❌ | |
 | Link Sharing | ➖ | Needs a server to host the shared email |
 | Spark CLI (Agent access) | ✅ | `spark-cli` is an MCP server for Claude Code, Codex and other agents, allowed to Read, Triage or Send per account |

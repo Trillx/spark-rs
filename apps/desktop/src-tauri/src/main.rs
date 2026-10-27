@@ -144,6 +144,7 @@ fn main() {
             prefs::get_prefs,
             prefs::save_prefs,
             notify::test_notification,
+            notify::focus_reminder,
             background::set_badge,
             agents::get_agents,
             agents::set_agent_access,

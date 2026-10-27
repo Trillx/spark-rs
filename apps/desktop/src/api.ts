@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Window, getCurrentWindow } from "@tauri-apps/api/window";
 import demo from "../demo/mailbox.json";
 import demoFolders from "../demo/folders.json";
 import { version as appVersion } from "../package.json";
@@ -829,6 +829,23 @@ export function testNotification(): Promise<void> {
   return Promise.reject("Run the desktop app to see notifications.");
 }
 
+/** Whether the meeting pop-up has focus: it's spark-rs too, so the user hasn't left it. */
+export async function otherWindowFocused(): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    const popup = await Window.getByLabel("meeting-popup");
+    return popup ? await popup.isFocused() : false;
+  } catch {
+    return false;
+  }
+}
+
+/** "It's time for Email Focus!", unless the window is in front (Settings → Home Screen → Remind me). */
+export function focusReminder(newEmails: number): Promise<void> {
+  if (isTauri()) return invoke("focus_reminder", { newEmails });
+  return Promise.resolve();
+}
+
 // ---- agents ----
 
 export function getAgents(): Promise<AgentsView> {
@@ -864,10 +881,13 @@ export const onUpdateProgress = (handler: (progress: UpdateProgress) => void) =>
 
 // ---- events ----
 // Each returns its unsubscribe. In the browser nothing is ever emitted.
+// `ready` runs once the listener is in place, for state that may have
+// changed before then.
 
-function on<T>(event: string, handler: (payload: T) => void): () => void {
+function on<T>(event: string, handler: (payload: T) => void, ready?: () => void): () => void {
   if (!isTauri()) return () => {};
   const stop = listen<T>(event, (e) => handler(e.payload));
+  if (ready) void stop.then(ready);
   return () => void stop.then((unlisten) => unlisten());
 }
 
@@ -896,6 +916,10 @@ export const onOpenMessage = (handler: (id: number) => void) => on("open-message
 /** A calendar alert, or the meeting pop-up's calendar button: show the calendar on the day of `at` (Unix ms), with `event` open. */
 export const onOpenCalendar = (handler: (focus: { at: number; event?: number }) => void) =>
   on("open-calendar", handler);
+
+/** A spark-rs window, this one or the meeting pop-up, gained or lost focus. */
+export const onWindowFocus = (handler: (focused: boolean) => void, ready?: () => void) =>
+  on("window-focus", handler, ready);
 
 /** The meeting pop-up's settings button: open this Settings page. */
 export const onOpenSettings = (handler: (page: "notifications") => void) => on("open-settings", handler);
