@@ -1450,7 +1450,10 @@ export default function App() {
   function leave(after: Message[], changed?: number[]): () => void {
     const before = listedIds(model);
     const remaining = listedIds(buildList(after, view, sticky, ctx));
-    const leaving = (changed ?? [...before]).filter((id) => before.has(id) && !remaining.has(id));
+    const leaving =
+      THREAD_WINDOW !== null
+        ? movedOn(after, changed)
+        : (changed ?? [...before]).filter((id) => before.has(id) && !remaining.has(id));
     const cursor = { selectedId, openId };
     moveOffMessages(leaving);
     return () => {
@@ -1459,6 +1462,22 @@ export default function App() {
         setOpenId(cursor.openId);
       }
     };
+  }
+
+  /**
+   * In a conversation's own window, which has no list to leave: what a change takes away from
+   * where it was (Done, Trash, Snooze, Set Aside, a folder), so the window moves on, wherever the
+   * conversation was. Moving it to the Inbox doesn't.
+   */
+  function movedOn(after: Message[], changed?: number[]) {
+    const ids = changed ? new Set(changed) : null;
+    return after
+      .filter((a) => {
+        const b = byId.get(a.id);
+        if (!b || (ids && !ids.has(a.id))) return false;
+        return (a.state !== b.state && a.state !== "inbox") || a.folder !== b.folder;
+      })
+      .map((a) => a.id);
   }
 
   /**

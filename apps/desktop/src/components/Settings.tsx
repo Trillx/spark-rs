@@ -71,6 +71,7 @@ import {
   failureOf,
   getAgents,
   getPrefs,
+  onSettingsChanged,
   mailApp,
   makeDefaultMailApp,
   openExternal,
@@ -1406,7 +1407,10 @@ function usePrefs() {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
 
   useEffect(() => {
-    void getPrefs().then(setPrefs, (error) => setStatus({ kind: "error", text: String(error) }));
+    const load = () => void getPrefs().then(setPrefs, (error) => setStatus({ kind: "error", text: String(error) }));
+    load();
+    // Saved meanwhile in another window: this page's next change starts from that, not its old copy.
+    return onSettingsChanged(load);
   }, []);
 
   async function change(patch: Partial<Prefs>) {
