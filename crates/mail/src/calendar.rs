@@ -563,16 +563,26 @@ pub fn series_from(
     }
     let html = master["body"]["content"].as_str().unwrap_or_default();
     let note = json!({ "contentType": "text", "content": draft.notes.trim() });
-    let description = if master["isOnlineMeeting"] == true || html.trim().is_empty() {
-        note
-    } else if draft.notes.trim() != before.notes.trim() {
-        with_notes(html, draft.notes.trim()).map_or(
-            note,
-            |html| json!({ "contentType": "html", "content": html }),
-        )
-    } else {
-        json!({ "contentType": "html", "content": html })
-    };
+    let changed_note = draft.notes.trim() != before.notes.trim();
+    let description =
+        if html.trim().is_empty() || (master["isOnlineMeeting"] == true && changed_note) {
+            note
+        } else if master["isOnlineMeeting"] == true {
+            // The series' notes as Outlook has them now (they may have changed
+            // since the editor opened), without its meeting: the new one gets
+            // its own.
+            before_meeting(html).map_or(
+                note,
+                |html| json!({ "contentType": "html", "content": html }),
+            )
+        } else if changed_note {
+            with_notes(html, draft.notes.trim()).map_or(
+                note,
+                |html| json!({ "contentType": "html", "content": html }),
+            )
+        } else {
+            json!({ "contentType": "html", "content": html })
+        };
     body.insert("body".into(), description);
     body.insert("start".into(), zone.time(draft.start, draft.all_day));
     body.insert("end".into(), zone.time(draft.end, draft.all_day));
@@ -594,6 +604,38 @@ pub const MASTER_SELECT: &str = "subject,body,start,end,isAllDay,location,attend
 /// element around it (Outlook's `WordSection1`, or the body). `None` if
 /// there's no meeting in it.
 fn with_notes(html: &str, notes: &str) -> Option<String> {
+    let (from, cut) = meeting_in(html)?;
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let lines: String = notes
+        .lines()
+        .map(|l| match l.trim_end() {
+            "" => "<div><br></div>".to_owned(),
+            l => format!("<div>{}</div>", escape(l)),
+        })
+        .collect();
+    let gap = if lines.is_empty() {
+        ""
+    } else {
+        "<div><br></div>"
+    };
+    Some(format!("{}{lines}{gap}{}", &html[..from], &html[cut..]))
+}
+
+/// `html`, an event's description, without the Teams meeting Outlook put in
+/// it (`with_notes`): its notes, for a new meeting to get joining details
+/// of its own. `None` if there's no meeting in it.
+fn before_meeting(html: &str) -> Option<String> {
+    let (_, cut) = meeting_in(html)?;
+    Some(html[..cut].to_owned())
+}
+
+/// Where the notes in `html` (an event's description) start, and where the
+/// Teams meeting after them does (`with_notes`).
+fn meeting_in(html: &str) -> Option<(usize, usize)> {
     const VOID: &[&str] = &[
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
         "source", "track", "wbr",
@@ -641,24 +683,7 @@ fn with_notes(html: &str, notes: &str) -> Option<String> {
         Some(i) => (open[i].0, if i == 0 { body } else { open[i - 1].1 }),
         None => (marker, open.last().map_or(body, |&(_, content)| content)),
     };
-    let escape = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-    let lines: String = notes
-        .lines()
-        .map(|l| match l.trim_end() {
-            "" => "<div><br></div>".to_owned(),
-            l => format!("<div>{}</div>", escape(l)),
-        })
-        .collect();
-    let gap = if lines.is_empty() {
-        ""
-    } else {
-        "<div><br></div>"
-    };
-    Some(format!("{}{lines}{gap}{}", &html[..from], &html[cut..]))
+    Some((from, cut))
 }
 
 /// Whether HTML has something to read in it, not only tags and spaces.
@@ -1871,6 +1896,52 @@ mod tests {
         );
         assert_eq!(body["recurrence"]["pattern"]["dayOfMonth"], 1);
         assert_eq!(body["recurrence"]["range"]["startDate"], "2027-02-01");
+    }
+
+    #[test]
+    fn all_future_takes_a_teams_series_notes_as_outlook_has_them_now() {
+        let start = parse_iso_date("2026-11-03T16:30:00Z").unwrap();
+        let meeting = format!(
+            "<div style=\"width:100%\"><span>{}</span><div>Microsoft Teams meeting</div></div>",
+            "_".repeat(80)
+        );
+        // The agenda changed in Outlook after the editor opened.
+        let master = json!({
+            "subject": "Sync",
+            "isOnlineMeeting": true,
+            "body": { "content": format!("<html><body><div>Newer agenda</div>{meeting}</body></html>") }
+        });
+        let before = EventDraft {
+            title: "Sync".into(),
+            start,
+            end: start + 1_800_000,
+            notes: "Agenda".into(),
+            teams: true,
+            ..Default::default()
+        };
+        let later = EventDraft {
+            start: start + 3_600_000,
+            end: start + 5_400_000,
+            ..before.clone()
+        };
+        let body = series_from(&master, &later, &before, PACIFIC, json!(null));
+        assert_eq!(body["body"]["contentType"], "html");
+        let html = body["body"]["content"].as_str().unwrap();
+        assert!(html.contains("Newer agenda"), "{html}");
+        assert!(
+            !html.contains("Teams meeting"),
+            "the new meeting gets its own: {html}"
+        );
+        // A note the user changed is theirs.
+        let renoted = EventDraft {
+            notes: "Mine".into(),
+            ..later
+        };
+        let body = series_from(&master, &renoted, &before, PACIFIC, json!(null));
+        assert_eq!(
+            body["body"],
+            json!({ "contentType": "text", "content": "Mine" })
+        );
     }
 
     #[test]

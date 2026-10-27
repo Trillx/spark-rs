@@ -163,7 +163,12 @@ impl Repeat {
             .map(|m| m as u8);
         // "On the last weekday" is one rule with several days; the editor's
         // "on the …" takes one, so it leaves such a rule as it is.
-        if pattern["index"].is_string() && weekdays.len() != 1 {
+        // (Graph puts an index on other rules too, where it means nothing.)
+        let relative = matches!(
+            pattern["type"].as_str(),
+            Some("relativeMonthly" | "relativeYearly")
+        );
+        if relative && weekdays.len() != 1 {
             return None;
         }
         let (every, nth, day, month) = match pattern["type"].as_str()? {
@@ -510,6 +515,21 @@ mod tests {
             Repeat::from_graph(&last_weekday),
             None,
             "left as Outlook has it"
+        );
+        // An index on a weekly rule means nothing; it's still one to edit.
+        let mondays_and_wednesdays = json!({
+            "pattern": { "type": "weekly", "interval": 1, "index": "first", "firstDayOfWeek": "sunday",
+                         "daysOfWeek": ["monday", "wednesday"] },
+            "range": { "type": "noEnd", "startDate": "2026-10-26" }
+        });
+        assert_eq!(
+            Repeat::from_graph(&mondays_and_wednesdays).map(|r| r.weekdays),
+            Some(vec![1, 3])
+        );
+        let daily = json!({ "pattern": { "type": "daily", "interval": 1, "index": "first" }, "range": { "type": "noEnd" } });
+        assert_eq!(
+            Repeat::from_graph(&daily).map(|r| r.every),
+            Some(Every::Day)
         );
     }
 
