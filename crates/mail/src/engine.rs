@@ -3919,6 +3919,9 @@ mod tests {
     /// by UID.
     type Held = HashMap<String, (u32, Vec<(u32, Vec<u8>)>)>;
 
+    /// The mailboxes the stand-in lists but won't select, with its NO.
+    type Refused = HashMap<String, String>;
+
     /// What the stand-in does once, as it's about to send a whole message.
     #[derive(Default)]
     struct BeforeBody {
@@ -3935,6 +3938,7 @@ mod tests {
         logins: Arc<AtomicUsize>,
         fetches: Arc<AtomicUsize>,
         before_body: Arc<BeforeBody>,
+        refused: Arc<Mutex<Refused>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -3954,17 +3958,21 @@ mod tests {
             let logins = Arc::new(AtomicUsize::new(0));
             let fetches = Arc::new(AtomicUsize::new(0));
             let before_body = Arc::new(BeforeBody::default());
+            let refused = Arc::new(Mutex::new(Refused::new()));
             let shared = (
                 held.clone(),
                 logins.clone(),
                 fetches.clone(),
                 before_body.clone(),
+                refused.clone(),
             );
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
-                    let (held, logins, fetches, before_body) = shared.clone();
+                    let (held, logins, fetches, before_body, refused) = shared.clone();
                     tokio::spawn(async move {
-                        let _ = imap_session(socket, &held, &logins, &fetches, &before_body).await;
+                        let _ =
+                            imap_session(socket, &held, &logins, &fetches, &before_body, &refused)
+                                .await;
                     });
                 }
             });
@@ -3974,8 +3982,19 @@ mod tests {
                 logins,
                 fetches,
                 before_body,
+                refused,
                 task,
             }
+        }
+
+        /// Has the server list `mailbox`, but answer selecting it with
+        /// `said` ("NO [NOPERM] …"). A mailbox it neither holds nor refuses
+        /// isn't listed, and selecting it gets a NO without a code.
+        fn refuse(&self, mailbox: &str, said: &str) {
+            self.refused
+                .lock()
+                .unwrap()
+                .insert(mailbox.into(), said.into());
         }
 
         /// Runs `then` as the next whole message is about to go out.
@@ -4054,6 +4073,7 @@ mod tests {
         logins: &AtomicUsize,
         fetches: &AtomicUsize,
         before_body: &BeforeBody,
+        refused: &Mutex<Refused>,
     ) -> std::io::Result<()> {
         let (read, mut write) = socket.into_split();
         write.write_all(b"* OK stand-in\r\n").await?;
@@ -4063,7 +4083,7 @@ mod tests {
             let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
             let upper = command.to_ascii_uppercase();
             let mut reply = Vec::new();
-            let mut status = "OK done";
+            let mut status = String::from("OK done");
             if upper.starts_with("LOGIN ") {
                 logins.fetch_add(1, SeqCst);
             } else if upper.starts_with("SELECT ") || upper.starts_with("EXAMINE ") {
@@ -4073,15 +4093,25 @@ mod tests {
                     .1
                     .trim_matches('"')
                     .to_owned();
-                match held.lock().unwrap().get(&selected) {
-                    Some((validity, mail)) => reply.extend(
+                let refusal = refused.lock().unwrap().get(&selected).cloned();
+                match (refusal, held.lock().unwrap().get(&selected)) {
+                    (Some(said), _) => status = said,
+                    (None, Some((validity, mail))) => reply.extend(
                         format!(
                             "* {} EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n",
                             mail.len()
                         )
                         .into_bytes(),
                     ),
-                    None => status = "NO no such mailbox",
+                    (None, None) => status = "NO no such mailbox".into(),
+                }
+            } else if upper.starts_with("LIST \"\" \"") {
+                // One mailbox, by its quoted name.
+                let name = command.rsplit('"').nth(1).unwrap_or_default();
+                let there = held.lock().unwrap().contains_key(name)
+                    || refused.lock().unwrap().contains_key(name);
+                if there {
+                    reply.extend(format!("* LIST () \"/\" \"{name}\"\r\n").into_bytes());
                 }
             } else if upper.starts_with("UID SEARCH ") {
                 let wanted = command.split('"').nth(1).unwrap_or_default();
@@ -4791,6 +4821,132 @@ mod tests {
         imap.hold(imap::INBOX, 7, vec![(60, moved.clone())]);
         let found = imap::fetch_raw(&mut session, &state, &at).await.unwrap();
         assert_eq!(found, Some(moved));
+    }
+
+    #[tokio::test]
+    async fn a_draft_waits_while_the_folder_of_its_forwarded_file_cant_be_opened() {
+        // A forward's original is in a shared folder the user may no
+        // longer read, and nowhere else.
+        let raw = big_message("shared@example.com", 1, 1024);
+        let imap = ImapStandIn::start(7, Vec::new()).await;
+        imap.refuse("Shared", "NO [NOPERM] Permission denied");
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        store
+            .replace_folders(
+                account.id,
+                &[RemoteFolder {
+                    remote_id: "Drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let source = store_imap(&mut store, account.id, "Shared", 42, &raw);
+        let draft = Draft {
+            account: account.id,
+            subject: "Fwd: Files".into(),
+            attachments: vec![OutgoingAttachment::Message {
+                message: source,
+                index: 1,
+                name: "part1.pdf".into(),
+                size: 1024,
+            }],
+            ..Default::default()
+        };
+        let saved = drafts::save(&mut store, &account, &draft, &[], 1).unwrap();
+        let listed = store.content(saved).unwrap().unwrap().attachments;
+        let store = Mutex::new(store);
+        let state = imap::SyncState {
+            uid_validity: Some(7),
+            ..Default::default()
+        };
+        let mut session = imap::login(&imap.server, "me@example.com", "pw")
+            .await
+            .unwrap();
+        let pushed = drafts::push_imap(&mut session, &store, &account, &state, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(pushed.uploaded, 0);
+        assert!(
+            matches!(&pushed.errors[..], [e] if e.contains("part1.pdf") && e.contains("Permission denied")),
+            "{:?}",
+            pushed.errors
+        );
+        let store = store.lock().unwrap();
+        let uploads = store.draft_uploads(account.id, i64::MAX).unwrap();
+        assert!(matches!(&uploads[..], [u] if u.draft.contains("part1.pdf")));
+        assert_eq!(store.content(saved).unwrap().unwrap().attachments, listed);
+    }
+
+    #[tokio::test]
+    async fn an_email_is_gone_with_its_folder_only_once_the_folder_is() {
+        let imap = ImapStandIn::start(7, Vec::new()).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let older = match store
+            .add_incoming(
+                &Incoming {
+                    account_id: account.id,
+                    mailbox: Some("Shared".into()),
+                    uid: Some(9),
+                    message_id: Some("<lost@example.com>".into()),
+                    from_address: "ana@example.com".into(),
+                    subject: "Files".into(),
+                    date: 1,
+                    body: Body::Missing,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        {
+            Added::New(id) | Added::Known(id) => id,
+        };
+        let at = store.location(older).unwrap().unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let state = imap::SyncState {
+            uid_validity: Some(7),
+            ..Default::default()
+        };
+        let mut session = imap::login(&imap.server, "me@example.com", "pw")
+            .await
+            .unwrap();
+
+        // Neither listed nor said why: gone, as a folder renamed away is.
+        let found = imap::fetch_raw(&mut session, &state, &at).await;
+        assert!(matches!(found, Ok(None)), "{found:?}");
+        for (said, gone) in [
+            ("NO [NONEXISTENT] No such mailbox", true),
+            ("NO [TRYCREATE] No such mailbox", true),
+            ("NO [NOPERM] Permission denied", false),
+            ("NO [CORRUPTION] Mailbox is damaged", false),
+            ("NO Mailbox is in use", false),
+        ] {
+            // Listed: a NO without a code doesn't say it's gone.
+            imap.refuse("Shared", said);
+            let found = imap::fetch_raw(&mut session, &state, &at).await;
+            if gone {
+                assert!(matches!(found, Ok(None)), "{said}: {found:?}");
+            } else {
+                let text = said.trim_start_matches("NO ");
+                assert!(
+                    matches!(&found, Err(Error::Server(e)) if e.contains(text) && e.contains("Shared")),
+                    "{said}: {found:?}"
+                );
+            }
+        }
+
+        // Opening it says why it can't be had, not that it's gone.
+        imap.refuse("Shared", "NO [NOPERM] Permission denied");
+        let fetched = engine.fetch_body(older).await;
+        assert!(
+            matches!(&fetched, Err(Error::Server(e)) if e.contains("Permission denied")),
+            "{fetched:?}"
+        );
+        assert!(engine.store().content(older).unwrap().unwrap().body_missing);
     }
 
     #[tokio::test]

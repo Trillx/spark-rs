@@ -2403,7 +2403,9 @@ pub async fn empty_folder(session: &mut Session, mailbox: &str) -> Result<u32> {
 
 /// The whole raw message, wherever the server keeps it now: at its known
 /// mailbox and UID, else found by Message-ID in the folder it was last
-/// pushed to, then the inbox. `None` if it's gone, its mailbox too.
+/// pushed to, then the inbox. `None` if it's gone, its mailbox too; an
+/// error if it may be in a mailbox that can't be opened now
+/// (`none_unreadable`).
 pub async fn fetch_raw(
     session: &mut Session,
     state: &SyncState,
@@ -2437,6 +2439,8 @@ pub async fn fetch_raw_checked(
             .is_none_or(|id| parse::message_id(raw) == Some(parse::bare_id(id)))
     };
     let mut renumbered = false;
+    // Mailboxes the server wouldn't open, and what it said.
+    let mut unopened: Vec<(String, String)> = Vec::new();
     if let (Some(mailbox), Some(uid)) = (&at.mailbox, at.uid) {
         match session.select(mailbox).await {
             Ok(selected) => {
@@ -2448,12 +2452,14 @@ pub async fn fetch_raw_checked(
                     renumbered = true;
                 }
             }
-            // Renamed or deleted: it's looked for where else it may be.
-            Err(async_imap::error::Error::No(_)) => {}
+            // Renamed or deleted, or it can't be read now: it's looked for
+            // where else it may be.
+            Err(async_imap::error::Error::No(said)) => unopened.push((mailbox.clone(), said)),
             Err(e) => return Err(e.into()),
         }
     }
     let Some(message_id) = &at.message_id else {
+        none_unreadable(session, &unopened).await?;
         return Ok(None);
     };
     let mut folders: Vec<String> = Vec::new();
@@ -2470,10 +2476,16 @@ pub async fn fetch_raw_checked(
     }
     let mut ambiguous = false;
     for mailbox in folders {
+        if unopened.iter().any(|(m, _)| *m == mailbox) {
+            continue;
+        }
         match session.select(&mailbox).await {
             Ok(_) => {}
-            // The folder doesn't exist (yet).
-            Err(async_imap::error::Error::No(_)) => continue,
+            // The folder doesn't exist (yet), or can't be read now.
+            Err(async_imap::error::Error::No(said)) => {
+                unopened.push((mailbox, said));
+                continue;
+            }
             Err(e) => return Err(e.into()),
         }
         let found = find_message_id(session, message_id).await?;
@@ -2497,7 +2509,56 @@ pub async fn fetch_raw_checked(
     if ambiguous {
         return Err(Error::Server(AMBIGUOUS.into()));
     }
+    none_unreadable(session, &unopened).await?;
     Ok(None)
+}
+
+/// Fails if a mailbox the server wouldn't open (`unopened`, with what it
+/// said) is still there: what wasn't found may be in it, so it isn't gone.
+/// RFC 5530 tells which: NONEXISTENT says it isn't there, as TRYCREATE
+/// (RFC 3501's for an APPEND or COPY to a mailbox that isn't) does when a
+/// server gives it for a SELECT; NOPERM, a damaged mailbox or one in use
+/// is still there. A NO without either is checked by listing the mailbox:
+/// it's gone unless it's listed as one that can be opened.
+async fn none_unreadable(session: &mut Session, unopened: &[(String, String)]) -> Result<()> {
+    for (mailbox, said) in unopened {
+        let code = said.to_ascii_uppercase();
+        if code.contains("[NONEXISTENT]") || code.contains("TRYCREATE") {
+            continue;
+        }
+        if selectable(session, mailbox).await? {
+            return Err(Error::Server(format!(
+                "The mail server wouldn't open {}: {}",
+                utf7::decode(mailbox),
+                no_text(said)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the server lists `mailbox` as one that can be selected.
+async fn selectable(session: &mut Session, mailbox: &str) -> Result<bool> {
+    let names: Vec<_> = session
+        .list(Some(""), Some(&quoted(mailbox)))
+        .await?
+        .try_collect()
+        .await?;
+    Ok(names.iter().any(|n| {
+        n.name() == mailbox
+            && !n
+                .attributes()
+                .iter()
+                .any(|a| matches!(attribute(a), Some(Attr::NoSelect | Attr::NonExistent)))
+    }))
+}
+
+/// The text of a NO, without how async-imap wraps a SELECT's
+/// (`outcome: Outcome { code: …, information: Some("…") }`).
+fn no_text(said: &str) -> &str {
+    said.split_once("information: Some(\"")
+        .and_then(|(_, rest)| rest.rsplit_once("\")"))
+        .map_or(said, |(text, _)| text)
 }
 
 /// Why an email found only by its Message-ID wasn't taken: the server has

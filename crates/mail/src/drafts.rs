@@ -574,8 +574,9 @@ async fn upload_imap(
                     continue;
                 };
                 // A source that's gone (or a mailbox renamed away) loses its file, not the draft.
-                // One that can't be read now (of several copies, which it is can't be told) holds
-                // the draft back: uploaded without it, the file would be gone from it for good.
+                // One that can't be read now (of several copies, which it is can't be told, or in
+                // a mailbox the server won't open) holds the draft back: uploaded without it, the
+                // file would be gone from it for good.
                 match imap::fetch_raw(session, state, &at).await {
                     Ok(Some(raw)) => files.extend(attachment::extract(&raw, index, name)),
                     Ok(None) => {}
