@@ -61,9 +61,10 @@ pub fn strip(html: &str) -> Cow<'_, str> {
         return Cow::Borrowed(html);
     }
     let doc = Document::from(html);
+    let styles = doc.select("style").text().to_ascii_lowercase();
     let mut removed = false;
     for img in doc.select("img").nodes() {
-        if is_tracker(img) {
+        if is_tracker(img, &styles) {
             picture(img).as_ref().unwrap_or(img).remove_from_parent();
             removed = true;
         }
@@ -84,9 +85,10 @@ fn picture<'a>(img: &NodeRef<'a>) -> Option<NodeRef<'a>> {
 /// A remote image that tracks opens. Any picture it may show counts: the
 /// `<img>`'s own, or a `<source>` of its `<picture>`, at the size the browser
 /// gives it there. One is a tracker if it's at an open-tracking address, at
-/// most 1×1 pixels, or hidden by the image's own style with nothing to show it
-/// again (no class or id for a stylesheet to reach it by, no real size).
-fn is_tracker(img: &NodeRef) -> bool {
+/// most 1×1 pixels with no stylesheet (`styles`, lowercase) naming it to make
+/// it bigger, or hidden by the image's own style with nothing to show it again
+/// (no class or id for a stylesheet to reach it by, no real size).
+fn is_tracker(img: &NodeRef, styles: &str) -> bool {
     let attr = |node: &NodeRef, name: &str| node.attr(name).map(|v| v.to_string());
     let length =
         |node: &NodeRef, name: &str| attr(node, name).as_deref().and_then(attribute_length);
@@ -129,6 +131,8 @@ fn is_tracker(img: &NodeRef) -> bool {
     let (css_width, css_height) = (css_length(&style, "width"), css_length(&style, "height"));
     let hidden =
         (img.has_attr("hidden") || hides(&style)) && !img.has_attr("class") && !img.has_attr("id");
+    // A responsive email's alternate picture can be 1×1 until a media query sizes it by its class.
+    let restyled = named_in(img, styles);
     let tiny = |side: Option<f64>| side.is_some_and(|px| px <= 1.0);
     let small = |side: Option<f64>| side.is_none_or(|px| px <= 1.0);
     candidates
@@ -139,9 +143,26 @@ fn is_tracker(img: &NodeRef) -> bool {
             let width = css_width.or(*width);
             let height = css_height.or(*height);
             urls.iter().any(|url| tracks_opens(url))
-                || (tiny(width) && tiny(height))
+                || (!restyled && tiny(width) && tiny(height))
                 || (hidden && small(width) && small(height))
         })
+}
+
+/// Whether a style sheet names the image by one of its classes or its id.
+fn named_in(img: &NodeRef, styles: &str) -> bool {
+    let named = |selector: String| {
+        styles.match_indices(&selector).any(|(at, _)| {
+            !styles[at + selector.len()..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+    };
+    let classes = img.attr("class").map(|c| c.to_ascii_lowercase());
+    let id = img.attr("id").map(|i| i.to_ascii_lowercase());
+    classes
+        .iter()
+        .flat_map(|c| c.split_ascii_whitespace())
+        .any(|class| named(format!(".{class}")))
+        || id.is_some_and(|id| !id.is_empty() && named(format!("#{id}")))
 }
 
 /// An http(s) or protocol-relative URL, lowercase and without its scheme.
@@ -220,8 +241,9 @@ fn css_value(style: &str, property: &str) -> Option<String> {
     important.or(normal)
 }
 
-/// A style's width or height in pixels. Other units, percentages and
-/// keywords count as large, unless the length is 0.
+/// A style's width or height in pixels: Outlook gives a 1×1 image as
+/// `.0104in` or `.75pt`. Relative units, percentages and keywords count as
+/// large, unless the length is 0.
 fn css_length(style: &str, property: &str) -> Option<f64> {
     let value = css_value(style, property)?;
     let digits = value
@@ -230,12 +252,18 @@ fn css_length(style: &str, property: &str) -> Option<f64> {
     let Ok(number) = value[..digits].parse::<f64>() else {
         return Some(f64::INFINITY);
     };
-    let unit = value[digits..].trim();
-    Some(if number == 0.0 || unit.is_empty() || unit == "px" {
-        number
-    } else {
-        f64::INFINITY
-    })
+    // How many of the unit make an inch, which is 96px.
+    let per_inch = match value[digits..].trim() {
+        "" | "px" => return Some(number),
+        "in" => 1.0,
+        "cm" => 2.54,
+        "mm" => 25.4,
+        "q" => 101.6,
+        "pt" => 72.0,
+        "pc" => 6.0,
+        _ => return Some(if number == 0.0 { 0.0 } else { f64::INFINITY }),
+    };
+    Some(number * 96.0 / per_inch)
 }
 
 /// Whether a style keeps its element from showing.
@@ -297,9 +325,36 @@ mod tests {
             r#"<img src="https://t.example.com/o.gif" width="600" height="400" style="width:0;height:0">"#,
             "<img\nsrc=\"https://t.example.com/o.gif\"\nwidth=\"1\"\nheight=\"1\"\n>",
             r#"<image src="https://t.example.com/o.gif" width="1" height="1">"#,
+            // As Outlook writes a 1×1 image.
+            r#"<img width="1" height="1" style="width:.0104in;height:.0104in" src="https://t.example.com/o.gif">"#,
+            r#"<img style="width:.75pt;height:.75pt" src="https://t.example.com/o.gif">"#,
+            r#"<img style="width:0.026cm;height:0.26mm" src="https://t.example.com/o.gif">"#,
+            // A class no style sheet uses doesn't save it.
+            r#"<style>.footer{color:#999}</style><img class="mailtrack-img" width="1" height="1" src="https://t.example.com/o.png">"#,
         ] {
             assert!(stripped(&around(tag)), "{tag}");
         }
+    }
+
+    #[test]
+    fn responsive_pictures_a_style_sheet_enlarges_stay() {
+        let sheet = "<style>@media (max-width:480px){.mobile-hero{width:300px!important;height:auto!important}#alt{width:100%!important}}</style>";
+        assert!(kept(&around(&format!(
+            r#"{sheet}<img class="block mobile-hero" src="https://x.com/m.jpg" width="1" height="1">"#
+        ))));
+        assert!(kept(&around(&format!(
+            r#"{sheet}<img id="alt" src="https://x.com/m.jpg" width="1" height="1">"#
+        ))));
+        // A longer name that starts the same isn't it, and an open-tracking address goes anyway.
+        assert!(stripped(&around(&format!(
+            r#"{sheet}<img class="mobile" src="https://x.com/o.gif" width="1" height="1">"#
+        ))));
+        assert!(stripped(&around(&format!(
+            r#"{sheet}<img class="mobile-hero" src="https://u1.ct.sendgrid.net/wf/open?upn=1" width="1" height="1">"#
+        ))));
+        assert!(kept(&around(
+            r#"<img src="https://x.com/hero.jpg" style="width:6.25in;height:4in">"#
+        )));
     }
 
     #[test]
