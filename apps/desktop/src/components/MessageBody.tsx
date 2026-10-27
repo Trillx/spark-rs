@@ -341,13 +341,29 @@ function loadsRemote(doc: Document) {
 }
 
 /**
+ * Whether CSS squeezes an element to nothing, as hybrid newsletters hide what's for phones:
+ * `max-height:0` or `max-width:0` on it, or on an ancestor that clips. Computed limits, not
+ * rendered sizes: a blocked picture with `alt=""` and no height is 0×0 until it loads.
+ */
+function squeezed(el: Element) {
+  const win = el.ownerDocument.defaultView;
+  for (let node: Element | null = el; node && win; node = node.parentElement) {
+    const style = win.getComputedStyle(node);
+    const zero = style.maxHeight === "0px" || style.maxWidth === "0px";
+    if (zero && (node === el || /hidden|clip/.test(style.overflowX + style.overflowY))) return true;
+  }
+  return false;
+}
+
+/**
  * Whether the laid-out email shows anything from the web. A hidden picture, like a newsletter's
  * banner for phones on a wide screen, doesn't count: Show images wouldn't show it. Nor does a
  * `<picture>`'s web alternative for another screen size: an image counts by the source it picked
  * (`currentSrc`, set once it has; its `src` until then).
  */
 function showsRemote(doc: Document) {
-  const visible = (el: Element) => el.checkVisibility({ visibilityProperty: true, opacityProperty: true });
+  const visible = (el: Element) =>
+    el.checkVisibility({ visibilityProperty: true, opacityProperty: true }) && !squeezed(el);
   return (
     sheetsLoadRemote(doc) ||
     [...doc.images].some((img) => isRemoteUrl(img.currentSrc || (img.getAttribute("src") ?? "")) && visible(img)) ||
