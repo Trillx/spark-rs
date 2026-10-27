@@ -1,4 +1,4 @@
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, LoaderCircle, PanelRight, Plus, Video, X } from "lucide-react";
+import { ArrowLeft, Check, ChevronDown, ChevronLeft, ChevronRight, LoaderCircle, PanelRight, Plus, Video, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   answerEvent,
@@ -18,6 +18,7 @@ import {
   addDays,
   addMonths,
   countdown,
+  eventDate,
   eventTime,
   loadHidden,
   loadKind,
@@ -34,7 +35,18 @@ import {
   type CalendarKind,
 } from "../lib/calendar";
 import { demoAnswer, demoCalendars, demoDeleteEvent, demoListEvents, demoSaveEvent } from "../lib/demoCalendar";
-import { draftOf, newDraft, newEventStart, type NewEventDefaults } from "../lib/eventDraft";
+import {
+  atMinutes,
+  dayOf,
+  draftOf,
+  fromUtcDate,
+  minutesOf,
+  newDraft,
+  newEventStart,
+  toUtcDate,
+  type DragOutcome,
+  type NewEventDefaults,
+} from "../lib/eventDraft";
 import { isInsideOverlay, isTypingTarget } from "../lib/shortcuts";
 import type {
   AccountId,
@@ -47,7 +59,7 @@ import type {
   InviteAnswer,
 } from "../types";
 import AccountMark from "./AccountMark";
-import { MonthGrid, WeekGrid } from "./CalendarGrid";
+import { MonthGrid, WeekGrid, type GridMenuTarget } from "./CalendarGrid";
 import { ChoiceDialog } from "./Dialog";
 import { Popover } from "./Dropdown";
 import EventEditor from "./EventEditor";
@@ -60,6 +72,7 @@ const FOCUS_REFRESH_MS = 60_000;
 /** Narrower than this, the side panel floats over the grid. */
 const SIDE_DOCK_MIN = 925;
 const DISMISSED_KEY = "spark.calendarUnsupportedSeen";
+const MINUTE = 60_000;
 
 const KINDS: { kind: CalendarKind; label: string; key: string }[] = [
   { kind: "day", label: "Day", key: "d" },
@@ -143,10 +156,21 @@ export default function CalendarScreen({
     defaults: NewEventDefaults;
     anchor: DOMRect;
     modal: boolean;
+    /** A copy not saved yet (Duplicate, Paste): closing asks even without changes. */
+    unsaved?: boolean;
   } | null>(null);
+  const [menu, setMenu] = useState<{ target: GridMenuTarget; x: number; y: number } | null>(null);
+  /** The event Copy remembered, for Paste Event. */
+  const [copied, setCopied] = useState<CalendarEvent | null>(null);
+  /** A word that the last thing happened ("Event copied"), for a moment. */
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef(0);
+  /** The editor or a question is up, as of the last render: a drag that ends meanwhile does nothing. */
+  const busyNow = useRef(false);
   const [question, setQuestion] = useState<Question | null>(null);
   /** What went wrong deleting an event, until the next try. */
   const [failed, setFailed] = useState<string | null>(null);
+  busyNow.current = editor !== null || question !== null;
   const [now, setNow] = useState(Date.now);
   const box = useRef<HTMLElement>(null);
   const [width, setWidth] = useState(1200);
@@ -271,7 +295,7 @@ export default function CalendarScreen({
   // event open. Others are kept from the hidden list. The editor and its questions have their own.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || editor || question) return;
+      if (e.defaultPrevented || editor || question || menu) return;
       if (isTypingTarget(e.target) || isInsideOverlay(e.target) || document.querySelector("[data-composer]")) return;
       const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       const handled = () => {
@@ -281,6 +305,11 @@ export default function CalendarScreen({
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && key === "e") {
         handled();
         void newEvent();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && key === "c" && open && !window.getSelection()?.toString()) {
+        handled();
+        copyEvent(open);
         return;
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -333,8 +362,8 @@ export default function CalendarScreen({
   const ask = (q: Omit<Question, "answer">) =>
     new Promise<string | null>((answer) => setQuestion({ ...q, answer }));
 
-  /** Spark's New Event: the next quarter hour today (going to today first), in the default calendar. */
-  const newEvent = async () => {
+  /** Where a new event goes: the default calendar of the user's own that show, else any of theirs. */
+  const newEventCalendar = async () => {
     const mine = list.calendars.filter((c) => c.own);
     const target =
       mine.find((c) => c.isDefault && !hidden.has(c.id)) ?? mine.find((c) => !hidden.has(c.id)) ?? mine[0];
@@ -344,8 +373,14 @@ export default function CalendarScreen({
         message: "To create events, add a Microsoft 365 account with its calendar in Settings → Accounts.",
         choices: [{ label: "Got it", value: "ok", primary: true }],
       });
-      return;
     }
+    return target;
+  };
+
+  /** Spark's New Event: the next quarter hour today (going to today first), in the default calendar. */
+  const newEvent = async () => {
+    const target = await newEventCalendar();
+    if (!target) return;
     const defaults = await newEventDefaults();
     const today = startOfDay(Date.now());
     if (!days.includes(today)) goToday();
@@ -356,6 +391,132 @@ export default function CalendarScreen({
       anchor: new DOMRect(),
       modal: true,
     });
+  };
+
+  /** Time dragged across or double-clicked on the grid: a new event there (`end` null: the default length). */
+  const createAt = async (start: number, end: number | null, allDay: boolean, anchor: DOMRect) => {
+    if (busyNow.current) return;
+    const target = await newEventCalendar();
+    if (!target) return;
+    const defaults = await newEventDefaults();
+    const draft = newDraft(target.id, start, allDay, defaults);
+    setPreview(null);
+    setEditor({ initial: end === null ? draft : { ...draft, end }, defaults, anchor, modal: kind === "day" });
+  };
+
+  /**
+   * An event dragged to new times on the grid: it's there at once, then saved (a repeating one asks
+   * which occurrences first); back where it was if that's cancelled or fails.
+   */
+  const moveEvent = async (e: CalendarEvent, to: DragOutcome) => {
+    if (busyNow.current) return;
+    const defaults = await newEventDefaults();
+    const end = to.end ?? to.start + defaults.minutes * MINUTE;
+    const draft: EventDraft = {
+      ...draftOf(e),
+      start: to.start,
+      end,
+      allDay: to.allDay,
+      // Going all day or back takes the alert new events of that kind get.
+      ...(to.allDay !== e.allDay ? { reminder: to.allDay ? defaults.allDayAlert : defaults.alert } : {}),
+    };
+    setFailed(null);
+    setEvents((all) => all.map((x) => (x.id === e.id ? { ...x, start: to.start, end, allDay: to.allDay } : x)));
+    try {
+      if (!(await saveDraft(e, draft))) await load();
+    } catch (error) {
+      setFailed(`Couldn't move "${e.title || "No Title"}": ${String(error)}`);
+      await load();
+    }
+  };
+
+  /** Where an event's editor goes when it's opened from the menu: beside the event, else at the pointer. */
+  const eventBox = (e: CalendarEvent, x: number, y: number) =>
+    box.current?.querySelector(`[data-event="${e.id}"]`)?.getBoundingClientRect() ?? new DOMRect(x, y, 1, 1);
+
+  /** Of the user's own calendars: `id` if it's one, else where new events go. */
+  const ownCalendar = async (id: number) => (calendars.get(id)?.own ? id : (await newEventCalendar())?.id);
+
+  /** Spark's Duplicate: a copy of the event in the editor, saved only by Create. */
+  const duplicate = async (e: CalendarEvent, anchor: DOMRect) => {
+    const calendar = await ownCalendar(e.calendar);
+    if (calendar === undefined) return;
+    const defaults = await newEventDefaults();
+    setPreview(null);
+    setEditor({ initial: { ...draftOf(e), calendar }, defaults, anchor, modal: kind === "day", unsaved: true });
+  };
+
+  /** Spark's Copy: the event remembered for Paste Event, and "Title (date, time)" on the clipboard. */
+  const copyEvent = (e: CalendarEvent) => {
+    setCopied(e);
+    void navigator.clipboard?.writeText(`${e.title || "No Title"} (${eventDate(e)}, ${eventTime(e)})`).catch(() => {});
+    window.clearTimeout(noticeTimer.current);
+    setNotice("Event copied");
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 2500);
+  };
+
+  /** Spark's Paste Event: a copy of the copied event at `target`, the same length, in the editor. */
+  const pasteAt = async (target: GridMenuTarget, anchor: DOMRect) => {
+    if (!copied) return;
+    const calendar = await ownCalendar(copied.calendar);
+    if (calendar === undefined) return;
+    const length = copied.end - copied.start;
+    const start = copied.allDay
+      ? target.allDay
+        ? target.at
+        : toUtcDate(dayOf(target.at))
+      : target.allDay
+        ? atMinutes(fromUtcDate(target.at), minutesOf(copied.start))
+        : target.at;
+    const defaults = await newEventDefaults();
+    setPreview(null);
+    setEditor({
+      initial: { ...draftOf(copied), calendar, start, end: start + length },
+      defaults,
+      anchor,
+      modal: kind === "day",
+      unsaved: true,
+    });
+  };
+
+  /** The right-click menu's items for `target`, at `x`, `y`. */
+  const menuItems = ({ event: e, ...at }: GridMenuTarget, x: number, y: number): MenuEntry[] => {
+    const here = new DOMRect(x, y, 1, 1);
+    if (!e) {
+      return [
+        { label: "New Event", run: () => void createAt(at.at, null, at.allDay, here) },
+        ...(copied ? [{ label: "Paste Event", run: () => void pasteAt({ ...at }, here) }] : []),
+      ];
+    }
+    const items: MenuEntry[] = [];
+    if (e.response !== "organizer" && !e.canceled) {
+      const answers: [InviteAnswer, string][] = [
+        ["accepted", "Accept"],
+        ["tentative", "Maybe"],
+        ["declined", "Decline"],
+      ];
+      for (const [chosen, label] of answers) {
+        items.push({
+          label,
+          checked: e.response === chosen,
+          run: () => void answer(e, chosen).catch((error: unknown) => setFailed(`Couldn't send your answer: ${String(error)}`)),
+        });
+      }
+      items.push("-");
+    }
+    if (editable(e)) items.push({ label: "Edit", run: () => void editEvent(e, eventBox(e, x, y)) });
+    if (list.calendars.some((c) => c.own)) items.push({ label: "Duplicate", run: () => void duplicate(e, eventBox(e, x, y)) });
+    items.push({ label: "Copy", run: () => copyEvent(e) });
+    if (editable(e)) items.push({ label: "Delete", danger: true, run: () => void removeEvent(e) });
+    items.push("-", {
+      label: "Show only this calendar",
+      run: () => {
+        const next = new Set(list.calendars.filter((c) => c.id !== e.calendar).map((c) => c.id));
+        setHidden(next);
+        saveHidden(next);
+      },
+    });
+    return items;
   };
 
   const editEvent = async (e: CalendarEvent, anchor: DOMRect) => {
@@ -547,6 +708,10 @@ export default function CalendarScreen({
               selected={open?.id}
               onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
               onPickDay={pickDay}
+              canEdit={editable}
+              onCreate={(start, end, allDay, anchor) => void createAt(start, end, allDay, anchor)}
+              onChange={(e, to) => void moveEvent(e, to)}
+              onMenu={(target, x, y) => setMenu({ target, x, y })}
             />
           ) : (
             <WeekGrid
@@ -558,6 +723,10 @@ export default function CalendarScreen({
               selected={open?.id}
               onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
               onPickDay={pickDay}
+              canEdit={editable}
+              onCreate={(start, end, allDay, anchor) => void createAt(start, end, allDay, anchor)}
+              onChange={(e, to) => void moveEvent(e, to)}
+              onMenu={(target, x, y) => setMenu({ target, x, y })}
             />
           )}
         </div>
@@ -600,9 +769,27 @@ export default function CalendarScreen({
           anchor={editor.anchor}
           modal={editor.modal}
           defaults={editor.defaults}
+          unsaved={editor.unsaved}
           onSave={(draft) => saveDraft(editor.event, draft)}
           onClose={() => setEditor(null)}
         />
+      )}
+      {menu && (
+        <GridMenu
+          x={menu.x}
+          y={menu.y}
+          label={menu.target.event ? `${menu.target.event.title || "No Title"} options` : "Calendar options"}
+          items={menuItems(menu.target, menu.x, menu.y)}
+          onClose={() => setMenu(null)}
+        />
+      )}
+      {notice && (
+        <div
+          role="status"
+          className="pointer-events-none fixed bottom-6 left-1/2 z-[2040] -translate-x-1/2 rounded-full bg-neutral px-4 py-2 text-[13px] text-neutral-content shadow-popup"
+        >
+          {notice}
+        </div>
       )}
       {question && (
         <ChoiceDialog
@@ -616,6 +803,85 @@ export default function CalendarScreen({
         />
       )}
     </section>
+  );
+}
+
+/** A right-click menu's item, or "-" between groups. */
+type MenuEntry = { label: string; run: () => void; danger?: boolean; checked?: boolean } | "-";
+
+/** A menu at the pointer, kept in the window; Esc or a click elsewhere closes it. */
+function GridMenu({
+  x,
+  y,
+  label,
+  items,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  label: string;
+  items: MenuEntry[];
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLUListElement>(null);
+  const [place, setPlace] = useState({ left: x, top: y });
+  const close = useRef(onClose);
+  close.current = onClose;
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setPlace({
+      left: Math.max(8, Math.min(x, window.innerWidth - el.offsetWidth - 8)),
+      top: Math.max(8, Math.min(y, window.innerHeight - el.offsetHeight - 8)),
+    });
+  }, [x, y]);
+  useEffect(() => {
+    const onPointer = (e: PointerEvent) => {
+      if (!ref.current?.contains(e.target as Node)) close.current();
+    };
+    // Capture, so Esc closes the menu and not the calendar.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      close.current();
+    };
+    window.addEventListener("pointerdown", onPointer, true);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", onPointer, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, []);
+  const checks = items.some((i) => i !== "-" && i.checked !== undefined);
+  return (
+    <ul
+      ref={ref}
+      role="menu"
+      aria-label={label}
+      className="menu menu-sm fixed z-[2030] w-56 gap-0.5 rounded-box border border-hairline bg-popover p-1 text-[13px] text-base-content shadow-popup"
+      style={place}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {items.map((item, i) =>
+        item === "-" ? (
+          <li key={i} role="separator" className="my-1 h-px bg-hairline" />
+        ) : (
+          <li key={item.label} role="none">
+            <button
+              role="menuitem"
+              className={`rounded-md ${item.danger ? "text-error" : ""}`}
+              onClick={() => {
+                onClose();
+                item.run();
+              }}
+            >
+              {checks && <Check size={14} className={item.checked ? "" : "invisible"} />}
+              <span className="flex-1 text-left">{item.label}</span>
+            </button>
+          </li>
+        ),
+      )}
+    </ul>
   );
 }
 

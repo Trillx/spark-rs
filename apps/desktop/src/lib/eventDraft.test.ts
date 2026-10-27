@@ -138,3 +138,91 @@ test("alerts are worded as the editor lists them", () => {
   assert.deepEqual(timed, [null, 0, 5, 10, 15, 25, 30, 60, 120, 1440, 2880], "Outlook's own value is kept, in order");
   assert.equal(alertChoices(true).length, 4);
 });
+
+test("drags on the grid end where Spark's do", async () => {
+  const { gestureOutcome, shiftDays } = await import("./eventDraft.ts");
+  const days = [0, 1, 2].map((i) => {
+    const d = new Date(today);
+    d.setDate(d.getDate() + i);
+    return d.getTime();
+  });
+  const at = (col: number, minutes: number, allDay = false) => ({ col, minutes, allDay });
+  const event = (start: number, end: number, extra: Partial<CalendarEvent> = {}): CalendarEvent => ({
+    id: 1,
+    calendar: 1,
+    account: 1,
+    title: "x",
+    start,
+    end,
+    allDay: false,
+    attendees: [],
+    response: "organizer",
+    canceled: false,
+    repeats: false,
+    showAs: "busy",
+    private: false,
+    onlineMeeting: false,
+    ...extra,
+  });
+
+  // A new event: from the quarter pressed to the one released, both included, upwards too.
+  assert.deepEqual(gestureOutcome({ kind: "create", from: at(1, 9 * 60 + 7) }, at(2, 10 * 60 + 20), days), {
+    start: atMinutes(days[1], 9 * 60),
+    end: atMinutes(days[1], 10 * 60 + 30),
+    allDay: false,
+  });
+  assert.deepEqual(gestureOutcome({ kind: "create", from: at(0, 11 * 60) }, at(0, 9 * 60 + 50), days), {
+    start: atMinutes(days[0], 9 * 60 + 45),
+    end: atMinutes(days[0], 11 * 60 + 15),
+    allDay: false,
+  });
+
+  // Moved: the length kept, to the quarter hour; onto the all-day row, all day.
+  const standup = event(atMinutes(days[0], 9 * 60 + 30), atMinutes(days[0], 9 * 60 + 45));
+  const moved = gestureOutcome({ kind: "move", event: standup, grab: 5 }, at(2, 14 * 60 + 12), days)!;
+  assert.equal(moved.start, atMinutes(days[2], 14 * 60));
+  assert.equal(moved.end! - moved.start, 15 * MINUTE);
+  assert.equal(gestureOutcome({ kind: "move", event: standup, grab: 0 }, at(0, 9 * 60 + 31), days), null, "no change");
+  assert.deepEqual(gestureOutcome({ kind: "move", event: standup, grab: 0 }, at(1, 0, true), days), {
+    start: toUtcDate(days[1]),
+    end: toUtcDate(days[1]) + DAY,
+    allDay: true,
+  });
+  assert.equal(
+    gestureOutcome({ kind: "move", event: { ...standup, repeats: true }, grab: 0 }, at(1, 0, true), days),
+    null,
+    "a repeating event keeps its all day",
+  );
+
+  // Edges: no closer than 15 minutes to the other.
+  const review = event(atMinutes(days[0], 10 * 60), atMinutes(days[0], 11 * 60));
+  const end = gestureOutcome({ kind: "resize", event: review, edge: "end" }, at(0, 8 * 60), days)!;
+  assert.equal(end.end, review.start + 15 * MINUTE);
+  const start = gestureOutcome({ kind: "resize", event: review, edge: "start" }, at(0, 8 * 60 + 52), days)!;
+  assert.equal(start.start, atMinutes(days[0], 8 * 60 + 45));
+  assert.equal(start.end, review.end);
+  assert.equal(gestureOutcome({ kind: "resize", event: standup, edge: "end" }, at(0, 8 * 60), days), null, "already 15 minutes");
+
+  // The all-day row: moved by days; onto the hours, timed with the default length.
+  const offsite = event(toUtcDate(days[0]), toUtcDate(days[0]) + 2 * DAY, { allDay: true });
+  assert.deepEqual(gestureOutcome({ kind: "row", event: offsite, from: at(0, 0, true) }, at(1, 0, true), days), {
+    start: offsite.start + DAY,
+    end: offsite.end + DAY,
+    allDay: true,
+  });
+  assert.deepEqual(gestureOutcome({ kind: "row", event: offsite, from: at(0, 0, true) }, at(2, 13 * 60 + 40), days), {
+    start: atMinutes(days[2], 13 * 60 + 30),
+    end: null,
+    allDay: false,
+  });
+
+  // Days later, the same clock times.
+  const shifted = shiftDays(standup, 2);
+  assert.equal(minutesOfTest(shifted.start), 9 * 60 + 30);
+  assert.equal(shifted.end - shifted.start, 15 * MINUTE);
+});
+
+function minutesOfTest(t: number) {
+  const d = new Date(t);
+  return d.getHours() * 60 + d.getMinutes();
+}

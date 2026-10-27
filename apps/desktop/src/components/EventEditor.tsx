@@ -60,6 +60,7 @@ export default function EventEditor({
   anchor,
   modal,
   defaults,
+  unsaved = false,
   onSave,
   onClose,
 }: {
@@ -72,6 +73,8 @@ export default function EventEditor({
   anchor: DOMRect;
   modal: boolean;
   defaults: NewEventDefaults;
+  /** A copy not saved yet (Duplicate, Paste Event): closing asks even without changes, as Spark does. */
+  unsaved?: boolean;
   /** Saves it: true once it's saved, false if the user went back to editing; rejects with what went wrong. */
   onSave: (draft: EventDraft) => Promise<boolean>;
   onClose: () => void;
@@ -87,8 +90,8 @@ export default function EventEditor({
   const place = usePopupPlace(ref, anchor, modal, WIDTH, event?.id ?? "new");
 
   const changed = draftChanged(draft, initial);
-  const latest = useRef({ changed, busy });
-  latest.current = { changed, busy };
+  const latest = useRef({ changed: changed || unsaved, busy });
+  latest.current = { changed: changed || unsaved, busy };
   const own = calendars.filter((c) => c.own);
   const calendar = calendars.find((c) => c.id === draft.calendar);
 

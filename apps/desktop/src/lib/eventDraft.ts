@@ -232,3 +232,99 @@ export function alertChoices(allDay: boolean, current?: number | null) {
   }
   return values.map((value) => ({ value, label: alertLabel(value, allDay) }));
 }
+
+// ---- dragging on the grid ----
+
+/** Where the pointer is over Day or Week: its column, the minutes into that day, and whether it's over the all-day row. */
+export interface GridPoint {
+  col: number;
+  minutes: number;
+  allDay: boolean;
+}
+
+/** What's being dragged on Day or Week. */
+export type GridGesture =
+  /** Across empty time: a new event, in the column it started in. */
+  | { kind: "create"; from: GridPoint }
+  /** A timed event, `grab` minutes after its start where it was picked up. */
+  | { kind: "move"; event: CalendarEvent; grab: number }
+  /** A timed event's top or bottom edge. */
+  | { kind: "resize"; event: CalendarEvent; edge: "start" | "end" }
+  /** An event in the all-day row, picked up in `from`'s column. */
+  | { kind: "row"; event: CalendarEvent; from: GridPoint };
+
+/** The times a drag ends with; `end` null for the default length. */
+export interface DragOutcome {
+  start: number;
+  end: number | null;
+  allDay: boolean;
+}
+
+const QUARTER = 15;
+const floorQuarter = (m: number) => Math.floor(m / QUARTER) * QUARTER;
+const roundQuarter = (m: number) => Math.round(m / QUARTER) * QUARTER;
+const clampDay = (m: number) => Math.max(0, Math.min(24 * 60 - QUARTER, m));
+
+/** An event moved by `days` days: the same times on the clock (all day: the same span of dates). */
+export function shiftDays(e: { start: number; end: number; allDay: boolean }, days: number) {
+  if (e.allDay) return { start: e.start + days * DAY, end: e.end + days * DAY };
+  const move = (t: number) => {
+    const d = new Date(t);
+    d.setDate(d.getDate() + days);
+    return d.getTime();
+  };
+  return { start: move(e.start), end: move(e.end) };
+}
+
+/**
+ * Where a drag over Day or Week (`days`: each column's local midnight) ends up with the pointer at
+ * `p`, snapped to quarter hours as Spark snaps them: null if it changes nothing. A new event covers
+ * the quarter hours from the one pressed to the one under the pointer, both included. A moved
+ * event keeps its length, and in the all-day row becomes all day (a repeating one stays as it is,
+ * as Spark keeps a repeating event's all day). An edge goes no closer than 15 minutes to the other.
+ * An all-day event dropped on the hours gets them, with the default length.
+ */
+export function gestureOutcome(g: GridGesture, p: GridPoint, days: number[]): DragOutcome | null {
+  const day = (col: number) => days[Math.max(0, Math.min(days.length - 1, col))];
+  switch (g.kind) {
+    case "create": {
+      const a = floorQuarter(g.from.minutes);
+      const b = floorQuarter(p.minutes);
+      const col = g.from.col;
+      return {
+        start: atMinutes(day(col), Math.min(a, b)),
+        end: atMinutes(day(col), Math.max(a, b) + QUARTER),
+        allDay: false,
+      };
+    }
+    case "move": {
+      const e = g.event;
+      if (p.allDay) {
+        if (e.repeats) return null;
+        const start = toUtcDate(day(p.col));
+        return { start, end: start + DAY, allDay: true };
+      }
+      const start = atMinutes(day(p.col), clampDay(roundQuarter(p.minutes - g.grab)));
+      return start === e.start ? null : { start, end: start + (e.end - e.start), allDay: false };
+    }
+    case "resize": {
+      const e = g.event;
+      if (p.allDay) return null;
+      const at = atMinutes(day(p.col), roundQuarter(p.minutes));
+      const outcome =
+        g.edge === "end"
+          ? { start: e.start, end: Math.max(at, e.start + QUARTER * MINUTE), allDay: false }
+          : { start: Math.min(at, e.end - QUARTER * MINUTE), end: e.end, allDay: false };
+      return outcome.start === e.start && outcome.end === e.end ? null : outcome;
+    }
+    case "row": {
+      const e = g.event;
+      if (p.allDay) {
+        const shift = p.col - g.from.col;
+        return shift === 0 ? null : { ...shiftDays(e, shift), allDay: e.allDay };
+      }
+      if (!e.allDay || e.repeats) return null;
+      return { start: atMinutes(day(p.col), clampDay(floorQuarter(p.minutes))), end: null, allDay: false };
+    }
+  }
+}

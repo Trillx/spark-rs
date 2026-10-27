@@ -328,8 +328,15 @@ place and a note. An event of your own shows Edit and Delete in its details;
 for a repeating event they ask whether to change only that occurrence or all
 of them. Saving writes to your Microsoft 365 calendar at once, and Outlook
 mails the invitations and updates. Settings → Calendar has the length and
-alerts new events start with. Repeat rules, dragging events on the grid and
-Gmail calendars aren't there yet.
+alerts new events start with.
+
+On the grid, drag across empty time (or double-click it) for a new event
+there; drag your own events to move them, by their top or bottom edge to
+change their length, or into the all-day row and out of it. In Month view
+they move to another day. Right-click an event for Edit, Duplicate, Copy,
+Delete, your answer to an invitation and Show only this calendar, and
+empty time for New Event and Paste Event. Repeat rules and Gmail calendars
+aren't there yet.
 
 Microsoft 365 accounts added before the calendar arrived signed in without
 the calendar permission: add `Calendars.ReadWrite` to the app registration
