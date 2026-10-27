@@ -3,9 +3,63 @@
 //! it's for by a script that runs before the page (`window.__sparkThread`);
 //! it shows that conversation alone, and closes when it's done with it.
 
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
 
 use crate::background;
+
+/// Set while quitting waits for the conversations' windows to close.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+fn is_thread_window(label: &str) -> bool {
+    label.starts_with("thread-")
+}
+
+/// Whether conversations' windows are open, besides the one labelled `but`.
+fn others_open(app: &AppHandle, but: &str) -> bool {
+    app.webview_windows()
+        .keys()
+        .any(|label| is_thread_window(label) && label != but)
+}
+
+/// Quits spark-rs once the conversations' windows have closed. Each saves
+/// its draft and queues its sends as it does for its own close button; one
+/// that can't stays open (its error says why), and so does spark-rs.
+pub fn quit(app: &AppHandle) {
+    let windows: Vec<_> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| is_thread_window(label))
+        .map(|(_, window)| window)
+        .collect();
+    if windows.is_empty() {
+        app.exit(0);
+        return;
+    }
+    QUITTING.store(true, Ordering::SeqCst);
+    for window in windows {
+        let _ = window.close();
+    }
+}
+
+/// The last conversation's window closing finishes a quit that waited for it.
+pub fn on_window_event(window: &Window, event: &WindowEvent) {
+    if matches!(event, WindowEvent::Destroyed)
+        && is_thread_window(window.label())
+        && QUITTING.load(Ordering::SeqCst)
+        && !others_open(window.app_handle(), window.label())
+    {
+        window.app_handle().exit(0);
+    }
+}
+
+/// A conversation's window stayed open when asked to close (its draft
+/// didn't save): a quit waiting for it stops.
+#[tauri::command]
+pub fn kept_open() {
+    QUITTING.store(false, Ordering::SeqCst);
+}
 
 /// What a conversation's window can be asked to do as it opens: an +AI
 /// summary, in one of Spark's styles.

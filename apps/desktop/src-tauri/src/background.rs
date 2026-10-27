@@ -30,7 +30,7 @@ pub fn setup(app: &App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show(app),
             "sync" => app.state::<Mailbox>().live.sync_now(),
-            "quit" => app.exit(0),
+            "quit" => crate::thread_window::quit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -94,7 +94,8 @@ pub fn in_front(app: &AppHandle) -> bool {
 
 /// Closing the window hides it when Settings → Notifications says to keep
 /// running. The first time, a notification says where the app went.
-/// Otherwise it quits, even with the meeting pop-up open.
+/// Otherwise it quits, even with the meeting pop-up open, once the
+/// conversations' windows have saved their drafts and closed.
 ///
 /// Any spark-rs window gaining or losing focus (the meeting pop-up too)
 /// tells the main window, whose Home Screen counts time away from all of
@@ -126,6 +127,8 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
     };
     let prefs = window.state::<PrefsState>();
     if !prefs.get().keep_running {
+        api.prevent_close();
+        crate::thread_window::quit(window.app_handle());
         return;
     }
     api.prevent_close();

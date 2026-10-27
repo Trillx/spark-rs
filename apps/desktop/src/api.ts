@@ -581,13 +581,16 @@ function mutate<T>(command: string, args: Record<string, unknown>): Promise<T> {
 }
 
 /**
- * This window being closed (its own button, Alt+F4, `closeWindow`): `before` runs first, and
- * then it closes, unless `before` says false. Returns the unsubscribe.
+ * This window being closed (its own button, Alt+F4, `closeWindow`, quitting): `before` runs
+ * first, and then it closes, unless `before` says false. Returns the unsubscribe.
  */
 export function onWindowClose(before: () => Promise<boolean>): () => void {
   if (!isTauri()) return () => {};
   const stop = getCurrentWindow().onCloseRequested(async (event) => {
-    if (!(await before())) event.preventDefault();
+    if (await before()) return;
+    event.preventDefault();
+    // If it was asked to close for quitting, spark-rs stays open with it.
+    void invoke("kept_open").catch(() => {});
   });
   return () => void stop.then((unlisten) => unlisten());
 }

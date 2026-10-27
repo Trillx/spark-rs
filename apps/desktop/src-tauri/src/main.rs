@@ -78,6 +78,7 @@ fn main() {
         })
         .on_window_event(|window, event| {
             background::on_window_event(window, event);
+            thread_window::on_window_event(window, event);
             meetings::on_window_event(window, event);
         })
         .invoke_handler(tauri::generate_handler![
@@ -159,6 +160,7 @@ fn main() {
             mailbox::save_eml,
             thread_window::open_thread_window,
             thread_window::search_in_main,
+            thread_window::kept_open,
             mailbox::prefetch_attachments,
             mailto::take_mailto,
             mailto::mail_app,

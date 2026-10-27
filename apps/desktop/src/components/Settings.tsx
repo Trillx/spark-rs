@@ -2429,21 +2429,33 @@ function AiPage() {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   /** Each provider's last form this session, so switching back restores it. */
   const remembered = useRef<Partial<Record<Preset, ProviderConfig>>>({});
+  const savedNow = useRef(saved);
+  savedNow.current = saved;
 
   useEffect(() => {
-    void getAiSettings().then(
-      (view) => {
-        setSaved(view);
-        if (view) {
-          setPreset(view.preset);
-          setForm(view.config);
-        }
-      },
-      (error) => {
-        setSaved(null);
-        setStatus({ kind: "error", text: String(error) });
-      },
-    );
+    const load = (first: boolean) =>
+      void getAiSettings().then(
+        (view) => {
+          // Saved meanwhile in another window: this page shows that, so its next save starts
+          // from it rather than putting its old copy back. Another setting changing leaves
+          // its fields as they are.
+          if (!first && JSON.stringify(view) === JSON.stringify(savedNow.current)) return;
+          if (!first && view?.preset !== savedNow.current?.preset) setModels([]);
+          setSaved(view);
+          if (view) {
+            setPreset(view.preset);
+            setForm(view.config);
+            remembered.current[view.preset] = view.config;
+          }
+        },
+        (error) => {
+          if (!first) return;
+          setSaved(null);
+          setStatus({ kind: "error", text: String(error) });
+        },
+      );
+    load(true);
+    return onSettingsChanged(() => load(false));
   }, []);
 
   const hasKey = saved?.preset === preset && saved.hasKey;
