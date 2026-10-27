@@ -193,6 +193,9 @@ pub struct Engine {
     /// Senders waiting in an account's Gatekeeper that its Sent folder
     /// didn't have, by account and lowercased address, with when it was asked.
     not_written_to: Mutex<HashMap<(i64, String), i64>>,
+    /// What each Microsoft account's rounds and searches learn of Graph
+    /// for the next ones (`graph::Standing`), in memory only.
+    standings: Mutex<HashMap<i64, Arc<graph::Standing>>>,
     /// Downloaded attachments kept on this computer, if they're kept.
     files: Option<Arc<AttachmentCache>>,
     /// Where Graph is: `graph::GRAPH`, or a stand-in's address in tests.
@@ -208,6 +211,7 @@ impl Engine {
             calendars: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             not_written_to: Mutex::new(HashMap::new()),
+            standings: Mutex::new(HashMap::new()),
             files: None,
             graph_base: graph::GRAPH.to_owned(),
         }
@@ -432,6 +436,10 @@ impl Engine {
             files.forget_account(account_id);
         }
         self.tokens_lock().remove(&account_id);
+        self.standings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&account_id);
         let _ = self.secrets.set(&password_key(account_id), "");
         let _ = self.secrets.set(&token_key(account_id), "");
         Ok(())
@@ -563,11 +571,7 @@ impl Engine {
             AccountConfig::Microsoft {
                 client_id, tenant, ..
             } => {
-                let graph = Graph::new(
-                    &self
-                        .access_token(account_id, &App::new(&client_id, &tenant)?)
-                        .await?,
-                );
+                let graph = self.syncing_graph(account_id, &client_id, &tenant).await?;
                 report.pushed = graph.push(&self.store, pending).await?;
                 if draft_work {
                     let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await?;
@@ -735,7 +739,7 @@ impl Engine {
                 client_id, tenant, ..
             } => {
                 let state: graph::SyncState = from_json(&account.sync_state);
-                self.graph(account_id, &client_id, &tenant)
+                self.syncing_graph(account_id, &client_id, &tenant)
                     .await?
                     .search_server(&self.store, account_id, &state, &query)
                     .await
@@ -998,6 +1002,16 @@ impl Engine {
             .clone()
     }
 
+    /// What the account's rounds and searches learned of Graph (`standings`).
+    fn standing(&self, account_id: i64) -> Arc<graph::Standing> {
+        self.standings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(account_id)
+            .or_default()
+            .clone()
+    }
+
     /// The account's folder with this role, if it has one.
     fn role_folder(&self, account_id: i64, role: FolderRole) -> Result<Option<Folder>> {
         Ok(self
@@ -1020,6 +1034,20 @@ impl Engine {
                 .access_token(account_id, &App::new(client_id, tenant)?)
                 .await?,
         ))
+    }
+
+    /// A Graph client for the account's rounds and searches, keeping to
+    /// what the ones before learned (`standings`). While Graph asks the
+    /// account to wait, it waits for the end before signing in, or fails as
+    /// busy at once if that's more than half a minute off. What the user
+    /// does themselves, like sending or opening a file, isn't held back.
+    async fn syncing_graph(&self, account_id: i64, client_id: &str, tenant: &str) -> Result<Graph> {
+        let standing = self.standing(account_id);
+        standing.paused().await?;
+        Ok(self
+            .graph(account_id, client_id, tenant)
+            .await?
+            .keeping(standing))
     }
 
     /// Sends the account's drafts whose time has come.
@@ -2060,6 +2088,8 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use spark_store::{Added, Attachment, FolderRole, Incoming, OutboxFile, RemoteFolder};
+
+    use crate::graph::tests::{Answer, Asked};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2933,10 +2963,10 @@ mod tests {
         })
     }
 
-    /// A Microsoft account signed in to the Graph stand-in at `base`, with
-    /// message m1: four files, the last stored without its attachment id.
-    fn graph_engine(base: String, dir: &Path) -> (Engine, i64) {
-        let mut store = Store::open_in_memory().unwrap();
+    /// An engine with a Microsoft account signed in to the Graph stand-in
+    /// at `base`.
+    fn microsoft_engine(base: String) -> (Engine, i64) {
+        let store = Store::open_in_memory().unwrap();
         let account = store
             .add_account(&NewAccount {
                 kind: AccountKind::Microsoft,
@@ -2950,6 +2980,24 @@ mod tests {
                 }),
             })
             .unwrap();
+        let mut engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        engine.graph_base = base;
+        engine.cache_token(
+            account.id,
+            &oauth::Tokens {
+                access_token: "token".into(),
+                refresh_token: None,
+                expires_at: now_ms() + 3_600_000,
+            },
+        );
+        (engine, account.id)
+    }
+
+    /// A Microsoft account signed in to the Graph stand-in at `base`, with
+    /// message m1: four files, the last stored without its attachment id.
+    fn graph_engine(base: String, dir: &Path) -> (Engine, i64) {
+        let (engine, account_id) = microsoft_engine(base);
+        let engine = engine.with_attachment_cache(dir.to_owned());
         let attached = |name: &str, id: Option<&str>| Attachment {
             name: name.into(),
             mime: "application/pdf".into(),
@@ -2957,7 +3005,7 @@ mod tests {
             remote_id: id.map(str::to_owned),
         };
         let incoming = Incoming {
-            account_id: account.id,
+            account_id,
             remote_id: Some("m1".into()),
             message_id: Some("m1@contoso.com".into()),
             from_address: "ana@contoso.com".into(),
@@ -2972,17 +3020,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (Added::New(id) | Added::Known(id)) = store.add_incoming(&incoming, false).unwrap();
-        let mut engine = caching(Arc::new(Mutex::new(store)), dir);
-        engine.graph_base = base;
-        engine.cache_token(
-            account.id,
-            &oauth::Tokens {
-                access_token: "token".into(),
-                refresh_token: None,
-                expires_at: now_ms() + 3_600_000,
-            },
-        );
+        let (Added::New(id) | Added::Known(id)) =
+            engine.store().add_incoming(&incoming, false).unwrap();
         (engine, id)
     }
 
@@ -3075,5 +3114,159 @@ mod tests {
         // Nor are they kept for after a restart.
         assert_eq!(kept_files(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where a synced account's inbox delta query stands, before `/delta1`.
+    const AT_DELTA1: &str = r#"{"deltaLink":"/delta1","replyToSelected":true}"#;
+
+    /// The account's inbox delta link.
+    fn delta_link(engine: &Engine, account_id: i64) -> Option<String> {
+        let account = engine.account(account_id).unwrap();
+        from_json::<graph::SyncState>(&account.sync_state).delta_link
+    }
+
+    /// A Graph stand-in whose inbox delta (`/delta1`) has four new messages
+    /// with a file each, n1 to n4, named for them (`n1.pdf`). Listing n2's
+    /// attachments fails every time.
+    fn n2_broken(asked: &Asked, _: usize) -> Answer {
+        use serde_json::json;
+        let route = asked.path.split('?').next().unwrap();
+        if route == "/delta1" {
+            let new: Vec<_> = (1..=4)
+                .map(|n| {
+                    json!({
+                        "id": format!("n{n}"), "subject": format!("Message n{n}"),
+                        "isRead": false, "receivedDateTime": "2026-10-27T09:00:00Z",
+                        "hasAttachments": true,
+                        "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
+                        "body": { "contentType": "text", "content": "Hi" },
+                    })
+                })
+                .collect();
+            return Answer::json(json!({ "value": new, "@odata.deltaLink": "/delta2" }));
+        }
+        let listed = route
+            .strip_prefix("/me/messages/")
+            .and_then(|rest| rest.strip_suffix("/attachments"));
+        match listed {
+            Some("n2") => Answer::status(500),
+            Some(id) => Answer::json(json!({ "value": [
+                { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
+            ] })),
+            None => Answer::status(404),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_message_holds_up_the_inbox_for_three_rounds_at_most() {
+        let (base, seen) = graph::tests::serve(n2_broken).await;
+        let (engine, account_id) = microsoft_engine(base);
+        engine
+            .store()
+            .set_sync_state(account_id, AT_DELTA1)
+            .unwrap();
+        let n2_listings = |asked: Vec<Asked>| {
+            let n2 = asked
+                .iter()
+                .filter(|a| a.path.starts_with("/me/messages/n2/"));
+            n2.count()
+        };
+
+        // Two rounds fail on n2: none of the page is stored, and the delta
+        // query stays where it was.
+        for round in 1..=2 {
+            let failed = engine.run(account_id, true).await;
+            assert!(matches!(failed, Err(Error::Server(_))), "{failed:?}");
+            assert_eq!(n2_listings(seen.take()), 1, "round {round}");
+            assert!(
+                engine.store().messages().unwrap().is_empty(),
+                "round {round}"
+            );
+            assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta1"));
+        }
+
+        // The third stores n2 without its file and the others with theirs,
+        // and moves on.
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!(report.new, 4);
+        assert_eq!(n2_listings(seen.take()), 1);
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta2"));
+        let store = engine.store();
+        for m in store.messages().unwrap() {
+            let id = m.subject.strip_prefix("Message ").unwrap();
+            let files = store.content(m.id).unwrap().unwrap().attachments;
+            let names: Vec<&str> = files.iter().map(|a| a.name.as_str()).collect();
+            match id {
+                "n2" => assert!(names.is_empty()),
+                _ => assert_eq!(names, [format!("{id}.pdf")], "{id}"),
+            }
+        }
+    }
+
+    /// A Graph stand-in whose inbox delta (`/delta1`) has nothing new.
+    /// Graph throttles it the first time, asking for a minute's pause.
+    fn throttled_for_a_minute(asked: &Asked, attempt: usize) -> Answer {
+        match (asked.path.as_str(), attempt) {
+            ("/delta1", 0) => Answer::status(429).with_retry_after(60),
+            ("/delta1", _) => Answer::json(serde_json::json!({
+                "value": [], "@odata.deltaLink": "/delta2",
+            })),
+            _ => Answer::status(404),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_throttled_account_sends_nothing_until_the_pause_ends() {
+        let (base, seen) = graph::tests::serve(throttled_for_a_minute).await;
+        let (engine, account_id) = microsoft_engine(base);
+        engine
+            .store()
+            .set_sync_state(account_id, AT_DELTA1)
+            .unwrap();
+
+        // Graph asks for a minute's pause: the round fails as busy.
+        let throttled = engine.run(account_id, true).await;
+        assert!(
+            matches!(throttled, Err(Error::Network { .. })),
+            "{throttled:?}"
+        );
+        assert_eq!(seen.take().len(), 1);
+
+        // The next round, with more than half a minute of it left, fails
+        // as busy at once and sends nothing.
+        let started = std::time::Instant::now();
+        let held = engine.run(account_id, true).await;
+        assert!(matches!(held, Err(Error::Network { .. })), "{held:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(seen.take().is_empty());
+
+        // Near its end, a round waits for it, then syncs.
+        let end = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        graph::tests::pause_until(&engine.standing(account_id), Some(end));
+        engine.run(account_id, true).await.unwrap();
+        let asked = seen.take();
+        assert_eq!(asked.len(), 1, "the delta query");
+        assert!(asked[0].at >= end.into_std());
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta2"));
+    }
+
+    #[tokio::test]
+    async fn a_search_keeps_to_the_accounts_pause_too() {
+        let (base, seen) = graph::tests::serve(throttled_for_a_minute).await;
+        let (engine, account_id) = microsoft_engine(base);
+        engine
+            .store()
+            .set_sync_state(account_id, AT_DELTA1)
+            .unwrap();
+        let throttled = engine.run(account_id, true).await;
+        assert!(
+            matches!(throttled, Err(Error::Network { .. })),
+            "{throttled:?}"
+        );
+        seen.take();
+
+        let held = engine.search_server(account_id, "invoice").await;
+        assert!(matches!(held, Err(Error::Network { .. })), "{held:?}");
+        assert!(seen.take().is_empty());
     }
 }

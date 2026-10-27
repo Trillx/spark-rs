@@ -7,7 +7,7 @@
 //! moves to Archive or Deleted Items and back.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -62,6 +62,10 @@ const IN_FLIGHT: usize = 4;
 const LONGEST_PAUSE: Duration = Duration::from_secs(30);
 /// How often a throttled request is tried again.
 const THROTTLED_RETRIES: u32 = 3;
+/// How many tries in a row, one a round, a new message's attachments or
+/// invite may fail of their own (`Graph::completing`) before it's stored
+/// without them.
+const COMPLETION_TRIES: u32 = 3;
 /// Well-known folders: their role, or `None` for ones left out of the list.
 /// Folders inside the inbox are listed at the top.
 const WELL_KNOWN: [(&str, Option<FolderRole>); 8] = [
@@ -296,11 +300,81 @@ enum Delta {
     },
 }
 
+/// What an account's Graph clients learn for the ones after them: until
+/// when Graph asked to be left alone, and which new messages keep failing
+/// to be completed. Its rounds and searches share it (`Graph::keeping`),
+/// as each makes a client of its own.
+#[derive(Default)]
+pub struct Standing {
+    /// Until when Graph asked to be left alone (`paused`).
+    paused_until: Mutex<Option<tokio::time::Instant>>,
+    /// How many tries in a row each new message, by id, failed to be
+    /// completed (`Graph::completing`).
+    failures: Mutex<HashMap<String, u32>>,
+}
+
+impl Standing {
+    /// Waits out the pause Graph asked for, if any. While more than
+    /// `LONGEST_PAUSE` of it is left, fails as busy at once instead: the
+    /// work goes in a later round.
+    pub async fn paused(&self) -> Result<()> {
+        loop {
+            let until = *lock(&self.paused_until);
+            let now = tokio::time::Instant::now();
+            match until {
+                Some(until) if until > now + LONGEST_PAUSE => return Err(busy()),
+                Some(until) if until > now => tokio::time::sleep_until(until).await,
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Holds back requests for `pause` from now, unless they're held back
+    /// longer already.
+    fn pause(&self, pause: Duration) {
+        let until = tokio::time::Instant::now() + pause;
+        let mut paused = lock(&self.paused_until);
+        if paused.is_none_or(|paused| paused < until) {
+            *paused = Some(until);
+        }
+    }
+
+    /// Counts one more try in a row that new message `id` failed to be
+    /// completed, and returns how many there have been.
+    fn failed(&self, id: &str) -> u32 {
+        let mut failures = lock(&self.failures);
+        let tries = failures.entry(id.to_owned()).or_default();
+        *tries = tries.saturating_add(1);
+        *tries
+    }
+
+    /// New message `id` was completed: its failures are forgotten.
+    fn completed(&self, id: &str) {
+        lock(&self.failures).remove(id);
+    }
+}
+
 pub struct Graph {
     token: String,
     base: String,
-    /// Until when Graph asked to be left alone (`paused`).
-    paused_until: Mutex<Option<tokio::time::Instant>>,
+    standing: Arc<Standing>,
+}
+
+/// Why a request got no answer from Graph (`send_once`).
+enum Unanswered {
+    /// It was held back while Graph asks to be left alone.
+    Held,
+    /// It failed on the way.
+    Failed(reqwest::Error),
+}
+
+impl From<Unanswered> for Error {
+    fn from(unanswered: Unanswered) -> Self {
+        match unanswered {
+            Unanswered::Held => busy(),
+            Unanswered::Failed(e) => Error::network(HOST, e),
+        }
+    }
 }
 
 impl Graph {
@@ -313,8 +387,14 @@ impl Graph {
         Self {
             token: access_token.to_owned(),
             base: base.trim_end_matches('/').to_owned(),
-            paused_until: Mutex::new(None),
+            standing: Arc::default(),
         }
+    }
+
+    /// This client, keeping to what the account's earlier clients learned
+    /// (`standing`) and adding to it.
+    pub fn keeping(self, standing: Arc<Standing>) -> Self {
+        Self { standing, ..self }
     }
 
     pub(crate) fn request(&self, method: Method, url: &str) -> RequestBuilder {
@@ -358,7 +438,7 @@ impl Graph {
     async fn answered_patiently(
         &self,
         request: impl Fn() -> RequestBuilder,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<reqwest::Response, Unanswered> {
         let mut retries = 0;
         loop {
             match self.send_once(request(), retries).await? {
@@ -370,19 +450,22 @@ impl Graph {
         }
     }
 
-    /// Sends `request` once Graph's pause is over (`paused`). A throttled
-    /// answer comes with the pause it asks for (`throttled`), which every
-    /// request then keeps to, whether or not this one is tried again.
+    /// Sends `request` once Graph's pause is over (`Standing::paused`). A
+    /// throttled answer comes with the pause it asks for (`throttled`),
+    /// which every request of the account's then keeps to, whether or not
+    /// this one is tried again.
     async fn send_once(
         &self,
         request: RequestBuilder,
         retries: u32,
-    ) -> Result<(reqwest::Response, Option<Duration>)> {
-        self.paused().await?;
-        let response = request.send().await.map_err(|e| Error::network(HOST, e))?;
+    ) -> Result<(reqwest::Response, Option<Duration>), Unanswered> {
+        if self.standing.paused().await.is_err() {
+            return Err(Unanswered::Held);
+        }
+        let response = request.send().await.map_err(Unanswered::Failed)?;
         let pause = throttled(&response, retries);
         if let Some(pause) = pause {
-            self.pause(pause);
+            self.standing.pause(pause);
         }
         Ok((response, pause))
     }
@@ -392,37 +475,6 @@ impl Graph {
         request: impl Fn() -> RequestBuilder,
     ) -> Result<T> {
         json_of(self.send_patiently(request).await?).await
-    }
-
-    /// Waits out the pause Graph asked for, if any. While more than
-    /// `LONGEST_PAUSE` of it is left, fails as busy at once instead: the
-    /// request goes in a later round.
-    async fn paused(&self) -> Result<()> {
-        loop {
-            let until = *self
-                .paused_until
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let now = tokio::time::Instant::now();
-            match until {
-                Some(until) if until > now + LONGEST_PAUSE => return Err(busy()),
-                Some(until) if until > now => tokio::time::sleep_until(until).await,
-                _ => return Ok(()),
-            }
-        }
-    }
-
-    /// Holds back requests for `pause` from now, unless they're held back
-    /// longer already.
-    fn pause(&self, pause: Duration) {
-        let until = tokio::time::Instant::now() + pause;
-        let mut paused = self
-            .paused_until
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if paused.is_none_or(|paused| paused < until) {
-            *paused = Some(until);
-        }
     }
 
     pub async fn me(&self) -> Result<Me> {
@@ -1137,9 +1189,12 @@ impl Graph {
     /// the invite a meeting message carries. What Graph won't give is left
     /// out; fails if Graph may give it later (`completing`).
     async fn complete(&self, m: &GraphMessage, incoming: &mut Incoming) -> Result<()> {
+        let mut left_out = false;
         if m.has_attachments == Some(true) {
             // Listed unreadably, they're left out too.
-            let listing = self.completing(&attachment_listing(&m.id)).await?;
+            let listing = self
+                .completing(&m.id, &attachment_listing(&m.id), &mut left_out)
+                .await?;
             incoming.attachments = listing
                 .and_then(|l| serde_json::from_slice::<Attachments>(&l).ok())
                 .map_or_else(Vec::new, Attachments::files);
@@ -1148,28 +1203,60 @@ impl Graph {
             .as_deref()
             .is_some_and(|t| t.contains("eventMessage"))
         {
-            incoming.invite = self.invite(&m.id).await?.map(|i| i.to_json());
+            // Exchange keeps meeting messages as items of their own and
+            // writes the calendar part out only in their MIME.
+            let mime = format!("/me/messages/{}/$value", path(&m.id));
+            let raw = self.completing(&m.id, &mime, &mut left_out).await?;
+            incoming.invite = raw
+                .and_then(|raw| Invite::from_raw(&raw))
+                .map(|i| i.to_json());
+        }
+        if !left_out {
+            self.standing.completed(&m.id);
         }
         Ok(())
     }
 
-    /// The body of Graph's answer to `url`, for completing a new message
+    /// The body of Graph's answer to `url`, for completing new message `id`
     /// (`complete`); `None` if Graph won't give it, e.g. an attachment
     /// deleted since the message was listed. Fails if Graph may give it
     /// when asked again later (`later`), or the answer was cut off.
-    async fn completing(&self, url: &str) -> Result<Option<Vec<u8>>> {
-        let response = self
+    ///
+    /// Such a failure of the request's own, rather than Graph holding off
+    /// every request (`everyone`), counts against the message once per
+    /// `complete`, which `left_out` marks. Once the message has failed
+    /// `COMPLETION_TRIES` tries in a row, what failed is left out like a
+    /// refusal, so a broken message can't hold up its page for good.
+    async fn completing(
+        &self,
+        id: &str,
+        url: &str,
+        left_out: &mut bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let failed = match self
             .answered_patiently(|| self.request(Method::GET, url))
-            .await?;
-        let status = response.status();
-        match checked(response).await {
-            Ok(response) => match response.bytes().await {
-                Ok(body) => Ok(Some(body.into())),
-                Err(e) => Err(Error::network(HOST, e)),
-            },
-            Err(e) if later(status) => Err(e),
-            Err(_) => Ok(None),
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                match checked(response).await {
+                    Ok(response) => match response.bytes().await {
+                        Ok(body) => return Ok(Some(body.into())),
+                        Err(e) => Error::network(HOST, e),
+                    },
+                    Err(e) if everyone(status) => return Err(e),
+                    Err(e) if later(status) => e,
+                    Err(_) => return Ok(None),
+                }
+            }
+            Err(Unanswered::Held) => return Err(busy()),
+            Err(Unanswered::Failed(e)) => Error::network(HOST, e),
+        };
+        if !*left_out && self.standing.failed(id) < COMPLETION_TRIES {
+            return Err(failed);
         }
+        *left_out = true;
+        Ok(None)
     }
 
     /// A message's MIME, as Outlook would export it.
@@ -1182,15 +1269,6 @@ impl Graph {
             .await
             .map_err(|e| Error::network(HOST, e))?
             .to_vec())
-    }
-
-    /// The invite in a meeting message; `None` if Graph won't give its MIME
-    /// (`completing`) or it has none. Exchange keeps meeting messages as
-    /// items of their own and writes the calendar part out only in their MIME.
-    async fn invite(&self, id: &str) -> Result<Option<Invite>> {
-        let url = format!("/me/messages/{}/$value", path(id));
-        let raw = self.completing(&url).await?;
-        Ok(raw.and_then(|raw| Invite::from_raw(&raw)))
     }
 
     /// Sends a message given whole as MIME: one with parts Graph's JSON
@@ -2039,16 +2117,22 @@ fn busy() -> Error {
     Error::network(HOST, "Microsoft is busy; trying again shortly")
 }
 
+/// Whether Graph refused a request with `status` as it refuses every other
+/// one: it's throttling them, or the sign-in ran out. Asked again later,
+/// it may give what it refused.
+fn everyone(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::UNAUTHORIZED
+    )
+}
+
 /// Whether Graph may give what it refused with `status` when asked again
-/// later: it was busy, failing or too slow, or the sign-in ran out (which
-/// fails every request alike). Other refusals stand, such as for an
-/// attachment deleted since its message was listed.
+/// later, besides when it's refusing `everyone`: it was failing or too
+/// slow. Other refusals stand, such as for an attachment deleted since its
+/// message was listed.
 fn later(status: StatusCode) -> bool {
-    status.is_server_error()
-        || matches!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT | StatusCode::UNAUTHORIZED
-        )
+    status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT
 }
 
 async fn json_of<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> Result<T> {
@@ -2105,8 +2189,8 @@ async fn in_turns<F: Future>(work: Vec<F>, mut done: impl FnMut(usize, F::Output
     }
 }
 
-fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
-    store
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -2335,7 +2419,7 @@ pub(crate) mod tests {
     }
 
     impl Answer {
-        fn json(body: Value) -> Self {
+        pub(crate) fn json(body: Value) -> Self {
             Self {
                 status: 200,
                 retry_after: None,
@@ -2344,7 +2428,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn status(status: u16) -> Self {
+        pub(crate) fn status(status: u16) -> Self {
             Self {
                 status,
                 ..Self::json(json!({ "error": { "message": "nope" } }))
@@ -2353,6 +2437,14 @@ pub(crate) mod tests {
 
         fn after(self, delay: Duration) -> Self {
             Self { delay, ..self }
+        }
+
+        /// This answer, asking to be tried again after `seconds`.
+        pub(crate) fn with_retry_after(self, seconds: u64) -> Self {
+            Self {
+                retry_after: Some(seconds),
+                ..self
+            }
         }
     }
 
@@ -2369,7 +2461,7 @@ pub(crate) mod tests {
 
     impl Seen {
         /// The requests so far, forgotten.
-        fn take(&self) -> Vec<Asked> {
+        pub(crate) fn take(&self) -> Vec<Asked> {
             std::mem::take(&mut *self.asked.lock().unwrap())
         }
     }
@@ -2461,6 +2553,12 @@ pub(crate) mod tests {
             }
         });
         (base, seen)
+    }
+
+    /// Ends the pause Graph asked for of clients keeping to `standing` at
+    /// `until`, as though Graph had asked for that.
+    pub(crate) fn pause_until(standing: &Standing, until: Option<tokio::time::Instant>) {
+        *lock(&standing.paused_until) = until;
     }
 
     /// Every request asked for immutable ids.
@@ -3695,7 +3793,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
 
         // Then it waits for the end, and all 50 come whole.
         let end = tokio::time::Instant::now() + Duration::from_millis(300);
-        *graph.paused_until.lock().unwrap() = Some(end);
+        pause_until(&graph.standing, Some(end));
         let synced = graph.sync_folder(&store, &folder, &mut state).await;
         assert_eq!(synced.unwrap(), Some(50));
         let asked = seen.take();
@@ -3773,7 +3871,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
 
         // Once the pause is over, the next sync gets the page again and
         // stores it whole.
-        *graph.paused_until.lock().unwrap() = None;
+        pause_until(&graph.standing, None);
         let report = graph.sync_inbox(&store, account_id, &mut state).await;
         assert_eq!(report.unwrap().new.len(), 1, "n2; n1 came before");
         assert_eq!(state.delta_link.as_deref(), Some("/delta3"));
@@ -3814,6 +3912,144 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         let paths = seen.lock().unwrap().clone();
         let asked = paths.iter().filter(|p| p.contains("/attachments"));
         assert_eq!(asked.count(), 1, "{paths:?}");
+    }
+
+    /// The `attached` stand-in, where Graph can't list m0's attachments
+    /// at all: it answers 503 each time, asking to be tried again at once.
+    fn m0_unavailable(asked: &Asked, attempt: usize) -> Answer {
+        if asked.path.starts_with("/me/messages/m0/attachments") {
+            return Answer {
+                retry_after: Some(0),
+                ..Answer::status(503)
+            };
+        }
+        attached(asked, attempt)
+    }
+
+    #[tokio::test]
+    async fn a_broken_message_holds_up_its_folder_for_three_rounds_at_most() {
+        let (base, seen) = serve(m0_unavailable).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let folder = projects(&store, account_id);
+        let mut state = FolderState {
+            limit: Some(STORE_BATCH),
+            ..Default::default()
+        };
+        let unsynced = state.clone();
+        let m0_listings = |asked: Vec<Asked>| {
+            let listings = completing(&asked, "attachments");
+            listings.into_iter().filter(|n| *n == 0).count()
+        };
+
+        // Two rounds fail on m0 and store none of the chunk. Each asks for
+        // its attachments four times, as Graph asks, which counts once.
+        for round in 1..=2 {
+            let failed = graph.sync_folder(&store, &folder, &mut state).await;
+            assert!(matches!(failed, Err(Error::Network { .. })), "{failed:?}");
+            assert_eq!(m0_listings(seen.take()), 4, "round {round}");
+            assert!(lock(&store).messages().unwrap().is_empty(), "round {round}");
+            assert_eq!(state, unsynced, "round {round}");
+        }
+
+        // The third stores m0 without them, with its invite, and the rest
+        // of the chunk whole.
+        let synced = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(synced.unwrap(), Some(50));
+        assert_eq!(m0_listings(seen.take()), 4);
+        let s = lock(&store);
+        let members = s.folder_member_ids(folder.id).unwrap();
+        assert_eq!(members.len(), 50);
+        for id in members {
+            let subject = s.message(id).unwrap().unwrap().subject;
+            let n = number(subject.strip_prefix("Message ").unwrap());
+            let content = s.content(id).unwrap().unwrap();
+            assert_eq!(
+                content.attachments.is_empty(),
+                matches!(n, 0 | 40 | 41),
+                "m{n}"
+            );
+            assert_eq!(content.invite.is_some(), n.is_multiple_of(25), "m{n}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_completed_starts_counting_its_failures_again() {
+        // Listing n2's attachments fails, except the third time.
+        let (base, _) = serve(|asked, attempt| {
+            if asked.path.starts_with("/me/messages/n2/attachments") && attempt != 2 {
+                return Answer::status(500);
+            }
+            delta(&asked.path).map_or_else(|| Answer::status(404), Answer::json)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let n2 = GraphMessage {
+            id: "n2".into(),
+            has_attachments: Some(true),
+            ..Default::default()
+        };
+
+        // Each try is a round's: twice it fails, then it comes whole. Its
+        // count starts over, so it fails twice more before it's left out.
+        for (round, files) in [None, None, Some(1), None, None, Some(0)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut incoming = Incoming::default();
+            let completed = graph.complete(&n2, &mut incoming).await;
+            let completed = completed.map(|()| incoming.attachments.len());
+            assert_eq!(completed.ok(), files, "round {}", round + 1);
+        }
+    }
+
+    /// The `delta` stand-in, where Graph throttles n2's attachments for
+    /// three rounds, asking to be tried again at once (four tries a round),
+    /// then turns them away for three more as the sign-in lapsed.
+    fn delta_turned_away(asked: &Asked, attempt: usize) -> Answer {
+        if asked.path.starts_with("/me/messages/n2/attachments") {
+            match attempt {
+                0..12 => {
+                    return Answer {
+                        retry_after: Some(0),
+                        ..Answer::status(429)
+                    };
+                }
+                12..15 => return Answer::status(401),
+                _ => {}
+            }
+        }
+        delta(&asked.path).map_or_else(|| Answer::status(404), Answer::json)
+    }
+
+    #[tokio::test]
+    async fn throttling_or_a_lapsed_sign_in_never_leaves_files_out() {
+        let (base, _) = serve(delta_turned_away).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let mut state = SyncState {
+            delta_link: Some("/delta1".into()),
+            reply_to_selected: true,
+            ..Default::default()
+        };
+
+        // They hold the account up, not n2: however many rounds fail, its
+        // page waits for its attachments.
+        for round in 1..=6 {
+            let failed = graph.sync_inbox(&store, account_id, &mut state).await;
+            match round {
+                1..=3 => assert!(matches!(failed, Err(Error::Network { .. })), "{failed:?}"),
+                _ => assert!(matches!(failed, Err(Error::Auth(_))), "{failed:?}"),
+            }
+            assert_eq!(state.delta_link.as_deref(), Some("/delta1"));
+            assert!(titled(&store, "Message n2").is_none(), "round {round}");
+        }
+        graph
+            .sync_inbox(&store, account_id, &mut state)
+            .await
+            .unwrap();
+        let n2 = titled(&store, "Message n2").unwrap();
+        assert_eq!(n2.attachment.as_deref(), Some("plan.pdf"));
     }
 
     /// The `attached` stand-in, where i300's MIME fails the first time.
