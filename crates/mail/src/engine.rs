@@ -1886,13 +1886,14 @@ impl Engine {
     /// waiting their turn stay queued, so they can still be taken back.
     /// `tell` hears how each went as soon as it's over, well before it's
     /// tried again. One that fails on the network stays queued, to be tried
-    /// again, and the Scheduled list shows it (`waiting_sends`). One that
-    /// keeps failing so, as a forward does whose original the server drops
-    /// the connection over, is told of once (`failed_again`), and still
-    /// tried.
+    /// again, and the Scheduled list shows it (`waiting_sends`); `trying`
+    /// hears of each try of it after. One that keeps failing so, as a
+    /// forward does whose original the server drops the connection over,
+    /// is told of once (`failed_again`), and still tried.
     pub async fn send_due_each(
         &self,
         account_id: i64,
+        mut trying: impl FnMut(i64),
         mut tell: impl FnMut(SendOutcome),
     ) -> Result<()> {
         let due = self.store().due_sends(account_id, now_ms())?;
@@ -1901,14 +1902,19 @@ impl Engine {
             let Some(json) = self.store().claim_send(id, account_id, now_ms())? else {
                 continue;
             };
-            let mut trying = Trying {
+            let mut guard = Trying {
                 engine: self,
                 id,
                 cut_off: true,
             };
+            // One the Scheduled list shows as failing is tried again.
+            let again = self.failing_sends_lock().contains_key(&id);
+            if again {
+                trying(id);
+            }
             let outcome = self.send_claimed(account_id, id, &json).await;
-            trying.cut_off = false;
-            drop(trying);
+            guard.cut_off = false;
+            drop(guard);
             tell(outcome?);
         }
         Ok(())
@@ -1917,7 +1923,7 @@ impl Engine {
     /// `send_due_each`, told of them all at the end.
     pub async fn send_due(&self, account_id: i64) -> Result<Vec<SendOutcome>> {
         let mut outcomes = Vec::new();
-        self.send_due_each(account_id, |outcome| outcomes.push(outcome))
+        self.send_due_each(account_id, |_| {}, |outcome| outcomes.push(outcome))
             .await?;
         Ok(outcomes)
     }
@@ -3955,13 +3961,17 @@ mod tests {
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
         let mut go = Some(go);
         let mut heard = 0;
-        let sent = engine.send_due_each(account.id, |outcome| {
-            assert!(matches!(outcome.result, Ok(true)));
-            heard += 1;
-            if let Some(go) = go.take() {
-                let _ = go.send(());
-            }
-        });
+        let sent = engine.send_due_each(
+            account.id,
+            |_| {},
+            |outcome| {
+                assert!(matches!(outcome.result, Ok(true)));
+                heard += 1;
+                if let Some(go) = go.take() {
+                    let _ = go.send(());
+                }
+            },
+        );
         tokio::time::timeout(std::time::Duration::from_secs(10), sent)
             .await
             .expect("the first send was heard before the second went")
@@ -5643,17 +5653,21 @@ mod tests {
         // told of isn't due again yet: its Edit finds it queued.
         let mut told = Vec::new();
         engine
-            .send_due_each(account, |o| {
-                let store = engine.store();
-                let due = store.due_sends(account, now_ms()).unwrap();
-                told.push((
-                    o.id,
-                    o.queued,
-                    store.queued_send(o.id).unwrap().is_some() && !due.contains(&o.id),
-                    store.queued_send(second).unwrap().is_some(),
-                    engine.failing_sends_lock().contains_key(&second),
-                ));
-            })
+            .send_due_each(
+                account,
+                |_| {},
+                |o| {
+                    let store = engine.store();
+                    let due = store.due_sends(account, now_ms()).unwrap();
+                    told.push((
+                        o.id,
+                        o.queued,
+                        store.queued_send(o.id).unwrap().is_some() && !due.contains(&o.id),
+                        store.queued_send(second).unwrap().is_some(),
+                        engine.failing_sends_lock().contains_key(&second),
+                    ));
+                },
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5663,6 +5677,37 @@ mod tests {
                 (second, false, true, true, true)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_send_tried_again_says_so_as_its_try_starts() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp_offline().await).id;
+        let (failing, _) = queue_to_ana(&mut store, account, "Failing", 0);
+        let (first_try, _) = queue_to_ana(&mut store, account, "First try", 1);
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        // It failed on the network before: the Scheduled list shows it.
+        let offline = Error::network("127.0.0.1", "offline");
+        assert!(!engine.failed_again(failing, &offline, now_ms()));
+
+        // Told as its try starts, while the list has it as being sent. A
+        // first try isn't, as the list doesn't show it.
+        let mut started = Vec::new();
+        let mut tried = Vec::new();
+        engine
+            .send_due_each(
+                account,
+                |id| {
+                    let waiting = engine.waiting_sends().unwrap();
+                    let row = waiting.iter().find(|w| w.id == id);
+                    started.push((id, row.map(|w| (w.failed.is_some(), w.sending))));
+                },
+                |o| tried.push(o.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started, [(failing, Some((true, true)))]);
+        assert_eq!(tried, [failing, first_try]);
     }
 
     #[tokio::test]

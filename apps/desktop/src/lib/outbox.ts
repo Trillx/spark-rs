@@ -18,6 +18,12 @@ export function stuckNotice(items: ScheduledView[], told: { id: number; message?
   return `Couldn't send${subject} yet: ${why}. It'll keep trying.`;
 }
 
+/** Send `id` that couldn't go yet is tried again (its send-status event): its row says so till the try is over. */
+export function markTrying(items: ScheduledView[], id: number) {
+  if (!items.some((s) => s.id === id)) return items;
+  return items.map((s) => (s.id === id ? { ...s, sending: true } : s));
+}
+
 /** The draft a change to a queued send leaves in Drafts: it taken back, or refused for good by the server first. */
 export function draftLeft(change: QueuedChange) {
   return change.status === "takenBack" || change.status === "failed" ? change.draftId : undefined;

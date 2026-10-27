@@ -459,9 +459,22 @@ async fn work(
             break;
         }
 
+        // One that couldn't go yet is tried again: the Scheduled list says so.
+        let trying = |id| {
+            let event = SendEvent {
+                id,
+                account: account_id,
+                draft_id: None,
+                status: "trying",
+                message: None,
+                certificate: None,
+                queued: false,
+            };
+            let _ = app.emit("send-status", event);
+        };
         // Each told of as soon as it's tried, before it's tried again.
         let sent = engine
-            .send_due_each(account_id, |outcome| {
+            .send_due_each(account_id, trying, |outcome| {
                 // Answered once it's gone, not when it was queued (Undo and
                 // Send Later can still take it back), and before the next
                 // one goes.

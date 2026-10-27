@@ -610,8 +610,11 @@ export interface SendStatusEvent {
   account: AccountId;
   /** The exact failed email recovered in Drafts, also for agent sends. */
   draftId?: number;
-  /** "retrying": it failed on the network and is queued again, which the Scheduled list shows. */
-  status: "sent" | "failed" | "retrying";
+  /**
+   * "retrying": it failed on the network and is queued again, which the Scheduled list shows; "trying": such a send
+   * is tried again.
+   */
+  status: "sent" | "failed" | "retrying" | "trying";
   message?: string;
   /** It failed on the SMTP server's certificate, which the user may trust. */
   certificate?: Untrusted;

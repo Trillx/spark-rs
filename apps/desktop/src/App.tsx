@@ -194,7 +194,7 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
-import { draftLeft, goneNotice, stuckNotice } from "./lib/outbox";
+import { draftLeft, goneNotice, markTrying, stuckNotice } from "./lib/outbox";
 import {
   activate as activateHome,
   clearAll as clearHomeFeed,
@@ -1412,6 +1412,8 @@ export default function App() {
   }
 
   function sendStatus(e: SendStatusEvent) {
+    // Tried again: only its row in the Scheduled list changes.
+    if (e.status === "trying") return setScheduled((items) => markTrying(items, e.id));
     reloadPlanned();
     // Queued again: the Scheduled list shows it, and it may be told of later.
     if (e.status === "retrying") return;
