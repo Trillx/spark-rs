@@ -624,11 +624,19 @@ fn an_auto_draft_deleted_in_another_app_answers_nothing() {
         .set_folder_synced(drafts, r#"{"limit":200,"complete":false}"#, NOW)
         .unwrap();
     assert!(store.conversation_has_draft(later).unwrap());
-    // Drafts was listed whole: it was deleted, in Outlook say.
+    assert_eq!(store.message(id).unwrap().unwrap().auto_draft, Some(draft));
+    // Drafts was listed whole: it was deleted, in Outlook say. Forgotten as
+    // the sync is recorded, the email it replied to shows none (the message
+    // list hears) and can get another.
+    let mark = store.messages_marked().unwrap().1.unwrap();
     store
         .set_folder_synced(drafts, r#"{"limit":200,"complete":true}"#, NOW)
         .unwrap();
     assert!(!store.conversation_has_draft(later).unwrap());
+    assert_eq!(store.message(id).unwrap().unwrap().auto_draft, None);
+    assert_eq!(store.auto_draft_for(id).unwrap(), None);
+    let changes = store.message_changes(&mark).unwrap().unwrap();
+    assert!(changes.messages.iter().any(|m| m.id == id));
 }
 
 #[test]

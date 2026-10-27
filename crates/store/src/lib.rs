@@ -1613,13 +1613,14 @@ impl Store {
             .optional()
     }
 
-    /// Records a finished sync of a folder's messages.
+    /// Records a finished sync of a folder's messages. Drafts synced tells
+    /// which auto-drafts were deleted in another app.
     pub fn set_folder_synced(&self, folder_id: i64, sync_state: &str, at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE folders SET sync_state = ?2, synced_at = ?3 WHERE id = ?1",
             params![folder_id, sync_state, at],
         )?;
-        Ok(())
+        automation::forget_gone_auto_drafts(&self.conn, folder_id)
     }
 
     /// The folder's messages by id.

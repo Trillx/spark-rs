@@ -861,8 +861,12 @@ impl Store {
     pub fn auto_draft_for(&self, message_id: i64) -> Result<Option<AutoDraft>> {
         self.conn
             .query_row(
-                "SELECT draft_id, message_id, options, chosen, created_at FROM auto_drafts
-                 WHERE message_id = ?1 ORDER BY created_at DESC, draft_id DESC LIMIT 1",
+                &format!(
+                    "SELECT a.draft_id, a.message_id, a.options, a.chosen, a.created_at
+                     FROM auto_drafts a WHERE a.message_id = ?1 AND {}
+                     ORDER BY a.created_at DESC, a.draft_id DESC LIMIT 1",
+                    still_draft("a.draft_id")
+                ),
                 [message_id],
                 auto_draft_row,
             )
@@ -907,10 +911,8 @@ impl Store {
     }
 
     /// Whether a draft already answers the conversation of email `id`: an
-    /// auto-draft, or one of the user's replying to any of its emails. An
-    /// auto-draft out of Drafts here was deleted in another app if the
-    /// account's Drafts was listed whole (`complete` in its sync state);
-    /// otherwise it may only be past the newest a listing holds, and counts.
+    /// auto-draft that still is one (`still_draft`), or one of the user's
+    /// replying to any of its emails.
     pub fn conversation_has_draft(&self, id: i64) -> Result<bool> {
         self.conn.query_row(
             &format!(
@@ -918,19 +920,15 @@ impl Store {
                       drafts AS (SELECT message_id AS id FROM draft_uploads
                                  UNION SELECT fm.message_id FROM folder_members fm
                                  JOIN folders f ON f.id = fm.folder_id WHERE f.role = 'drafts')
-                 SELECT EXISTS (SELECT 1 FROM auto_drafts a JOIN members ON members.id = a.message_id, o
-                                WHERE a.draft_id IN (SELECT id FROM drafts)
-                                   OR NOT EXISTS (SELECT 1 FROM folders f
-                                                  WHERE f.account_id = o.account_id AND f.role = 'drafts'
-                                                    AND CASE WHEN json_valid(f.sync_state)
-                                                        THEN json_extract(f.sync_state, '$.complete')
-                                                        END IS 1))
+                 SELECT EXISTS (SELECT 1 FROM auto_drafts a JOIN members ON members.id = a.message_id
+                                WHERE {})
                      OR EXISTS (SELECT 1 FROM drafts JOIN messages d ON d.id = drafts.id, o
                                 WHERE d.account_id = o.account_id
                                   AND trim(d.in_reply_to, '<> ') IN
                                       (SELECT trim(m.message_id, '<> ') FROM messages m
                                        JOIN members ON members.id = m.id
-                                       WHERE m.message_id IS NOT NULL))"
+                                       WHERE m.message_id IS NOT NULL))",
+                still_draft("a.draft_id")
             ),
             [id],
             |r| r.get(0),
@@ -1121,6 +1119,39 @@ fn answered_as(
 
 /// Whether email `id` has a label the user or AI gave it, or one the user
 /// took off.
+/// Whether the auto-draft whose draft is `draft` still is one: queued for
+/// upload or in Drafts here, or out of a Drafts that wasn't listed whole
+/// (`complete` in its sync state), so it may only be past the newest a
+/// listing holds. Out of one listed whole, it was deleted in another app.
+fn still_draft(draft: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM draft_uploads u WHERE u.message_id = {draft})
+          OR EXISTS (SELECT 1 FROM folder_members fm JOIN folders f ON f.id = fm.folder_id
+                     WHERE fm.message_id = {draft} AND f.role = 'drafts')
+          OR NOT EXISTS (SELECT 1 FROM messages dm JOIN folders f ON f.account_id = dm.account_id
+                         WHERE dm.id = {draft} AND f.role = 'drafts'
+                           AND CASE WHEN json_valid(f.sync_state)
+                               THEN json_extract(f.sync_state, '$.complete') END IS 1))"
+    )
+}
+
+/// Folder `folder_id` was just synced: if it's Drafts, its account's
+/// auto-drafts deleted in another app (`still_draft`) are forgotten, so the
+/// emails they reply to show none and can get another.
+pub(crate) fn forget_gone_auto_drafts(conn: &Connection, folder_id: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "DELETE FROM auto_drafts
+             WHERE EXISTS (SELECT 1 FROM messages m JOIN folders f ON f.account_id = m.account_id
+                           WHERE m.id = auto_drafts.draft_id AND f.id = ?1 AND f.role = 'drafts')
+               AND NOT {}",
+            still_draft("auto_drafts.draft_id")
+        ),
+        [folder_id],
+    )?;
+    Ok(())
+}
+
 fn has_label_row(conn: &Connection, id: i64) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM auto_labels WHERE message_id = ?1)",
