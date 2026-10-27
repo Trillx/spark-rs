@@ -752,18 +752,42 @@ fn with_notes(html: &str, notes: &str) -> Option<String> {
 
 /// `html`, an event's description, without the Teams meeting Outlook put in
 /// it (`with_notes`), for a new meeting to get joining details of its own:
-/// its notes, and anything after the meeting. The meeting runs from where it
-/// starts to the end of the element holding its last rule or marker. `None`
-/// if there's no meeting in it.
+/// its notes, and anything after the meeting (directions, a map). The
+/// meeting runs from the element holding its first rule or marker to the
+/// one holding its last, side by side in the element around both, and the
+/// elements around them that hold nothing else. With one marker, it runs
+/// from where it starts to the end of the element holding it. `None` if
+/// there's no meeting in it.
 fn before_meeting(html: &str) -> Option<String> {
     let (_, cut) = meeting_in(html)?;
     let lower = html.to_ascii_lowercase();
-    let last = [lower.rfind(&"_".repeat(20)), lower.rfind("-::~:~::~")]
-        .into_iter()
-        .flatten()
-        .max()
-        .unwrap_or(cut);
-    // Element by element from the meeting's first, to past its last marker.
+    let marks = markers(&lower);
+    let (&first, &last) = (marks.first()?, marks.last()?);
+    if marks.len() > 1 {
+        let body = body_start(&lower);
+        let around_first = open_elements(&lower, body, first);
+        let around_last = open_elements(&lower, body, last);
+        let shared = around_first
+            .iter()
+            .zip(&around_last)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if let (Some(&(from, _)), Some(&(to, _))) =
+            (around_first.get(shared), around_last.get(shared))
+        {
+            let (mut start, mut end) = (from, element_end(&lower, to));
+            for &(outer, content) in around_first[..shared].iter().rev() {
+                let close = element_end(&lower, outer);
+                let inner = lower[..close].rfind("</").unwrap_or(close).max(end);
+                if has_text(&html[content..start]) || has_text(&html[end..inner]) {
+                    break;
+                }
+                (start, end) = (outer, close);
+            }
+            return Some(format!("{}{}", &html[..start], &html[end..]));
+        }
+    }
+    // Element by element from the meeting's first, to past its marker.
     let mut end = cut;
     while end <= last {
         match lower[end..].find('<').map(|i| end + i) {
@@ -775,13 +799,35 @@ fn before_meeting(html: &str) -> Option<String> {
     Some(format!("{}{}", &html[..cut], &html[end..]))
 }
 
+/// Where each rule of underscores or `-::~:~::~` marker around a Teams
+/// meeting starts in `lower` (lowercased HTML), a run of them once.
+fn markers(lower: &str) -> Vec<usize> {
+    let rule = "_".repeat(20);
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(start) = [lower[at..].find(&rule), lower[at..].find("-::~:~::~")]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|i| at + i)
+    {
+        found.push(start);
+        at = lower[start..]
+            .find(|c: char| !matches!(c, '_' | '-' | ':' | '~'))
+            .map_or(lower.len(), |n| start + n);
+    }
+    found
+}
+
+/// Elements with no closing tag.
+const VOID: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
 /// Where the element that starts at `start` in `lower` (lowercased HTML)
 /// ends: past its closing tag, or its own end for a void or self-closing one.
 fn element_end(lower: &str, start: usize) -> usize {
-    const VOID: &[&str] = &[
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-        "source", "track", "wbr",
-    ];
     let mut depth = 0usize;
     let mut at = start;
     while let Some(open) = lower[at..].find('<').map(|i| at + i) {
@@ -807,30 +853,21 @@ fn element_end(lower: &str, start: usize) -> usize {
     lower.len()
 }
 
-/// Where the notes in `html` (an event's description) start, and where the
-/// Teams meeting after them does (`with_notes`).
-fn meeting_in(html: &str) -> Option<(usize, usize)> {
-    const VOID: &[&str] = &[
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-        "source", "track", "wbr",
-    ];
-    let lower = html.to_ascii_lowercase();
-    let marker = [lower.find(&"_".repeat(20)), lower.find("-::~:~::~")]
-        .into_iter()
-        .flatten()
-        .min()?;
-    let body = lower
+/// Where the content of `lower`'s (lowercased HTML's) body starts: past its
+/// `<body>` tag, or at the start if it has none.
+fn body_start(lower: &str) -> usize {
+    lower
         .find("<body")
         .and_then(|at| lower[at..].find('>').map(|end| at + end + 1))
-        .unwrap_or(0);
-    if marker < body {
-        return None;
-    }
-    // The elements open where the meeting starts, outermost first: where
-    // each starts, and where its content does.
-    let mut open: Vec<(usize, usize)> = Vec::new();
-    let mut at = body;
-    while let Some(start) = lower[at..marker].find('<').map(|i| at + i) {
+        .unwrap_or(0)
+}
+
+/// The elements open at `upto` in `lower` (lowercased HTML), read from
+/// `from`, outermost first: where each starts, and where its content does.
+fn open_elements(lower: &str, from: usize, upto: usize) -> Vec<(usize, usize)> {
+    let mut open = Vec::new();
+    let mut at = from;
+    while let Some(start) = lower[at..upto].find('<').map(|i| at + i) {
         let Some(end) = lower[start..].find('>').map(|i| start + i + 1) else {
             break;
         };
@@ -846,10 +883,24 @@ fn meeting_in(html: &str) -> Option<(usize, usize)> {
             open.push((start, end));
         }
         at = end;
-        if at >= marker {
+        if at >= upto {
             break;
         }
     }
+    open
+}
+
+/// Where the notes in `html` (an event's description) start, and where the
+/// Teams meeting after them does (`with_notes`).
+fn meeting_in(html: &str) -> Option<(usize, usize)> {
+    let lower = html.to_ascii_lowercase();
+    let marker = *markers(&lower).first()?;
+    let body = body_start(&lower);
+    if marker < body {
+        return None;
+    }
+    // The elements open where the meeting starts, outermost first.
+    let open = open_elements(&lower, body, marker);
     let (cut, from) = match open
         .iter()
         .position(|&(_, content)| !has_text(&html[content..marker]))
@@ -2456,6 +2507,23 @@ mod tests {
             before_meeting(&html).unwrap(),
             "<html><body><div class=\"WordSection1\"><p><img src=\"cid:agenda\"></p></div></body></html>"
         );
+        // Nothing before the meeting, directions and a map after it, all in
+        // WordSection1: they stay.
+        let html = format!(
+            "<html><body><div class=\"WordSection1\"><div><span>{rule}</span></div>\
+             <div>Teams meeting, join here</div><div><span>{rule}</span></div>\
+             <p>Parking: level 2</p><p><img src=\"cid:map\"></p></div></body></html>"
+        );
+        assert_eq!(
+            before_meeting(&html).unwrap(),
+            "<html><body><div class=\"WordSection1\"><p>Parking: level 2</p><p><img src=\"cid:map\"></p></div></body></html>"
+        );
+        // The meeting alone, wrapped: it all goes.
+        let html = format!(
+            "<html><body><div class=\"WordSection1\"><div><div><span>{rule}</span></div>\
+             <div>Teams meeting, join here</div><div><span>{rule}</span></div></div></div></body></html>"
+        );
+        assert_eq!(before_meeting(&html).unwrap(), "<html><body></body></html>");
     }
 
     #[test]
