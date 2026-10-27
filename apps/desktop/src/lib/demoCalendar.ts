@@ -225,6 +225,7 @@ export function demoSaveEvent(id: number | null, draft: EventDraft, scope: Event
     showAs: draft.showAs,
     onlineMeeting: draft.teams,
     callLink: draft.teams ? TEAMS : undefined,
+    private: draft.private,
   };
   if (id === null) {
     made.push({
@@ -236,7 +237,6 @@ export function demoSaveEvent(id: number | null, draft: EventDraft, scope: Event
       response: "organizer",
       canceled: false,
       repeats: false,
-      private: false,
     });
   } else {
     const before = scoped(id, "one")[0];

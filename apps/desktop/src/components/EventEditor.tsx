@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight, FileText, MapPin, Users, Video, X } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import { parseEntry } from "../lib/addresses";
 import { addMonths, formatTime, startOfMonth, viewDays } from "../lib/calendar";
 import {
@@ -62,6 +62,7 @@ export default function EventEditor({
   modal,
   defaults,
   unsaved = false,
+  closeRef,
   onSave,
   onClose,
 }: {
@@ -76,6 +77,11 @@ export default function EventEditor({
   defaults: NewEventDefaults;
   /** A copy not saved yet (Duplicate, Paste Event): closing asks even without changes, as Spark does. */
   unsaved?: boolean;
+  /**
+   * Set while it's open: asks it to close as its ✕ does (asking first about changes), then runs
+   * `after` once it has; for the calendar closing around it.
+   */
+  closeRef?: MutableRefObject<((after: () => void) => void) | null>;
   /** Saves it: true once it's saved, false if the user went back to editing; rejects with what went wrong. */
   onSave: (draft: EventDraft) => Promise<boolean>;
   onClose: () => void;
@@ -103,11 +109,20 @@ export default function EventEditor({
     box.style.height = `${box.scrollHeight}px`;
   }, [draft.title]);
 
+  /** What to do once it's closed, when the calendar closing around it asked it to. */
+  const then = useRef<(() => void) | undefined>(undefined);
+  const done = () => {
+    const after = then.current;
+    then.current = undefined;
+    onClose();
+    after?.();
+  };
   /** ✕, Esc or a click elsewhere: with changes, it asks first. */
-  const close = () => {
+  const close = (after?: () => void) => {
     if (latest.current.busy) return;
+    then.current = after;
     if (latest.current.changed) setAsking(true);
-    else onClose();
+    else done();
   };
   const latestClose = useRef(close);
   latestClose.current = close;
@@ -116,12 +131,32 @@ export default function EventEditor({
     const asked = () => document.querySelector("[aria-modal]") !== null;
     // What's still being typed (a time, someone to invite) counts: it's taken in first, then
     // whether anything changed is looked at.
-    const closeSoon = () => {
+    const closeSoon = (after?: () => void) => {
       const typing = document.activeElement;
       if (typing instanceof HTMLElement && ref.current?.contains(typing)) typing.blur();
-      window.setTimeout(() => latestClose.current());
+      window.setTimeout(() => {
+        if (!asked()) latestClose.current(after);
+      });
+    };
+    if (closeRef) closeRef.current = closeSoon;
+    // Like a backdrop: the press that closes it doesn't also act on what's under it (another
+    // event, the calendar's close button, the sidebar).
+    const swallow = (e: MouseEvent) => {
+      e.stopPropagation();
+      e.preventDefault();
     };
     const onPointer = (e: PointerEvent) => {
+      if (asked() || ref.current?.contains(e.target as Node)) return;
+      window.addEventListener("click", swallow, { capture: true, once: true });
+      window.addEventListener(
+        "pointerup",
+        () => window.setTimeout(() => window.removeEventListener("click", swallow, true)),
+        { capture: true, once: true },
+      );
+      closeSoon();
+    };
+    // Tabbing out of it is leaving it too.
+    const onFocus = (e: FocusEvent) => {
       if (asked() || ref.current?.contains(e.target as Node)) return;
       closeSoon();
     };
@@ -135,9 +170,12 @@ export default function EventEditor({
     };
     window.addEventListener("pointerdown", onPointer, true);
     window.addEventListener("keydown", onKey, true);
+    window.addEventListener("focusin", onFocus, true);
     return () => {
+      if (closeRef) closeRef.current = null;
       window.removeEventListener("pointerdown", onPointer, true);
       window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("focusin", onFocus, true);
     };
   }, []);
 
@@ -146,7 +184,7 @@ export default function EventEditor({
     setBusy(true);
     setError(null);
     try {
-      if (await onSave(draft)) onClose();
+      if (await onSave(draft)) done();
       else setBusy(false);
     } catch (e) {
       setError(String(e));
@@ -207,7 +245,7 @@ export default function EventEditor({
             data-tip="Close"
             aria-label="Close"
             className="grid size-7 shrink-0 place-items-center rounded-lg text-text-2 hover:bg-base-content/10 hover:text-base-content"
-            onClick={close}
+            onClick={() => close()}
           >
             <X size={16} />
           </button>
@@ -380,8 +418,9 @@ export default function EventEditor({
           ]}
           onChoose={(choice) => {
             setAsking(false);
-            if (choice === "discard") onClose();
+            if (choice === "discard") done();
             else if (choice === "save") void save();
+            else then.current = undefined;
           }}
         />
       )}

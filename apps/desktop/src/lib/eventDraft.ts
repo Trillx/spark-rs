@@ -68,6 +68,7 @@ export function draftOf(e: CalendarEvent): EventDraft {
     reminder: e.reminder ?? null,
     showAs: e.showAs,
     teams: e.onlineMeeting,
+    private: e.private,
   };
 }
 
@@ -92,6 +93,7 @@ export function newDraft(calendar: number, start: number, allDay: boolean, defau
     reminder: allDay ? defaults.allDayAlert : defaults.alert,
     showAs: allDay ? "free" : "busy",
     teams: false,
+    private: false,
   };
 }
 

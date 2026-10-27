@@ -112,6 +112,7 @@ test("changes and new people are told apart", () => {
   };
   const before = draftOf(event);
   assert.deepEqual(before.attendees, [{ name: "Sam", address: "Sam@contoso.com" }]);
+  assert.equal(draftOf({ ...event, private: true }).private, true, "a copy stays private");
   assert.equal(before.reminder, null);
   assert.equal(before.location, "");
   const same: EventDraft = { ...before, title: " Standup ", attendees: [{ name: "", address: "sam@contoso.com " }] };

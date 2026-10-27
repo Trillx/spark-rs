@@ -175,6 +175,8 @@ export default function CalendarScreen({
   /** A word that the last thing happened ("Event copied"), for a moment. */
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef(0);
+  /** The open editor's close, which asks about changes first; the calendar closes after it. */
+  const closeEditor = useRef<((after: () => void) => void) | null>(null);
   /** The editor or a question is up, as of the last render: a drag that ends meanwhile does nothing. */
   const busyNow = useRef(false);
   /** Events (or series) whose move is being saved; `savingNow` as of now, for a drag ending meanwhile. */
@@ -650,7 +652,7 @@ export default function CalendarScreen({
   return (
     <section ref={box} aria-label="Calendar" className="relative flex min-w-0 flex-1 flex-col pt-8">
       <header className="flex h-[58px] shrink-0 items-center gap-2 pl-3 pr-4">
-        <HeaderButton tip="Close calendar" onClick={onClose}>
+        <HeaderButton tip="Close calendar" onClick={() => (closeEditor.current ? closeEditor.current(onClose) : onClose())}>
           <ArrowLeft size={18} />
         </HeaderButton>
         <h1 className="ml-1 min-w-0 truncate text-xl font-semibold">{title(kind, anchor, days)}</h1>
@@ -804,6 +806,7 @@ export default function CalendarScreen({
           modal={editor.modal}
           defaults={editor.defaults}
           unsaved={editor.unsaved}
+          closeRef={closeEditor}
           onSave={(draft) => saveDraft(editor.event, draft, editor.event ? editor.initial : null)}
           onClose={() => setEditor(null)}
         />

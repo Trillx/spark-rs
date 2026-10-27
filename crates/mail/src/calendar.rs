@@ -241,6 +241,8 @@ pub struct EventDraft {
     pub show_as: ShowAs,
     /// With a Teams meeting.
     pub teams: bool,
+    /// Private in Outlook: people who share the calendar see only "Busy".
+    pub private: bool,
 }
 
 impl EventDraft {
@@ -258,6 +260,7 @@ impl EventDraft {
             reminder: e.reminder,
             show_as: e.show_as,
             teams: e.online_meeting,
+            private: e.private,
         }
     }
 }
@@ -290,6 +293,9 @@ pub fn new_event_body(draft: &EventDraft, zone: Zone) -> serde_json::Value {
     if draft.teams {
         body.insert("isOnlineMeeting".into(), json!(true));
         body.insert("onlineMeetingProvider".into(), json!("teamsForBusiness"));
+    }
+    if draft.private {
+        body.insert("sensitivity".into(), json!("private"));
     }
     body.into()
 }
@@ -391,6 +397,10 @@ pub fn changed_event_body(
     if draft.teams && !before.teams {
         body.insert("isOnlineMeeting".into(), json!(true));
         body.insert("onlineMeetingProvider".into(), json!("teamsForBusiness"));
+    }
+    if draft.private != before.private {
+        let sensitivity = if draft.private { "private" } else { "normal" };
+        body.insert("sensitivity".into(), json!(sensitivity));
     }
     body.into()
 }
@@ -1049,6 +1059,21 @@ mod tests {
         assert_eq!(body["reminderMinutesBeforeStart"], 10);
         assert_eq!(body["showAs"], "busy");
         assert_eq!(body["onlineMeetingProvider"], "teamsForBusiness");
+        assert!(
+            body.get("sensitivity").is_none(),
+            "normal, as Outlook makes it"
+        );
+        let copy = new_event_body(
+            &EventDraft {
+                private: true,
+                ..draft.clone()
+            },
+            PACIFIC,
+        );
+        assert_eq!(
+            copy["sensitivity"], "private",
+            "a copy of a private event stays private"
+        );
 
         // An all-day event's days start at midnight on the user's clock.
         let day = parse_iso_date("2026-10-30T00:00:00Z").unwrap();

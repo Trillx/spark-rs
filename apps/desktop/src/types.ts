@@ -447,6 +447,8 @@ export interface EventDraft {
   showAs: CalendarEvent["showAs"];
   /** With a Teams meeting. */
   teams: boolean;
+  /** Private in Outlook: people who share the calendar see only "Busy". The editor keeps it as it is. */
+  private: boolean;
 }
 
 /** Which occurrences of a repeating event a change is for: that one, or all of them. */
