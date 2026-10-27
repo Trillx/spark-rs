@@ -7,7 +7,7 @@
 
 mod prompts;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -125,8 +125,10 @@ async fn round(app: &AppHandle) -> Duration {
     // round aren't tried again in it either.
     let mut last: Vec<i64> = Vec::new();
     let mut tried: HashSet<i64> = HashSet::new();
-    // Emails whose bodies couldn't be downloaded this round (`with_bodies`).
+    // Emails whose bodies couldn't be downloaded this round, and accounts
+    // found offline in it, whose others aren't tried (`with_bodies`).
     let mut unready: HashSet<i64> = HashSet::new();
+    let mut offline: HashMap<i64, bool> = HashMap::new();
     loop {
         let Some(settings) = saved_settings(&engine) else {
             return LOOK_EVERY;
@@ -162,61 +164,65 @@ async fn round(app: &AppHandle) -> Duration {
                 let engine = engine.clone();
                 async move { engine.fetch_body(id).await }
             };
-            let (ready, filled) = with_bodies(&engine, &batch.ids, &mut unready, fetch).await;
+            let offline = offline.entry(batch.account).or_default();
+            let (ready, filled) =
+                with_bodies(&engine, &batch.ids, &mut unready, offline, fetch).await;
             if filled {
                 let _ = app.emit("mailbox-changed", ());
             }
             batch.ids = ready;
-            let request = match sort_request(&engine.store(), &batch) {
-                Ok(Some(request)) if !batch.ids.is_empty() => request,
-                Ok(_) => continue,
-                Err(e) => {
-                    eprintln!("spark-rs: inbox automation: {e}");
+            // None of them ready, or their account gone: the replies due go on.
+            'sort: {
+                let request = match sort_request(&engine.store(), &batch) {
+                    Ok(Some(request)) if !batch.ids.is_empty() => request,
+                    Ok(_) => break 'sort,
+                    Err(e) => {
+                        eprintln!("spark-rs: inbox automation: {e}");
+                        return LOOK_EVERY;
+                    }
+                };
+                let answer = complete(&client, &request).await;
+                let now = now_ms();
+                let verdicts = match answer {
+                    Ok(Some(text)) => prompts::read_verdicts(&text, batch.ids.len())
+                        .unwrap_or_else(|e| {
+                            eprintln!("spark-rs: inbox automation: {e}");
+                            vec![None; batch.ids.len()]
+                        }),
+                    // Declined: these emails are tried again later, the rest go on.
+                    Ok(None) => vec![None; batch.ids.len()],
+                    Err(e) => {
+                        // The provider can't be reached or refuses the key: nothing
+                        // is held against the emails, which wait for it.
+                        let problem = redact(describe(&e), key.as_deref());
+                        automation.failed(app, &engine.store(), problem);
+                        return AFTER_FAILING;
+                    }
+                };
+                // What the user wants now, not when the request went out.
+                let Some(settings) = saved_settings(&engine) else {
                     return LOOK_EVERY;
-                }
-            };
-            let answer = complete(&client, &request).await;
-            let now = now_ms();
-            let verdicts = match answer {
-                Ok(Some(text)) => {
-                    prompts::read_verdicts(&text, batch.ids.len()).unwrap_or_else(|e| {
-                        eprintln!("spark-rs: inbox automation: {e}");
-                        vec![None; batch.ids.len()]
-                    })
-                }
-                // Declined: these emails are tried again later, the rest go on.
-                Ok(None) => vec![None; batch.ids.len()],
-                Err(e) => {
-                    // The provider can't be reached or refuses the key: nothing
-                    // is held against the emails, which wait for it.
-                    let problem = redact(describe(&e), key.as_deref());
-                    automation.failed(app, &engine.store(), problem);
-                    return AFTER_FAILING;
-                }
-            };
-            // What the user wants now, not when the request went out.
-            let Some(settings) = saved_settings(&engine) else {
-                return LOOK_EVERY;
-            };
-            let push = push_labels(&engine, batch.account);
-            let mut changed = false;
-            {
-                let mut store = engine.store();
-                for (&id, verdict) in batch.ids.iter().zip(verdicts) {
-                    let recorded = match verdict {
-                        Some(verdict) => store
-                            .record_verdict(id, verdict, &settings, push, now)
-                            .map(|c| changed |= c),
-                        None => store.record_check_failed(id, now),
-                    };
-                    if let Err(e) = recorded {
-                        eprintln!("spark-rs: inbox automation: {e}");
+                };
+                let push = push_labels(&engine, batch.account);
+                let mut changed = false;
+                {
+                    let mut store = engine.store();
+                    for (&id, verdict) in batch.ids.iter().zip(verdicts) {
+                        let recorded = match verdict {
+                            Some(verdict) => store
+                                .record_verdict(id, verdict, &settings, push, now)
+                                .map(|c| changed |= c),
+                            None => store.record_check_failed(id, now),
+                        };
+                        if let Err(e) = recorded {
+                            eprintln!("spark-rs: inbox automation: {e}");
+                        }
                     }
                 }
-            }
-            if changed {
-                let _ = app.emit("mailbox-changed", ());
-                mailbox.live.nudge(batch.account);
+                if changed {
+                    let _ = app.emit("mailbox-changed", ());
+                    mailbox.live.nudge(batch.account);
+                }
             }
         }
 
@@ -332,13 +338,15 @@ fn sort_request(store: &Store, batch: &Batch) -> spark_store::Result<Option<Chat
 /// sorted by their preview, a request further on could be missed, and what
 /// AI says of an email stands. Those that can't be downloaded are left out,
 /// unchecked, while the rest go on: offline, they wait for a later round
-/// (`unready`), as do the rest of them, not tried; else they're tried again
-/// later as when AI couldn't answer (`record_check_failed`). Returns those
-/// to sort, and whether a body was filled in.
+/// (`unready`), as do the rest of their account's this round, not tried
+/// (`offline`, kept from batch to batch); else they're tried again later as
+/// when AI couldn't answer (`record_check_failed`). Returns those to sort,
+/// and whether a body was filled in.
 async fn with_bodies<F, Fut>(
     engine: &Engine,
     ids: &[i64],
     unready: &mut HashSet<i64>,
+    offline: &mut bool,
     fetch: F,
 ) -> (Vec<i64>, bool)
 where
@@ -347,7 +355,6 @@ where
 {
     let mut ready = Vec::with_capacity(ids.len());
     let mut filled = false;
-    let mut offline = false;
     for &id in ids {
         let missing = engine
             .store()
@@ -357,7 +364,7 @@ where
             ready.push(id);
             continue;
         }
-        if offline {
+        if *offline {
             unready.insert(id);
             continue;
         }
@@ -369,7 +376,7 @@ where
             Err(e) => {
                 unready.insert(id);
                 if matches!(e, spark_mail::Error::Network { .. }) {
-                    offline = true;
+                    *offline = true;
                     continue;
                 }
                 eprintln!("spark-rs: inbox automation: email {id} couldn't be downloaded: {e}");
@@ -1273,9 +1280,16 @@ mod tests {
                 })
             }
         };
-        let (ready, filled) = with_bodies(&engine, &[whole, a, b], &mut unready, offline).await;
+        let mut cut_off = false;
+        let (ready, filled) =
+            with_bodies(&engine, &[whole, a, b], &mut unready, &mut cut_off, offline).await;
         assert_eq!((ready, filled), (vec![whole], false));
         assert_eq!(unready, HashSet::from([a, b]));
+        assert_eq!(asked.load(SeqCst), 1);
+        // The round's next batch of the account's doesn't try again.
+        let (ready, _) = with_bodies(&engine, &[c], &mut unready, &mut cut_off, offline).await;
+        assert!(ready.is_empty());
+        assert_eq!(unready, HashSet::from([a, b, c]));
         assert_eq!(asked.load(SeqCst), 1);
         let settings = AutomationSettings {
             label_accounts: [(account, now_ms())].into(),
@@ -1307,7 +1321,8 @@ mod tests {
                 Ok(engine.store().fill_in_body(id, &whole).unwrap() == Some(true))
             }
         };
-        let (ready, filled) = with_bodies(&engine, &[whole, a, b, c], &mut unready, fetch).await;
+        let (ready, filled) =
+            with_bodies(&engine, &[whole, a, b, c], &mut unready, &mut false, fetch).await;
         assert_eq!((ready, filled), (vec![whole, b, c], true));
         assert_eq!(unready, HashSet::from([a]));
         assert_eq!(candidates(&engine), HashSet::from([whole, b, c]));
