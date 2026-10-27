@@ -35,13 +35,15 @@ import {
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  WandSparkles,
+  LoaderCircle,
   Zap,
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { QUICK_REPLIES, SUMMARY_STYLES, type QuickReply, type SummaryStyle } from "../ai";
 import { senderStatus } from "../api";
-import type { AccountView, Category, Message, MessageContent, SenderStatus } from "../types";
+import type { AccountView, AutoLabel, Category, Message, MessageContent, SenderStatus } from "../types";
 
 const CATEGORIES: { key: Category; label: string }[] = [
   { key: "people", label: "People" },
@@ -49,6 +51,7 @@ const CATEGORIES: { key: Category; label: string }[] = [
   { key: "newsletters", label: "Newsletters" },
 ];
 import { isFromYou, useAccount } from "../lib/accounts";
+import { conversationLabel } from "../lib/autoLabels";
 import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
 import { shownFromCache, useInlineImages, useMessageContent, type ContentState } from "../lib/content";
@@ -78,6 +81,8 @@ import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AiMark from "./AiMark";
 import OverlayScroll from "./OverlayScroll";
 import { AttachmentList } from "./Attachments";
+import AutoDraftCard, { type AutoDraftActions } from "./AutoDraftCard";
+import { AutoLabelPill } from "./AutoLabelChip";
 import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
 import FindBar from "./FindBar";
@@ -159,6 +164,15 @@ export interface ThreadActions {
   openAttachment: (m: Message, index: number) => Promise<void>;
   saveAttachment: (m: Message, index: number) => Promise<void>;
   saveAllAttachments: (m: Message) => Promise<void>;
+  /** Gives the conversation this Auto-Label (null: none), on its newest email that had one. */
+  setAutoLabel: (conversation: Message[], label: AutoLabel | null) => void;
+  /** Spark's "Auto-Draft a reply": AI writes a reply to the email now. */
+  autoDraft: (m: Message) => void;
+  /** Whether a reply to email `id` is being written. */
+  drafting: (id: number) => boolean;
+  /** The draft with this id, while it's listed. */
+  draftOf: (id: number) => Message | undefined;
+  autoDrafts: AutoDraftActions;
 }
 
 const STYLE_ICONS: Record<SummaryStyle, LucideIcon> = { short: Text, detailed: AlignLeft, actionPoints: ListChecks };
@@ -280,6 +294,7 @@ export default function ThreadView({
   }, [conversation.length]);
   const several = conversation.length > 1;
   const latest = conversation[conversation.length - 1];
+  const label = conversationLabel(conversation);
 
   /** Search in conversation: open, and asked for again (its field takes focus). */
   const [finding, setFinding] = useState(false);
@@ -384,6 +399,7 @@ export default function ThreadView({
             <BellOff size={12} /> Muted
           </Pill>
         )}
+        {label && <AutoLabelPill label={label} onChange={(l) => actions.setAutoLabel(conversation, l)} />}
         {m.category === "newsletters" && !scrolled && (
           <button
             className="ml-auto shrink-0 text-xs font-medium text-primary hover:underline"
@@ -432,6 +448,14 @@ export default function ThreadView({
                     onCollapse={several ? () => toggle(x.id) : undefined}
                     actions={actions}
                   />
+                )}
+                {actions.drafting(x.id) && (
+                  <div className="flex items-center gap-2 px-5 py-2 text-[13px] text-text-2">
+                    <LoaderCircle size={14} className="animate-spin" /> Generating auto-draft reply…
+                  </div>
+                )}
+                {x.autoDraft !== undefined && actions.draftOf(x.autoDraft) && (
+                  <AutoDraftCard draft={actions.draftOf(x.autoDraft)!} actions={actions.autoDrafts} />
                 )}
               </Fragment>
             ))}
@@ -935,6 +959,9 @@ function MessageMenuItems({
   return (
     <>
       <MenuItem label="Reply" detail={shortcutLabel("reply")} icon={<Reply size={15} />} onSelect={() => actions.reply(m)} />
+      {!yours && m.autoDraft === undefined && !actions.drafting(m.id) && (
+        <MenuItem label="Auto-Draft a Reply" icon={<WandSparkles size={15} />} onSelect={() => actions.autoDraft(m)} />
+      )}
       <MenuItem
         label="Reply all"
         detail={shortcutLabel("replyAll")}

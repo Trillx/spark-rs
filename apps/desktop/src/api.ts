@@ -14,6 +14,7 @@ import type {
   AgentSendingEvent,
   AgentsView,
   AccountView,
+  AutoLabel,
   Category,
   Failure,
   FolderRole,
@@ -438,6 +439,14 @@ export function setMuted(conversation: number, muted: boolean): Promise<void> {
   for (const [i, m] of browserMailbox.entries()) {
     if ((m.conversation ?? m.id) === conversation) browserMailbox[i] = { ...m, muted };
   }
+  return Promise.resolve();
+}
+
+/** Shows `label` on an email instead of its own Auto-Label; null takes it off. */
+export function setAutoLabel(id: number, label: AutoLabel | null): Promise<void> {
+  if (isTauri()) return mutate("set_auto_label", { id, label });
+  const i = browserMailbox.findIndex((m) => m.id === id);
+  if (i >= 0) browserMailbox[i] = { ...browserMailbox[i], autoLabel: label ?? undefined };
   return Promise.resolve();
 }
 

@@ -12,10 +12,12 @@ import {
   Pin,
   Send,
   ShieldAlert,
+  Tag,
   Trash2,
   type LucideIcon,
 } from "lucide-react";
-import type { AccountId, FolderRole, FolderView, Message, MessagePatch } from "../types";
+import type { AccountId, AutoLabel, FolderRole, FolderView, Message, MessagePatch } from "../types";
+import { AUTO_LABELS } from "./autoLabels";
 import { isDraft } from "./drafts";
 import { SIDEBAR_DEFAULT } from "./panes";
 
@@ -39,8 +41,11 @@ export type SystemList =
   | "scheduled"
   | "reminders";
 
-/** Any list the message list can show: the Inbox, a shared list, a server folder or a smart folder. */
-export type ListKey = "inbox" | SystemList | `folder:${number}` | `smart:${string}`;
+/**
+ * Any list the message list can show: the Inbox, a shared list, a server folder, a smart folder, or
+ * the mail with an Auto-Label.
+ */
+export type ListKey = "inbox" | SystemList | `folder:${number}` | `smart:${string}` | `auto:${AutoLabel}`;
 
 export const SYSTEM_LISTS: Record<SystemList, { label: string; Icon: LucideIcon; role?: FolderRole }> = {
   pins: { label: "Pins", Icon: Pin },
@@ -89,6 +94,8 @@ export interface SidebarLayout {
   /** Docked rather than the rail. */
   locked: boolean;
   width: number;
+  /** Auto-Labels whose list was put in the sidebar once: removed, it stays out. */
+  autoOffered: AutoLabel[];
 }
 
 export const RECENTS_MAX = 5;
@@ -111,6 +118,7 @@ export const DEFAULT_LAYOUT: SidebarLayout = {
   tipHidden: false,
   locked: false,
   width: SIDEBAR_DEFAULT,
+  autoOffered: [],
 };
 
 const STORAGE_KEY = "spark-rs.sidebar";
@@ -136,6 +144,7 @@ export function loadLayout(): SidebarLayout {
       hiddenBadges: keys(saved.hiddenBadges, []),
       smartFolders: Array.isArray(saved.smartFolders) ? saved.smartFolders : DEFAULT_LAYOUT.smartFolders,
       colors: saved.colors && typeof saved.colors === "object" ? saved.colors : {},
+      autoOffered: Array.isArray(saved.autoOffered) ? saved.autoOffered.filter((l) => l in AUTO_LABELS) : [],
     };
   } catch {
     return DEFAULT_LAYOUT;
@@ -155,6 +164,26 @@ export function folderIdOf(key: ListKey): number | undefined {
 
 export function smartIdOf(key: ListKey): string | undefined {
   return key.startsWith("smart:") ? key.slice(6) : undefined;
+}
+
+export const autoKey = (label: AutoLabel): ListKey => `auto:${label}`;
+
+export function autoLabelOf(key: ListKey): AutoLabel | undefined {
+  const label = key.startsWith("auto:") ? key.slice(5) : undefined;
+  return label !== undefined && label in AUTO_LABELS ? (label as AutoLabel) : undefined;
+}
+
+/**
+ * Lists for Auto-Labels that mail has now: each goes in the sidebar the first time, as Spark adds them.
+ * One the user took out stays out.
+ */
+export function offerAutoLabels(layout: SidebarLayout, labels: Iterable<AutoLabel>): SidebarLayout {
+  let next = layout;
+  for (const label of labels) {
+    if (next.autoOffered.includes(label)) continue;
+    next = { ...addToSidebar(next, autoKey(label)), autoOffered: [...next.autoOffered, label] };
+  }
+  return next;
 }
 
 export function isSystemList(key: ListKey): key is SystemList {
@@ -310,6 +339,8 @@ export interface ListInfo {
   smart?: SmartFolder;
   /** For a row's tooltip, e.g. "Projects / Q4 · Work". */
   detail?: string;
+  /** Its icon's color unless the user chose one: an Auto-Label's. */
+  color?: string;
 }
 
 /** How to show a list; `undefined` if it names a folder or smart folder that's gone. */
@@ -335,6 +366,8 @@ export function listInfo(
       detail: [path, account].filter(Boolean).join(" · "),
     };
   }
+  const label = autoLabelOf(key);
+  if (label) return { label: AUTO_LABELS[label].name, Icon: Tag, color: AUTO_LABELS[label].color, detail: "Auto-Label" };
   const smart = smartFolders.find((f) => f.id === smartIdOf(key));
   return smart && { label: smart.name, Icon: FolderSearch, smart, detail: smart.query };
 }

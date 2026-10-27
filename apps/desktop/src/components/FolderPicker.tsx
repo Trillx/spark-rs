@@ -1,11 +1,13 @@
-import { Folder, FolderSearch, Plus, Star, X } from "lucide-react";
+import { Folder, FolderSearch, Plus, Star, Tag, X } from "lucide-react";
 import { useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import type { AccountId, AccountView, FolderView } from "../types";
 import { useAccounts } from "../lib/accounts";
+import { AUTO_LABELS, AUTO_LABEL_ORDER } from "../lib/autoLabels";
 import { IS_MAC } from "../lib/shortcuts";
 import {
   SYSTEM_LISTS,
   SYSTEM_ORDER,
+  autoKey,
   folderKey,
   folderPath,
   inSidebar,
@@ -111,6 +113,29 @@ export default function FolderPicker(props: Props) {
             );
           })}
         </ul>
+
+        {layout.autoOffered.length > 0 && (
+          <>
+            <Heading>Auto-Labels</Heading>
+            <ul>
+              {AUTO_LABEL_ORDER.map((label) => {
+                const key = autoKey(label);
+                const { name, color } = AUTO_LABELS[label];
+                return (
+                  <li key={label}>
+                    <Row
+                      icon={<Tag size={16} style={{ color: layout.colors[key] ?? color }} />}
+                      label={name}
+                      added={added(key)}
+                      onPick={(add) => props.onPick(key, add)}
+                      onStar={() => star(key)}
+                    />
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
 
         {accounts.map((a) => (
           <AccountSection key={a.id} account={a} {...props} added={added} star={star} />

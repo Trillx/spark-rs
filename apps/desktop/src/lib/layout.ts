@@ -17,7 +17,16 @@ import { asThread, conversationOf, indexConversations, participantNames } from "
 import { datePeriod, futurePeriod } from "./format";
 import { showsRecipients } from "./recipients";
 import type { ActionId } from "./shortcuts";
-import { folderIdOf, hasAccountRows, listFolderIds, listInfo, smartIdOf, type ListKey, type SmartFolder } from "./sidebar";
+import {
+  autoLabelOf,
+  folderIdOf,
+  hasAccountRows,
+  listFolderIds,
+  listInfo,
+  smartIdOf,
+  type ListKey,
+  type SmartFolder,
+} from "./sidebar";
 
 export type InboxMode = "focused" | "cards" | "simple";
 export type AccountFilter = AccountId | "all";
@@ -454,6 +463,8 @@ export function listItems(
     const smart = ctx.smartFolders.find((f) => f.id === smartId);
     return smart ? live.filter((m) => matchesQuery(m, smart.query, ctx.hits, read)).sort(newestFirst) : [];
   }
+  const label = autoLabelOf(key);
+  if (label) return live.filter((m) => m.autoLabel === label && !waiting(m, ctx.gatekeeper)).sort(newestFirst);
   return live.filter(inFolders(listFolderIds(key, ctx.folders))).sort(newestFirst);
 }
 
@@ -667,7 +678,7 @@ export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListCon
       counted = listItems(messages, key, ctx);
     } else if (key === "snoozed" || key === "aside") {
       counted = oneEach(listItems(messages, key, ctx));
-    } else if (key === "spam" || folderIdOf(key) !== undefined) {
+    } else if (key === "spam" || folderIdOf(key) !== undefined || autoLabelOf(key)) {
       counted = oneEach(listItems(messages, key, ctx).filter((m) => m.unread && !waiting(m, ctx.gatekeeper)));
     } else continue;
     lists[key] = counted.length;

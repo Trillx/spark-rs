@@ -79,7 +79,7 @@ Last full check: 2026-10-26.
 | AI Assistant | ❌ | Meanwhile, agents such as Claude Code can search and read your mail through `spark-cli` |
 | Meeting Notes | ❌ | |
 | Autopilot | ❌ | |
-| Auto-Drafts | ❌ | |
+| Auto-Drafts | 🟡 | New mail that needs an answer gets a reply waiting in Drafts and in the conversation, written with your own AI provider: up to three options to pick from, your custom instructions, senders to leave out, and cleanup of drafts you didn't use. Auto-Labels sort new mail into To respond, FYI and Spark's other labels, kept on Gmail and in Outlook too. Drafts don't learn your writing style yet |
 
 ## Team Collaboration
 

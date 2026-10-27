@@ -117,7 +117,22 @@ export interface Message {
   reminder?: { id: number; at: number };
   /** The calendar invite it carries, by kind, for the Invitations and Responses cards. */
   inviteKind?: "invitation" | "reply" | "cancellation" | "proposal";
+  /** The Auto-Label inbox automation gave it, or the user chose. */
+  autoLabel?: AutoLabel;
+  /** The draft inbox automation wrote in reply to it, by id. */
+  autoDraft?: number;
 }
+
+/** Spark's Auto-Labels (AutoLabel in the store's automation.rs). */
+export type AutoLabel =
+  | "toRespond"
+  | "fyi"
+  | "comment"
+  | "notification"
+  | "meetingUpdate"
+  | "actioned"
+  | "marketing"
+  | "news";
 
 /** How far a read of the message list got, to ask `messageChanges` from. Only the app's backend reads it. */
 export interface MessageMark {

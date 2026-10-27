@@ -20,6 +20,7 @@ import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
 import { recipientNames } from "../lib/recipients";
 import { hint } from "../lib/shortcuts";
 import Avatar from "./Avatar";
+import { AutoLabelChip } from "./AutoLabelChip";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 
 export interface RowActions {
@@ -128,7 +129,12 @@ function MessageRow({
               {to.more > 0 && <span className="shrink-0 text-[13px] text-text-2">+{to.more}</span>}
             </span>
           ) : (
-            <span className={`truncate text-sm leading-5 ${weight}`}>{names ?? m.from}</span>
+            <span className={`truncate text-sm leading-5 ${weight}`}>
+              {/* Spark's row for a conversation with an auto-draft waiting: "Draft, Dana". */}
+              {m.autoDraft !== undefined && <em className="text-error">Draft</em>}
+              {m.autoDraft !== undefined && ", "}
+              {names ?? m.from}
+            </span>
           )}
           <span
             data-tip={
@@ -214,6 +220,7 @@ function MessageRow({
               {count > 99 ? "99+" : count}
             </span>
           )}
+          {m.autoLabel && <AutoLabelChip label={m.autoLabel} />}
           {m.attachment && <Paperclip size={12} className="shrink-0 rotate-45 text-text-2" aria-label="Has attachment" />}
           {m.muted && <BellOff size={12} className="shrink-0 text-text-2" aria-label="Muted" />}
         </div>

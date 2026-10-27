@@ -61,7 +61,9 @@ Created in [T3 Code](https://t3.codes).
   before the server sees it.
 - **+AI on your own key.** Summaries, quick replies, and writing and rewriting
   in the composer, through Anthropic, OpenAI, or an OpenAI-compatible server
-  such as Ollama on your own computer.
+  such as Ollama on your own computer. Turn on Auto-Labels and Auto-Drafts and
+  new mail is sorted under To respond, FYI and the like, with replies waiting
+  in Drafts for the mail that needs one.
 - **Calendar.** Microsoft 365 calendars by day, week or month, invitations you
   answer from the email, event alerts with Snooze, and a pop-up before
   meetings, with Join for Teams, Zoom and Meet calls.
@@ -437,12 +439,40 @@ kept in Windows Credential Manager, not in a settings file.
   shortens, expands or proofreads what you've written, changes its tone, or
   changes it the way you describe.
 
-Nothing is sent in the background: your provider gets only what you use AI
-on, under its terms. A summary sends the email's sender, date, subject and
-text. The composer sends what you ask for, the draft or the part you
-selected, the email you're replying to or forwarding, and, when no signature
-follows, your name for the sign-off. Check your employer's policy before
-using AI on work mail.
+### Auto-Labels and Auto-Drafts
+
+Settings → Inbox Automation turns these on for each account. Both are off
+until you do.
+
+- **Auto-Labels** give each new Inbox email one of Spark's labels: To
+  respond, FYI, Comment, Notification, Meeting update, Actioned, Marketing or
+  News. The label shows on the email, each label has a list you can keep in
+  the sidebar, and you can change or remove it from the conversation. Gmail
+  gets them as Gmail labels and Microsoft 365 as Outlook categories, so they
+  show in your other mail apps too; other IMAP servers keep them in spark-rs
+  only. When you turn Auto-Labels on, the past week's mail is labeled too.
+  Replying to a To respond conversation makes it Actioned.
+- **Auto-Drafts** write a reply to new mail that needs one. It waits in
+  Drafts and under the email, signed with your signature, and nothing is
+  sent until you send it. When an email asks you to choose, such as yes or no
+  or one time or another, there are up to three replies to pick from. Custom
+  instructions change how drafts are written, senders you list never get one,
+  and drafts you don't touch are deleted after 7 days (you can change this).
+  Senders waiting in the Gatekeeper get none unless you turn that on. Any
+  email's menu has **Auto-Draft a Reply** to get one on request.
+
+Sorting runs on every new email, so you can give inbox automation a smaller,
+cheaper model than the one in Settings → AI.
+
+Your provider gets only what you use AI on, under its terms. A summary sends
+the email's sender, date, subject and text. The composer sends what you ask
+for, the draft or the part you selected, the email you're replying to or
+forwarding, and, when no signature follows, your name for the sign-off.
+Nothing is sent in the background unless you turn on Inbox Automation: then
+each new Inbox email in those accounts is sent (sender, recipients, date,
+subject and text, a few at a time), and for a draft, the earlier emails of
+its conversation, your instructions and your name. Check your employer's
+policy before using AI on work mail.
 
 ## AI agents
 

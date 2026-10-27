@@ -28,6 +28,7 @@ import { hint, shortcutLabel } from "../lib/shortcuts";
 import {
   FOLDER_COLORS,
   SYSTEM_LISTS,
+  autoLabelOf,
   dropPatch,
   folderIdOf,
   hasAccountRows,
@@ -225,7 +226,7 @@ function Rail(props: ViewProps) {
               onClick={() => actions.select(key)}
               onContextMenu={(e) => onMenu(key, section, e)}
             >
-              <ListIcon info={i} color={layout.colors[key]} abbreviate />
+              <ListIcon info={i} color={layout.colors[key] ?? i.color} abbreviate />
               {current === key && narrowed && <NarrowedMark account={narrowed} />}
             </RailButton>
           );
@@ -440,7 +441,7 @@ function Expanded(props: ViewProps) {
       <div key={key} data-item={index} className={`relative ${moving?.key === key ? "opacity-50" : ""}`}>
         {line(section, index, "top")}
         <SidebarRow
-          icon={<ListIcon info={i} color={layout.colors[key]} />}
+          icon={<ListIcon info={i} color={layout.colors[key] ?? i.color} />}
           label={i.label}
           title={i.detail}
           count={hidden(key) ? 0 : (counts.lists[key] ?? 0)}
@@ -749,7 +750,13 @@ function RowMenu({
   const folder = folders.find((f) => f.id === folderIdOf(key));
   const smart = layout.smartFolders.find((f) => f.id === smartIdOf(key));
   const name = folder?.name ?? smart?.name ?? "";
-  const countable = key === "snoozed" || key === "aside" || key === "drafts" || key === "spam" || folder !== undefined;
+  const countable =
+    key === "snoozed" ||
+    key === "aside" ||
+    key === "drafts" ||
+    key === "spam" ||
+    folder !== undefined ||
+    autoLabelOf(key) !== undefined;
 
   const close = useRef(onClose);
   close.current = onClose;

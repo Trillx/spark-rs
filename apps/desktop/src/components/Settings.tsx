@@ -41,6 +41,7 @@ import {
   Trash2,
   UserCheck,
   UsersRound,
+  WandSparkles,
   X,
   Zap,
   type LucideIcon,
@@ -124,6 +125,7 @@ import type { Updates } from "../lib/updates";
 import Dropdown, { MenuItem } from "./Dropdown";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
 import TemplatesPage, { type TemplateDraft } from "./TemplatesPage";
+import InboxAutomationPage from "./InboxAutomationPage";
 import { tipAttrs } from "../lib/tooltip";
 
 export type SettingsPage =
@@ -132,6 +134,7 @@ export type SettingsPage =
   | "signatures"
   | "templates"
   | "ai"
+  | "automation"
   | "agents"
   | "home"
   | "gatekeeper"
@@ -148,6 +151,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
     { key: "signatures", label: "Signatures", Icon: SignatureIcon },
     { key: "templates", label: "Templates", Icon: LayoutTemplate },
     { key: "ai", label: "AI", Icon: Sparkles },
+    { key: "automation", label: "Inbox Automation", Icon: WandSparkles },
     { key: "agents", label: "Agents", Icon: Bot },
   ],
   [
@@ -303,6 +307,7 @@ export default function Settings({
               {page === "signatures" && <SignaturesPage />}
               {page === "templates" && <TemplatesPage start={newTemplate} onStarted={onNewTemplateTaken} />}
               {page === "ai" && <AiPage />}
+              {page === "automation" && <InboxAutomationPage onOpenAi={() => onPage("ai")} />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "about" && <About updates={updates} />}
               {page === "home" && <HomeScreenPage settings={home} onChange={onHome} />}
@@ -348,7 +353,7 @@ export function Group({ title, children, note }: { title?: string; children: Rea
   );
 }
 
-function Row({
+export function Row({
   label,
   description,
   children,
@@ -372,7 +377,7 @@ function Row({
   );
 }
 
-function Switch({
+export function Switch({
   id,
   on,
   disabled = false,
@@ -2721,7 +2726,8 @@ function AiPage() {
           When you use an AI feature, what it works on is sent to {presetLabel(preset)}
           {form.baseUrl ? ` (${host(form.baseUrl)})` : ""} and handled under that provider's terms: an email's sender,
           date, subject and text, and in the composer your request, your draft and your name for the sign-off. Nothing
-          is sent in the background. Check your employer's policy before using AI on work mail.
+          is sent in the background unless you turn on Inbox Automation, which sends new mail to label it and draft
+          replies. Check your employer's policy before using AI on work mail.
         </p>
       </Group>
     </>

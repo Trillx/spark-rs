@@ -1,6 +1,6 @@
 [
   {
-    "id": 1, "account": "personal", "category": "people", "pinned": true, "unread": true,
+    "id": 1, "account": "personal", "category": "people", "autoLabel": "toRespond", "autoDraft": 28, "pinned": true, "unread": true,
     "from": "Dana Whitfield", "address": "dana@whitfieldproperties.example", "ageMinutes": 120,
     "subject": "Lease renewal — signature needed by Friday",
     "snippet": "Hi! Attached is the renewal for next year. Nothing changed except the parking spot…",
@@ -15,7 +15,7 @@
     "body": ["Thinking Mt. Si if the weather holds. Leave around 8 and grab breakfast after?", "I can drive — just bring water and the good snacks this time.", "— M"]
   },
   {
-    "id": 3, "account": "work", "category": "people", "priority": true, "unread": true,
+    "id": 3, "account": "work", "category": "people", "autoLabel": "actioned", "priority": true, "unread": true,
     "from": "Priya Raman", "address": "priya@acme.example", "ageMinutes": 1500,
     "subject": "Re: Q4 roadmap review",
     "snippet": "Moved it to Thursday 2pm — does that still work for you?",
@@ -23,7 +23,7 @@
     "html": "<div dir=\"ltr\"><div>Moved the roadmap review to Thursday at 2pm since half the team is out Wednesday.</div><div><br></div><div>Does that still work for you? If not I can do Friday morning.</div><div><br></div><div>Priya</div></div><br><div class=\"gmail_quote\"><div dir=\"ltr\" class=\"gmail_attr\">On Wed, Oct 21, 2026 at 4:05 PM Hannah Cole &lt;hannah@acme.example&gt; wrote:<br></div><blockquote class=\"gmail_quote\" style=\"margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex\"><div dir=\"ltr\">Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?<div><br></div><div>Hannah</div></div></blockquote></div>"
   },
   {
-    "id": 4, "account": "personal", "category": "people", "priority": true, "unread": true,
+    "id": 4, "account": "personal", "category": "people", "autoLabel": "fyi", "priority": true, "unread": true,
     "from": "Mom", "address": "mom@example.com", "ageMinutes": 1560,
     "subject": "Photos from the weekend",
     "snippet": "Finally got them off my phone! The one of the dog is my favorite",
@@ -31,7 +31,7 @@
     "attachment": "weekend-photos.zip"
   },
   {
-    "id": 5, "account": "work", "category": "people",
+    "id": 5, "account": "work", "category": "people", "autoLabel": "toRespond",
     "from": "Alex Moreno", "address": "alex@moreno-design.example", "ageMinutes": 4400,
     "subject": "Invoice #1042",
     "snippet": "Please find the October invoice attached. Net 30 as usual.",
@@ -39,35 +39,35 @@
     "attachment": "invoice-1042.pdf"
   },
   {
-    "id": 6, "account": "personal", "category": "notifications", "unread": true,
+    "id": 6, "account": "personal", "category": "notifications", "autoLabel": "notification", "unread": true,
     "from": "GitHub", "address": "notifications@github.com", "ageMinutes": 100,
     "subject": "[spark-rs] CI passed on main",
     "snippet": "All checks have passed for 7d0d20a.",
     "body": ["All checks have passed for commit 7d0d20a on main."]
   },
   {
-    "id": 7, "account": "personal", "category": "notifications", "unread": true,
+    "id": 7, "account": "personal", "category": "notifications", "autoLabel": "notification", "unread": true,
     "from": "First Bank", "address": "alerts@firstbank.example", "ageMinutes": 1620,
     "subject": "Your October statement is ready",
     "snippet": "Sign in to view your statement.",
     "body": ["Your October statement is ready. Sign in to view it."]
   },
   {
-    "id": 8, "account": "work", "category": "notifications",
+    "id": 8, "account": "work", "category": "notifications", "autoLabel": "notification",
     "from": "Linear", "address": "notifications@linear.app", "ageMinutes": 4500,
     "subject": "3 issues assigned to you",
     "snippet": "ENG-412, ENG-415 and ENG-420 are waiting on you.",
     "body": ["ENG-412, ENG-415 and ENG-420 were assigned to you."]
   },
   {
-    "id": 9, "account": "personal", "category": "newsletters", "unread": true,
+    "id": 9, "account": "personal", "category": "newsletters", "autoLabel": "news", "unread": true,
     "from": "This Week in Rust", "address": "newsletter@this-week-in-rust.org", "ageMinutes": 2900,
     "subject": "This Week in Rust 612",
     "snippet": "Crate of the week, call for participation, and updates from the compiler team.",
     "body": ["Crate of the week, call for participation, and updates from the compiler team."]
   },
   {
-    "id": 10, "account": "personal", "category": "newsletters",
+    "id": 10, "account": "personal", "category": "newsletters", "autoLabel": "news",
     "from": "Morning Brew", "address": "crew@morningbrew.example", "ageMinutes": 5800,
     "subject": "The weekend reading list",
     "snippet": "Five long reads for your Saturday coffee.",
@@ -81,28 +81,28 @@
     "body": ["Hi — I came across your work and had a quick question about a project.", "Do you have time for a call next week?", "— Jordan"]
   },
   {
-    "id": 12, "account": "personal", "category": "newsletters", "screening": true, "unread": true,
+    "id": 12, "account": "personal", "category": "newsletters", "autoLabel": "marketing", "screening": true, "unread": true,
     "from": "Deals Daily", "address": "promo@dealsdaily.example", "ageMinutes": 280,
     "subject": "72 hours only — everything must go",
     "snippet": "Our biggest sale of the year starts now.",
     "body": ["Our biggest sale of the year starts now."]
   },
   {
-    "id": 13, "account": "work", "category": "people", "unread": true,
+    "id": 13, "account": "work", "category": "people", "autoLabel": "fyi", "unread": true,
     "from": "Sam Okafor", "address": "sam.okafor@acme.example", "ageMinutes": 45,
     "subject": "Offsite logistics",
     "snippet": "Booking the cabins today. Any dietary restrictions I should pass along?",
     "body": ["Booking the cabins for the offsite today.", "Any dietary restrictions I should pass along to the caterer? I need the list by tomorrow noon.", "Thanks,", "Sam"]
   },
   {
-    "id": 14, "account": "personal", "category": "notifications", "unread": true,
+    "id": 14, "account": "personal", "category": "notifications", "autoLabel": "notification", "unread": true,
     "from": "SkyWay Airlines", "address": "no-reply@skyway.example", "ageMinutes": 330,
     "subject": "Check in for your flight to Denver",
     "snippet": "Online check-in is open for SW 482 on Friday, departing 7:15 AM.",
     "body": ["Online check-in is now open for flight SW 482 to Denver on Friday, departing 7:15 AM.", "Check in early to choose your seat."]
   },
   {
-    "id": 15, "account": "work", "category": "people",
+    "id": 15, "account": "work", "category": "people", "autoLabel": "fyi",
     "from": "Hannah Cole", "address": "hannah@acme.example", "ageMinutes": 12000,
     "subject": "Design review notes",
     "snippet": "Summary from Tuesday: we keep the cards, drop the left border selection.",
@@ -110,14 +110,14 @@
     "attachment": "review-notes.pdf"
   },
   {
-    "id": 16, "account": "work", "category": "notifications", "unread": true,
+    "id": 16, "account": "work", "category": "notifications", "autoLabel": "comment", "unread": true,
     "from": "Figma", "address": "comments@figma.example", "ageMinutes": 600,
     "subject": "Kai commented on Inbox v3",
     "snippet": "“Can the hover actions sit where the date is?”",
     "body": ["Kai Tanaka commented on Inbox v3:", "“Can the hover actions sit where the date is?”"]
   },
   {
-    "id": 17, "account": "work", "category": "newsletters", "unread": true,
+    "id": 17, "account": "work", "category": "newsletters", "autoLabel": "news", "unread": true,
     "from": "The Pragmatic Weekly", "address": "hello@pragmaticweekly.example", "ageMinutes": 1450,
     "subject": "How small teams ship desktop apps",
     "snippet": "Three teams on choosing a UI toolkit, and what they would do differently.",
@@ -178,7 +178,7 @@
     "body": ["Wednesday is tough for me and Kai, we're both at the vendor summit. Could we push it?", "Hannah"]
   },
   {
-    "id": 25, "account": "personal", "category": "people", "unread": true, "conversation": 2,
+    "id": 25, "account": "personal", "category": "people", "autoLabel": "fyi", "unread": true, "conversation": 2,
     "from": "Marcus Lee", "address": "marcus.lee@example.com", "ageMinutes": 170,
     "to": ["Me <me@gmail.com>"],
     "subject": "Re: Saturday hike?",
@@ -186,7 +186,7 @@
     "body": ["Perfect. I'll pick you up at 7:45 — the trailhead lot fills up fast.", "— M"]
   },
   {
-    "id": 26, "account": "work", "category": "people", "unread": true,
+    "id": 26, "account": "work", "category": "people", "autoLabel": "meetingUpdate", "unread": true,
     "from": "Priya Raman", "address": "priya@acme.example", "ageMinutes": 35,
     "to": ["Me <me@outlook.com>", "Sam Okafor <sam.okafor@acme.example>", "Hannah Cole <hannah@acme.example>", "alex@moreno-design.example"],
     "subject": "Invitation: Q4 planning sync",
@@ -206,7 +206,7 @@
     }
   },
   {
-    "id": 27, "account": "personal", "category": "people",
+    "id": 27, "account": "personal", "category": "people", "autoLabel": "meetingUpdate",
     "from": "Marcus Lee", "address": "marcus.lee@example.com", "ageMinutes": 150,
     "to": ["Me <me@gmail.com>"],
     "subject": "Accepted: Saturday hike",
@@ -218,5 +218,17 @@
       "organizer": { "name": "Me", "address": "me@gmail.com", "answer": "accepted" },
       "attendees": [{ "name": "Marcus Lee", "address": "marcus.lee@example.com", "answer": "accepted" }]
     }
+  },
+  {
+    "id": 28, "account": "personal", "category": "people", "state": "filed",
+    "from": "Me", "address": "me@gmail.com", "ageMinutes": 110, "conversation": 1,
+    "to": ["Dana Whitfield <dana@whitfieldproperties.example>"],
+    "subject": "Re: Lease renewal — signature needed by Friday",
+    "snippet": "Hi Dana, Thanks for sending the renewal over. I'll sign it and get it back to you before Friday.",
+    "body": ["Hi Dana,", "Thanks for sending the renewal over. I'll sign it and get it back to you before Friday."],
+    "autoDraftOptions": [
+      { "title": "I'll sign it", "body": "Hi Dana,\n\nThanks for sending the renewal over. I'll sign it and get it back to you before Friday." },
+      { "title": "A question first", "body": "Hi Dana,\n\nThanks for sending the renewal. Before I sign, could you tell me where parking spot 14B is?" }
+    ]
   }
 ]

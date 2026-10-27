@@ -130,6 +130,7 @@ import {
   prefetchAttachments,
   saveEml,
   setBadge,
+  setAutoLabel,
   setMuted,
   setReminder,
   setSenderCategory,
@@ -268,6 +269,7 @@ import {
   listInfo,
   loadLayout,
   loadSeen,
+  offerAutoLabels,
   pruneLayout,
   removeSmartFolder,
   renameSmartFolder,
@@ -296,10 +298,13 @@ import { dropPlaceholders, hasPlaceholders, htmlText, replaceText, resendHtml, t
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import { forgetSearch, loadRecentSearches, rememberSearch, useSearchHits, useServerSearch } from "./lib/search";
 import { applyZoom, loadZoom, stepZoom } from "./lib/zoom";
+import { autoDraftReply, chooseAutoDraftOption, onAutoDraftWriting } from "./automation";
+import { AUTO_LABEL_ORDER } from "./lib/autoLabels";
 import type {
   AccountId,
   AccountView,
   AgentSendingEvent,
+  AutoLabel,
   Category,
   FolderView,
   GatekeeperMode,
@@ -562,6 +567,8 @@ export default function App() {
   const writingRun = useRef(0);
   /** Drafts deleted while their Undo toast is up: hidden now, deleted when it's gone. */
   const [discarding, setDiscarding] = useState<ReadonlySet<number>>(new Set());
+  /** Emails a reply is being written for by "Auto-Draft a reply". */
+  const [drafting, setDrafting] = useState<ReadonlySet<number>>(new Set());
   const [palette, setPalette] = useState<Palette | null>(null);
   /** List rows (conversations) selected for a batch action. */
   const [picked, setPicked] = useState<ReadonlySet<number>>(new Set());
@@ -965,6 +972,23 @@ export default function App() {
   useEffect(() => {
     if (THREAD_WINDOW === null) saveLayout(layout);
   }, [layout]);
+
+  // An Auto-Label's list joins the sidebar once mail has it, as Spark adds them.
+  const labelsInUse = AUTO_LABEL_ORDER.filter((l) => messages.some((m) => m.autoLabel === l)).join(",");
+  useEffect(() => {
+    if (THREAD_WINDOW !== null || !labelsInUse) return;
+    const labels = labelsInUse.split(",") as AutoLabel[];
+    setLayout((l) => (labels.every((x) => l.autoOffered.includes(x)) ? l : offerAutoLabels(l, labels)));
+  }, [labelsInUse]);
+
+  // "Auto-Draft a reply" from another window: this one shows it under way too.
+  useEffect(
+    () =>
+      onAutoDraftWriting((id, writing) =>
+        setDrafting((s) => (writing ? new Set([...s, id]) : new Set([...s].filter((x) => x !== id)))),
+      ),
+    [],
+  );
   useEffect(() => saveCardPrefs(cardPrefs), [cardPrefs]);
   useEffect(() => saveGrouped(grouped), [grouped]);
   useEffect(() => saveSeen(seen), [seen]);
@@ -2471,6 +2495,35 @@ export default function App() {
         size: a.size,
       })),
     });
+  }
+
+  /**
+   * A conversation's Auto-Label, as the user picks it: on its newest email that had one (else its
+   * newest), and off the others, so it's in one label's list. Null takes it off.
+   */
+  async function setConversationLabel(thread: Message[], label: AutoLabel | null) {
+    const labeled = thread.filter((x) => x.autoLabel);
+    const keep = labeled[labeled.length - 1] ?? thread[thread.length - 1];
+    try {
+      for (const x of labeled) if (x !== keep || label === null) await setAutoLabel(x.id, null);
+      if (label && keep) await setAutoLabel(keep.id, label);
+    } catch (error) {
+      showToast(`Couldn't change the label: ${String(error)}`, undefined, ICONS.error);
+    }
+    void reloadMessages();
+  }
+
+  /** Spark's "Auto-Draft a reply": AI writes one now, which shows in the conversation. */
+  async function autoDraftFor(m: Message) {
+    setDrafting((s) => new Set([...s, m.id]));
+    try {
+      await autoDraftReply(m.id);
+      await reloadMessages();
+    } catch (error) {
+      showToast(String(error), undefined, ICONS.error, { duration: ERROR_TOAST_MS });
+    } finally {
+      setDrafting((s) => new Set([...s].filter((id) => id !== m.id)));
+    }
   }
 
   /**
@@ -4013,6 +4066,20 @@ export default function App() {
 
   const threadActions: ThreadActions = {
     ...actions,
+    setAutoLabel: (thread, label) => void setConversationLabel(thread, label),
+    autoDraft: (m) => void autoDraftFor(m),
+    drafting: (id) => drafting.has(id),
+    draftOf: (id) => (discarding.has(id) ? undefined : messages.find((x) => x.id === id)),
+    autoDrafts: {
+      edit: (d) => void editDraft(d),
+      send: (d) => void sendDraftNow(d),
+      remove: (d) => discardLater([d.id]),
+      choose: (d, index) =>
+        chooseAutoDraftOption(d.id, index).then(
+          () => reloadMessages(),
+          (error) => showToast(`Couldn't change the draft: ${String(error)}`, undefined, ICONS.error),
+        ),
+    },
     // A conversation's own window doesn't open another.
     popOut: THREAD_WINDOW === null ? popOut : undefined,
     inSpam,
