@@ -6,7 +6,8 @@
 //! checked every 30 seconds, and when the window comes to the front. Every
 //! five minutes a sweep also syncs the folders the UI watches, lists the
 //! folders again and fetches what Microsoft mail was stored without. Older
-//! mail is reached back for when the UI asks.
+//! mail is reached back for when the UI asks, and while nothing else waits,
+//! a year of it downloads in the background (`Engine::backfill`).
 //! Searches go to every account's server at once, beside the workers. It
 //! tells the UI through events (`mailbox-changed`, `folders-changed`,
 //! `accounts-changed`, `sync-status`, `send-status`), and the user through
@@ -594,6 +595,10 @@ async fn work(
             }
         }
 
+        if idle(asks) && engine.backfill_due(account_id) {
+            backfill(&app, &engine, account_id).await;
+        }
+
         tokio::select! {
             _ = wake.notified() => {}
             _ = tokio::time::sleep(TICK) => {}
@@ -776,6 +781,36 @@ fn next_watch(
             wait
         }
     })
+}
+
+/// Whether the user has asked the worker for nothing since its round.
+fn idle(asks: &Asks) -> bool {
+    !asks.fetch.load(Ordering::Relaxed)
+        && !asks.inbox.load(Ordering::Relaxed)
+        && !asks.focus.load(Ordering::Relaxed)
+        && !asks.woke.load(Ordering::Relaxed)
+        && !asks.list_folders.load(Ordering::Relaxed)
+        && asks.folders.lock().unwrap().is_empty()
+        && !asks.older_inbox.load(Ordering::Relaxed)
+        && asks.older_folders.lock().unwrap().is_empty()
+        && asks.older_waiters.lock().unwrap().is_empty()
+}
+
+/// One step of the background download of older inbox mail
+/// (`Engine::backfill`), telling the UI what it brought in. A failure is
+/// only noted: the engine waits longer before the next step.
+async fn backfill(app: &AppHandle, engine: &Engine, account_id: i64) {
+    let had_older = has_older(engine, account_id);
+    match engine.backfill(account_id).await {
+        Ok(report) if report.changed() => {
+            let _ = app.emit("mailbox-changed", ());
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("spark-rs: downloading older mail for account {account_id}: {e}"),
+    }
+    if had_older != has_older(engine, account_id) {
+        let _ = app.emit("accounts-changed", ());
+    }
 }
 
 fn has_older(engine: &Engine, account_id: i64) -> bool {

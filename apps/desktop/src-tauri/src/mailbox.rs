@@ -274,15 +274,37 @@ impl Mailbox {
         self.live.has_accounts()
     }
 
-    /// A message with its text, for the +AI prompts.
-    pub fn with_body(&self, id: i64) -> Option<Message> {
+    /// A message with its text, for the +AI prompts: downloaded first if
+    /// it was stored without it (`body`).
+    pub async fn with_body(&self, app: &AppHandle, id: i64) -> Result<Message, String> {
+        let missing = || format!("no message with id {id}");
         if !self.live() {
-            return self.demo.get(id);
+            return self.demo.get(id).ok_or_else(missing);
         }
+        self.body(app, id).await?;
         let store = self.live.engine.store();
-        let mut message = from_store(store.message(id).ok()??);
-        message.body = Some(paragraphs(&store.content(id).ok()??.text));
-        Some(message)
+        let mut message = from_store(store.message(id).map_err(text)?.ok_or_else(missing)?);
+        let content = store.content(id).map_err(text)?.ok_or_else(missing)?;
+        message.body = Some(paragraphs(&content.text));
+        Ok(message)
+    }
+
+    /// Downloads the body of a message stored without it, the background
+    /// download's older mail (`Engine::fetch_body`). Its list row may change
+    /// with it (its preview, its attachments' names), which the UI hears.
+    /// Fails, worded for the reader, if it can't.
+    pub(crate) async fn body(&self, app: &AppHandle, id: i64) -> Result<(), String> {
+        match self.live.engine.fetch_body(id).await {
+            Ok(filled) => {
+                if filled {
+                    let _ = app.emit("mailbox-changed", ());
+                }
+                Ok(())
+            }
+            Err(e @ Error::Network { .. }) => Err(format!("It hasn't been downloaded yet. {e}.")),
+            Err(Error::Gone) => Err("It's no longer on the server.".into()),
+            Err(e) => Err(text(e)),
+        }
     }
 
     /// The user's own name on an account, to sign the replies AI writes. The
@@ -898,8 +920,14 @@ pub async fn empty_folders(
     }
 }
 
+/// A message's body and what goes with it. Older mail the background
+/// download stored without its body gets it first.
 #[tauri::command]
-pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<MessageContent, String> {
+pub async fn get_message_content(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    id: i64,
+) -> Result<MessageContent, String> {
     if !mailbox.live() {
         let m = mailbox
             .demo
@@ -935,12 +963,19 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
             ),
         });
     }
+    mailbox.body(&app, id).await?;
     let store = mailbox.live.engine.store();
     let content = store
         .content(id)
         .map_err(text)?
         .ok_or_else(|| format!("no message with id {id}"))?;
-    let invite = match content.invite.as_deref().and_then(Invite::from_json) {
+    // Without its calendar text, it's only a listing's hint of an invite.
+    let invite = content
+        .invite
+        .as_deref()
+        .and_then(Invite::from_json)
+        .filter(|i| !i.ics.is_empty());
+    let invite = match invite {
         Some(invite) => {
             let account = store.message(id).map_err(text)?.map(|m| m.account_id);
             let me = match account {

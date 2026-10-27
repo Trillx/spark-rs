@@ -1028,11 +1028,18 @@ async fn imap_inbox_reaches_back() {
     assert!(!first.complete);
     assert!(has_older());
 
-    // Reaching back: the next 100 below the floor, stored quietly.
+    // Reaching back: the next 100 below the floor, stored quietly. GreenMail
+    // can't send the start of a text as IMAP says to (no space before its
+    // literal), which loses the connection: the first try fails, and asks
+    // for less from then on.
     let older = Round {
         older_inbox: true,
         ..Default::default()
     };
+    assert!(engine.run_round(account.id, &older).await.is_err());
+    let after = account_state(&engine, account.id);
+    assert_eq!(after.heads, imap::Heads::Structure);
+    assert_eq!(after.floor, first.floor, "nothing passed");
     let report = engine.run_round(account.id, &older).await.unwrap();
     assert_eq!(report.older, OLDER_STEP, "{report:?}");
     assert!(report.changed());
@@ -1891,4 +1898,275 @@ async fn imap_engine_watches_the_inbox() {
         watched.expect("the watch didn't stop").unwrap(),
         Watch::Restart
     );
+}
+
+/// An INTERNALDATE for APPEND, `days` before now.
+fn days_ago(days: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = now_ms() / 1000 - days * 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "\"{day:02}-{}-{year} 12:00:00 +0000\"",
+        MONTHS[month as usize - 1]
+    )
+}
+
+/// Mail with a file, whose name is written as RFC 2231 has it, and a long
+/// text whose last word is past its preview.
+fn with_file(message_id: &str, subject: &str) -> String {
+    let filler = "and so on ".repeat(40);
+    format!(
+        "Message-ID: <{message_id}>\r\nFrom: Ana Ruiz <ana@x.com>\r\nTo: me@example.com\r\n\
+         Subject: {subject}\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=m\r\n\r\n\
+         --m\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+         Here are the figures, {filler}zanzibar.\r\n\
+         --m\r\nContent-Type: application/pdf\r\n\
+         Content-Disposition: attachment; filename*=utf-8''R%C3%A9sum%C3%A9.pdf\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--m--\r\n"
+    )
+}
+
+/// A meeting request.
+fn invitation(message_id: &str, subject: &str) -> String {
+    format!(
+        "Message-ID: <{message_id}>\r\nFrom: Ana Ruiz <ana@x.com>\r\nTo: me@example.com\r\n\
+         Subject: {subject}\r\nMIME-Version: 1.0\r\n\
+         Content-Type: multipart/alternative; boundary=a\r\n\r\n\
+         --a\r\nContent-Type: text/plain\r\n\r\nJoin us.\r\n\
+         --a\r\nContent-Type: text/calendar; charset=utf-8; method=REQUEST\r\n\r\n\
+         BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:review@x.com\r\n\
+         SUMMARY:Review\r\nDTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\n\
+         ORGANIZER;CN=Ana Ruiz:mailto:ana@x.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n\
+         --a--\r\n"
+    )
+}
+
+#[tokio::test]
+async fn imap_inbox_downloads_a_year_in_the_background() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("year{}@example.com", now_ms());
+    let today = imap::FIRST_SYNC_LIMIT;
+    // Oldest first, so UIDs go up with the dates: 120 from 700 to 581 days
+    // ago, 150 within the year (330 to 32 days ago), and 300 from today.
+    const ANCIENT: usize = 120;
+    const YEAR: usize = 150;
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    for n in 0..ANCIENT {
+        let content = raw(&format!("ancient{n}@x.com"), &format!("Ancient {n}"));
+        let date = days_ago(700 - n as i64);
+        other
+            .append("INBOX", None, Some(&date), content)
+            .await
+            .unwrap();
+    }
+    for n in 0..YEAR {
+        let (id, subject) = (format!("year{n}@x.com"), format!("Year {n}"));
+        let content = match n {
+            120 => with_file(&id, &subject),
+            121 => invitation(&id, &subject),
+            _ => raw(&id, &subject),
+        };
+        let date = days_ago(330 - 2 * n as i64);
+        other
+            .append("INBOX", None, Some(&date), content)
+            .await
+            .unwrap();
+    }
+    for n in 0..today {
+        let content = raw(&format!("today{n}@x.com"), &format!("Today {n}"));
+        other.append("INBOX", None, None, content).await.unwrap();
+    }
+    let _ = other.logout().await;
+
+    let dir = std::env::temp_dir().join(format!("spark-greenmail-year-{}", now_ms()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mail.sqlite");
+    let secrets = Arc::new(MemorySecrets::default());
+    let open = || {
+        let store = Store::open(&path).unwrap();
+        Engine::new(Arc::new(Mutex::new(store)), secrets.clone())
+    };
+    let engine = open();
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    assert!(!engine.backfill_due(account.id), "before the first sync");
+    let report = engine.run(account.id, true).await.unwrap();
+    assert_eq!(report.new, today);
+    assert!(engine.backfill_due(account.id));
+
+    // The first step finds where the year starts on the server. GreenMail
+    // can't send the start of a text as IMAP says to: the step fails, asks
+    // for less from then on, and waits before the next.
+    assert!(engine.backfill(account.id).await.is_err());
+    let state = account_state(&engine, account.id);
+    assert!(
+        state.window.is_some() && state.floor > state.window,
+        "{state:?}"
+    );
+    assert_eq!(state.heads, imap::Heads::Structure);
+    assert!(!engine.backfill_due(account.id), "it waits after failing");
+
+    // A restart goes on from where it got to: the 100 before today's mail,
+    // quietly, without their bodies.
+    drop(engine);
+    let engine = open();
+    assert!(engine.backfill_due(account.id));
+    let report = engine.backfill(account.id).await.unwrap();
+    assert_eq!(report.older, OLDER_STEP, "{report:?}");
+    assert!(report.arrived.is_empty() && report.new == 0);
+    assert!(!engine.backfill_due(account.id), "it pauses between steps");
+    let year = find(&engine, "Year 140");
+    assert!(year.state == MessageState::Inbox && !year.screening);
+    assert_eq!(year.snippet, "", "no preview from GreenMail");
+    let content = engine.store().content(year.id).unwrap().unwrap();
+    assert!(content.body_missing && content.html.is_none());
+    // As a whole email lists: its file, and as an invitation.
+    let file = find(&engine, "Year 120");
+    assert_eq!(file.attachment.as_deref(), Some("Résumé.pdf"));
+    assert_eq!(
+        find(&engine, "Year 121").invite_kind.as_deref(),
+        Some("invitation")
+    );
+    // Search has its sender and subject, not its text yet.
+    let found = |engine: &Engine, text: &str| -> Vec<String> {
+        let found = engine.store().search(text).unwrap();
+        found.into_iter().map(|m| m.subject).collect()
+    };
+    assert_eq!(found(&engine, "\"Year 120\""), ["Year 120"]);
+    assert!(found(&engine, "zanzibar").is_empty());
+
+    // After another restart: the rest of the year, and the 50 beyond it the
+    // step reaches.
+    drop(engine);
+    let engine = open();
+    assert!(engine.backfill_due(account.id));
+    let report = engine.backfill(account.id).await.unwrap();
+    assert_eq!(report.older, OLDER_STEP);
+    let stored = engine.store().messages().unwrap();
+    assert_eq!(stored.len(), today + YEAR + 50);
+    for n in 0..YEAR {
+        let subject = format!("Year {n}");
+        assert!(stored.iter().any(|m| m.subject == subject), "{subject}");
+    }
+    assert!(stored.iter().all(|m| m.subject != "Ancient 69"));
+
+    // That's the year: it stops, after a restart too.
+    drop(engine);
+    let engine = open();
+    assert!(!engine.backfill_due(account.id));
+    assert_eq!(engine.backfill(account.id).await.unwrap().older, 0);
+    let has_older = || inbox_has_older(&engine.store().account(account.id).unwrap().unwrap());
+    assert!(has_older());
+
+    // Scrolling still reaches back past it, the same way.
+    let older = Round {
+        older_inbox: true,
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &older).await.unwrap();
+    assert_eq!(report.older, ANCIENT - 50);
+    assert!(!has_older());
+    let ancient = find(&engine, "Ancient 0");
+    assert!(
+        engine
+            .store()
+            .content(ancient.id)
+            .unwrap()
+            .unwrap()
+            .body_missing
+    );
+
+    // Opened, an email gets its body, files and invite; what the user did
+    // with it stays.
+    let read = Patch {
+        unread: Some(false),
+        pinned: Some(true),
+        ..Default::default()
+    };
+    engine.store().update(file.id, &read, now_ms()).unwrap();
+    assert!(engine.fetch_body(file.id).await.unwrap());
+    let content = engine.store().content(file.id).unwrap().unwrap();
+    assert!(!content.body_missing);
+    assert!(
+        content.text.trim_end().ends_with("zanzibar."),
+        "{:?}",
+        content.text
+    );
+    let names: Vec<&str> = content
+        .attachments
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
+    assert_eq!(names, ["Résumé.pdf"]);
+    let opened = find(&engine, "Year 120");
+    assert!(!opened.unread && opened.pinned);
+    assert_eq!(opened.attachment, file.attachment, "it looked as it does");
+    assert!(
+        opened
+            .snippet
+            .starts_with("Here are the figures, and so on")
+    );
+    assert_eq!(found(&engine, "zanzibar"), ["Year 120"]);
+    assert!(!engine.fetch_body(file.id).await.unwrap(), "once");
+
+    let meeting = find(&engine, "Year 121");
+    assert!(engine.fetch_body(meeting.id).await.unwrap());
+    let content = engine.store().content(meeting.id).unwrap().unwrap();
+    let invite = spark_mail::invite::Invite::from_json(content.invite.as_deref().unwrap()).unwrap();
+    assert_eq!(invite.summary, "Review");
+    assert!(!invite.ics.is_empty());
+
+    // Gone from the server: it says so, and still waits for its body.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.select("INBOX").await.unwrap();
+    let uids = other
+        .uid_search("HEADER Message-ID \"year3@x.com\"")
+        .await
+        .unwrap();
+    let uid = uids.into_iter().next().unwrap();
+    let _: Vec<_> = other
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let _: Vec<_> = other.expunge().await.unwrap().try_collect().await.unwrap();
+    let _ = other.logout().await;
+    let gone = find(&engine, "Year 3");
+    let fetched = engine.fetch_body(gone.id).await;
+    assert!(
+        matches!(fetched, Err(spark_mail::Error::Gone)),
+        "{fetched:?}"
+    );
+    assert!(
+        engine
+            .store()
+            .content(gone.id)
+            .unwrap()
+            .unwrap()
+            .body_missing
+    );
+
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -384,6 +384,12 @@ async fn write_draft(
     id: i64,
     asked: Asked,
 ) -> Result<i64, Failed> {
+    // Older mail may be stored with only its preview: the reply answers the
+    // whole email, downloaded first as for +AI.
+    app.state::<Mailbox>()
+        .body(app, id)
+        .await
+        .map_err(Failed::Email)?;
     let email_failed = |e: spark_store::Error| Failed::Email(e.to_string());
     let (request, account_id) = {
         let store = engine.store();
@@ -549,10 +555,22 @@ fn email(store: &Store, id: i64) -> spark_store::Result<Option<Email>> {
         return Ok(None);
     };
     let content = store.content(id)?;
-    let (to, cc, text) = match content {
-        Some(c) => (c.to, c.cc, c.text),
-        None => (m.to.clone(), Vec::new(), m.snippet.clone()),
+    let (to, cc, text, partial) = match content {
+        Some(c) => (c.to, c.cc, c.text, c.body_missing),
+        None => (m.to.clone(), Vec::new(), m.snippet.clone(), false),
     };
+    let mut text = if text.trim().is_empty() {
+        m.snippet
+    } else {
+        text
+    };
+    // Older mail stored without its body (the background download's) has
+    // only its preview until it's opened.
+    if partial {
+        text.push_str(
+            "\n\n[This is only the start: the rest of this older email isn't downloaded yet.]",
+        );
+    }
     Ok(Some(Email {
         from: m.from_name,
         address: m.from_address,
@@ -565,11 +583,7 @@ fn email(store: &Store, id: i64) -> spark_store::Result<Option<Email>> {
             Category::Notifications => Some("automated notification, going by its headers"),
             Category::Newsletters => Some("newsletter or bulk mail, going by its headers"),
         },
-        text: if text.trim().is_empty() {
-            m.snippet
-        } else {
-            text
-        },
+        text,
     }))
 }
 
@@ -1098,6 +1112,38 @@ mod tests {
         };
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(NoSecrets));
         (engine, account.id, id)
+    }
+
+    #[test]
+    fn mail_stored_without_its_body_is_told_to_be_only_its_start() {
+        use spark_store::{Added, Incoming};
+        let (engine, account, whole) = one_email();
+        let mut store = engine.store();
+        let Added::New(older) = store
+            .add_incoming(
+                &Incoming {
+                    account_id: account,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(2),
+                    message_id: Some("<2@x.com>".into()),
+                    from_address: "dana@x.com".into(),
+                    subject: "Budget".into(),
+                    snippet: "The figures for May".into(),
+                    text: "The figures for May".into(),
+                    body_missing: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        else {
+            panic!("new");
+        };
+        let older = email(&store, older).unwrap().unwrap();
+        assert!(older.text.starts_with("The figures for May"));
+        assert!(older.text.contains("only the start"), "{}", older.text);
+        let whole = email(&store, whole).unwrap().unwrap();
+        assert!(!whole.text.contains("only the start"), "{}", whole.text);
     }
 
     fn options() -> Vec<DraftOption> {

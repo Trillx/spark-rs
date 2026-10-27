@@ -113,12 +113,13 @@ impl Tally {
         self.commands.iter().any(|c| c.contains(what))
     }
 
-    /// The fetches of stored mail's headers, and of new mail's in a folder.
+    /// The fetches of stored mail's headers, and of new mail's in a folder:
+    /// not those of older mail reaching back fetches without its body.
     fn header_fetches(&self) -> Vec<&str> {
         self.commands
             .iter()
             .map(String::as_str)
-            .filter(|c| c.contains("HEADER.FIELDS"))
+            .filter(|c| c.contains("HEADER.FIELDS") && !c.contains("BODYSTRUCTURE"))
             .collect()
     }
 }
@@ -345,6 +346,17 @@ fn respond(
         }
         if items.contains("INTERNALDATE") {
             parts.push("INTERNALDATE \"26-Oct-2026 10:00:00 +0000\"".into());
+        }
+        let text = &raw[raw.find("\r\n\r\n").unwrap() + 4..];
+        if items.contains("BODYSTRUCTURE") {
+            parts.push(format!(
+                "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"us-ascii\") NIL NIL \"7BIT\" {} 1 \
+                 NIL NIL NIL NIL)",
+                text.len()
+            ));
+        }
+        if items.contains("BODY.PEEK[TEXT]<0.") {
+            parts.push(format!("BODY[TEXT]<0> {{{}}}\r\n{text}", text.len()));
         }
         if items.contains("BODY.PEEK[]") {
             parts.push(format!("BODY[] {{{}}}\r\n{raw}", raw.len()));
@@ -626,6 +638,19 @@ async fn inbox_scenarios(condstore: bool) -> Vec<(&'static str, Tally)> {
     );
     assert!(state.floor < floor && !state.complete);
     tallies.push(("one older page", stand_in.take_tally()));
+    // It came without its body, and lists as if it were whole.
+    let older = message(&store, oldest_tracked - 1);
+    assert_eq!(
+        older.snippet,
+        format!("Body of message {}.", oldest_tracked - 1)
+    );
+    assert!(
+        lock(&store)
+            .content(older.id)
+            .unwrap()
+            .unwrap()
+            .body_missing
+    );
 
     // Mail the reach-back brought in is tracked like the rest.
     let reached = oldest_tracked - 1;
@@ -718,8 +743,8 @@ async fn inbox_polls_without_condstore() {
             // The new one's size and body, and its flags with the rest.
             ("one arrival", 7, 1 + k + 2 + k),
             // Two searches below the floor (200 UIDs and 400, a third of
-            // them in the inbox) and 100 sizes and bodies, 25 at a time.
-            ("one older page", 12, 1 + 200 + 2 * OLDER_STEP),
+            // them in the inbox) and 100 heads, without their bodies.
+            ("one older page", 5, 1 + 200 + OLDER_STEP),
             // The newest 300 again, refetched to be found by Message-ID.
             ("UIDVALIDITY change", 27, 3 * FIRST_SYNC_LIMIT),
         ],
@@ -749,7 +774,7 @@ async fn inbox_polls_with_condstore() {
             ("one flag change", 4, 1 + k + 1),
             ("one expunge", 4, 1 + (k - 1)),
             ("one arrival", 6, 1 + k + 2 + 1),
-            ("one older page", 12, 1 + 200 + 2 * OLDER_STEP),
+            ("one older page", 5, 1 + 200 + OLDER_STEP),
             ("UIDVALIDITY change", 26, 3 * FIRST_SYNC_LIMIT),
         ],
     );
@@ -1149,13 +1174,13 @@ async fn a_refused_search_below_the_floor_reaches_back_no_further() {
     assert!(!cached.state.complete);
 }
 
-/// Mail whose body fetch is refused isn't passed by reaching back.
+/// Mail whose fetch is refused isn't passed by reaching back.
 /// (Refused with BAD: for a NO, see
 /// `a_broken_message_reaching_back_is_left_to_the_inbox_sync`.)
 #[tokio::test]
-async fn a_refused_body_fetch_drops_no_mail() {
+async fn a_refused_head_fetch_drops_no_mail() {
     let mut cached = Cached::synced(false).await;
-    cached.refused("BODY.PEEK[]", "BAD", true).await;
+    cached.refused("BODYSTRUCTURE", "BAD", true).await;
     assert_eq!(cached.older().await.unwrap(), OLDER_STEP);
     assert_eq!(cached.in_inbox(), TRACKED as usize + OLDER_STEP);
     let oldest_tracked = ON_SERVER - TRACKED + 1;
@@ -1256,18 +1281,20 @@ async fn a_broken_message_reaching_back_is_left_to_the_inbox_sync() {
     let mut cached = Cached::synced(false).await;
     let oldest_tracked = ON_SERVER - TRACKED + 1;
     let broken = oldest_tracked - 3;
-    cached.stand_in.break_message(broken, "BODY.PEEK[]");
+    // Its head, and its body when the sync asks for it.
+    cached.stand_in.break_message(broken, "INTERNALDATE");
     assert_eq!(cached.older().await.unwrap(), OLDER_STEP - 1);
     let floor = (oldest_tracked - OLDER_STEP as u32) * SPACING;
     assert_eq!(cached.state.floor, Some(floor));
     assert!(!cached.state.complete);
     assert!(stored(&cached.store, broken).is_none());
+    let head_alone = format!("UID FETCH {} {}", broken * SPACING, Heads::Full.query());
+    assert!(cached.stand_in.take_tally().commands.contains(&head_alone));
+
     let alone = format!(
         "UID FETCH {} (UID FLAGS INTERNALDATE BODY.PEEK[])",
         broken * SPACING
     );
-    assert!(cached.stand_in.take_tally().commands.contains(&alone));
-
     let report = cached.sync().await.unwrap();
     assert!(report.new.is_empty(), "{report:?}");
     assert!(cached.stand_in.take_tally().commands.contains(&alone));

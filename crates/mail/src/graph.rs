@@ -26,7 +26,7 @@ use crate::attachment::{
     AttachmentData, INLINE_IMAGE_MAX, INLINE_TOTAL_MAX, InlineImage, cid_key, cid_refs, mime_for,
 };
 use crate::draft::{Bodies, Draft, recipients};
-use crate::invite::Invite;
+use crate::invite::{self, Invite};
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::search::{self, SERVER_HITS};
 use crate::{BLOCKED, Error, OLDER_STEP, Result};
@@ -98,6 +98,14 @@ const FOLDER_SELECT: &str = "id,displayName,childFolderCount";
 const SELECT: &str = "subject,from,replyTo,toRecipients,ccRecipients,bccRecipients,receivedDateTime,\
      isRead,flag,bodyPreview,body,hasAttachments,internetMessageId,conversationId,\
      inferenceClassification";
+/// `SELECT` without the body: what reaching back lists of older mail, which
+/// is stored without it (`older_inbox`).
+const HEAD_SELECT: &str = "subject,from,replyTo,toRecipients,ccRecipients,bccRecipients,\
+     receivedDateTime,isRead,flag,bodyPreview,hasAttachments,internetMessageId,conversationId,\
+     inferenceClassification";
+/// What mail stored without its body lists as its attachment until it's
+/// downloaded, when Graph says it has some (`hasAttachments`).
+pub const UNLISTED_ATTACHMENT: &str = "Attachment";
 
 /// One HTTP client for the process (connection reuse).
 pub(crate) fn http() -> reqwest::Client {
@@ -991,7 +999,9 @@ impl Graph {
     /// Reaches further back in the inbox than the delta query: stores the
     /// next `OLDER_STEP` messages received before the oldest reached so far
     /// (at first, before the delta window), as on a first sync: no
-    /// screening. Returns how many were new.
+    /// screening. They're listed without their bodies (`HEAD_SELECT`), and
+    /// stored so, without their attachments' names and invites: those come
+    /// when they're opened (`fetch_body`). Returns how many were new.
     ///
     /// The delta query only covers its own window, so changes made
     /// elsewhere to mail this old (read, flagged, moved, deleted) don't
@@ -1017,46 +1027,25 @@ impl Graph {
             "/me/mailFolders/inbox/messages?$filter=receivedDateTime+lt+{}&$orderby=receivedDateTime+desc",
             iso_date(before)
         );
-        let mut next = Some(format!("{messages}&$top={OLDER_STEP}&$select={LISTED}"));
-        let mut offset = 0;
+        let mut next = Some(format!(
+            "{messages}&$top={OLDER_STEP}&$select={HEAD_SELECT}"
+        ));
         let mut stored = 0;
         while let Some(url) = next.take() {
-            let page: Page<Listed> = self.json(self.request(Method::GET, &url)).await?;
-            let known: HashSet<String> = {
-                let store = lock(store);
-                let mut known = HashSet::new();
-                for m in &page.value {
-                    if store.has_remote_id(account_id, &m.id)? {
-                        known.insert(m.id.clone());
-                    }
-                }
-                known
-            };
-            let full = self
-                .unknown_in_full(&messages, offset, &page.value, &known)
-                .await?;
-            let new: Vec<&GraphMessage> = page
-                .value
-                .iter()
-                .filter_map(|listed| full.get(&listed.id))
-                .collect();
-            let mut incomings: Vec<Incoming> =
-                new.iter().map(|m| to_incoming(account_id, m)).collect();
-            // What Graph can't give yet is listed as the page is stored.
-            let repairs = self
-                .complete_all(new.into_iter().zip(&mut incomings).collect())
-                .await;
+            let page: Page<GraphMessage> = self.json(self.request(Method::GET, &url)).await?;
             stored += lock(store).batch(|b| {
                 let mut new = 0;
-                for incoming in &incomings {
-                    if let Added::New(_) = b.add_incoming(incoming, false)? {
+                for m in &page.value {
+                    // Mail a search stored already is passed.
+                    if b.has_remote_id(account_id, &m.id)? {
+                        continue;
+                    }
+                    if let Added::New(_) = b.add_incoming(&to_incoming(account_id, m), false)? {
                         new += 1;
                     }
                 }
-                listed_for_repair(b, account_id, repairs)?;
                 Ok(new)
             })?;
-            offset += page.value.len();
             if let Some(oldest) = page
                 .value
                 .iter()
@@ -1074,6 +1063,49 @@ impl Graph {
             }
         }
         Ok(stored)
+    }
+
+    /// Downloads the body of stored message `id` (Graph's `remote_id`),
+    /// stored without it (`older_inbox`), with its attachments and invite as
+    /// new mail gets them (`complete_all`), and fills them in
+    /// (`Store::fill_in_body`). What Graph can't give of those yet is listed
+    /// for the account's rounds (`repair`); till then the message keeps what
+    /// its listing told of them. Returns whether it was waiting for its
+    /// body: false if it had it by then. Fails as gone if the mailbox no
+    /// longer has it.
+    pub async fn fetch_body(
+        &self,
+        store: &Mutex<Store>,
+        account_id: i64,
+        id: i64,
+        remote_id: &str,
+    ) -> Result<bool> {
+        let m = self.message_in_full(remote_id).await?.ok_or(Error::Gone)?;
+        let mut whole = to_incoming(account_id, &m);
+        if whole.body_missing {
+            return Err(Error::Server(
+                "Microsoft Graph sent the email without its body.".into(),
+            ));
+        }
+        let repairs = self.complete_all(vec![(&m, &mut whole)]).await;
+        let mut store = lock(store);
+        if let Some(listed) = store.content(id)?
+            && let Some(repair) = repairs.first()
+        {
+            if repair.missing.attachments {
+                whole.attachments = listed.attachments;
+            }
+            if repair.missing.invite {
+                whole.invite = listed.invite;
+            }
+        }
+        Ok(store.batch(|b| {
+            let filled = b.fill_in_body(id, &whole)?;
+            if filled {
+                listed_for_repair(b, account_id, repairs)?;
+            }
+            Ok(filled)
+        })?)
     }
 
     /// Puts a search to the mailbox (all its folders) and stores the newest
@@ -2345,6 +2377,18 @@ pub fn draft_message(draft: &Draft, bodies: &Bodies) -> Value {
     })
 }
 
+/// Whether the background download has inbox mail left to reach back for
+/// (`Graph::older_inbox`): after the first sync, until what's reached goes
+/// back to `since` (Unix ms), or there's nothing older.
+pub fn backfill_due(state: &SyncState, since: i64) -> bool {
+    state.delta_link.is_some()
+        && !state.complete
+        && state
+            .older_than
+            .or(state.since)
+            .is_none_or(|reached| reached > since)
+}
+
 /// Where the first sync's window starts: `FIRST_SYNC_DAYS` before now.
 pub fn first_sync_since(now_ms: i64) -> i64 {
     now_ms - FIRST_SYNC_DAYS * DAY_MS
@@ -2387,6 +2431,17 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
     } else {
         Category::People
     };
+    // Without its body, it lists as it would whole: with an attachment if it
+    // has any, and with the kind of invite its type says it carries.
+    let body_missing = m.body.is_none();
+    let attachments = match m.has_attachments {
+        Some(true) if body_missing => vec![Attachment {
+            name: UNLISTED_ATTACHMENT.into(),
+            ..Default::default()
+        }],
+        _ => Vec::new(),
+    };
+    let invite = listed_invite(m).filter(|_| body_missing);
     Incoming {
         account_id,
         remote_id: Some(m.id.clone()),
@@ -2410,11 +2465,31 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
             .unwrap_or_else(spark_store::now_ms),
         text,
         html,
+        attachments,
+        invite,
         category,
         unread: !m.is_read.unwrap_or(false),
         flagged: m.flag.as_ref().is_some_and(|f| f.flag_status == "flagged"),
+        body_missing,
         ..Default::default()
     }
+}
+
+/// The kind of invite a meeting message carries, by its type, as JSON with
+/// nothing else in it, to list it with the invitations till its body comes.
+fn listed_invite(m: &GraphMessage) -> Option<String> {
+    let kind = match m.odata_type.as_deref()? {
+        t if t.ends_with("eventMessageRequest") => invite::Kind::Invitation,
+        t if t.ends_with("eventMessageResponse") => invite::Kind::Reply,
+        _ => return None,
+    };
+    Some(
+        Invite {
+            kind,
+            ..Default::default()
+        }
+        .to_json(),
+    )
 }
 
 fn display(r: &GraphRecipient) -> Option<String> {
@@ -3335,18 +3410,25 @@ pub(crate) mod tests {
 
     /// A stand-in mailbox: 350 inbox messages `i0`… and 260 in folder `f1`
     /// (`m0`…), newest first. Listings take `$filter` (`lt` only), `$skip`
-    /// and `$top`, give at most 100 a page, and link the next page.
+    /// and `$top`, give at most 100 a page, and link the next page. Messages
+    /// come with their bodies unless `$select` leaves them out.
     fn mailbox(path: &str) -> Option<Value> {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let q: HashMap<&str, &str> = query.split('&').filter_map(|p| p.split_once('=')).collect();
+        let bodies = q.get("$select").is_none_or(|s| s.contains(",body,"));
         let full = |id: &str, n: usize| {
-            json!({
+            let mut m = json!({
                 "id": id, "subject": format!("Message {id}"), "isRead": true,
                 "receivedDateTime": iso_date(received(n)),
                 "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
                 "internetMessageId": format!("<{id}@contoso.com>"),
-                "body": { "contentType": "text", "content": "Hi" },
-            })
+                "bodyPreview": format!("Hi from {id}"),
+            });
+            if bodies {
+                m["body"] =
+                    json!({ "contentType": "text", "content": format!("Hi from {id}, in full") });
+            }
+            m
         };
         if let Some(id) = route.strip_prefix("/me/messages/") {
             return Some(full(id, id[1..].parse().ok()?));
@@ -3578,7 +3660,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        // Past the stored ones until at least 100 are new: two pages.
+        // Past the stored ones until at least 100 are new: two pages, listed
+        // without their bodies, and nothing else asked.
         let stored = graph.older_inbox(&store, account_id, &mut state).await;
         assert_eq!(stored.unwrap(), 70 + 100);
         assert_eq!(state.older_than, Some(received(249)));
@@ -3591,10 +3674,12 @@ pub(crate) mod tests {
             )),
             "{paths:?}"
         );
-        assert_eq!(
-            full_listings(&paths),
-            [30, 80, 100, 150],
-            "from the first unknown, not the stored ones"
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(
+            paths
+                .iter()
+                .all(|p| p.contains(&format!("&$top={OLDER_STEP}&$select={HEAD_SELECT}"))),
+            "{paths:?}"
         );
         let messages = lock(&store).messages().unwrap();
         let old = messages
@@ -3602,6 +3687,10 @@ pub(crate) mod tests {
             .find(|m| m.subject == "Message i200")
             .unwrap();
         assert!(!old.screening && old.state == spark_store::MessageState::Inbox);
+        assert_eq!(old.snippet, "Hi from i200");
+        let content = lock(&store).content(old.id).unwrap().unwrap();
+        assert!(content.body_missing && content.html.is_none());
+        assert_eq!(content.text, "Hi from i200", "its preview, for search");
 
         // The next 100, which end the inbox; i249 is listed again, as mail
         // of its second might not have been.
@@ -4946,8 +5035,8 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
     }
 
     #[tokio::test]
-    async fn reaching_back_lists_a_meeting_whose_invite_failed() {
-        let (base, _) = serve(invite_fails_once).await;
+    async fn reaching_back_lists_mail_as_whole_and_opening_it_brings_the_rest() {
+        let (base, seen) = serve(invite_fails_once).await;
         let graph = Graph::with_base(&base, "token");
         let (store, account_id) = microsoft_store();
         // The delta window ends between i249 and i250.
@@ -4957,38 +5046,91 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
             ..Default::default()
         };
 
-        // The page is stored and reaching back moves on, i300 without its
-        // invite, which is listed.
+        // One listing, without bodies: no attachments or invites asked for.
         let stored = graph.older_inbox(&store, account_id, &mut state).await;
         assert_eq!(stored.unwrap(), 100);
         assert_eq!(state.older_than, Some(received(349)));
-        let missing = repair_list(&store, account_id);
+        let asked = seen.take();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(repair_list(&store, account_id).is_empty());
+        // Each lists with an attachment, every 25th as an invitation.
+        for m in lock(&store).messages().unwrap() {
+            let n = number(m.subject.strip_prefix("Message ").unwrap());
+            assert_eq!(m.attachment.as_deref(), Some(UNLISTED_ATTACHMENT), "i{n}");
+            let invitation = m.invite_kind.as_deref() == Some("invitation");
+            assert_eq!(invitation, n.is_multiple_of(25), "i{n}");
+        }
+
+        // Opened, i301 gets its body and its attachment's name.
+        let i301 = titled(&store, "Message i301").unwrap();
+        assert!(
+            graph
+                .fetch_body(&store, account_id, i301.id, "i301")
+                .await
+                .unwrap()
+        );
+        let content = lock(&store).content(i301.id).unwrap().unwrap();
+        assert!(!content.body_missing);
+        assert_eq!(content.text, "Hi from i301, in full");
+        let names: Vec<&str> = content
+            .attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, ["i301.pdf"]);
+        assert!(content.invite.is_none());
+        assert_eq!(completing(&seen.take(), "attachments"), [301]);
+        // Asked again, it has it already.
+        assert!(
+            !graph
+                .fetch_body(&store, account_id, i301.id, "i301")
+                .await
+                .unwrap()
+        );
+
+        // i300's invite fails: it keeps what it was listed with till a
+        // round fetches it.
+        let i300 = titled(&store, "Message i300").unwrap();
+        assert!(
+            graph
+                .fetch_body(&store, account_id, i300.id, "i300")
+                .await
+                .unwrap()
+        );
+        let content = lock(&store).content(i300.id).unwrap().unwrap();
+        assert!(!content.body_missing);
+        assert_eq!(content.attachments[0].name, "i300.pdf");
+        let listed_invite = Invite::from_json(content.invite.as_deref().unwrap()).unwrap();
+        assert!(listed_invite.ics.is_empty());
         let invite = Missing {
             attachments: false,
             invite: true,
         };
-        assert_eq!(
-            missing
-                .iter()
-                .map(|r| (r.id.as_str(), r.missing))
-                .collect::<Vec<_>>(),
-            [("i300", invite)]
-        );
-        let i300 = titled(&store, "Message i300").unwrap();
-        let content = lock(&store).content(i300.id).unwrap().unwrap();
-        assert!(content.invite.is_none());
-        assert_eq!(content.attachments.len(), 1);
-
+        let missing: Vec<(String, Missing)> = repair_list(&store, account_id)
+            .into_iter()
+            .map(|r| (r.id, r.missing))
+            .collect();
+        assert_eq!(missing, [("i300".to_owned(), invite)]);
         let now = spark_store::now_ms();
         assert_eq!(graph.repair(&store, account_id, now).await, 1);
         assert!(repair_list(&store, account_id).is_empty());
-        let s = lock(&store);
-        for m in s.messages().unwrap() {
-            let n = number(m.subject.strip_prefix("Message ").unwrap());
-            let content = s.content(m.id).unwrap().unwrap();
-            assert_eq!(content.invite.is_some(), n.is_multiple_of(25), "i{n}");
-            assert_eq!(content.attachments.len(), 1, "i{n}");
-        }
+        let content = lock(&store).content(i300.id).unwrap().unwrap();
+        let invite = Invite::from_json(content.invite.as_deref().unwrap()).unwrap();
+        assert_eq!(invite.summary, "Sync");
+
+        // Gone from the mailbox: it fails, and stays as it was.
+        let gone = Incoming {
+            account_id,
+            remote_id: Some("i3".into()),
+            body_missing: true,
+            ..Default::default()
+        };
+        let Added::New(i3) = lock(&store).add_incoming(&gone, false).unwrap() else {
+            panic!("stored before");
+        };
+        let fetched = graph.fetch_body(&store, account_id, i3, "i3").await;
+        assert!(matches!(fetched, Err(Error::Gone)), "{fetched:?}");
+        assert!(lock(&store).content(i3).unwrap().unwrap().body_missing);
     }
 
     /// The `searchable` stand-in, where a8 is a meeting request whose MIME
@@ -5147,7 +5289,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
     }
 
     #[tokio::test]
-    async fn reaching_back_stores_a_page_with_its_repair_listing_or_not_at_all() {
+    async fn an_opened_body_is_stored_with_its_repair_listing_or_not_at_all() {
         let (base, _) = serve(invite_fails_once).await;
         let graph = Graph::with_base(&base, "token");
         let (store, account_id) = microsoft_store();
@@ -5156,23 +5298,30 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
             since: Some(received(250) + 1_800_000),
             ..Default::default()
         };
-        let unsynced = state.clone();
-
-        // Killed as it lists i300's invite: none of the page is stored, and
-        // reaching back hasn't moved.
-        LISTING_FAILS.set(true);
-        let killed = graph.older_inbox(&store, account_id, &mut state).await;
-        assert!(killed.is_err());
-        assert!(lock(&store).messages().unwrap().is_empty());
-        assert!(listed(&store, account_id).is_empty());
-        assert_eq!(state, unsynced);
-
-        // The next try gets the page again, i300 with its invite this time.
-        let stored = graph.older_inbox(&store, account_id, &mut state).await;
-        assert_eq!(stored.unwrap(), 100);
+        graph
+            .older_inbox(&store, account_id, &mut state)
+            .await
+            .unwrap();
         let i300 = titled(&store, "Message i300").unwrap();
+
+        // Killed as it lists i300's invite: its body isn't stored either.
+        LISTING_FAILS.set(true);
+        let killed = graph.fetch_body(&store, account_id, i300.id, "i300").await;
+        assert!(killed.is_err());
+        assert!(lock(&store).content(i300.id).unwrap().unwrap().body_missing);
+        assert!(listed(&store, account_id).is_empty());
+
+        // The next try gets it all, its invite too this time.
+        assert!(
+            graph
+                .fetch_body(&store, account_id, i300.id, "i300")
+                .await
+                .unwrap()
+        );
         let content = lock(&store).content(i300.id).unwrap().unwrap();
-        assert!(content.invite.is_some());
+        assert!(!content.body_missing);
+        let invite = Invite::from_json(content.invite.as_deref().unwrap()).unwrap();
+        assert_eq!(invite.summary, "Sync");
         assert!(listed(&store, account_id).is_empty());
     }
 

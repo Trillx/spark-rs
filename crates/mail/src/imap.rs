@@ -34,16 +34,17 @@ use std::time::Duration;
 
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{
-    AttributeValue, MailboxDatum, MessageSection, NameAttribute, Outcome, Response, SectionPath,
-    Status,
+    AttributeValue, BodyContentCommon, BodyParams, BodyStructure, ContentEncoding, ContentType,
+    MailboxDatum, MessageSection, NameAttribute, Outcome, Response, SectionPath, Status,
 };
 use async_imap::types::{Fetch, Flag, UnsolicitedResponse};
 use async_imap::{Client, Session as ImapSession};
 use futures_util::TryStreamExt;
+use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 use spark_store::{
-    Account, AccountKind, Added, Folder, FolderRole, Incoming, Location, Pending, Place, Pushed,
-    Query, RemoteFolder, Store,
+    Account, AccountKind, Added, Attachment, Folder, FolderRole, Incoming, Location, Pending,
+    Place, Pushed, Query, RemoteFolder, Store,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -51,8 +52,9 @@ use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 use tokio_rustls::client::TlsStream;
 
+use crate::invite::{self, Invite};
 use crate::search::{self, SERVER_HITS};
-use crate::{BLOCKED, Error, OLDER_STEP, Result, Service, parse, tls, utf7};
+use crate::{BLOCKED, Error, OLDER_STEP, Result, Service, attachment, graph, parse, tls, utf7};
 
 pub const INBOX: &str = "INBOX";
 /// Messages fetched on the first sync of an account.
@@ -71,6 +73,16 @@ const FETCH_BYTES: u64 = 16 * 1024 * 1024;
 const OLDER_SPAN: u32 = 2 * OLDER_STEP as u32;
 /// Message-ID and Reply-To, the headers stored mail is checked against.
 const REPLY_TO_HEADERS: &str = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)]";
+/// The header fields a sync reads of mail it fetches without its body
+/// (`Heads`).
+const HEAD_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (FROM TO CC BCC REPLY-TO SUBJECT DATE \
+     MESSAGE-ID IN-REPLY-TO REFERENCES MIME-VERSION CONTENT-TYPE CONTENT-TRANSFER-ENCODING \
+     LIST-ID LIST-UNSUBSCRIBE PRECEDENCE AUTO-SUBMITTED)]";
+/// How much of each message's text reaching back asks for, for its preview.
+const PREVIEW_BYTES: usize = 2048;
+/// Most messages reaching back fetches at once: they come without their
+/// bodies, so they're small.
+const HEAD_BATCH: usize = OLDER_STEP;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +157,54 @@ pub struct SyncState {
     /// only for flags changed since.
     #[serde(default)]
     pub modseq: Option<u64>,
+    /// The lowest inbox UID of the mail that arrived in the background
+    /// download's window, as the server said when first asked
+    /// (`backfill_inbox`): the download reaches back to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u32>,
+    /// How much of each message reaching back asks the server for.
+    #[serde(default)]
+    pub heads: Heads,
+}
+
+/// How much of each message reaching back asks for: it comes without its
+/// body (`head`). A server that answers part of it in a way that can't be
+/// read loses the connection; each time one does, it's asked for less
+/// from then on (`fetch_heads`). (GreenMail, for one, can't send part of a
+/// text the way IMAP says to.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Heads {
+    /// Its flags and arrival, the header fields a sync reads, its structure
+    /// for its attachments and invite, and the start of its text
+    /// (`PREVIEW_BYTES`) for its preview.
+    #[default]
+    Full,
+    /// Without the start of its text: no preview.
+    Structure,
+    /// Without its structure either: no attachments or invite until it's
+    /// opened.
+    Fields,
+}
+
+impl Heads {
+    fn query(self) -> String {
+        match self {
+            Self::Full => format!(
+                "(UID FLAGS INTERNALDATE BODYSTRUCTURE {HEAD_FIELDS} \
+                 BODY.PEEK[TEXT]<0.{PREVIEW_BYTES}>)"
+            ),
+            Self::Structure => format!("(UID FLAGS INTERNALDATE BODYSTRUCTURE {HEAD_FIELDS})"),
+            Self::Fields => format!("(UID FLAGS INTERNALDATE {HEAD_FIELDS})"),
+        }
+    }
+
+    fn less(self) -> Self {
+        match self {
+            Self::Full => Self::Structure,
+            Self::Structure | Self::Fields => Self::Fields,
+        }
+    }
 }
 
 /// Where a folder's sync stands, kept as JSON with the folder.
@@ -863,6 +923,7 @@ pub async fn sync_inbox(
         state.uid_validity = mailbox.uid_validity;
         state.floor = None;
         state.modseq = None;
+        state.window = None;
         state.reply_to_pending.clear();
     }
 
@@ -983,9 +1044,11 @@ pub async fn sync_inbox(
 /// Reaches further back in the inbox: fetches the newest `OLDER_STEP`
 /// messages below the floor that aren't stored yet (a search may have
 /// stored some), and lowers the floor to the oldest of them, so later
-/// syncs track them like the rest. Stored as on a first sync: no
-/// screening. Returns how many were new. Does nothing before the first
-/// sync, or if the server renumbered the inbox (the next sync starts over).
+/// syncs track them like the rest. They come without their bodies
+/// (`head`), which download when they're opened. Stored as on a first
+/// sync: no screening. Returns how many were new. Does nothing before the
+/// first sync, or if the server renumbered the inbox (the next sync starts
+/// over).
 pub async fn older_inbox(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -1034,16 +1097,14 @@ pub async fn older_inbox(
     }
 
     let mut stored = 0;
-    for batch in older.chunks(FETCH_BATCH) {
+    for batch in older.chunks(HEAD_BATCH) {
         let new: Vec<u32> = batch
             .iter()
             .copied()
             .filter(|uid| !known.contains(uid))
             .collect();
-        stored += fetch_new(session, store, account_id, &new, false)
-            .await?
-            .0
-            .len();
+        let heads = fetch_heads(session, &new, INBOX, &mut state.heads).await?;
+        stored += store_new(store, account_id, heads, false)?.len();
         // Mail a search stored brings its flags from then: the next sync
         // asks for every flag, not just the changes.
         if new.len() < batch.len() {
@@ -1155,6 +1216,70 @@ fn reports_change(response: &UnsolicitedResponse) -> bool {
         }
         UnsolicitedResponse::Status { .. } => false,
     }
+}
+
+/// Whether the background download has inbox mail left to reach back for
+/// (`backfill_inbox`): after the first sync, until the floor is down to the
+/// oldest mail in its window, or there's nothing older.
+pub fn backfill_due(state: &SyncState) -> bool {
+    match state.floor {
+        Some(floor) => !state.complete && state.window.is_none_or(|window| floor > window),
+        None => false,
+    }
+}
+
+/// One step of the background download of older inbox mail: reaching back
+/// (`older_inbox`) while the floor is above the oldest mail that arrived
+/// since `since` (Unix ms) by INTERNALDATE. Which UID that is the server is
+/// asked once, and it's kept (`SyncState::window`): the window's start then
+/// is as good as later, as mail only ever comes in above the floor. Returns
+/// how many were new.
+pub async fn backfill_inbox(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    account_id: i64,
+    state: &mut SyncState,
+    since: i64,
+) -> Result<usize> {
+    let Some(floor) = state.floor else {
+        return Ok(0);
+    };
+    if state.window.is_none() {
+        let mailbox = session.select(INBOX).await?;
+        if mailbox.uid_validity != state.uid_validity {
+            return Ok(0);
+        }
+        let found = match floor {
+            0 | 1 => HashSet::new(),
+            _ => {
+                uid_search(
+                    session,
+                    format!("UID 1:{} SINCE {}", floor - 1, imap_date(since)),
+                )
+                .await?
+            }
+        };
+        state.window = Some(
+            found
+                .into_iter()
+                .filter(|uid| *uid < floor)
+                .min()
+                .unwrap_or(floor),
+        );
+    }
+    if !backfill_due(state) {
+        return Ok(0);
+    }
+    older_inbox(session, store, account_id, state).await
+}
+
+/// An IMAP date ("27-Oct-2025") from Unix ms.
+fn imap_date(ms: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (year, month, day) = graph::civil_from_days(ms.div_euclid(86_400_000));
+    format!("{day}-{}-{year}", MONTHS[(month - 1) as usize])
 }
 
 /// The lowest UID in the selected mailbox, `exists` messages long: its
@@ -1405,12 +1530,24 @@ async fn fetch_new(
     uids: &[u32],
     screen_new_senders: bool,
 ) -> Result<(Vec<i64>, usize)> {
-    let (mut fetched, refused) = fetch_messages(session, uids, INBOX).await?;
+    let (fetched, refused) = fetch_messages(session, uids, INBOX).await?;
+    let added = store_new(store, account_id, fetched, screen_new_senders)?;
+    Ok((added, refused.len()))
+}
+
+/// Stores fetched inbox messages in one transaction; returns the ids of
+/// those that were new.
+fn store_new(
+    store: &Mutex<Store>,
+    account_id: i64,
+    mut fetched: Vec<Incoming>,
+    screen_new_senders: bool,
+) -> Result<Vec<i64>> {
     for m in &mut fetched {
         m.account_id = account_id;
     }
     // All of them are stored, or (if one fails) none.
-    let added = lock(store).batch(|b| {
+    Ok(lock(store).batch(|b| {
         let mut added = Vec::new();
         for m in &fetched {
             if let Added::New(id) = b.add_incoming(m, screen_new_senders)? {
@@ -1418,8 +1555,7 @@ async fn fetch_new(
             }
         }
         Ok(added)
-    })?;
-    Ok((added, refused.len()))
+    })?)
 }
 
 /// Fetches and parses messages from the selected `mailbox`, with their
@@ -1473,6 +1609,76 @@ async fn fetch_messages(
         m.mailbox = Some(mailbox.into());
     }
     Ok((messages, refused))
+}
+
+/// Fetches messages from the selected `mailbox` without their bodies, as
+/// much of them as `heads` says (`head`), with their location, flags and
+/// arrival time; the account is left for the caller. Those a NO held back
+/// are asked for one at a time, and any the server won't give even alone
+/// are left out, as `fetch_messages` leaves them. An answer that can't be
+/// read fails it, and `heads` asks for less from then on.
+async fn fetch_heads(
+    session: &mut Session,
+    uids: &[u32],
+    mailbox: &str,
+    heads: &mut Heads,
+) -> Result<Vec<Incoming>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = heads.query();
+    let mut messages = Vec::new();
+    let mut came = HashSet::new();
+    let mut unreadable = false;
+    let fetched = uid_fetch(session, uid_set(uids), &query)
+        .await?
+        .inspect_ok(|f| came.extend(f.uid))
+        .inspect_err(|e| unreadable |= cannot_read(e));
+    let completion = parse_each(fetched, head, &mut messages).await;
+    let completion = asking_less(completion, unreadable, mailbox, heads)?;
+    for uid in held_back(mailbox, uids, &came, completion).0 {
+        let mut unreadable = false;
+        let fetched = uid_fetch(session, uid.to_string(), &query)
+            .await?
+            .inspect_err(|e| unreadable |= cannot_read(e));
+        let completion = parse_each(fetched, head, &mut messages).await;
+        if let Completion::Partial(said) = asking_less(completion, unreadable, mailbox, heads)? {
+            skipped(mailbox, &format!("message {uid}"), &said);
+        }
+    }
+    for m in &mut messages {
+        m.mailbox = Some(mailbox.into());
+    }
+    Ok(messages)
+}
+
+/// Whether a fetch failed on an answer that can't be read: async-imap's own
+/// failures, which a server's odd answer or one too big to hold makes. A
+/// lost connection fails otherwise.
+fn cannot_read(e: &async_imap::error::Error) -> bool {
+    match e {
+        async_imap::error::Error::Parse(_) => true,
+        async_imap::error::Error::Io(e) => e.kind() == io::ErrorKind::Other,
+        _ => false,
+    }
+}
+
+/// `fetch_heads`'s fetch, which asks for less from then on if it failed on
+/// an answer that can't be read.
+fn asking_less(
+    completion: Result<Completion>,
+    unreadable: bool,
+    mailbox: &str,
+    heads: &mut Heads,
+) -> Result<Completion> {
+    if completion.is_err() && unreadable {
+        let less = heads.less();
+        eprintln!(
+            "spark-rs: {mailbox}: the server's answer couldn't be read; reaching back asks for less ({less:?})"
+        );
+        *heads = less;
+    }
+    completion
 }
 
 /// Splits messages (UID and size, in order) into fetches of at most
@@ -1555,6 +1761,183 @@ fn incoming(fetch: Fetched) -> Option<Incoming> {
         m.date = date;
     }
     Some(m)
+}
+
+/// A message fetched without its body (`HEAD`), with its UID, flags and
+/// arrival time, ready to list as if it were whole: its headers and preview
+/// (`parse::parse_head`), its attachments and the kind of invite it carries
+/// as its structure tells (`Structure`). `None` if it can't be parsed, or
+/// came without its header.
+fn head(mut fetch: Fetched) -> Option<Incoming> {
+    let uid = fetch.uid?;
+    let structure = fetch.structure.take().unwrap_or_default();
+    let text = fetch.text.as_deref().unwrap_or_default();
+    let mut m = parse::parse_head(fetch.header()?, text, text.len() >= PREVIEW_BYTES)?;
+    m.attachments = structure.files;
+    // Only its kind, to list it with the invitations: `Invite::find` reads
+    // the rest from the body.
+    m.invite = structure.invite.map(|kind| {
+        Invite {
+            kind,
+            ..Default::default()
+        }
+        .to_json()
+    });
+    let (unread, flagged) = read_flags(&fetch);
+    m.uid = Some(uid);
+    m.unread = unread;
+    m.flagged = flagged;
+    if let Some(date) = fetch.arrived {
+        m.date = date;
+    }
+    Some(m)
+}
+
+/// What a message's BODYSTRUCTURE tells of it, to list it without its body:
+/// its attachments, as near as it can to how `attachment::describe` lists
+/// them from the message itself, and the kind of invite its calendar part
+/// says it carries (by its `method`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Structure {
+    files: Vec<Attachment>,
+    invite: Option<invite::Kind>,
+}
+
+impl Structure {
+    fn of(structure: &BodyStructure<'_>) -> Self {
+        let mut found = Self::default();
+        found.add(structure);
+        found
+    }
+
+    fn add(&mut self, part: &BodyStructure<'_>) {
+        let (common, other, text) = match part {
+            BodyStructure::Multipart { bodies, .. } => {
+                for part in bodies {
+                    self.add(part);
+                }
+                return;
+            }
+            BodyStructure::Basic { common, other, .. } => (common, other, false),
+            BodyStructure::Text { common, other, .. } => (common, other, true),
+            // A forwarded email attached whole.
+            BodyStructure::Message {
+                common,
+                other,
+                envelope,
+                ..
+            } => {
+                let name = part_name(common).unwrap_or_else(|| {
+                    let subject = envelope.subject.as_deref().and_then(decoded_subject);
+                    format!("{}.eml", subject.as_deref().unwrap_or("Message"))
+                });
+                self.files.push(Attachment {
+                    name,
+                    mime: "message/rfc822".into(),
+                    size: other.octets.into(),
+                    remote_id: None,
+                });
+                return;
+            }
+        };
+        let mime = format!("{}/{}", common.ty.ty, common.ty.subtype).to_ascii_lowercase();
+        let name = part_name(common);
+        let ics = name
+            .as_deref()
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".ics"));
+        if mime == "text/calendar" || mime == "application/ics" || ics {
+            self.invite = self.invite.or_else(|| method(&common.ty));
+        }
+        // Inline images the HTML refers to aren't attachments; nor are
+        // unnamed text parts, which are pieces of the body.
+        let inline = common
+            .disposition
+            .as_ref()
+            .is_some_and(|d| d.ty.eq_ignore_ascii_case("inline"));
+        if (inline && other.id.is_some()) || (text && name.is_none()) {
+            return;
+        }
+        let size = u64::from(other.octets);
+        let size = match other.transfer_encoding {
+            ContentEncoding::Base64 => size * 3 / 4,
+            _ => size,
+        };
+        let name = name.unwrap_or_else(|| {
+            let n = self.files.len() + 1;
+            format!("Attachment {n}{}", attachment::extension_for(&mime))
+        });
+        self.files.push(Attachment {
+            name,
+            mime,
+            size,
+            remote_id: None,
+        });
+    }
+}
+
+/// The name a part's Content-Disposition or Content-Type gives it, decoded
+/// as the parser decodes it in the message itself (RFC 2047, RFC 2231).
+fn part_name(common: &BodyContentCommon<'_>) -> Option<String> {
+    let ty = &common.ty;
+    let mut header = format!(
+        "Content-Type: {}/{}{}\r\n",
+        ty.ty,
+        ty.subtype,
+        header_params(&ty.params)
+    );
+    if let Some(d) = &common.disposition {
+        header.push_str(&format!(
+            "Content-Disposition: {}{}\r\n",
+            d.ty,
+            header_params(&d.params)
+        ));
+    }
+    header.push_str("\r\n");
+    let parsed = MessageParser::default().parse_headers(header.as_bytes())?;
+    let name = parsed.attachment_name()?.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// A BODYSTRUCTURE's parameters as a header writes them. RFC 2231's
+/// extended values (`filename*=utf-8''…`) aren't quoted.
+fn header_params(params: &BodyParams<'_>) -> String {
+    let mut out = String::new();
+    for (key, value) in params.iter().flatten() {
+        let value: String = value
+            .chars()
+            .filter(|c| !matches!(c, '\r' | '\n'))
+            .collect();
+        if key.ends_with('*') {
+            out.push_str(&format!("; {key}={value}"));
+        } else {
+            out.push_str(&format!("; {key}={}", quoted(&value)));
+        }
+    }
+    out
+}
+
+/// A forwarded email's subject as its envelope has it, decoded.
+fn decoded_subject(raw: &[u8]) -> Option<String> {
+    let header = format!("Subject: {}\r\n\r\n", String::from_utf8_lossy(raw));
+    let parsed = MessageParser::default().parse_headers(header.as_bytes())?;
+    let subject = parsed.subject()?.trim();
+    (!subject.is_empty()).then(|| subject.to_owned())
+}
+
+/// What a calendar part's `method` says its invite is.
+fn method(ty: &ContentType<'_>) -> Option<invite::Kind> {
+    let (_, method) = ty
+        .params
+        .iter()
+        .flatten()
+        .find(|(key, _)| key.eq_ignore_ascii_case("method"))?;
+    match method.trim().to_ascii_uppercase().as_str() {
+        "REQUEST" => Some(invite::Kind::Invitation),
+        "REPLY" => Some(invite::Kind::Reply),
+        "CANCEL" => Some(invite::Kind::Cancellation),
+        "COUNTER" => Some(invite::Kind::Proposal),
+        _ => None,
+    }
 }
 
 /// Sends local changes to the server: flags (read, pinned as flagged), then
@@ -2096,6 +2479,10 @@ struct Fetched {
     flagged: bool,
     header: Option<Vec<u8>>,
     body: Option<Vec<u8>>,
+    /// The start of its text (`HEAD`).
+    text: Option<Vec<u8>>,
+    /// What its BODYSTRUCTURE tells (`HEAD`).
+    structure: Option<Structure>,
     /// INTERNALDATE, in milliseconds.
     arrived: Option<i64>,
 }
@@ -2135,6 +2522,16 @@ impl Fetched {
                 }
                 | AttributeValue::Rfc822(Some(data)) => {
                     fetched.body.get_or_insert_with(|| data.to_vec());
+                }
+                AttributeValue::BodySection {
+                    section: Some(SectionPath::Full(MessageSection::Text)),
+                    data: Some(data),
+                    ..
+                } => {
+                    fetched.text.get_or_insert_with(|| data.to_vec());
+                }
+                AttributeValue::BodyStructure(structure) => {
+                    fetched.structure = Some(Structure::of(structure));
                 }
                 AttributeValue::InternalDate(date) => fetched.arrived = internal_date(date),
                 _ => {}
@@ -2405,6 +2802,159 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     use super::*;
+
+    /// `fetch` as a FETCH response reads, its literals counted out.
+    fn read_fetch_response(fetch: &str) -> Fetched {
+        let mut response = String::new();
+        let mut rest = fetch;
+        while let Some(start) = rest.find("{}") {
+            let after = &rest[start + 2..];
+            let end = after.find("\u{1}").unwrap();
+            let literal = &after[..end];
+            response.push_str(&rest[..start]);
+            response.push_str(&format!("{{{}}}\r\n{literal}", literal.len()));
+            rest = &after[end + 1..];
+        }
+        response.push_str(rest);
+        response.push_str("\r\n");
+        let (_, parsed) = Response::parse(response.as_bytes()).unwrap();
+        match parsed {
+            Response::Fetch(message, attributes) => Fetched::read(message, &attributes),
+            other => panic!("not a FETCH: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reaching_back_asks_for_less_of_a_server_it_cant_read() {
+        let full = Heads::Full.query();
+        assert!(full.contains("BODY.PEEK[TEXT]<0.2048>") && full.contains("BODYSTRUCTURE"));
+        assert!(full.contains(" LIST-UNSUBSCRIBE "));
+        let structure = Heads::Full.less().query();
+        assert!(structure.contains("BODYSTRUCTURE") && !structure.contains("TEXT"));
+        let fields = Heads::Full.less().less().query();
+        assert!(!fields.contains("BODYSTRUCTURE") && fields.contains("HEADER.FIELDS"));
+        assert_eq!(Heads::Fields.less(), Heads::Fields);
+        // The odd answer, not a lost connection.
+        let odd = std::io::Error::other("Error(..) during parsing of \"* 1 FETCH\"");
+        assert!(cannot_read(&async_imap::error::Error::Io(odd)));
+        let lost = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(!cannot_read(&async_imap::error::Error::Io(lost)));
+        assert!(!cannot_read(&async_imap::error::Error::ConnectionLost));
+        // States from before keep asking for all of it.
+        let state: SyncState = serde_json::from_str(r#"{"uidValidity":1,"floor":9}"#).unwrap();
+        assert_eq!(state.heads, Heads::Full);
+    }
+
+    #[test]
+    fn mail_fetched_without_its_body_lists_like_whole_mail() {
+        // Literals are written {}…\u{1}: their lengths are filled in.
+        let fields = "From: Ana Ruiz <ana@x.com>\r\nSubject: Plan\r\nDate: Tue, 21 Oct 2025 \
+                      14:00:00 +0000\r\nMessage-ID: <plan@x.com>\r\nList-Unsubscribe: \
+                      <mailto:u@x.com>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; \
+                      boundary=m\r\n\r\n";
+        let text = "--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\r\nHere's the plan for \
+                    Friday.\r\n--a\r\nContent-Type: text/html\r\n\r\n<p>Here's the pl";
+        let fetch = format!(
+            "* 3 FETCH (UID 70 FLAGS (\\Flagged) INTERNALDATE \"21-Oct-2025 14:00:05 +0000\" \
+             BODYSTRUCTURE (((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"7BIT\" 30 1 \
+             NIL NIL NIL NIL)(\"TEXT\" \"HTML\" (\"CHARSET\" \"utf-8\") NIL NIL \
+             \"QUOTED-PRINTABLE\" 300 6 NIL NIL NIL NIL) \"ALTERNATIVE\" (\"BOUNDARY\" \"a\") NIL \
+             NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"x.pdf\") NIL NIL \"BASE64\" 4000 NIL \
+             (\"ATTACHMENT\" (\"FILENAME*\" \"utf-8''%E2%82%AC%20plan.pdf\")) NIL NIL)\
+             (\"IMAGE\" \"PNG\" (\"NAME\" \"logo.png\") \"<logo@x>\" NIL \"BASE64\" 800 NIL \
+             (\"INLINE\" (\"FILENAME\" \"logo.png\")) NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" \
+             (\"NAME\" \"=?UTF-8?B?w6l0w6kudHh0?=\") NIL NIL \"BASE64\" 40 NIL NIL NIL NIL)\
+             (\"TEXT\" \"CALENDAR\" (\"CHARSET\" \"utf-8\" \"METHOD\" \"REQUEST\") NIL NIL \
+             \"7BIT\" 500 10 NIL NIL NIL NIL)(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" 342 \
+             (\"Mon, 20 Oct 2025 09:00:00 +0000\" \"=?UTF-8?Q?Caf=C3=A9_plans?=\" NIL NIL NIL \
+             NIL NIL NIL NIL \"<inner@x>\") (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"us-ascii\") NIL \
+             NIL \"7BIT\" 20 1 NIL NIL NIL NIL) 12 NIL NIL NIL NIL) \"MIXED\" (\"BOUNDARY\" \"m\") \
+             NIL NIL NIL) BODY[HEADER.FIELDS (FROM SUBJECT)] {{}}{fields}\u{1} \
+             BODY[TEXT]<0> {{}}{text}\u{1})"
+        );
+        let m = head(read_fetch_response(&fetch)).unwrap();
+        assert!(m.body_missing && m.html.is_none());
+        assert_eq!((m.uid, m.unread, m.flagged), (Some(70), true, true));
+        assert_eq!(m.date, 1_761_055_205_000, "INTERNALDATE");
+        assert_eq!(
+            (m.from_name.as_str(), m.subject.as_str()),
+            ("Ana Ruiz", "Plan")
+        );
+        assert_eq!(
+            m.category,
+            spark_store::Category::Newsletters,
+            "from the header fields"
+        );
+        assert_eq!(m.snippet, "Here's the plan for Friday.");
+        let files: Vec<(&str, &str, u64)> = m
+            .attachments
+            .iter()
+            .map(|a| (a.name.as_str(), a.mime.as_str(), a.size))
+            .collect();
+        // The inline image and the unnamed calendar part aren't listed.
+        assert_eq!(
+            files,
+            [
+                ("€ plan.pdf", "application/pdf", 3000),
+                ("été.txt", "application/octet-stream", 30),
+                ("Café plans.eml", "message/rfc822", 342),
+            ]
+        );
+        let invite = Invite::from_json(m.invite.as_deref().unwrap()).unwrap();
+        assert_eq!(invite.kind, invite::Kind::Invitation);
+        assert!(invite.ics.is_empty(), "only its kind, till the body comes");
+    }
+
+    #[test]
+    fn plain_mail_without_its_body_has_no_files() {
+        let fields = "From: bob@y.org\r\nSubject: Hi\r\n\r\n";
+        let fetch = format!(
+            "* 1 FETCH (UID 9 FLAGS (\\Seen) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \
+             \"us-ascii\") NIL NIL \"7BIT\" 12 1 NIL NIL NIL NIL) BODY[HEADER.FIELDS (FROM)] \
+             {{}}{fields}\u{1} BODY[TEXT]<0> {{}}Hi there.\r\n\u{1})"
+        );
+        let m = head(read_fetch_response(&fetch)).unwrap();
+        assert_eq!((m.snippet.as_str(), m.unread), ("Hi there.", false));
+        assert!(m.attachments.is_empty() && m.invite.is_none());
+        // A message with no text at all, and one without its header.
+        let fetch = format!(
+            "* 1 FETCH (UID 9 FLAGS () BODY[HEADER.FIELDS (FROM)] {{}}{fields}\u{1} \
+             BODY[TEXT]<0> NIL)"
+        );
+        assert_eq!(head(read_fetch_response(&fetch)).unwrap().snippet, "");
+        assert!(head(read_fetch_response("* 1 FETCH (UID 9 FLAGS ())")).is_none());
+    }
+
+    #[test]
+    fn imap_dates_are_day_month_year() {
+        assert_eq!(imap_date(1_761_055_205_000), "21-Oct-2025");
+        assert_eq!(imap_date(1_735_689_600_000), "1-Jan-2025");
+    }
+
+    #[test]
+    fn the_background_download_goes_down_to_its_window() {
+        let state = |floor, window, complete| SyncState {
+            floor,
+            window,
+            complete,
+            ..Default::default()
+        };
+        assert!(
+            !backfill_due(&state(None, None, false)),
+            "before the first sync"
+        );
+        assert!(
+            backfill_due(&state(Some(500), None, false)),
+            "the window isn't known yet"
+        );
+        assert!(backfill_due(&state(Some(500), Some(120), false)));
+        assert!(!backfill_due(&state(Some(120), Some(120), false)));
+        assert!(
+            !backfill_due(&state(Some(500), Some(120), true)),
+            "nothing older"
+        );
+    }
 
     #[test]
     fn uid_sets_collapse_runs() {

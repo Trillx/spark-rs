@@ -252,9 +252,7 @@ pub async fn summarize_message(
     window: Option<u64>,
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
-    let mail = mailbox
-        .with_body(id)
-        .ok_or_else(|| format!("no message with id {id}"))?;
+    let mail = mailbox.with_body(&app, id).await?;
     let request = summary::summary_request(&mail, style.unwrap_or_default());
     let key = RunKey::Summary(id, window.unwrap_or(0));
     state.start(app, key, request, on_event);
@@ -287,12 +285,7 @@ pub async fn compose_with_ai(
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     let email = match reference {
-        Some(r) => Some((
-            mailbox
-                .with_body(r.id)
-                .ok_or_else(|| format!("no message with id {}", r.id))?,
-            r.relation,
-        )),
+        Some(r) => Some((mailbox.with_body(&app, r.id).await?, r.relation)),
         None => None,
     };
     let name = mailbox.user_name(account);

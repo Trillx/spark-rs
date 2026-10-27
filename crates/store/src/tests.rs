@@ -1441,6 +1441,144 @@ fn what_a_sync_couldnt_fetch_is_filled_in_later_and_nothing_else() {
     );
 }
 
+/// A message as the background download stores it: no body, its preview
+/// as its text, a file and an invite as its listing told of them.
+fn head(account_id: i64, uid: u32) -> Incoming {
+    Incoming {
+        snippet: "Quarterly figures attached".into(),
+        text: "Quarterly figures attached".into(),
+        attachments: vec![Attachment {
+            name: "figures.xlsx".into(),
+            ..Default::default()
+        }],
+        invite: Some(r#"{"kind":"invitation"}"#.into()),
+        body_missing: true,
+        ..incoming(account_id, uid, "ana@parts.com")
+    }
+}
+
+/// `head`, fetched in full.
+fn whole(account_id: i64, uid: u32) -> Incoming {
+    Incoming {
+        snippet: "Quarterly figures attached, see the totals tab".into(),
+        text: "Quarterly figures attached, see the totals tab for margins.".into(),
+        html: Some("<p>Quarterly figures attached, see the <b>totals</b> tab</p>".into()),
+        attachments: vec![Attachment {
+            name: "figures.xlsx".into(),
+            mime: "application/vnd.ms-excel".into(),
+            size: 2_048,
+            remote_id: None,
+        }],
+        invite: None,
+        body_missing: false,
+        ..head(account_id, uid)
+    }
+}
+
+#[test]
+fn mail_stored_without_its_body_gets_it_once_and_keeps_the_users_changes() {
+    let (mut store, account) = store_with_account();
+    let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());
+    let content = store.content(id).unwrap().unwrap();
+    assert!(content.body_missing);
+    assert_eq!(
+        (content.text.as_str(), content.html.as_deref()),
+        ("Quarterly figures attached", None)
+    );
+    // The row looks as it would whole: a file, an invitation, the preview.
+    let row = store.message(id).unwrap().unwrap();
+    assert_eq!(row.attachment.as_deref(), Some("figures.xlsx"));
+    assert_eq!(row.invite_kind.as_deref(), Some("invitation"));
+    // Search has the sender, subject and preview, but not the body yet.
+    assert_eq!(found(&store, "quarterly"), [id]);
+    assert_eq!(found(&store, "parts.com"), [id]);
+    assert!(found(&store, "margins").is_empty());
+
+    let changed = Patch {
+        unread: Some(false),
+        pinned: Some(true),
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    store.update(id, &changed, 5_000).unwrap();
+    let before = store.message(id).unwrap().unwrap();
+
+    // A fetch without the body fills in nothing.
+    assert!(!store.fill_in_body(id, &head(account, 1)).unwrap());
+    assert!(store.content(id).unwrap().unwrap().body_missing);
+
+    assert!(store.fill_in_body(id, &whole(account, 1)).unwrap());
+    let content = store.content(id).unwrap().unwrap();
+    assert!(!content.body_missing);
+    assert!(content.text.ends_with("for margins."));
+    assert!(content.html.unwrap().contains("<b>totals</b>"));
+    assert_eq!(content.attachments, whole(account, 1).attachments);
+    assert_eq!(content.invite, None, "the listing's invite was only a hint");
+    let after = store.message(id).unwrap().unwrap();
+    assert_eq!(
+        after.snippet,
+        "Quarterly figures attached, see the totals tab"
+    );
+    assert_eq!(after.invite_kind, None);
+    assert_eq!(
+        (after.unread, after.pinned, after.state),
+        (before.unread, before.pinned, before.state),
+        "the user's changes stay"
+    );
+    assert_eq!(store.pending_for(id).unwrap().map(|p| p.id), Some(id));
+    assert_eq!(found(&store, "margins"), [id]);
+    check_search_index(&store);
+
+    // Once it has its body, it's left as it is.
+    let mut later = whole(account, 1);
+    later.text = "Something else".into();
+    assert!(!store.fill_in_body(id, &later).unwrap());
+    assert!(
+        store
+            .content(id)
+            .unwrap()
+            .unwrap()
+            .text
+            .ends_with("for margins.")
+    );
+}
+
+#[test]
+fn mail_fetched_whole_elsewhere_fills_in_the_body_stored_without_it() {
+    let (mut store, account) = store_with_account();
+    let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());
+    // Found again by a later fetch of it in full (a search, a renumbered inbox).
+    assert_eq!(
+        store.add_incoming(&whole(account, 1), true).unwrap(),
+        Added::Known(id)
+    );
+    let content = store.content(id).unwrap().unwrap();
+    assert!(!content.body_missing && content.text.ends_with("for margins."));
+
+    // A folder's sync does it too, and one without the body doesn't undo it.
+    let other = new_id(store.add_incoming(&head(account, 2), false).unwrap());
+    store
+        .replace_folders(
+            account,
+            &[RemoteFolder {
+                remote_id: "Projects".into(),
+                parent: None,
+                name: "Projects".into(),
+                role: None,
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    let folder = store.folders().unwrap()[0].id;
+    store
+        .add_folder_message(folder, &whole(account, 2))
+        .unwrap();
+    assert!(!store.content(other).unwrap().unwrap().body_missing);
+    store.add_incoming(&head(account, 2), false).unwrap();
+    assert!(!store.content(other).unwrap().unwrap().body_missing);
+    check_search_index(&store);
+}
+
 #[test]
 fn locations_say_where_the_server_keeps_a_message() {
     let (mut store, account) = store_with_account();
@@ -3568,6 +3706,7 @@ fn version_21_databases_index_pending_and_snoozed_mail() {
         .execute_batch(
             "DROP INDEX messages_pending;
              DROP INDEX messages_due_snooze;
+             ALTER TABLE messages DROP COLUMN body_missing;
              PRAGMA user_version = 21;",
         )
         .unwrap();
@@ -3590,6 +3729,55 @@ fn version_21_databases_index_pending_and_snoozed_mail() {
     );
     // Reopening a migrated database must not create them twice.
     assert_eq!(indexes(&Store::open(&path).unwrap()).len(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn version_25_databases_have_every_body() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v25-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v25.sqlite");
+    let _ = std::fs::remove_file(&path);
+    let id = {
+        let (mut store, account) = {
+            let store = Store::open(&path).unwrap();
+            let account = store
+                .add_account(&NewAccount {
+                    kind: AccountKind::Imap,
+                    email: "a@b.c",
+                    name: "A",
+                    label: "A",
+                    config: "{}",
+                })
+                .unwrap();
+            (store, account.id)
+        };
+        let id = new_id(
+            store
+                .add_incoming(&incoming(account, 1, "a@x.com"), false)
+                .unwrap(),
+        );
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE messages DROP COLUMN body_missing;
+                 PRAGMA user_version = 25;",
+            )
+            .unwrap();
+        id
+    };
+    let store = Store::open(&path).unwrap();
+    assert!(!store.content(id).unwrap().unwrap().body_missing);
+    drop(store);
+    // Reopening a migrated database doesn't add the column twice.
+    assert!(
+        !Store::open(&path)
+            .unwrap()
+            .content(id)
+            .unwrap()
+            .unwrap()
+            .body_missing
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

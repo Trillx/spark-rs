@@ -2,11 +2,14 @@
 //! work at a time (send what's due, push local changes, fetch new mail,
 //! reach back for older mail, list and sync folders). Callers run rounds
 //! for an account one after another; different accounts can run in
-//! parallel.
+//! parallel. Between rounds, while nothing else waits, the background
+//! download brings in a year of older inbox mail a step at a time, without
+//! bodies; a body downloads when its email is opened.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use async_imap::types::Fetch;
 use futures_util::TryStreamExt;
@@ -30,7 +33,7 @@ use crate::labels;
 use crate::oauth::{self, App};
 use crate::recurrence::{self, Repeat};
 use crate::unsubscribe::{self, Unsubscribed};
-use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
+use crate::{Error, OLDER_STEP, Result, Service, parse, search, smtp};
 
 /// How long a local change waits before it's pushed: longer than the UI's
 /// undo window, so an undone change never reaches the server.
@@ -216,6 +219,26 @@ const CALENDAR_STRETCH_MS: i64 = 400 * 86_400_000;
 /// Auto-download leaves alone an email whose attachments add up to more.
 pub const PREFETCH_MAX_BYTES: u64 = 30 * 1024 * 1024;
 
+/// How far back the background download of older inbox mail reaches: a
+/// year, like Spark's. Mail older than that comes in as the user scrolls
+/// to it.
+pub const BACKFILL_DAYS: i64 = 366;
+/// The background download's pause between steps, so new mail and what
+/// the user does go first.
+const BACKFILL_PAUSE: Duration = Duration::from_secs(2);
+/// A failed step is tried again after this long, twice as long after each
+/// failure in a row, up to `BACKFILL_LONGEST_WAIT`.
+const BACKFILL_RETRY: Duration = Duration::from_secs(30);
+const BACKFILL_LONGEST_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// When an account's next background download step may start (`Engine::backfill`).
+#[derive(Default)]
+struct Pace {
+    next: Option<Instant>,
+    /// Steps that failed in a row.
+    failures: u32,
+}
+
 pub struct Engine {
     store: Arc<Mutex<Store>>,
     secrets: Arc<dyn Secrets>,
@@ -238,6 +261,12 @@ pub struct Engine {
     files: Option<Arc<AttachmentCache>>,
     /// Where Graph is: `graph::GRAPH`, or a stand-in's address in tests.
     graph_base: String,
+    /// Each account's background download pace (`backfill`), in memory only:
+    /// a restart starts it again where the sync state says it got to.
+    paces: Mutex<HashMap<i64, Pace>>,
+    /// Per message whose body is downloading (`fetch_body`), taken by each
+    /// asker in turn, so it's downloaded once.
+    bodies: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
 }
 
 impl Engine {
@@ -252,6 +281,8 @@ impl Engine {
             standings: Mutex::new(HashMap::new()),
             files: None,
             graph_base: graph::GRAPH.to_owned(),
+            paces: Mutex::new(HashMap::new()),
+            bodies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -692,6 +723,218 @@ impl Engine {
             }
         }
         Ok(report)
+    }
+
+    /// Whether the account's background download has a step to take now
+    /// (`backfill`): its first sync is done, its inbox isn't covered back to
+    /// `BACKFILL_DAYS` yet nor complete, the pause since its last step is
+    /// over, and nothing else waits for the account: no local change or
+    /// draft to push, nor mail to send.
+    pub fn backfill_due(&self, account_id: i64) -> bool {
+        let now = now_ms();
+        let paused = self
+            .paces_lock()
+            .get(&account_id)
+            .and_then(|pace| pace.next)
+            .is_some_and(|next| Instant::now() < next);
+        if paused {
+            return false;
+        }
+        let store = self.store();
+        let Ok(Some(account)) = store.account(account_id) else {
+            return false;
+        };
+        let left = match config(&account) {
+            Ok(AccountConfig::Imap { .. }) => imap::backfill_due(&from_json(&account.sync_state)),
+            Ok(AccountConfig::Microsoft { .. }) => {
+                graph::backfill_due(&from_json(&account.sync_state), backfill_since(now))
+            }
+            Err(_) => false,
+        };
+        left && store
+            .pending(account_id, now, SETTLE_MS)
+            .is_ok_and(|p| p.is_empty())
+            && store
+                .has_draft_work(account_id, now - SETTLE_MS)
+                .is_ok_and(|work| !work)
+            && store.has_due_sends(account_id, now).is_ok_and(|due| !due)
+    }
+
+    /// One step of the account's background download of older inbox mail:
+    /// reaching back `OLDER_STEP` messages, without their bodies, as
+    /// scrolling does, while what's stored doesn't go back `BACKFILL_DAYS`.
+    /// Where it got to is kept with the sync state, so a restart goes on
+    /// from there. It takes the account's turn, like a round, and keeps to
+    /// Microsoft's pause. The next step waits `BACKFILL_PAUSE`, or after a
+    /// failure longer each time (`backfill_due`). The report says what it
+    /// brought in, as `older`.
+    pub async fn backfill(&self, account_id: i64) -> Result<Report> {
+        let turn = self.turn(account_id);
+        let _turn = turn.lock().await;
+        let stepped = self.backfill_step(account_id).await;
+        let mut paces = self.paces_lock();
+        let pace = paces.entry(account_id).or_default();
+        let wait = match &stepped {
+            Ok(_) => {
+                pace.failures = 0;
+                BACKFILL_PAUSE
+            }
+            Err(_) => {
+                pace.failures = pace.failures.saturating_add(1);
+                BACKFILL_RETRY
+                    .saturating_mul(1 << pace.failures.min(6).saturating_sub(1))
+                    .min(BACKFILL_LONGEST_WAIT)
+            }
+        };
+        pace.next = Some(Instant::now() + wait);
+        Ok(Report {
+            older: stepped?,
+            ..Default::default()
+        })
+    }
+
+    async fn backfill_step(&self, account_id: i64) -> Result<usize> {
+        let account = self.account(account_id)?;
+        let since = backfill_since(now_ms());
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let mut state: imap::SyncState = from_json(&account.sync_state);
+                if !imap::backfill_due(&state) {
+                    return Ok(0);
+                }
+                let password = self.password(account_id)?;
+                let mut session = imap::login(&server, &username, &password).await?;
+                let older =
+                    imap::backfill_inbox(&mut session, &self.store, account_id, &mut state, since)
+                        .await;
+                // Keep the lowered floor even if part of it failed.
+                self.store().set_sync_state(account_id, &to_json(&state))?;
+                let _ = session.logout().await;
+                older
+            }
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let mut state: graph::SyncState = from_json(&account.sync_state);
+                if !graph::backfill_due(&state, since) {
+                    return Ok(0);
+                }
+                let graph = self.syncing_graph(account_id, &client_id, &tenant).await?;
+                let older = graph.older_inbox(&self.store, account_id, &mut state).await;
+                // Keep how far it got even if part of it failed.
+                graph::save_state(&self.store(), account_id, &state)?;
+                older
+            }
+        }
+    }
+
+    /// Downloads the body of a stored message that came without it
+    /// (`Incoming::body_missing`: reaching back, and the background
+    /// download), and fills it in (`Store::fill_in_body`) with its
+    /// attachments and invite. An IMAP email comes whole, once, and the
+    /// files in it are kept too, so opening them doesn't download it again.
+    /// It runs beside the account's rounds, on a connection of its own, and
+    /// isn't held back by Microsoft's pause: the user is waiting for it.
+    /// Several asking at once download it once. Returns whether it was
+    /// filled in: false if it had its body already, or by then.
+    pub async fn fetch_body(&self, message_id: i64) -> Result<bool> {
+        if !self.body_missing(message_id)? {
+            return Ok(false);
+        }
+        let flight = self.bodies_lock().entry(message_id).or_default().clone();
+        let _flight = flight.lock().await;
+        let fetched = match self.body_missing(message_id) {
+            Ok(true) => self.download_body(message_id).await,
+            other => other.map(|_| false),
+        };
+        // The last asker to have its turn takes it off the list: those
+        // waiting meanwhile take theirs on the same one.
+        let mut bodies = self.bodies_lock();
+        if Arc::strong_count(&flight) <= 2 {
+            bodies.remove(&message_id);
+        }
+        fetched
+    }
+
+    /// Whether a stored message waits for its body.
+    fn body_missing(&self, message_id: i64) -> Result<bool> {
+        let content = self.store().content(message_id)?;
+        let content =
+            content.ok_or_else(|| Error::Config("That email is no longer here.".into()))?;
+        Ok(content.body_missing)
+    }
+
+    /// `fetch_body`'s download, once it's this one's turn.
+    async fn download_body(&self, message_id: i64) -> Result<bool> {
+        let (at, validity) = self.locate(message_id)?;
+        let account = self.account(at.account_id)?;
+        match config(&account)? {
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let (raw, trusted) = self
+                    .fetch_raw(&account, &server, &username, &at, validity)
+                    .await?;
+                let (raw, whole) = blocking(move || {
+                    let whole = parse::parse_message(&raw);
+                    (raw, whole)
+                })
+                .await?;
+                let whole = whole.ok_or_else(|| {
+                    Error::Server("The email on the server is unreadable.".into())
+                })?;
+                let filled = self.store().fill_in_body(message_id, &whole)?;
+                // Not what was found by Message-ID in a renumbered mailbox
+                // (`imap::fetch_raw_checked`), as `download_imap` doesn't.
+                if filled && trusted {
+                    self.keep_whole(message_id, raw).await;
+                }
+                Ok(filled)
+            }
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                let remote = at.remote_id.ok_or(Error::Gone)?;
+                self.graph(account.id, &client_id, &tenant)
+                    .await?
+                    .fetch_body(&self.store, account.id, message_id, &remote)
+                    .await
+            }
+        }
+    }
+
+    /// Keeps the attachments and embedded images of an IMAP email that was
+    /// just downloaded whole (`fetch_body`), as `download_imap` keeps them.
+    /// Nothing if there's no cache, or nothing to keep; a failure only
+    /// leaves them to be downloaded when they're opened.
+    async fn keep_whole(&self, message_id: i64, raw: Vec<u8>) {
+        if self.files.is_none() {
+            return;
+        }
+        let Ok(email) = self.email_files(message_id) else {
+            return;
+        };
+        if email.attachments.is_empty() && email.images.is_empty() {
+            return;
+        }
+        // Auto-download, which opening it starts, waits for these.
+        let _turn = self.turn_at(&email, FILES).await;
+        let names: Vec<String> = email.attachments.iter().map(|a| a.name.clone()).collect();
+        let cids = email.images.clone();
+        let extracted = blocking(move || {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            attachment::extract_files(&raw, &names, &cids)
+        })
+        .await;
+        if let Ok((files, images)) = extracted {
+            let _ = self.keep(&email, files, Some(images)).await;
+        }
     }
 
     /// Senders waiting in any account's Gatekeeper to ask this account's
@@ -1462,6 +1705,13 @@ impl Engine {
         draft: &Draft,
     ) -> Result<Option<String>> {
         let account = self.account(account_id)?;
+        // An IMAP reply quotes the email it answers: one stored without its
+        // body gets it first, if its server gives it.
+        if let Some(id) = draft.reply_to
+            && matches!(config(&account)?, AccountConfig::Imap { .. })
+        {
+            let _ = self.fetch_body(id).await;
+        }
         let original = draft
             .reply_to
             .map(|id| self.original(id))
@@ -2587,6 +2837,23 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn paces_lock(&self) -> MutexGuard<'_, HashMap<i64, Pace>> {
+        self.paces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn bodies_lock(&self) -> MutexGuard<'_, HashMap<i64, Arc<AsyncMutex<()>>>> {
+        self.bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Where the background download's window starts, at `now` (Unix ms).
+fn backfill_since(now: i64) -> i64 {
+    now - BACKFILL_DAYS * 86_400_000
 }
 
 /// A series' own clock: its time zone, where its range's dates are, which
@@ -3798,6 +4065,176 @@ mod tests {
         );
         assert_eq!(imap.counts(), (2, 2));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stores `raw` as UID `uid` of the inbox without its body, as the
+    /// background download would.
+    fn store_head(store: &mut Store, account_id: i64, uid: u32, raw: &[u8]) -> i64 {
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let incoming = Incoming {
+            account_id,
+            mailbox: Some(imap::INBOX.into()),
+            uid: Some(uid),
+            message_id: parsed.message_id().map(str::to_owned),
+            from_address: "ana@example.com".into(),
+            subject: "Files".into(),
+            snippet: "The files".into(),
+            text: "The files".into(),
+            date: 1,
+            attachments: vec![Attachment {
+                name: "part0.pdf".into(),
+                ..Default::default()
+            }],
+            body_missing: true,
+            ..Default::default()
+        };
+        match store.add_incoming(&incoming, false).unwrap() {
+            Added::New(id) | Added::Known(id) => id,
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_older_mail_downloads_its_body_once_with_its_files() {
+        const SIZE: usize = 16 * 1024;
+        let (one, two) = (
+            big_message("one@example.com", 1, SIZE),
+            big_message("two@example.com", 2, SIZE),
+        );
+        let imap = ImapStandIn::start(7, vec![(42, one.clone()), (43, two.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let a = store_head(&mut store, account.id, 42, &one);
+        let b = store_head(&mut store, account.id, 43, &two);
+        let gone = store_head(
+            &mut store,
+            account.id,
+            44,
+            b"Message-ID: <gone@example.com>\r\n\r\n",
+        );
+        let dir = files_dir("bodies");
+        let store = Arc::new(Mutex::new(store));
+        let engine = caching(store.clone(), &dir);
+
+        // The reader and a reply ask at once: one download.
+        let (x, y) = tokio::join!(engine.fetch_body(a), engine.fetch_body(a));
+        assert_eq!((x.unwrap(), y.unwrap()), (true, false));
+        assert_eq!(imap.counts(), (1, 1));
+        let content = store.lock().unwrap().content(a).unwrap().unwrap();
+        assert!(!content.body_missing);
+        assert_eq!(content.html.as_deref(), Some(HTML));
+        assert_eq!(content.attachments.len(), 4);
+        assert!(engine.bodies_lock().is_empty(), "nothing left behind");
+
+        // Its files and images came with it: opening them, or Auto-download,
+        // downloads nothing more.
+        assert_eq!(engine.prefetch_attachments(a).await.unwrap(), 0);
+        assert_eq!(
+            engine.attachment(a, 2).await.unwrap().bytes,
+            part(1, 2, SIZE)
+        );
+        assert_eq!(engine.inline_images(a).await.unwrap().len(), 2);
+        assert_eq!(imap.counts(), (1, 1));
+        // Asked again, it has it: no connection.
+        assert!(!engine.fetch_body(a).await.unwrap());
+        assert_eq!(imap.counts(), (1, 1));
+
+        // Without a cache, it still fills in.
+        let bare = Engine::new(store.clone(), Arc::new(TestSecrets));
+        assert!(bare.fetch_body(b).await.unwrap());
+        assert_eq!(imap.counts(), (2, 2));
+
+        // Gone from the server: it fails, and still waits for its body.
+        assert!(matches!(engine.fetch_body(gone).await, Err(Error::Gone)));
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .content(gone)
+                .unwrap()
+                .unwrap()
+                .body_missing
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_background_download_waits_for_the_rest_and_after_failing() {
+        // A server that isn't there.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let server = Server {
+            host: "127.0.0.1".into(),
+            port,
+            security: imap::Security::Plain,
+            trusted_cert: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &server, 7);
+        let id = store_imap(
+            &mut store,
+            account.id,
+            "INBOX",
+            42,
+            b"Message-ID: <a@x>\r\n\r\n",
+        );
+        let store = Arc::new(Mutex::new(store));
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+        assert!(!engine.backfill_due(account.id), "before the first sync");
+        let synced = |window: Option<u32>, complete: bool| {
+            let state = imap::SyncState {
+                uid_validity: Some(7),
+                floor: Some(500),
+                window,
+                complete,
+                ..Default::default()
+            };
+            store
+                .lock()
+                .unwrap()
+                .set_sync_state(account.id, &to_json(&state))
+                .unwrap();
+        };
+        synced(None, false);
+        assert!(engine.backfill_due(account.id));
+        synced(Some(500), false);
+        assert!(!engine.backfill_due(account.id), "down to the window");
+        synced(Some(100), true);
+        assert!(!engine.backfill_due(account.id), "nothing older");
+        synced(Some(100), false);
+        assert!(engine.backfill_due(account.id));
+
+        // A change to push, or mail to send, goes first.
+        let done = spark_store::Patch {
+            state: Some(spark_store::MessageState::Done),
+            ..Default::default()
+        };
+        store
+            .lock()
+            .unwrap()
+            .update(id, &done, now_ms() - 60_000)
+            .unwrap();
+        assert!(!engine.backfill_due(account.id));
+        store.lock().unwrap().drop_pending(id).unwrap();
+        assert!(engine.backfill_due(account.id));
+        let queued = store
+            .lock()
+            .unwrap()
+            .queue_send(account.id, "{}", now_ms() - 1, &[])
+            .unwrap();
+        assert!(!engine.backfill_due(account.id));
+        assert!(store.lock().unwrap().cancel_send(queued).unwrap());
+        assert!(engine.backfill_due(account.id));
+
+        // A step that fails waits before the next.
+        assert!(engine.backfill(account.id).await.is_err());
+        assert!(!engine.backfill_due(account.id));
+        let pace = engine.paces_lock().remove(&account.id).unwrap();
+        assert_eq!(pace.failures, 1);
+        let wait = pace.next.unwrap() - Instant::now();
+        assert!(wait > BACKFILL_RETRY - Duration::from_secs(5) && wait <= BACKFILL_RETRY);
+        assert!(engine.backfill_due(account.id), "once the wait is over");
     }
 
     #[tokio::test]

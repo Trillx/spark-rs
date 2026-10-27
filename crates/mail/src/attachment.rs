@@ -340,7 +340,7 @@ pub fn mime_for(name: &str) -> &'static str {
 }
 
 /// An extension for an unnamed part, so it opens in the right app.
-fn extension_for(mime: &str) -> &'static str {
+pub(crate) fn extension_for(mime: &str) -> &'static str {
     match mime {
         "application/pdf" => ".pdf",
         "image/png" => ".png",

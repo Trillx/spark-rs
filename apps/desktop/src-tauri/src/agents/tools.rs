@@ -314,6 +314,12 @@ fn read_message(cx: &mut Context, args: &Value) -> ToolResult {
         text.truncate(cut);
         text.push_str("\n\n[spark-rs cut the rest of this long message.]");
     }
+    if content.body_missing {
+        text.push_str(
+            "\n\n[This is only the start: spark-rs hasn't downloaded the rest of this older \
+             email yet. Opening it in spark-rs downloads it.]",
+        );
+    }
     let mut value = summary(&m, &[account]);
     merge(
         &mut value,

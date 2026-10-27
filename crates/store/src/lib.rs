@@ -193,6 +193,11 @@ pub struct Incoming {
     pub flagged: bool,
     /// The calendar invite it carries, JSON owned by the mail crate.
     pub invite: Option<String>,
+    /// Fetched without its body, as the background download fetches older
+    /// mail: `text` is only its preview, it has no HTML, and its attachments
+    /// and invite are what its listing told of them. The rest comes when
+    /// it's opened (`Store::fill_in_body`).
+    pub body_missing: bool,
 }
 
 /// A file attached to a stored message. Only what describes it is kept; the
@@ -306,6 +311,9 @@ pub struct Content {
     /// the answer to it sent from here.
     pub invite: Option<String>,
     pub rsvp: Option<String>,
+    /// Stored without its body (`Incoming::body_missing`): `text` is its
+    /// preview until the body is downloaded.
+    pub body_missing: bool,
 }
 
 /// Threading headers of a stored message, for replies.
@@ -861,6 +869,16 @@ impl Store {
             tx.pragma_update(None, "user_version", 25)?;
             tx.commit()?;
         }
+        if version < 26 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "-- Stored without its body, which downloads when it's opened
+                 -- (`Incoming::body_missing`).
+                 ALTER TABLE messages ADD COLUMN body_missing INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            tx.pragma_update(None, "user_version", 26)?;
+            tx.commit()?;
+        }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
         conn.execute_batch(&changes::WATCH_MESSAGES)?;
         conn.execute_batch(drafts::WATCH_SENDS)?;
@@ -992,11 +1010,7 @@ impl Store {
     }
 
     pub fn has_remote_id(&self, account_id: i64, remote_id: &str) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND remote_id = ?2)",
-            params![account_id, remote_id],
-            |r| r.get(0),
-        )
+        has_remote_id_in(&self.conn, account_id, remote_id)
     }
 
     /// The Graph ids of `account_id`'s messages, with their row ids, but for
@@ -1172,7 +1186,8 @@ impl Store {
     pub fn content(&self, id: i64) -> Result<Option<Content>> {
         self.conn
             .query_row(
-                "SELECT text_body, html_body, to_list, cc_list, attachments, bcc_list, invite, rsvp, reply_to_list
+                "SELECT text_body, html_body, to_list, cc_list, attachments, bcc_list, invite, rsvp, reply_to_list,
+                    body_missing
                  FROM messages WHERE id = ?1",
                 [id],
                 |r| {
@@ -1186,10 +1201,21 @@ impl Store {
                         attachments: attachments_from_json(&r.get::<_, String>(4)?),
                         invite: r.get(6)?,
                         rsvp: r.get(7)?,
+                        body_missing: r.get(9)?,
                     })
                 },
             )
             .optional()
+    }
+
+    /// Fills in the body of message `id`, stored without it
+    /// (`Incoming::body_missing`), from `m`, a fetch of it in full: its
+    /// text and HTML, which the search index takes in, its attachments and
+    /// invite as `m` has them, and its preview. Nothing else of it changes,
+    /// so what the user changed (read, pinned, Done, filed) stays. Returns
+    /// whether it was waiting for its body: one that has it is left as it is.
+    pub fn fill_in_body(&self, id: i64, m: &Incoming) -> Result<bool> {
+        fill_in_body_in(&self.conn, id, m)
     }
 
     /// Fills in what a sync stored message `remote_id` of `account_id`
@@ -1894,6 +1920,17 @@ impl Store {
         )? == 1)
     }
 
+    /// Whether the account has mail queued to go out by `now`
+    /// (`claim_due_sends` would claim some).
+    pub fn has_due_sends(&self, account_id: i64, now: i64) -> Result<bool> {
+        self.conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM outbox
+                     WHERE account_id = ?1 AND status = 'queued' AND send_at <= ?2)",
+            )?
+            .query_row(params![account_id, now], |r| r.get(0))
+    }
+
     /// Takes the due drafts for an account, marking them as sending so they
     /// can no longer be cancelled.
     pub fn claim_due_sends(&mut self, account_id: i64, now: i64) -> Result<Vec<(i64, String)>> {
@@ -1966,6 +2003,16 @@ impl Batch<'_> {
         observe_reply_to_in(self.conn, m)
     }
 
+    /// `Store::fill_in_body`, in the batch.
+    pub fn fill_in_body(&self, id: i64, m: &Incoming) -> Result<bool> {
+        fill_in_body_in(self.conn, id, m)
+    }
+
+    /// `Store::has_remote_id`, in the batch.
+    pub fn has_remote_id(&self, account_id: i64, remote_id: &str) -> Result<bool> {
+        has_remote_id_in(self.conn, account_id, remote_id)
+    }
+
     /// `Store::observe_gone_remote`, in the batch.
     pub fn observe_gone_remote(&self, account_id: i64, remote_id: &str) -> Result<usize> {
         observe_gone_remote_in(self.conn, account_id, remote_id)
@@ -1998,6 +2045,7 @@ fn set_sync_state_in(conn: &Connection, id: i64, sync_state: &str) -> Result<()>
 fn add_incoming_in(conn: &Connection, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
     if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
+        fill_in_body_in(conn, id, m)?;
         let (dirty, folder_only): (bool, bool) = conn
             .prepare_cached("SELECT changed_at != 0, folder_only FROM messages WHERE id = ?1")?
             .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -2066,6 +2114,7 @@ fn add_folder_message_in(conn: &Connection, folder_id: i64, m: &Incoming) -> Res
     let home = (place == Place::Folder).then_some(folder_id);
     let added = if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
+        fill_in_body_in(conn, id, m)?;
         let (dirty, remote_place, mailbox): (bool, String, Option<String>) = conn
             .prepare_cached(
                 "SELECT changed_at != 0, remote_place, mailbox FROM messages WHERE id = ?1",
@@ -2258,6 +2307,37 @@ fn arrival_change(state: MessageState) -> i64 {
     }
 }
 
+/// `Store::has_remote_id`, in the caller's transaction.
+fn has_remote_id_in(conn: &Connection, account_id: i64, remote_id: &str) -> Result<bool> {
+    conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND remote_id = ?2)",
+    )?
+    .query_row(params![account_id, remote_id], |r| r.get(0))
+}
+
+/// `Store::fill_in_body`. A message fetched without its body fills in
+/// nothing.
+fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
+    if m.body_missing {
+        return Ok(false);
+    }
+    Ok(conn
+        .prepare_cached(
+            "UPDATE messages SET text_body = ?2, html_body = ?3, attachments = ?4, invite = ?5,
+                snippet = CASE WHEN ?6 = '' THEN snippet ELSE ?6 END, body_missing = 0
+             WHERE id = ?1 AND body_missing != 0",
+        )?
+        .execute(params![
+            id,
+            m.text,
+            m.html,
+            json(&m.attachments),
+            m.invite,
+            m.snippet
+        ])?
+        > 0)
+}
+
 /// Full header fetches refresh reply addresses; flags-only fetches leave them alone.
 fn refresh_reply_to(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
     let Some(recipients) = &m.reply_to else {
@@ -2284,12 +2364,12 @@ fn insert_message(
             from_name, from_address, to_list, cc_list, subject, snippet, date,
             text_body, html_body, attachments, category, state, unread, pinned, screening,
             remote_place, remote_unread, remote_pinned, bcc_list, invite, reply_to_list,
-            auto_category)
+            auto_category, body_missing)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  ?16, ?17, ?18,
                  -- The sender's category if the user chose one, else what its headers say.
                  COALESCE((SELECT category FROM sender_categories WHERE address = ?10), ?19),
-                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19)",
+                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19, ?28)",
     )?
     .execute(params![
         m.account_id,
@@ -2319,6 +2399,7 @@ fn insert_message(
         json(&m.bcc),
         m.invite,
         json(m.reply_to.as_deref().unwrap_or_default()),
+        m.body_missing,
     ])?;
     let id = conn.last_insert_rowid();
     let threading = conversations::Threading {

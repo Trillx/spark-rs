@@ -1,7 +1,7 @@
 //! Turning raw messages into what the store keeps, and Spark's Smart Inbox
 //! categories (people, notifications, newsletters) from headers alone.
 
-use mail_parser::{Address, HeaderValue, MessageParser};
+use mail_parser::{Address, HeaderValue, MessageParser, MimeHeaders};
 use spark_store::{Category, Incoming};
 
 use crate::attachment;
@@ -65,6 +65,69 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         invite: Invite::find(&m).map(|i| i.to_json()),
         ..Default::default()
     })
+}
+
+/// Parses a message fetched without its body (`Incoming::body_missing`):
+/// `header`, its header or the fields of it a sync reads, and `text`, the
+/// start of what follows. `cut`: the message goes on past `text`. Of the
+/// text only the preview is kept, as its text too, for the search index.
+/// Text that's cut is read leniently: its last line, which may be cut in
+/// two, is left out, and the multiparts it leaves open are closed, so the
+/// parts it has decode. Attachments and the invite are left for the
+/// caller, which knows them from the message's structure.
+pub fn parse_head(header: &[u8], text: &[u8], cut: bool) -> Option<Incoming> {
+    let mut raw = header.to_vec();
+    if !raw.ends_with(b"\n\n") && !raw.ends_with(b"\r\n\r\n") {
+        raw.extend_from_slice(if raw.ends_with(b"\n") {
+            b"\r\n"
+        } else {
+            b"\r\n\r\n"
+        });
+    }
+    let text = match text.iter().rposition(|&b| b == b'\n') {
+        Some(end) if cut => &text[..=end],
+        None if cut => &[],
+        _ => text,
+    };
+    raw.extend_from_slice(text);
+    if cut && let Some(m) = MessageParser::default().parse(&raw) {
+        let mut open: Vec<String> = m
+            .parts
+            .iter()
+            .filter_map(|part| {
+                let ct = part.content_type()?;
+                ct.ctype()
+                    .eq_ignore_ascii_case("multipart")
+                    .then(|| ct.attribute("boundary"))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .filter(|b| !contains(text, format!("--{b}--").as_bytes()))
+            .collect();
+        // Innermost first: they come after the ones they're in.
+        open.reverse();
+        for boundary in open {
+            raw.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        }
+    }
+    let mut m = parse_message(&raw)?;
+    // A character cut in two at the end of a base64 line.
+    let preview = m.snippet.trim_end_matches(['\u{fffd}', '…']).trim_end();
+    m.snippet = if m.snippet.ends_with('…') {
+        format!("{preview}…")
+    } else {
+        preview.to_owned()
+    };
+    m.text = m.snippet.clone();
+    m.html = None;
+    m.attachments = Vec::new();
+    m.invite = None;
+    m.body_missing = true;
+    Some(m)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Header hints that a message was sent by a machine or to a list.
@@ -347,6 +410,109 @@ Content-Type: text/html\r\n\
             ),
             Category::Notifications
         );
+    }
+
+    /// The fields a sync asks for of mail it fetches without its body.
+    const HEAD: &str = "From: Ana Ruiz <ana@x.com>\r\n\
+To: me@x.com\r\n\
+Subject: Figures\r\n\
+Date: Tue, 21 Oct 2025 14:00:00 +0000\r\n\
+Message-ID: <fig@x.com>\r\n\
+MIME-Version: 1.0\r\n";
+
+    fn head(content_type: &str) -> Vec<u8> {
+        format!("{HEAD}Content-Type: {content_type}\r\n\r\n").into_bytes()
+    }
+
+    #[test]
+    fn mail_without_its_body_keeps_its_headers_and_preview() {
+        let m = parse_head(
+            &head("text/plain"),
+            b"Hello Ana,\r\nthe figures.\r\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (m.from_name.as_str(), m.subject.as_str()),
+            ("Ana Ruiz", "Figures")
+        );
+        assert_eq!(m.message_id.as_deref(), Some("fig@x.com"));
+        assert_eq!(m.date, 1_761_055_200_000);
+        assert_eq!(m.snippet, "Hello Ana, the figures.");
+        assert_eq!(m.text, m.snippet, "only the preview, for search");
+        assert!(m.body_missing && m.html.is_none() && m.attachments.is_empty());
+
+        // The fields come without the blank line that ends them, or with
+        // nothing after them at all.
+        let fields = format!("{HEAD}Content-Type: text/plain\r\n");
+        let m = parse_head(fields.as_bytes(), b"Short.", false).unwrap();
+        assert_eq!(m.snippet, "Short.");
+        let m = parse_head(&head("text/plain"), b"", true).unwrap();
+        assert_eq!((m.subject.as_str(), m.snippet.as_str()), ("Figures", ""));
+    }
+
+    #[test]
+    fn a_cut_multipart_still_decodes_its_first_text() {
+        // Base64 in an alternative, cut in the middle of a line.
+        let text = b"--b\r\nContent-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+SGVsbG8gdGhlcmUsIHRoaXMgaXMg\r\ndGhlIHN0YXJ0IG9mIGEgbG9uZyB0ZXh0IGFiY";
+        let m = parse_head(&head("multipart/alternative; boundary=b"), text, true).unwrap();
+        assert_eq!(m.snippet, "Hello there, this is");
+
+        // Nested in a mixed message, with HTML after it.
+        let text = b"--m\r\nContent-Type: multipart/alternative; boundary=\"a\"\r\n\r\n\
+--a\r\nContent-Type: text/plain; charset=utf-8\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+SGVsbG8gdGhlcmUsIHRoaXMgaXMg\r\ndGhlIHN0YXJ0IG9mIGEgbG9uZyB0ZXh0IGFi\r\nY2Rl";
+        let m = parse_head(&head("multipart/mixed; boundary=m"), text, true).unwrap();
+        assert_eq!(
+            m.snippet,
+            "Hello there, this is the start of a long text ab"
+        );
+
+        // Cut in the boundary line after the text: none of it shows.
+        let text = b"--bbbbbbbb\r\nContent-Type: text/plain\r\n\r\nSome text.\r\n--bbbb";
+        let m = parse_head(
+            &head("multipart/alternative; boundary=bbbbbbbb"),
+            text,
+            true,
+        )
+        .unwrap();
+        assert_eq!(m.snippet, "Some text.");
+
+        // Cut before any text.
+        let text = b"This is a multi-part message in MIME format.\r\n\r\n--m\r\nContent-Ty";
+        let m = parse_head(&head("multipart/mixed; boundary=m"), text, true).unwrap();
+        assert_eq!(m.snippet, "");
+    }
+
+    #[test]
+    fn cut_text_loses_its_last_line_not_its_characters() {
+        // Quoted-printable cut in the middle of an escape.
+        let text = b"Caf=C3=A9 au lait,\r\ntr=C3=A8s bon=\r\n et encore =C3";
+        let m = parse_head(
+            &head("text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable"),
+            text,
+            true,
+        )
+        .unwrap();
+        assert_eq!(m.snippet, "Café au lait, très bon");
+
+        // Base64 whose last whole line ends half way into a character.
+        let text = b"Q2Fmw6kgYXUgbGFpdCwgdHLD\r\nqHMgYm9uIGV0";
+        let m = parse_head(
+            &head("text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64"),
+            text,
+            true,
+        )
+        .unwrap();
+        assert_eq!(m.snippet, "Café au lait, tr");
+
+        // HTML only: its words, not its markup.
+        let text = b"<html><head><style>p{color:red}</style></head><body><p>Hi Ana, the figures</p>\r\n<p>More text that goes on and o";
+        let m = parse_head(&head("text/html; charset=utf-8"), text, true).unwrap();
+        assert_eq!(m.snippet, "Hi Ana, the figures");
     }
 
     #[test]
