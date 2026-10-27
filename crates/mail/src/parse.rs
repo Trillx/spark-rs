@@ -178,6 +178,21 @@ pub fn reply_to(headers: &[u8]) -> Option<Vec<String>> {
     Some(display_list(parsed.reply_to()))
 }
 
+/// The addresses a block of headers is to (To, Cc and Bcc), lowercased.
+pub fn recipient_addresses(headers: &[u8]) -> Vec<String> {
+    let Some(parsed) = MessageParser::default().parse_headers(headers) else {
+        return Vec::new();
+    };
+    [parsed.to(), parsed.cc(), parsed.bcc()]
+        .into_iter()
+        .flatten()
+        .flat_map(|list| {
+            list.iter()
+                .filter_map(|a| a.address().map(str::to_lowercase))
+        })
+        .collect()
+}
+
 /// Message-IDs are stored without angle brackets.
 pub fn bare_id(id: &str) -> String {
     id.trim()
@@ -213,6 +228,15 @@ fn display_list(address: Option<&Address>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recipients_are_whole_addresses() {
+        let headers = b"To: Jo Ann <JoAnn@Vendor.org>, bob@x.com\r\nCc: \"C\" <c@y.org>\r\n\r\n";
+        assert_eq!(
+            recipient_addresses(headers),
+            ["joann@vendor.org", "bob@x.com", "c@y.org"]
+        );
+    }
 
     const NEWSLETTER: &str = "From: \"The Verge\" <newsletter@theverge.com>\r\n\
 To: Me <me@gmail.com>, other@x.com\r\n\

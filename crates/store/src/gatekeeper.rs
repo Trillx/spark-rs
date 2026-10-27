@@ -238,10 +238,13 @@ impl Store {
             [mode.as_str()],
         )?;
         if mode == GatekeeperMode::Off {
+            // Not those whose domain was decided: that decision stands.
             tx.execute(
                 "INSERT OR IGNORE INTO gatekeeper_senders (address, status)
                  SELECT DISTINCT from_address, 'accepted' FROM messages
-                 WHERE screening = 1 AND from_address != ''",
+                 WHERE screening = 1 AND from_address != ''
+                   AND NOT EXISTS (SELECT 1 FROM gatekeeper_domains d
+                                   WHERE d.domain = substr(from_address, instr(from_address, '@') + 1))",
                 [],
             )?;
             tx.execute("UPDATE messages SET screening = 0 WHERE screening = 1", [])?;
@@ -568,6 +571,11 @@ fn resettle(conn: &Connection, address: &str, now: i64) -> Result<()> {
                 moved("blocked")
             ),
             params![address, now],
+        )?;
+        // Their mail elsewhere (snoozed, say) isn't waiting for a decision either.
+        conn.execute(
+            "UPDATE messages SET screening = 0 WHERE from_address = ?1 AND screening = 1",
+            [address],
         )?;
         return Ok(());
     }

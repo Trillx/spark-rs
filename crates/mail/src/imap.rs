@@ -695,7 +695,9 @@ async fn delimiter(session: &mut Session, mailbox: &str) -> Result<Option<String
 }
 
 /// Of `senders`, the ones the user has written to: the Sent mailbox has
-/// mail to them. Addresses that can't be searched for are left out.
+/// mail to them. SEARCH matches parts of addresses (ann@ in joann@), so the
+/// newest candidates' recipients are checked. Addresses that can't be
+/// searched for are left out.
 pub async fn written_to(
     session: &mut Session,
     sent: &str,
@@ -708,16 +710,37 @@ pub async fn written_to(
         .filter(|a| a.is_ascii() && !a.contains(['"', '\\']))
     {
         let q = quoted(address);
-        if !session
+        let mut uids: Vec<u32> = session
             .uid_search(format!("OR OR TO {q} CC {q} BCC {q}"))
             .await?
-            .is_empty()
-        {
+            .into_iter()
+            .collect();
+        if uids.is_empty() {
+            continue;
+        }
+        uids.sort_unstable();
+        let newest = &uids[uids.len().saturating_sub(SENT_CANDIDATES)..];
+        let headers: Vec<Fetch> = session
+            .uid_fetch(
+                uid_set(newest),
+                "(UID BODY.PEEK[HEADER.FIELDS (TO CC BCC)])",
+            )
+            .await?
+            .try_collect()
+            .await?;
+        let wanted = address.to_lowercase();
+        if headers.iter().any(|f| {
+            f.header()
+                .is_some_and(|h| parse::recipient_addresses(h).contains(&wanted))
+        }) {
             found.push(address.clone());
         }
     }
     Ok(found)
 }
+
+/// How many of the Sent mail a search found are checked for the exact address.
+const SENT_CANDIDATES: usize = 10;
 
 /// Brings the inbox into the store: new messages, flag changes, and
 /// messages that left the inbox elsewhere.

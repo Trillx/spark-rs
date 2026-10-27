@@ -1586,3 +1586,24 @@ async fn imap_accepted_mail_comes_back_from_a_renamed_blocked_folder() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn imap_sent_search_needs_the_exact_address() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let me = format!("exact{}@example.com", now_ms());
+    let mut session = imap::login(&imap, &me, "pw").await.unwrap();
+    session.create("Sent").await.unwrap();
+    let to_joann = format!(
+        "Message-ID: <to-joann@x.com>\r\nFrom: {me}\r\nTo: Jo Ann <joann@vendor.org>\r\nSubject: Hi\r\n\r\nHi\r\n"
+    );
+    session.append("Sent", None, None, to_joann).await.unwrap();
+    let senders = ["ann@vendor.org".to_owned(), "JoAnn@vendor.org".to_owned()];
+    let found = imap::written_to(&mut session, "Sent", &senders)
+        .await
+        .unwrap();
+    assert_eq!(found, ["JoAnn@vendor.org"]);
+}

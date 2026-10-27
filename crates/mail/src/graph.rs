@@ -850,7 +850,8 @@ impl Graph {
     }
 
     /// Of `senders`, the ones the user has written to: Sent Items has mail
-    /// to them.
+    /// to them. Search matches more than the exact address, so the
+    /// candidates' recipients are checked.
     pub async fn written_to(&self, senders: &[String]) -> Result<Vec<String>> {
         let mut found = Vec::new();
         for address in senders.iter().filter(|a| !a.contains(['"', '\\'])) {
@@ -859,12 +860,21 @@ impl Graph {
                 .json(self.request(
                     Method::GET,
                     &format!(
-                        "/me/mailFolders/sentitems/messages?$search={}&$top=1&$select=id",
+                        "/me/mailFolders/sentitems/messages?$search={}&$top=10\
+                         &$select=toRecipients,ccRecipients,bccRecipients",
                         path(&search)
                     ),
                 ))
                 .await?;
-            if !page.value.is_empty() {
+            let to = |m: &Value| {
+                ["toRecipients", "ccRecipients", "bccRecipients"]
+                    .iter()
+                    .filter_map(|field| m[field].as_array())
+                    .flatten()
+                    .filter_map(|r| r["emailAddress"]["address"].as_str())
+                    .any(|a| a.eq_ignore_ascii_case(address))
+            };
+            if page.value.iter().any(to) {
                 found.push(address.clone());
             }
         }
@@ -2090,6 +2100,26 @@ pub(crate) mod tests {
         let at = lock(&store).location(id).unwrap().unwrap();
         assert_eq!(at.remote_place, Place::Blocked);
         assert!(lock(&store).pending(account, 2, 0).unwrap().is_empty());
+    }
+
+    fn sent_items(path: &str) -> Option<Value> {
+        path.starts_with("/me/mailFolders/sentitems/messages?")
+            .then(|| {
+                json!({ "value": [{ "toRecipients": [
+                { "emailAddress": { "name": "Jo Ann", "address": "JoAnn@vendor.org" } }
+            ], "ccRecipients": [] }] })
+            })
+    }
+
+    #[tokio::test]
+    async fn written_to_needs_the_exact_address_among_the_recipients() {
+        let (base, _) = stand_in(sent_items).await;
+        let graph = Graph::with_base(&base, "token");
+        let senders = ["ann@vendor.org".to_owned(), "joann@vendor.org".to_owned()];
+        assert_eq!(
+            graph.written_to(&senders).await.unwrap(),
+            ["joann@vendor.org"]
+        );
     }
 
     /// The `$skip`s of the listings with bodies among `paths`.

@@ -3014,3 +3014,34 @@ fn scheduled_sends_can_move_or_come_back_out() {
     assert_eq!(owner, account);
     assert!(draft.contains("\"Later\""));
 }
+
+#[test]
+fn turning_the_gatekeeper_off_keeps_a_blocked_domain_blocked() {
+    let (mut store, account) = store_with_account();
+    let snoozed = arrive(&mut store, account, 1, "spam@spam.biz").id;
+    let later = Patch {
+        state: Some(MessageState::Snoozed),
+        snoozed_until: Some(100),
+        ..Default::default()
+    };
+    store.update(snoozed, &later, 1).unwrap();
+    let other = arrive(&mut store, account, 2, "ads@spam.biz").id;
+    decide(
+        &mut store,
+        Screen::Domain("spam.biz".into()),
+        Some(Decision::Blocked),
+        2,
+    );
+    assert_eq!(
+        store.message(other).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+
+    store.set_gatekeeper_mode(GatekeeperMode::Off).unwrap();
+    assert_eq!(store.sender_status("spam@spam.biz").unwrap().sender, None);
+    store.wake_snoozed(101).unwrap();
+    assert_eq!(
+        store.message(snoozed).unwrap().unwrap().state,
+        MessageState::Blocked
+    );
+}
