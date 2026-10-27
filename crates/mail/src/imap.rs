@@ -133,9 +133,12 @@ pub struct SyncState {
     pub blocked: Option<String>,
     /// The Reply-To of the inbox mail stored has been fetched. Caches from
     /// before Reply-To was kept fetch it once; mail fetched since has it.
-    /// Mail whose headers the server wouldn't give, even alone, is passed.
     #[serde(default)]
     pub reply_to_fetched: bool,
+    /// Until then, the UIDs whose Reply-To is still to fetch: at first all
+    /// the inbox mail stored, then what the server didn't give yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_to_pending: Vec<u32>,
     /// On servers with CONDSTORE, the inbox's HIGHESTMODSEQ when the flags
     /// of all the mail tracked were last brought in: the next sync asks
     /// only for flags changed since.
@@ -158,6 +161,9 @@ pub struct FolderState {
     /// The Reply-To of the mail it lists has been fetched (as for the inbox).
     #[serde(default)]
     pub reply_to_fetched: bool,
+    /// Until then, the UIDs whose Reply-To is still to fetch (as for the inbox).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_to_pending: Vec<u32>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -539,12 +545,13 @@ pub async fn sync_folder(
             lock(store).forget_folder_uids(folder.id)?;
         }
         state.uid_validity = mailbox.uid_validity;
+        state.reply_to_pending.clear();
     }
 
     // The newest messages by sequence number. Of the mail it lists
     // already, the flags are stored as they come. A list the server cut
     // short (NO) may leave out mail still there, so then nothing leaves
-    // the folder, and Reply-To waits for a whole one.
+    // the folder, or the Reply-To still to fetch.
     let limit = state.limit.unwrap_or(FOLDER_LIMIT);
     state.complete = mailbox.exists <= limit;
     let known = lock(store).folder_uids(folder.id)?;
@@ -572,16 +579,26 @@ pub async fn sync_folder(
         .filter(|uid| known.contains_key(uid))
         .collect();
     let mut report = FolderReport::default();
-    if !state.reply_to_fetched && whole {
+    if !state.reply_to_fetched {
+        // At first all the mail stored in it. What it lists is asked for;
+        // after a whole list, what it doesn't list has left it.
+        let pending = &mut state.reply_to_pending;
+        if pending.is_empty() {
+            pending.extend(known.keys());
+            pending.sort_unstable();
+        }
+        let listing: HashSet<u32> = listed.iter().copied().collect();
+        pending.retain(|uid| known.contains_key(uid) && (!whole || listing.contains(uid)));
         report.changed += fetch_reply_to(
             session,
             store,
             folder.account_id,
             &folder.remote_id,
-            &listed,
+            pending,
+            |uid| listing.contains(&uid),
         )
         .await?;
-        state.reply_to_fetched = true;
+        state.reply_to_fetched = pending.is_empty();
     }
     let mut members: Vec<(i64, Option<u32>)> =
         listed.iter().map(|uid| (known[uid], Some(*uid))).collect();
@@ -592,7 +609,7 @@ pub async fn sync_folder(
         .filter(|uid| !known.contains_key(uid))
         .collect();
     for batch in new.chunks(FETCH_BATCH * 4) {
-        let heads = uid_fetch_each(
+        let (heads, _) = uid_fetch_each(
             session,
             &folder.remote_id,
             batch,
@@ -842,6 +859,7 @@ pub async fn sync_inbox(
         state.uid_validity = mailbox.uid_validity;
         state.floor = None;
         state.modseq = None;
+        state.reply_to_pending.clear();
     }
 
     let first = state.floor.is_none();
@@ -901,10 +919,16 @@ pub async fn sync_inbox(
     }
 
     if !state.reply_to_fetched {
-        let mut stored: Vec<u32> = known.iter().copied().collect();
-        stored.sort_unstable();
-        report.headers += fetch_reply_to(session, store, account_id, INBOX, &stored).await?;
-        state.reply_to_fetched = true;
+        // At first all the mail stored. Mail no longer stored left the inbox.
+        let pending = &mut state.reply_to_pending;
+        if pending.is_empty() {
+            pending.extend(&known);
+            pending.sort_unstable();
+        }
+        pending.retain(|uid| known.contains(uid));
+        report.headers +=
+            fetch_reply_to(session, store, account_id, INBOX, pending, |_| true).await?;
+        state.reply_to_fetched = pending.is_empty();
     }
 
     // Only from a SELECT that turned CONDSTORE on: a server that sends
@@ -1090,23 +1114,26 @@ fn store_flags(
     })?)
 }
 
-/// Fetches the Message-ID and Reply-To of stored mail at `uids` in the
-/// selected `mailbox`, `OBSERVE_BATCH` at a time, and brings the stored
-/// Reply-To up to date. Caches from before Reply-To was kept do this once.
-/// Returns how many changed. Mail whose headers the server won't give,
-/// even alone, keeps the Reply-To it has: done once, this asks for it
-/// once, where trying again each round would mean asking for every stored
-/// message's headers each round.
+/// Fetches the Message-ID and Reply-To of the stored mail at the UIDs in
+/// `pending` that `wanted` keeps, in the selected `mailbox`,
+/// `OBSERVE_BATCH` at a time, and brings the stored Reply-To up to date.
+/// Caches from before Reply-To was kept do this until `pending` is empty.
+/// As each batch is stored, its UIDs leave `pending`, but for those the
+/// server wouldn't give, even alone, or gave without the headers: they're
+/// asked for again next round. (Those an OK left out are gone.) Returns
+/// how many changed.
 async fn fetch_reply_to(
     session: &mut Session,
     store: &Mutex<Store>,
     account_id: i64,
     mailbox: &str,
-    uids: &[u32],
+    pending: &mut Vec<u32>,
+    wanted: impl Fn(u32) -> bool,
 ) -> Result<usize> {
+    let asked: Vec<u32> = pending.iter().copied().filter(|uid| wanted(*uid)).collect();
     let mut changed = 0;
-    for chunk in uids.chunks(OBSERVE_BATCH) {
-        let fetched = uid_fetch_each(
+    for chunk in asked.chunks(OBSERVE_BATCH) {
+        let (fetched, refused) = uid_fetch_each(
             session,
             mailbox,
             chunk,
@@ -1134,6 +1161,19 @@ async fn fetch_reply_to(
             }
             Ok(changed)
         })?;
+        let came: HashSet<u32> = headers.iter().filter_map(|m| m.uid).collect();
+        let held: HashSet<u32> = fetched
+            .iter()
+            .filter_map(|f| f.uid)
+            .chain(refused)
+            .filter(|uid| !came.contains(uid))
+            .collect();
+        let done: HashSet<u32> = chunk
+            .iter()
+            .copied()
+            .filter(|uid| !held.contains(uid))
+            .collect();
+        pending.retain(|uid| !done.contains(uid));
     }
     Ok(changed)
 }
@@ -1201,7 +1241,7 @@ pub async fn search_server(
     });
     for batch in hits.chunks(FETCH_BATCH) {
         // Mail stored from elsewhere (the inbox, another label) is left as it is.
-        let heads = uid_fetch_each(
+        let (heads, _) = uid_fetch_each(
             session,
             &folder.remote_id,
             batch,
@@ -1290,7 +1330,7 @@ async fn fetch_messages(
     if uids.is_empty() {
         return Ok(Vec::new());
     }
-    let sizes = uid_fetch_each(session, mailbox, uids, "(UID RFC822.SIZE)").await?;
+    let (sizes, _) = uid_fetch_each(session, mailbox, uids, "(UID RFC822.SIZE)").await?;
     let (small, large): (Vec<_>, Vec<_>) = sizes
         .iter()
         .filter_map(|f| Some((f.uid?, f.size.unwrap_or(0))))
@@ -1311,7 +1351,7 @@ async fn fetch_messages(
             .await?
             .inspect_ok(|f| came.extend(f.uid));
         let completion = parse_each(fetched, incoming, &mut messages).await?;
-        for uid in held_back(mailbox, &uids, &came, completion) {
+        for uid in held_back(mailbox, &uids, &came, completion).0 {
             let fetched = uid_fetch(session, uid.to_string(), query).await?;
             if let Completion::Partial(said) = parse_each(fetched, incoming, &mut messages).await? {
                 skipped(mailbox, &format!("message {uid}"), &said);
@@ -2111,34 +2151,40 @@ async fn read_fetch(
 /// UID FETCH of `uids` in the selected `mailbox`, which a NO holds back
 /// only the messages the server couldn't fetch: what came is kept, the
 /// rest asked for one at a time, and any it won't give even alone left
-/// out. For answers read whole (sizes, headers); a BAD fails it.
+/// out. Returns what came, and the UIDs left out. For answers read whole
+/// (sizes, headers); a BAD fails it.
 async fn uid_fetch_each(
     session: &mut Session,
     mailbox: &str,
     uids: &[u32],
     query: &str,
-) -> Result<Vec<Fetched>> {
+) -> Result<(Vec<Fetched>, Vec<u32>)> {
     let (mut fetched, completion) =
         read_fetch(uid_fetch(session, uid_set(uids), query).await?).await?;
     let came = fetched.iter().filter_map(|f| f.uid).collect();
-    for uid in held_back(mailbox, uids, &came, completion) {
+    let (again, mut refused) = held_back(mailbox, uids, &came, completion);
+    for uid in again {
         let (alone, completion) =
             read_fetch(uid_fetch(session, uid.to_string(), query).await?).await?;
-        if let Completion::Partial(said) = completion {
-            skipped(mailbox, &format!("message {uid}"), &said);
-        }
+        let came = alone.iter().filter_map(|f| f.uid).collect();
+        refused.extend(held_back(mailbox, &[uid], &came, completion).1);
         fetched.extend(alone);
     }
-    Ok(fetched)
+    Ok((fetched, refused))
 }
 
-/// Of the `uids` a fetch asked for, with those in `came` back, the ones to
-/// ask for again one at a time: after a NO, those that didn't come. (After
-/// an OK, mail that didn't come was expunged meanwhile.) A fetch of one was
-/// that already, so its message is left out this round instead.
-fn held_back(mailbox: &str, uids: &[u32], came: &HashSet<u32>, completion: Completion) -> Vec<u32> {
+/// Of the `uids` a fetch asked for, with those in `came` back, the ones a
+/// NO held back: to ask for again one at a time, and (of a fetch of one,
+/// which was that already) refused, left out this round. (After an OK,
+/// mail that didn't come was expunged meanwhile.)
+fn held_back(
+    mailbox: &str,
+    uids: &[u32],
+    came: &HashSet<u32>,
+    completion: Completion,
+) -> (Vec<u32>, Vec<u32>) {
     let Completion::Partial(said) = completion else {
-        return Vec::new();
+        return Default::default();
     };
     let held: Vec<u32> = uids
         .iter()
@@ -2148,9 +2194,9 @@ fn held_back(mailbox: &str, uids: &[u32], came: &HashSet<u32>, completion: Compl
     match held[..] {
         [uid] if uids.len() == 1 => {
             skipped(mailbox, &format!("message {uid}"), &said);
-            Vec::new()
+            (Vec::new(), held)
         }
-        _ => held,
+        _ => (held, Vec::new()),
     }
 }
 

@@ -112,6 +112,15 @@ impl Tally {
     fn asked(&self, what: &str) -> bool {
         self.commands.iter().any(|c| c.contains(what))
     }
+
+    /// The fetches of stored mail's headers, and of new mail's in a folder.
+    fn header_fetches(&self) -> Vec<&str> {
+        self.commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| c.contains("HEADER.FIELDS"))
+            .collect()
+    }
 }
 
 struct Shared {
@@ -671,11 +680,7 @@ fn check(name: &str, tallies: &[(&str, Tally)], expected: &[(&str, usize, usize)
 /// Stored headers are asked for once, by the first poll of an old cache.
 fn headers_asked_once(tallies: &[(&str, Tally)]) {
     for (scenario, t) in tallies {
-        let headers = t
-            .commands
-            .iter()
-            .filter(|c| c.contains("HEADER.FIELDS"))
-            .count();
+        let headers = t.header_fetches().len();
         let expected = match *scenario {
             "old cache, first poll" => (TRACKED as usize).div_ceil(OBSERVE_BATCH),
             _ => 0,
@@ -1033,20 +1038,100 @@ async fn a_refused_changedsince_keeps_the_modseq() {
     }
 }
 
-/// A refused fetch of stored mail's headers leaves Reply-To to fetch.
+/// A refused fetch of stored mail's headers leaves Reply-To to fetch: of
+/// the state, only what's still to fetch is kept (all of it).
 /// (Refused with BAD: a NO holds back only the messages it left out, as
-/// `a_broken_message_in_the_reply_to_backfill_is_passed` shows.)
+/// `reply_to_refused_for_a_while_is_fetched_once_the_server_recovers`
+/// shows.)
 #[tokio::test]
 async fn a_refused_header_fetch_leaves_reply_to_to_fetch() {
     let mut cached = Cached::old(false).await;
-    cached.refused("HEADER.FIELDS", "BAD", false).await;
+    let before = cached.state.clone();
+    cached.stand_in.refuse("HEADER.FIELDS", "BAD");
+    let refused = cached.sync().await;
+    cached.stand_in.heal();
+    assert!(refused.is_err(), "{refused:?}");
+    let pending = std::mem::take(&mut cached.state.reply_to_pending);
+    assert_eq!(cached.state, before);
+    assert_eq!(pending.len(), TRACKED as usize);
+    cached.state.reply_to_pending = pending;
+
     let report = cached.sync().await.unwrap();
     assert_eq!(report.headers, TRACKED as usize);
     assert!(cached.state.reply_to_fetched);
+    assert!(cached.state.reply_to_pending.is_empty());
     assert_eq!(
         message(&cached.store, ON_SERVER).reply_to,
         [format!("Desk <desk{ON_SERVER}@x.test>")]
     );
+}
+
+/// A provider that briefly refuses the Reply-To backfill (each batch cut
+/// short, then what it held back refused even alone) fails nothing: the
+/// round goes on to flags, what came is stored, and the rest stays to
+/// fetch. The next round asks for only that, and the backfill is done.
+#[tokio::test]
+async fn reply_to_refused_for_a_while_is_fetched_once_the_server_recovers() {
+    let mut cached = Cached::old(false).await;
+    let flagged = ON_SERVER - 10;
+    cached
+        .stand_in
+        .with(INBOX, |b| b.set_flags(flagged, false, true));
+    cached.stand_in.refuse("HEADER.FIELDS", "NO");
+    let report = cached.sync().await.unwrap();
+    cached.stand_in.heal();
+    // Each batch of 500 sends its first half.
+    let held = TRACKED as usize / 2;
+    assert_eq!(report.headers, held);
+    assert!(message(&cached.store, flagged).pinned);
+    assert!(!cached.state.reply_to_fetched);
+    let pending = cached.state.reply_to_pending.clone();
+    assert_eq!(pending.len(), held);
+    assert!(pending.contains(&(ON_SERVER * SPACING)));
+    assert!(message(&cached.store, ON_SERVER).reply_to.is_empty());
+    let tally = cached.stand_in.take_tally();
+    let headers = tally.header_fetches();
+    assert_eq!(headers.len(), 2 + held, "the batches, then each held alone");
+    // Kept as JSON between rounds.
+    let saved = serde_json::to_string(&cached.state).unwrap();
+    cached.state = serde_json::from_str(&saved).unwrap();
+    assert_eq!(cached.state.reply_to_pending, pending);
+
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.headers, held);
+    assert_eq!(
+        message(&cached.store, ON_SERVER).reply_to,
+        [format!("Desk <desk{ON_SERVER}@x.test>")]
+    );
+    assert!(cached.state.reply_to_fetched);
+    assert!(cached.state.reply_to_pending.is_empty());
+    let asked = format!("UID FETCH {} (UID {REPLY_TO_HEADERS})", uid_set(&pending));
+    assert_eq!(
+        cached.stand_in.take_tally().header_fetches(),
+        [asked.as_str()]
+    );
+
+    cached.sync().await.unwrap();
+    assert!(!cached.stand_in.take_tally().asked("HEADER.FIELDS"));
+}
+
+/// What's still to fetch is in UIDs the server numbered anew: forgotten
+/// with them.
+#[tokio::test]
+async fn a_uidvalidity_change_forgets_the_reply_to_still_to_fetch() {
+    let mut cached = Cached::old(false).await;
+    cached.stand_in.refuse("HEADER.FIELDS", "NO");
+    cached.sync().await.unwrap();
+    cached.stand_in.heal();
+    assert!(!cached.state.reply_to_pending.is_empty());
+
+    cached.stand_in.with(INBOX, Remote::renumber);
+    cached.stand_in.take_tally();
+    let report = cached.sync().await.unwrap();
+    assert!(report.first, "{report:?}");
+    assert!(cached.state.reply_to_fetched);
+    assert!(cached.state.reply_to_pending.is_empty());
+    assert!(!cached.stand_in.take_tally().asked("HEADER.FIELDS"));
 }
 
 /// Reaching back past UIDs a refused search didn't list neither passes
@@ -1172,10 +1257,10 @@ async fn a_broken_message_reaching_back_is_left_to_the_inbox_sync() {
 }
 
 /// A message whose headers the server can't fetch doesn't hold up the
-/// Reply-To backfill, or the round: it's asked for once alone, then
-/// passed for good, keeping the Reply-To it had (none).
+/// Reply-To backfill of the rest, or the round: it stays to fetch, and
+/// each round asks for it alone (and nothing else) until it comes.
 #[tokio::test]
-async fn a_broken_message_in_the_reply_to_backfill_is_passed() {
+async fn a_broken_message_in_the_reply_to_backfill_holds_back_only_itself() {
     let mut cached = Cached::old(false).await;
     let broken = ON_SERVER - 5;
     let flagged = ON_SERVER - 10;
@@ -1185,7 +1270,8 @@ async fn a_broken_message_in_the_reply_to_backfill_is_passed() {
     cached.stand_in.break_message(broken, "HEADER.FIELDS");
     let report = cached.sync().await.unwrap();
     assert_eq!(report.headers, TRACKED as usize - 1);
-    assert!(cached.state.reply_to_fetched);
+    assert!(!cached.state.reply_to_fetched);
+    assert_eq!(cached.state.reply_to_pending, [broken * SPACING]);
     assert!(message(&cached.store, broken).reply_to.is_empty());
     assert_eq!(
         message(&cached.store, ON_SERVER).reply_to,
@@ -1196,7 +1282,59 @@ async fn a_broken_message_in_the_reply_to_backfill_is_passed() {
     assert!(cached.stand_in.take_tally().commands.contains(&alone));
 
     cached.sync().await.unwrap();
+    assert_eq!(
+        cached.stand_in.take_tally().header_fetches(),
+        [alone.as_str()]
+    );
+    assert_eq!(cached.state.reply_to_pending, [broken * SPACING]);
+
+    cached.stand_in.heal();
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.headers, 1);
+    assert_eq!(
+        message(&cached.store, broken).reply_to,
+        [format!("Desk <desk{broken}@x.test>")]
+    );
+    assert!(cached.state.reply_to_fetched);
+    assert!(cached.state.reply_to_pending.is_empty());
+    assert_eq!(
+        cached.stand_in.take_tally().header_fetches(),
+        [alone.as_str()]
+    );
+
+    cached.sync().await.unwrap();
     assert!(!cached.stand_in.take_tally().asked("HEADER.FIELDS"));
+}
+
+/// A message expunged while its Reply-To is still to fetch is no longer
+/// asked for: the fetch finds it gone (an OK without it).
+#[tokio::test]
+async fn expunged_mail_leaves_the_reply_to_still_to_fetch() {
+    let mut cached = Cached::old(false).await;
+    let (first, second) = (ON_SERVER - 5, ON_SERVER - 6);
+    for id in [first, second] {
+        cached.stand_in.break_message(id, "HEADER.FIELDS");
+    }
+    cached.sync().await.unwrap();
+    cached.stand_in.heal();
+    assert_eq!(
+        cached.state.reply_to_pending,
+        [second * SPACING, first * SPACING]
+    );
+
+    // Gone before the fetch: an OK without it.
+    cached.stand_in.with(INBOX, |b| b.expunge(first));
+    cached.sync().await.unwrap();
+    assert!(cached.state.reply_to_fetched);
+    assert!(cached.state.reply_to_pending.is_empty());
+    assert_eq!(
+        message(&cached.store, second).reply_to,
+        [format!("Desk <desk{second}@x.test>")]
+    );
+    assert_eq!(
+        message(&cached.store, first).state,
+        spark_store::MessageState::Done
+    );
 }
 
 /// A flags fetch the server cuts short keeps the flags that came, and
@@ -1256,6 +1394,72 @@ async fn a_folder_list_cut_short_takes_nothing_out_of_it() {
     assert_eq!(report.changed, 1, "{report:?}");
     assert_eq!(listed_in(&store, &folder), FOLDER_LIMIT as usize);
     assert!(!message(&store, expunged).folders.contains(&folder.id));
+}
+
+/// A folder whose list always ends in NO (a damaged message in it) still
+/// fetches the Reply-To of the stored mail it lists. Only the damaged one
+/// stays to fetch, and it isn't asked for until a list has it.
+#[tokio::test]
+async fn a_damaged_message_holds_back_only_its_own_reply_to_in_a_folder() {
+    let (stand_in, store, folder, mut session) = projects().await;
+    // The window, stored before Reply-To was kept.
+    let window: Vec<Incoming> = stand_in.with(PROJECTS, |b| {
+        b.by_uid
+            .iter()
+            .rev()
+            .take(FOLDER_LIMIT as usize)
+            .map(|(uid, m)| {
+                let mut stored = parse::parse_message(raw(m.id).as_bytes()).unwrap();
+                stored.account_id = folder.account_id;
+                stored.mailbox = Some(PROJECTS.into());
+                stored.uid = Some(*uid);
+                stored.reply_to = None;
+                stored
+            })
+            .collect()
+    });
+    add_to_folder(&store, folder.id, &window).unwrap();
+    let mut state: FolderState =
+        serde_json::from_value(serde_json::json!({ "uidValidity": 1 })).unwrap();
+    let newest = 100_000 + FOLDER_LIMIT + 100;
+    let damaged = newest - 2;
+    let damaged_uid = stand_in.with(PROJECTS, |b| b.uid_of(damaged));
+    stand_in.break_message(damaged, "(UID FLAGS)");
+    let reply_to = |id: u32| message(&store, id).reply_to;
+    let desk = |id: u32| [format!("Desk <desk{id}@x.test>")];
+
+    let report = sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(report.changed, FOLDER_LIMIT as usize - 1, "{report:?}");
+    assert_eq!(reply_to(newest), desk(newest));
+    assert!(reply_to(damaged).is_empty());
+    assert!(!state.reply_to_fetched);
+    assert_eq!(state.reply_to_pending, [damaged_uid]);
+    assert_eq!(listed_in(&store, &folder), FOLDER_LIMIT as usize);
+    stand_in.take_tally();
+
+    // Still left out of the list: not asked for.
+    sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    assert!(stand_in.take_tally().header_fetches().is_empty());
+    assert_eq!(state.reply_to_pending, [damaged_uid]);
+
+    stand_in.heal();
+    sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(reply_to(damaged), desk(damaged));
+    assert!(state.reply_to_fetched);
+    assert!(state.reply_to_pending.is_empty());
+    let alone = format!("UID FETCH {damaged_uid} (UID {REPLY_TO_HEADERS})");
+    assert_eq!(stand_in.take_tally().header_fetches(), [alone.as_str()]);
+
+    sync_folder(&mut session, &store, &folder, &mut state)
+        .await
+        .unwrap();
+    assert!(!stand_in.take_tally().asked("HEADER.FIELDS"));
 }
 
 /// A CHANGEDSINCE the server cuts short keeps the flags that came, but not
