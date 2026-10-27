@@ -3,10 +3,13 @@
 /* Only the custom themes below, and no modal (the app has its own dialogs).
    Both would add :root:has() rules (daisyUI's modal scroll lock, and
    daisyui/theme's theme-controller selectors), which make Blink restyle the
-   whole page on every DOM change: with a long message list, each keystroke. */
+   whole page on every DOM change: with a long message list, each keystroke.
+   No scrollbar either: its `scrollbar-color` on :root makes Chromium ignore
+   the ::-webkit-scrollbar rules below, so WebView2 drew Windows' own
+   scrollbars, arrow buttons and all. */
 @plugin "daisyui" {
   themes: false;
-  exclude: modal;
+  exclude: modal, scrollbar;
 }
 
 /* The daisyUI themes, as daisyui/theme makes them minus the theme-controller

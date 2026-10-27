@@ -17,6 +17,7 @@ import {
   type SidebarLayout,
 } from "../lib/sidebar";
 import AccountMark from "./AccountMark";
+import OverlayScroll from "./OverlayScroll";
 
 interface Props {
   /** The sidebar's width: the picker opens flush against it. */
@@ -60,8 +61,9 @@ export default function FolderPicker(props: Props) {
       style={{ left: props.left }}
       onKeyDown={onKeyDown}
     >
-      <div
-        className={`flex-1 overflow-y-auto px-2 pb-4 pt-8 ${scrolled ? "shadow-[inset_0_8px_8px_-8px_rgba(0,0,0,.5)]" : ""}`}
+      <OverlayScroll
+        className="min-h-0 flex-1"
+        viewportClassName={`px-2 pb-4 pt-8 ${scrolled ? "shadow-[inset_0_8px_8px_-8px_rgba(0,0,0,.5)]" : ""}`}
         onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}
       >
         <Heading>All Folders</Heading>
@@ -140,7 +142,7 @@ export default function FolderPicker(props: Props) {
         {accounts.map((a) => (
           <AccountSection key={a.id} account={a} {...props} added={added} star={star} />
         ))}
-      </div>
+      </OverlayScroll>
 
       {!layout.tipHidden && (
         <div className="group flex shrink-0 items-start gap-2 border-t border-white/5 px-4 py-2.5 text-xs leading-[18px] text-[#66707e]">

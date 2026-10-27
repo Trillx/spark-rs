@@ -276,6 +276,8 @@ import {
   renameSmartFolder,
   saveLayout,
   saveSeen,
+  shownKeys,
+  sidebarKeys,
   smartIdOf,
   visit,
   watchedFolderIds,
@@ -674,11 +676,11 @@ export default function App() {
   );
   const model = useMemo(() => buildList(listed, view, sticky, ctx), [listed, view, sticky, ctx]);
   const counts = useMemo(() => {
-    const found = sidebarCounts(listed, [...layout.favorites, ...layout.folders, ...layout.recents], ctx);
+    const found = sidebarCounts(listed, shownKeys(layout, folders), ctx);
     found.lists.scheduled = scheduled.length;
     found.lists.reminders = reminders.filter((r) => !r.due).length;
     return found;
-  }, [listed, layout, ctx, scheduled, reminders]);
+  }, [listed, layout, folders, ctx, scheduled, reminders]);
   /** Planned items of the account the list is narrowed to. */
   const inAccount = <T extends { account: AccountId }>(items: T[]) =>
     view.account === "all" ? items : items.filter((x) => x.account === view.account);
@@ -3923,7 +3925,7 @@ export default function App() {
         Icon: SYSTEM_LISTS[key].Icon,
         run: () => selectList(key),
       })),
-      ...[...layout.favorites, ...layout.folders, ...layout.recents]
+      ...sidebarKeys(layout)
         .filter((key) => !isSystemList(key))
         .flatMap((key) => {
           const info = listInfo(key, folders, layout.smartFolders, (id) => accounts.find((a) => a.id === id)?.label ?? "");

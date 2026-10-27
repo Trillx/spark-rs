@@ -11,6 +11,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -27,11 +28,16 @@ import { SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, clamp, startHorizontalDrag }
 import { hint, shortcutLabel } from "../lib/shortcuts";
 import {
   FOLDER_COLORS,
+  SUBFOLDER_DEPTH,
   SYSTEM_LISTS,
+  accepts,
+  addToSidebar,
   autoLabelOf,
   dropPatch,
   folderIdOf,
+  folderKey,
   hasAccountRows,
+  inSidebar,
   isSystemList,
   listInfo,
   moveInSidebar,
@@ -40,6 +46,7 @@ import {
   removeFromTop,
   setColor,
   smartIdOf,
+  subfolders,
   toggleBadge,
   toggleExpanded,
   type ListInfo,
@@ -52,6 +59,7 @@ import AccountMark from "./AccountMark";
 import CalendarIcon from "./CalendarIcon";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import FolderPicker from "./FolderPicker";
+import OverlayScroll from "./OverlayScroll";
 
 export type SidebarMode = "rail" | "overlay" | "locked";
 
@@ -109,7 +117,8 @@ interface Props {
   actions: SidebarActions;
 }
 
-type Section = "favorites" | "folders" | "recents";
+/** Where a row is; `other` is a subfolder under its parent, or the open list on the rail when it's in no section. */
+type Section = SidebarSection | "recents" | "other";
 type RowMenuState = { key: ListKey; section: Section; x: number; y: number };
 type DialogState =
   | { kind: "create"; account: AccountId; parent?: number }
@@ -189,7 +198,8 @@ const DROP_OVER = "bg-primary/30 text-white ring-1 ring-inset ring-primary";
 function railKeys(layout: SidebarLayout, current: ListKey): [ListKey, Section][] {
   const keys: [ListKey, Section][] = layout.favorites.map((k) => [k, "favorites"]);
   if (current !== "inbox" && current !== NO_LIST && !layout.favorites.includes(current)) {
-    keys.push([current, layout.folders.includes(current) ? "folders" : "recents"]);
+    const section = (["folders", "labels", "recents"] as const).find((s) => layout[s].includes(current));
+    keys.push([current, section ?? "other"]);
   }
   return keys;
 }
@@ -392,7 +402,7 @@ function Expanded(props: ViewProps) {
       ghost: label,
       start: () => setMoving({ key, to }),
       move: (x, y) => {
-        const next = slotAt(scroller.current, x, y);
+        const next = slotAt(scroller.current, x, y, key);
         if (next?.section === to?.section && next?.index === to?.index) return;
         to = next;
         setMoving({ key, to });
@@ -410,9 +420,9 @@ function Expanded(props: ViewProps) {
   const line = (section: Section, index: number, edge: "top" | "bottom") =>
     moving?.to?.section === section && moving.to.index === index && <DropLine edge={edge} />;
 
-  const toggle = (key: ListKey, open: boolean) => ({
+  const toggle = (key: ListKey, open: boolean, under: "accounts" | "subfolders" = "accounts") => ({
     open,
-    label: open ? "Hide accounts" : "Show accounts",
+    label: `${open ? "Hide" : "Show"} ${under}`,
     onToggle: () => actions.layout((l) => toggleExpanded(l, key)),
   });
 
@@ -431,12 +441,43 @@ function Expanded(props: ViewProps) {
     />
   );
 
-  /** A list's row and, when it's expanded, one row per account under it. */
+  /** A subfolder under its parent's row, and its own subfolders when it's expanded. */
+  const subfolderRow = (f: FolderView, level: number): ReactNode => {
+    const key = folderKey(f.id);
+    const i = info(key);
+    if (!i) return null;
+    const children = level < SUBFOLDER_DEPTH ? subfolders(key, folders) : [];
+    const open = children.length > 0 && layout.expanded.includes(key);
+    return (
+      <Fragment key={key}>
+        <SidebarRow
+          level={level}
+          icon={<ListIcon info={i} color={layout.colors[key]} />}
+          label={i.label}
+          title={i.detail}
+          count={hidden(key) ? 0 : (counts.lists[key] ?? 0)}
+          active={current === key}
+          toggle={children.length ? toggle(key, open, "subfolders") : undefined}
+          drop={drop(key)}
+          onClick={() => {
+            if (f.selectable) actions.select(key);
+            // A folder that only holds folders opens and closes instead.
+            else if (children.length) actions.layout((l) => toggleExpanded(l, key));
+          }}
+          onContextMenu={f.selectable ? (e) => onMenu(key, "other", e) : undefined}
+        />
+        {open && children.map((c) => subfolderRow(c, level + 1))}
+      </Fragment>
+    );
+  };
+
+  /** A list's row and, when it's expanded, one row per account or its subfolders under it. */
   const row = (key: ListKey, section: Section, index: number) => {
     const i = info(key);
     if (!i) return null;
     const expandable = accounts.length > 1 && hasAccountRows(key);
-    const open = expandable && layout.expanded.includes(key);
+    const children = subfolders(key, folders);
+    const open = (expandable || children.length > 0) && layout.expanded.includes(key);
     return (
       <div key={key} data-item={index} className={`relative ${moving?.key === key ? "opacity-50" : ""}`}>
         {line(section, index, "top")}
@@ -446,14 +487,16 @@ function Expanded(props: ViewProps) {
           title={i.detail}
           count={hidden(key) ? 0 : (counts.lists[key] ?? 0)}
           active={current === key && (account === "all" || !open)}
-          toggle={expandable ? toggle(key, open) : undefined}
+          toggle={expandable ? toggle(key, open) : children.length ? toggle(key, open, "subfolders") : undefined}
           drop={drop(key)}
           onClick={() => actions.select(key)}
           onContextMenu={(e) => onMenu(key, section, e)}
           onPointerDown={(e) => startMove(e, key, i.label)}
         />
         {open &&
+          expandable &&
           accounts.map((a) => accountRow(key, a, hidden(key) ? 0 : (counts.listAccounts[key]?.[a.id] ?? 0)))}
+        {open && children.map((f) => subfolderRow(f, 1))}
         {line(section, index + 1, "bottom")}
       </div>
     );
@@ -485,7 +528,8 @@ function Expanded(props: ViewProps) {
         </SidebarIconButton>
       </div>
 
-      <div ref={scroller} className="flex-1 overflow-y-auto px-2 pb-2 pt-1">
+      {/* The left padding holds the expand arrows, as in Spark. */}
+      <OverlayScroll viewportRef={scroller} className="min-h-0 flex-1" viewportClassName="pb-2 pl-5 pr-2 pt-1">
         {props.home && (
           <SidebarRow
             icon={<House size={18} />}
@@ -526,6 +570,18 @@ function Expanded(props: ViewProps) {
           onClick={actions.togglePicker}
         />
 
+        {layout.labels.length > 0 && (
+          <>
+            <SectionLabel
+              open={layout.labelsOpen}
+              onToggle={() => actions.layout((l) => ({ ...l, labelsOpen: !l.labelsOpen }))}
+            >
+              Auto-Labels
+            </SectionLabel>
+            {layout.labelsOpen && sectionRows("labels")}
+          </>
+        )}
+
         {layout.recents.length > 0 && (
           <>
             <SectionLabel
@@ -546,9 +602,9 @@ function Expanded(props: ViewProps) {
             {layout.recentsOpen && layout.recents.map((k, index) => row(k, "recents", index))}
           </>
         )}
-      </div>
+      </OverlayScroll>
 
-      <div className="shrink-0 px-2 pb-3">
+      <div className="shrink-0 pb-3 pl-5 pr-2">
         <button
           className="flex h-[34px] w-full items-center gap-2 rounded-lg px-2 text-[13px] hover:bg-sidebar-hover hover:text-white"
           onClick={actions.settings}
@@ -587,13 +643,15 @@ function SectionLabel({
   const label = (
     <>
       {onToggle && (
-        <ChevronRight size={12} className={`-ml-0.5 shrink-0 transition-transform ${open ? "rotate-90" : ""}`} />
+        <span className="absolute -left-3.5 top-0 grid h-[22px] w-3.5 place-items-center">
+          <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
+        </span>
       )}
       <span className="truncate">{children}</span>
     </>
   );
   return (
-    <div className="group mb-px mt-5 flex min-h-[22px] items-center gap-1 pl-2 pr-1 text-[13px] leading-[22px]">
+    <div className="group relative mb-px mt-5 flex min-h-[22px] items-center gap-1 pl-2 pr-1 text-[13px] leading-[22px]">
       {onToggle ? (
         <button className="flex min-w-0 flex-1 items-center gap-1 text-left opacity-50 hover:opacity-80" aria-expanded={open} onClick={onToggle}>
           {label}
@@ -614,6 +672,7 @@ function SidebarRow({
   alert,
   active,
   indent = false,
+  level = 0,
   toggle,
   drop,
   onClick,
@@ -627,8 +686,11 @@ function SidebarRow({
   /** A sync error, shown as an icon in place of the count. */
   alert?: string;
   active: boolean;
+  /** An account's row: its content is indented. */
   indent?: boolean;
-  /** An expand toggle, e.g. the Inbox's accounts. */
+  /** A subfolder's depth: the whole row moves in, its arrow with it. */
+  level?: number;
+  /** An expand toggle in the padding to the row's left, e.g. the Inbox's accounts. */
   toggle?: { open: boolean; label: string; onToggle: () => void };
   drop?: RowDrop;
   onClick: () => void;
@@ -637,7 +699,20 @@ function SidebarRow({
   onPointerDown?: (e: ReactPointerEvent<HTMLElement>) => void;
 }) {
   return (
-    <div className={`group relative mb-0.5 ${drop && !drop.target ? "opacity-40" : ""}`}>
+    <div
+      className={`group relative mb-0.5 ${drop && !drop.target ? "opacity-40" : ""}`}
+      style={level ? { marginLeft: 10 * Math.min(level, 5) } : undefined}
+    >
+      {toggle && (
+        <button
+          aria-label={toggle.label}
+          aria-expanded={toggle.open}
+          className="absolute -left-3.5 top-0 grid h-[30px] w-3.5 place-items-center opacity-50 hover:text-white hover:opacity-100"
+          onClick={toggle.onToggle}
+        >
+          <ChevronRight size={12} className={`transition-transform ${toggle.open ? "rotate-90" : ""}`} />
+        </button>
+      )}
       <button
         data-tip={title}
         data-tip-side="right"
@@ -662,24 +737,10 @@ function SidebarRow({
           </span>
         ) : (
           count > 0 && (
-            <span className={`text-[11px] font-medium leading-[13px] ${active ? "" : "opacity-50"} ${toggle ? "mr-5" : ""}`}>
-              {count}
-            </span>
+            <span className={`text-[11px] font-medium leading-[13px] ${active ? "" : "opacity-50"}`}>{count}</span>
           )
         )}
       </button>
-      {toggle && (
-        <button
-          aria-label={toggle.label}
-          aria-expanded={toggle.open}
-          className={`absolute right-1.5 top-[7px] grid size-4 place-items-center rounded opacity-50 hover:opacity-100 ${
-            active ? "text-white" : ""
-          }`}
-          onClick={toggle.onToggle}
-        >
-          <ChevronRight size={12} className={`transition-transform ${toggle.open ? "rotate-90" : ""}`} />
-        </button>
-      )}
     </div>
   );
 }
@@ -694,13 +755,16 @@ function DropLine({ edge }: { edge: "top" | "bottom" }) {
   );
 }
 
-/** The gap nearest the pointer in the top section or Folders, while the pointer is over the sidebar's lists. */
-function slotAt(scroller: HTMLElement | null, x: number, y: number): Slot | null {
+/**
+ * The gap nearest the pointer in a section that takes `key` (the top section, and Folders or
+ * Auto-Labels), while the pointer is over the sidebar's lists.
+ */
+function slotAt(scroller: HTMLElement | null, x: number, y: number, key: ListKey): Slot | null {
   const box = scroller?.getBoundingClientRect();
   if (!scroller || !box || x < box.left || x > box.right || y < box.top || y > box.bottom) return null;
   let best: Slot | null = null;
   let distance = Infinity;
-  for (const section of ["favorites", "folders"] as const) {
+  for (const section of (["favorites", "folders", "labels"] as const).filter((s) => accepts(s, key))) {
     const list = scroller.querySelector<HTMLElement>(`[data-section="${section}"]`);
     if (!list) continue;
     // Before each row, and after the last; an empty section is one gap.
@@ -816,7 +880,9 @@ function RowMenu({
       {section === "favorites"
         ? item("Remove from the top", change((l) => removeFromTop(l, key)))
         : item("Pin to the top", change((l) => pinToTop(l, key)))}
-      {item(section === "recents" ? "Remove from Recents" : "Remove from Sidebar", change((l) => removeFromSidebar(l, key)))}
+      {section !== "other"
+        ? item(section === "recents" ? "Remove from Recents" : "Remove from Sidebar", change((l) => removeFromSidebar(l, key)))
+        : !inSidebar(layout, key) && item("Add to Sidebar", change((l) => addToSidebar(l, key)))}
       {countable && item(layout.hiddenBadges.includes(key) ? "Show Badge" : "Hide Badge", change((l) => toggleBadge(l, key)))}
       {key !== "drafts" && item("Mark All as Read", () => actions.markAllRead(key))}
       {actions.canEmpty(key) &&

@@ -23,8 +23,9 @@ import { SIDEBAR_DEFAULT } from "./panes";
 
 // What the sidebar holds, like Spark's: a top section without a label, a
 // "Folders" section, Recents (lists opened from the folder picker), and the
-// smart folders (saved searches). A display preference of this machine, so
-// it lives in localStorage like the theme.
+// smart folders (saved searches). Unlike Spark, the Auto-Labels' lists get a
+// section of their own, so they don't mix with the server's folders. A display
+// preference of this machine, so it lives in localStorage like the theme.
 
 /** Lists every account shares. Server-backed ones gather each account's folder with `role`. */
 export type SystemList =
@@ -78,17 +79,20 @@ export interface SmartFolder {
 export interface SidebarLayout {
   /** The top section, right under the Inbox. */
   favorites: ListKey[];
-  /** The "Folders" section. */
+  /** The "Folders" section: any list but an Auto-Label's. */
   folders: ListKey[];
+  /** The "Auto-Labels" section: only Auto-Labels' lists. */
+  labels: ListKey[];
   /** Lists opened from the folder picker without adding them, newest first. */
   recents: ListKey[];
   smartFolders: SmartFolder[];
   hiddenBadges: ListKey[];
   /** Icon colors chosen for folders and smart folders. */
   colors: Partial<Record<ListKey, string>>;
-  /** Lists showing a row per account under them, the Inbox at first. */
+  /** Lists showing what's under them: a row per account, or a folder's subfolders. The Inbox at first. */
   expanded: ListKey[];
   recentsOpen: boolean;
+  labelsOpen: boolean;
   /** The folder picker's "Use Ctrl to add multiple folders" tip was closed. */
   tipHidden: boolean;
   /** Docked rather than the rail. */
@@ -106,6 +110,7 @@ export const FOLDER_COLORS = ["#ff5b5b", "#ff9f2e", "#f5c400", "#3ccb6e", "#2cc5
 export const DEFAULT_LAYOUT: SidebarLayout = {
   favorites: ["pins", "drafts", "sent", "trash"],
   folders: ["archive"],
+  labels: [],
   recents: [],
   smartFolders: [
     { id: "attachments", name: "Attachments", query: "has:attachment" },
@@ -115,6 +120,7 @@ export const DEFAULT_LAYOUT: SidebarLayout = {
   colors: {},
   expanded: ["inbox"],
   recentsOpen: true,
+  labelsOpen: true,
   tipHidden: false,
   locked: false,
   width: SIDEBAR_DEFAULT,
@@ -134,12 +140,16 @@ export function loadLayout(): SidebarLayout {
     const { inboxOpen, ...saved } = parsed;
     const keys = (value: unknown, fallback: ListKey[]) =>
       Array.isArray(value) ? value.filter((k): k is ListKey => typeof k === "string") : fallback;
+    const folders = keys(saved.folders, DEFAULT_LAYOUT.folders);
+    // Before the Auto-Labels section, their lists were in Folders.
+    const labels = [...keys(saved.labels, []), ...folders].filter((k) => autoLabelOf(k));
     return {
       ...DEFAULT_LAYOUT,
       ...saved,
       expanded: keys(saved.expanded, inboxOpen === false ? [] : DEFAULT_LAYOUT.expanded),
       favorites: keys(saved.favorites, DEFAULT_LAYOUT.favorites),
-      folders: keys(saved.folders, DEFAULT_LAYOUT.folders),
+      folders: folders.filter((k) => !autoLabelOf(k)),
+      labels: [...new Set(labels)],
       recents: keys(saved.recents, []),
       hiddenBadges: keys(saved.hiddenBadges, []),
       smartFolders: Array.isArray(saved.smartFolders) ? saved.smartFolders : DEFAULT_LAYOUT.smartFolders,
@@ -174,8 +184,8 @@ export function autoLabelOf(key: ListKey): AutoLabel | undefined {
 }
 
 /**
- * Lists for Auto-Labels that mail has now: each goes in the sidebar the first time, as Spark adds them.
- * One the user took out stays out.
+ * Lists for Auto-Labels that mail has now: each goes in the sidebar's Auto-Labels section the first
+ * time, as Spark adds them. One the user took out stays out.
  */
 export function offerAutoLabels(layout: SidebarLayout, labels: Iterable<AutoLabel>): SidebarLayout {
   let next = layout;
@@ -190,17 +200,36 @@ export function isSystemList(key: ListKey): key is SystemList {
   return key in SYSTEM_LISTS;
 }
 
-/** Added to the sidebar (top section or Folders), not just recent. */
+/** Added to the sidebar (top section, Folders or Auto-Labels), not just recent. */
 export function inSidebar(layout: SidebarLayout, key: ListKey) {
-  return layout.favorites.includes(key) || layout.folders.includes(key);
+  return layout.favorites.includes(key) || layout.folders.includes(key) || layout.labels.includes(key);
 }
+
+/** Every list placed in the sidebar, Recents included. */
+export function sidebarKeys(layout: SidebarLayout): ListKey[] {
+  return [...layout.favorites, ...layout.folders, ...layout.labels, ...layout.recents];
+}
+
+/** The lists the sidebar has rows for: those placed in it, and the subfolders open under them. */
+export function shownKeys(layout: SidebarLayout, folders: FolderView[]): ListKey[] {
+  const placed = sidebarKeys(layout);
+  return [...new Set([...placed, ...placed.flatMap((k) => openSubfolders(layout, k, folders))])];
+}
+
+/** Where a list goes below the top section: an Auto-Label's in Auto-Labels, any other in Folders. */
+export const homeSection = (key: ListKey): "folders" | "labels" => (autoLabelOf(key) ? "labels" : "folders");
+
+/** Whether a list can be put in a section. The top section takes any. */
+export const accepts = (section: SidebarSection, key: ListKey) =>
+  section === "favorites" || section === homeSection(key);
 
 const without = (keys: ListKey[], key: ListKey) => keys.filter((k) => k !== key);
 
-/** Adds a list to the end of Folders (out of Recents); no change if it's already there. */
+/** Adds a list to the end of Folders or Auto-Labels (out of Recents); no change if it's already there. */
 export function addToSidebar(layout: SidebarLayout, key: ListKey): SidebarLayout {
   if (inSidebar(layout, key)) return layout;
-  return { ...layout, folders: [...layout.folders, key], recents: without(layout.recents, key) };
+  const section = homeSection(key);
+  return { ...layout, [section]: [...layout[section], key], recents: without(layout.recents, key) };
 }
 
 export function removeFromSidebar(layout: SidebarLayout, key: ListKey): SidebarLayout {
@@ -208,6 +237,7 @@ export function removeFromSidebar(layout: SidebarLayout, key: ListKey): SidebarL
     ...layout,
     favorites: without(layout.favorites, key),
     folders: without(layout.folders, key),
+    labels: without(layout.labels, key),
     recents: without(layout.recents, key),
   };
 }
@@ -218,20 +248,22 @@ export function pinToTop(layout: SidebarLayout, key: ListKey): SidebarLayout {
   return { ...rest, favorites: [...rest.favorites, key] };
 }
 
-/** Moves a list from the top section to the start of Folders. */
+/** Moves a list from the top section to the start of Folders or Auto-Labels. */
 export function removeFromTop(layout: SidebarLayout, key: ListKey): SidebarLayout {
   const rest = removeFromSidebar(layout, key);
-  return { ...rest, folders: [key, ...rest.folders] };
+  const section = homeSection(key);
+  return { ...rest, [section]: [key, ...rest[section]] };
 }
 
 /** The sections a list can be dragged into. */
-export type SidebarSection = "favorites" | "folders";
+export type SidebarSection = "favorites" | "folders" | "labels";
 
 /**
  * Dragging a list to position `index` of a section, counted before the move.
- * It leaves wherever it was, Recents included.
+ * It leaves wherever it was, Recents included. No change if the section doesn't take it.
  */
 export function moveInSidebar(layout: SidebarLayout, key: ListKey, section: SidebarSection, index: number): SidebarLayout {
+  if (!accepts(section, key)) return layout;
   const from = layout[section].indexOf(key);
   const at = from >= 0 && from < index ? index - 1 : index;
   const rest = removeFromSidebar(layout, key);
@@ -292,7 +324,7 @@ export function removeSmartFolder(layout: SidebarLayout, id: string): SidebarLay
 export function pruneLayout(layout: SidebarLayout, folders: FolderView[]): SidebarLayout {
   const exists = new Set(folders.map((f) => folderKey(f.id)));
   const gone = new Set(
-    [...layout.favorites, ...layout.folders, ...layout.recents].filter((k) => k.startsWith("folder:") && !exists.has(k)),
+    [...sidebarKeys(layout), ...layout.expanded].filter((k) => k.startsWith("folder:") && !exists.has(k)),
   );
   return gone.size ? forget(layout, gone) : layout;
 }
@@ -305,8 +337,10 @@ function forget(layout: SidebarLayout, keys: Set<ListKey>): SidebarLayout {
     ...layout,
     favorites: keep(layout.favorites),
     folders: keep(layout.folders),
+    labels: keep(layout.labels),
     recents: keep(layout.recents),
     hiddenBadges: keep(layout.hiddenBadges),
+    expanded: keep(layout.expanded),
     colors,
   };
 }
@@ -323,9 +357,9 @@ export function listFolderIds(key: ListKey, folders: FolderView[], account?: Acc
   return folders.filter((f) => f.role === role && (account === undefined || f.account === account)).map((f) => f.id);
 }
 
-/** Folders to keep in sync: every list in the sidebar, plus the open one. */
+/** Folders to keep in sync: every list the sidebar shows, plus the open one. */
 export function watchedFolderIds(layout: SidebarLayout, folders: FolderView[], open: ListKey): number[] {
-  const keys = new Set([...layout.favorites, ...layout.folders, ...layout.recents, open]);
+  const keys = new Set([...shownKeys(layout, folders), open]);
   const ids = new Set([...keys].flatMap((k) => listFolderIds(k, folders)));
   return [...ids].sort((a, b) => a - b);
 }
@@ -385,6 +419,24 @@ export function folderPath(folder: FolderView, folders: FolderView[]) {
 
 /** Folders the user made: what the folder picker lists per account. Shared lists cover the rest. */
 export const isUserFolder = (f: FolderView) => f.role === undefined || f.role === null;
+
+/** How deep the sidebar shows subfolders. */
+export const SUBFOLDER_DEPTH = 10;
+
+/** A server folder's own folders, which its sidebar row can show under it. */
+export function subfolders(key: ListKey, folders: FolderView[]): FolderView[] {
+  const id = folderIdOf(key);
+  return id === undefined ? [] : folders.filter((f) => f.parent === id && isUserFolder(f));
+}
+
+/** The subfolders showing under a sidebar list, theirs included, as far as each is expanded. */
+export function openSubfolders(layout: SidebarLayout, key: ListKey, folders: FolderView[], depth = 1): ListKey[] {
+  if (depth > SUBFOLDER_DEPTH || !layout.expanded.includes(key)) return [];
+  return subfolders(key, folders).flatMap((f) => {
+    const sub = folderKey(f.id);
+    return [sub, ...openSubfolders(layout, sub, folders, depth + 1)];
+  });
+}
 
 /**
  * What dropping a message on a sidebar list does, or `undefined` if the list
