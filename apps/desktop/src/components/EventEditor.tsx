@@ -493,7 +493,7 @@ function TimeField({ label, value, onChange }: { label: string; value: number; o
             e.preventDefault();
             e.currentTarget.blur();
           } else if (e.key === "Escape") {
-            edit(null);
+            // Closes the list, keeping what's typed; the next Esc closes the editor.
             e.currentTarget.blur();
           }
         }}
