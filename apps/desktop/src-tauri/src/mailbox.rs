@@ -964,23 +964,28 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
 }
 
 /// Answers the invitation a message carries, by email to its organizer.
-/// Resolves once the reply is sent.
+/// Resolves once the reply is sent; the app's other windows are told then
+/// ("invite-answered"), even if the asking window has closed meanwhile.
 #[tauri::command]
 pub async fn answer_invite(
+    window: Window,
     mailbox: State<'_, Mailbox>,
     id: i64,
     answer: Answer,
 ) -> Result<(), String> {
     if !mailbox.live() {
         mailbox.demo.set_answer(id, answer);
-        return Ok(());
+    } else {
+        mailbox
+            .live
+            .engine
+            .answer_invite(id, answer)
+            .await
+            .map_err(text)?;
     }
-    mailbox
-        .live
-        .engine
-        .answer_invite(id, answer)
-        .await
-        .map_err(text)
+    let answered = serde_json::json!({ "window": window.label(), "id": id });
+    let _ = window.emit("invite-answered", answered);
+    Ok(())
 }
 
 /// The stored name of attachment `index`, checked before downloading.

@@ -1683,8 +1683,9 @@ export default function App() {
    */
   function popOut(m: Message, then?: SummaryStyle) {
     void openThreadWindow(m.id, m.subject || "No subject", then).then(() => {
-      if (openId === m.id) setOpenId(null);
-      // The list's cursor goes to it, as opening it here would: keys act on it, not the one before.
+      // The reader lets go of what it showed (in split view, maybe another conversation), and the
+      // list's cursor goes to this one, as opening it here would: keys act on it, not the one before.
+      setOpenId(null);
       setSelectedId(m.id);
     }, fileError);
   }
