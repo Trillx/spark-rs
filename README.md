@@ -296,6 +296,12 @@ the conversation, and each email's own ⋯ prints it, saves it as an .eml file,
 copies it as Markdown, or copies everyone's addresses. Windows' print dialog
 saves as PDF too (Microsoft Print to PDF).
 
+Ctrl+Alt+N (or Open in a New Window in the ⋯ menu) opens the conversation in
+a window of its own, which closes with Esc or once you're done with it.
+With Settings → Appearance → Always open conversations in a new window, the
+one-column layout does that for every conversation you open. Read to its
+end, a conversation scrolls to a new email as it arrives.
+
 Calendar invitations show as a card in place of the email: the date and time
 in your time zone, who's invited and how they answered, the call to join,
 the place and the description. Accept, Maybe or Decline emails your answer to

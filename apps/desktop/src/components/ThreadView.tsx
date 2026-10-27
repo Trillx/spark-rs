@@ -10,6 +10,7 @@ import {
   ChevronsDownUp,
   ChevronsUpDown,
   Circle,
+  AppWindow,
   Clock,
   Copy,
   Ellipsis,
@@ -150,6 +151,8 @@ export interface ThreadActions {
   copyAddresses: (m: Message) => void;
   /** Saves the email as an .eml file. */
   saveEml: (m: Message) => void;
+  /** Spark's "Open Thread in a new Window"; absent in a conversation's own window. */
+  popOut?: (m: Message) => void;
   /** Spark's Auto-download: the email's files, fetched ahead as it shows (if that's on). */
   prefetchAttachments: (m: Message) => void;
   /** Settle when done (errors are reported by the caller), so tiles can show progress. */
@@ -247,6 +250,32 @@ export default function ThreadView({
     return new Set(conversation.slice(0, Math.max(at, 0)).map((x) => x.id));
   });
   const firstNew = conversation.findIndex((x) => unread.has(x.id));
+  // Spark's pin to the bottom: read to the end, a new email in the conversation comes into
+  // view as it arrives.
+  const atEnd = useRef(false);
+  const count = useRef(conversation.length);
+  useEffect(() => {
+    // Measured as it opens, and again whenever bodies load or cards open: a conversation that
+    // fits without scrolling is read to its end, until what loads pushes the end out of view.
+    // A new email's own growth comes after the effect below has looked.
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => (atEnd.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24);
+    measure();
+    const resized = new ResizeObserver(measure);
+    resized.observe(el);
+    if (el.firstElementChild) resized.observe(el.firstElementChild);
+    return () => resized.disconnect();
+  }, []);
+  useLayoutEffect(() => {
+    const grew = conversation.length > count.current;
+    count.current = conversation.length;
+    const newest = conversation[conversation.length - 1];
+    if (!grew || !atEnd.current || !newest) return;
+    scrollRef.current
+      ?.querySelector(`[data-message="${newest.id}"]`)
+      ?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, [conversation.length]);
   const several = conversation.length > 1;
   const latest = conversation[conversation.length - 1];
 
@@ -370,6 +399,7 @@ export default function ThreadView({
         viewportRef={scrollRef}
         onScroll={(e) => {
           const el = e.currentTarget;
+          atEnd.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
           // Once shrunk, it stays so until the top; it only shrinks when there's
           // more to scroll than it gives back, so it can't flicker.
           setScrolled((was) => el.scrollTop > 0 && (was || el.scrollHeight - el.clientHeight > HEADER_SLACK));
@@ -767,6 +797,14 @@ function Toolbar({
             </>
           )}
           <li role="none" className="my-0.5 h-px bg-hairline" />
+          {actions.popOut && (
+            <MenuItem
+              label="Open in a New Window"
+              detail={shortcutLabel("openInNewWindow")}
+              icon={<AppWindow size={15} />}
+              onSelect={() => actions.popOut?.(m)}
+            />
+          )}
           <MenuItem
             label="Find in Conversation"
             detail={shortcutLabel("findInThread")}

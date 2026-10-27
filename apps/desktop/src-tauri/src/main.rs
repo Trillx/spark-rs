@@ -19,6 +19,7 @@ mod secrets;
 mod signatures;
 mod templates;
 mod updates;
+mod thread_window;
 
 use tauri::Manager;
 
@@ -156,6 +157,7 @@ fn main() {
             mailbox::describe_files,
             mailbox::read_image,
             mailbox::save_eml,
+            thread_window::open_thread_window,
             mailbox::prefetch_attachments,
             mailto::take_mailto,
             mailto::mail_app,

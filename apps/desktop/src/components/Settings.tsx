@@ -173,6 +173,8 @@ export default function Settings({
   onTheme,
   minimize,
   onMinimize,
+  popOut,
+  onPopOut,
   cards,
   onCards,
   priorityLines,
@@ -196,6 +198,9 @@ export default function Settings({
   /** Minimize old emails in a conversation. */
   minimize: boolean;
   onMinimize: (on: boolean) => void;
+  /** In the one-column layout, conversations open in windows of their own. */
+  popOut: boolean;
+  onPopOut: (on: boolean) => void;
   /** Unread cards: which are on, and how many emails each shows. */
   cards: CardPrefs;
   onCards: (cards: CardPrefs) => void;
@@ -316,6 +321,8 @@ export default function Settings({
                   onTheme={onTheme}
                   minimize={minimize}
                   onMinimize={onMinimize}
+                  popOut={popOut}
+                  onPopOut={onPopOut}
                   cards={cards}
                   onCards={onCards}
                 />
@@ -1921,6 +1928,8 @@ function AppearancePage({
   onTheme,
   minimize,
   onMinimize,
+  popOut,
+  onPopOut,
   cards,
   onCards,
 }: {
@@ -1928,6 +1937,8 @@ function AppearancePage({
   onTheme: (theme: ThemePref) => void;
   minimize: boolean;
   onMinimize: (on: boolean) => void;
+  popOut: boolean;
+  onPopOut: (on: boolean) => void;
   cards: CardPrefs;
   onCards: (cards: CardPrefs) => void;
 }) {
@@ -1967,6 +1978,13 @@ function AppearancePage({
           htmlFor="minimize-old"
         >
           <Switch id="minimize-old" on={minimize} onToggle={() => onMinimize(!minimize)} />
+        </Row>
+        <Row
+          label="Always open conversations in a new window"
+          description="In the one-column layout, opening a conversation opens a window of its own. Ctrl+Alt+N does it for one."
+          htmlFor="pop-out"
+        >
+          <Switch id="pop-out" on={popOut} onToggle={() => onPopOut(!popOut)} />
         </Row>
         <Row
           label="Load remote images"

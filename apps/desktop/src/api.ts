@@ -1,5 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Window, getCurrentWindow } from "@tauri-apps/api/window";
 import demo from "../demo/mailbox.json";
@@ -382,7 +382,7 @@ export function listScheduled(): Promise<ScheduledView[]> {
 
 /** Sends a scheduled message at `at` instead, or (null) now. False once it's gone out. */
 export function rescheduleSend(id: number, at: number | null): Promise<boolean> {
-  if (isTauri()) return invoke("reschedule_send", { id, at });
+  if (isTauri()) return mutate("reschedule_send", { id, at });
   return Promise.resolve(false);
 }
 
@@ -392,7 +392,7 @@ export function rescheduleSend(id: number, at: number | null): Promise<boolean> 
  * null once it's gone out.
  */
 export function unscheduleSend(id: number, keepSchedule: boolean): Promise<number | null> {
-  if (isTauri()) return invoke("unschedule_send", { id, keepSchedule });
+  if (isTauri()) return mutate("unschedule_send", { id, keepSchedule });
   return Promise.resolve(null);
 }
 
@@ -403,13 +403,13 @@ export function listReminders(): Promise<ReminderView[]> {
 
 /** Moves a reminder to `at`, or (null) removes it. */
 export function setReminder(id: number, at: number | null): Promise<void> {
-  if (isTauri()) return invoke("set_reminder", { id, at });
+  if (isTauri()) return mutate("set_reminder", { id, at });
   return Promise.resolve();
 }
 
 /** Done on a reminder in the Inbox, or (false) its undo. */
 export function finishReminder(id: number, done: boolean): Promise<void> {
-  if (isTauri()) return invoke("finish_reminder", { id, done });
+  if (isTauri()) return mutate("finish_reminder", { id, done });
   return Promise.resolve();
 }
 
@@ -419,7 +419,7 @@ export function finishReminder(id: number, done: boolean): Promise<void> {
  * category before, for undo.
  */
 export function setSenderCategory(address: string, category: Category | null): Promise<Category | null> {
-  if (isTauri()) return invoke("set_sender_category", { address, category });
+  if (isTauri()) return mutate("set_sender_category", { address, category });
   // Like the store: the sender's choice, over each email's own category.
   const key = address.toLowerCase();
   const before = browserCategories.get(key) ?? null;
@@ -434,7 +434,7 @@ export function setSenderCategory(address: string, category: Category | null): P
 
 /** Mutes or unmutes a conversation (`Message.conversation`, or the message's id). */
 export function setMuted(conversation: number, muted: boolean): Promise<void> {
-  if (isTauri()) return invoke("set_muted", { conversation, muted });
+  if (isTauri()) return mutate("set_muted", { conversation, muted });
   for (const [i, m] of browserMailbox.entries()) {
     if ((m.conversation ?? m.id) === conversation) browserMailbox[i] = { ...m, muted };
   }
@@ -558,6 +558,52 @@ export function onFileDrag(handler: (e: FileDrag) => void): () => void {
   return () => void stop.then((unlisten) => unlisten());
 }
 
+/** Opens a conversation in a window of its own, or brings its window forward. */
+export function openThreadWindow(id: number, title: string): Promise<void> {
+  if (isTauri()) return invoke("open_thread_window", { id, title });
+  window.open(`${window.location.pathname}?thread=${id}`, `thread-${id}`, "width=880,height=780");
+  return Promise.resolve();
+}
+
+/** A command that changes mail: once it has, the app's other windows read the changes too. */
+function mutate<T>(command: string, args: Record<string, unknown>): Promise<T> {
+  return invoke<T>(command, args).then((result) => {
+    announceMailEdited();
+    return result;
+  });
+}
+
+/**
+ * This window being closed (its own button, Alt+F4, `closeWindow`): `before` runs first, and
+ * then it closes. Returns the unsubscribe.
+ */
+export function onWindowClose(before: () => Promise<void>): () => void {
+  if (!isTauri()) return () => {};
+  const stop = getCurrentWindow().onCloseRequested(() => before());
+  return () => void stop.then((unlisten) => unlisten());
+}
+
+/** Closes this window (a conversation's own). */
+export function closeWindow() {
+  if (isTauri()) void getCurrentWindow().close();
+  else window.close();
+}
+
+/** This window changed mail: the app's other windows read the changes too. */
+export function announceMailEdited() {
+  if (isTauri()) void emit("mail-edited", getCurrentWindow().label).catch(() => {});
+}
+
+/** Another of the app's windows changed mail. Returns the unsubscribe. */
+export function onMailEdited(handler: () => void): () => void {
+  if (!isTauri()) return () => {};
+  const here = getCurrentWindow().label;
+  const stop = listen<string>("mail-edited", (e) => {
+    if (e.payload !== here) handler();
+  });
+  return () => void stop.then((unlisten) => unlisten());
+}
+
 /** The `mailto:` link spark-rs was opened with, if the window hasn't taken it yet. */
 export function takeMailto(): Promise<string | null> {
   if (isTauri()) return invoke("take_mailto");
@@ -589,7 +635,7 @@ export function readImage(path: string): Promise<string> {
 }
 
 export function updateMessage(id: number, patch: MessagePatch): Promise<Message> {
-  if (isTauri()) return invoke("update_message", { id, patch });
+  if (isTauri()) return mutate("update_message", { id, patch });
   const index = browserMailbox.findIndex((m) => m.id === id);
   if (index < 0) return Promise.reject(new Error(`no message ${id}`));
   const folder = BROWSER_FOLDERS.find((f) => f.id === patch.folder);
@@ -634,7 +680,7 @@ export function patched(message: Message, patch: MessagePatch): Message {
  * changes that undo it. A free mail provider's domain is refused.
  */
 export function decideSenders(changes: SenderChange[]): Promise<SenderChange[]> {
-  if (isTauri()) return invoke("decide_senders", { changes });
+  if (isTauri()) return mutate("decide_senders", { changes });
   const undo: SenderChange[] = [];
   for (const change of changes) {
     const isDomain = "domain" in change.screen;
@@ -670,7 +716,7 @@ export function getGatekeeperMode(): Promise<GatekeeperMode> {
 
 /** Turning the Gatekeeper off accepts everyone waiting in it. */
 export function saveGatekeeperMode(mode: GatekeeperMode): Promise<void> {
-  if (isTauri()) return invoke("set_gatekeeper_mode", { mode });
+  if (isTauri()) return mutate("set_gatekeeper_mode", { mode });
   browserMode = mode;
   if (mode === "off") {
     browserMailbox.forEach((m, i) => {
@@ -692,7 +738,7 @@ export function getPrioritySenders(): Promise<string[]> {
 
 /** Adds senders to the Priority senders, or takes them off, and marks their mail Priority or not. */
 export function prioritizeSenders(addresses: string[], priority: boolean): Promise<PriorityUndo> {
-  if (isTauri()) return invoke("prioritize_senders", { addresses, priority });
+  if (isTauri()) return mutate("prioritize_senders", { addresses, priority });
   const keys = addresses.map((a) => a.trim().toLowerCase());
   // All or nothing, as the store's transaction is.
   if (keys.some((a) => !a.includes("@"))) return Promise.reject("That isn't an email address.");
@@ -714,7 +760,7 @@ export function prioritizeSenders(addresses: string[], priority: boolean): Promi
 }
 
 export function undoPrioritize(undo: PriorityUndo): Promise<void> {
-  if (isTauri()) return invoke("undo_prioritize", { undo });
+  if (isTauri()) return mutate("undo_prioritize", { undo });
   for (const address of undo.senders) {
     if (undo.priority) browserPriority.add(address);
     else browserPriority.delete(address);
@@ -738,7 +784,7 @@ function browserStatus(address: string): SenderStatus {
 
 /** Queues a message to go out at `draft.sendAt`. Returns its outbox id. A saved draft it came from leaves Drafts. */
 export function sendMessage(draft: OutgoingDraft): Promise<number> {
-  if (isTauri()) return invoke("send_message", { draft });
+  if (isTauri()) return mutate("send_message", { draft });
   const address = BROWSER_ACCOUNTS.find((a) => a.id === draft.account)?.email.toLowerCase();
   if (address && draft.signature && draft.signatureId !== undefined) browserSignatureUsage.set(address, draft.signatureId);
   const id = ++browserOutbox;
@@ -749,7 +795,7 @@ export function sendMessage(draft: OutgoingDraft): Promise<number> {
 
 /** True if it was cancelled before going out; a saved draft it came from is back in Drafts. */
 export function cancelSend(id: number): Promise<boolean> {
-  if (isTauri()) return invoke("cancel_send", { id });
+  if (isTauri()) return mutate("cancel_send", { id });
   const draft = browserSending.get(id);
   browserSending.delete(id);
   if (draft) browserMailbox.push(draft);
@@ -760,7 +806,7 @@ export function cancelSend(id: number): Promise<boolean> {
 
 /** Saves the composer's draft in its account's Drafts: here at once, on the server with the next sync. Resolves to its id. */
 export function saveDraft(draft: OutgoingDraft): Promise<number> {
-  if (isTauri()) return invoke("save_draft", { draft });
+  if (isTauri()) return mutate("save_draft", { draft });
   return Promise.resolve(saveBrowserDraft(draft));
 }
 
@@ -786,7 +832,7 @@ export function openDraft(id: number): Promise<OutgoingDraft> {
 
 /** Deletes a draft, here and on the server. */
 export function discardDraft(id: number): Promise<void> {
-  if (isTauri()) return invoke("discard_draft", { id });
+  if (isTauri()) return mutate("discard_draft", { id });
   const i = browserMailbox.findIndex((m) => m.id === id && isBrowserDraft(m));
   if (i >= 0) browserMailbox.splice(i, 1);
   browserDrafts.delete(id);

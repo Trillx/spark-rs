@@ -47,7 +47,8 @@ export type ActionId =
   | "zoomOut"
   | "zoomReset"
   | "move"
-  | "findInThread";
+  | "findInThread"
+  | "openInNewWindow";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -114,6 +115,8 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   move: [{ key: "m" }],
   /** Search in the open conversation. */
   findInThread: [{ key: "f", mod: true, shift: true }],
+  /** Spark's "Open Thread in a new Window". */
+  openInNewWindow: [{ code: "KeyN", mod: true, alt: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {

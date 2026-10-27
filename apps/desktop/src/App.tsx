@@ -1,6 +1,7 @@
 import {
   AlignLeft,
   ArrowDownLeft,
+  AppWindow,
   Ban,
   Bell,
   BellOff,
@@ -102,7 +103,11 @@ import {
   listReminders,
   listScheduled,
   getInlineImages,
+  onMailEdited,
   onMailto,
+  openThreadWindow,
+  closeWindow,
+  onWindowClose,
   openDraft,
   patched,
   prioritizeSenders,
@@ -276,6 +281,7 @@ import {
   type ActionId,
 } from "./lib/shortcuts";
 import { setLinkHandlers } from "./lib/links";
+import { THREAD_WINDOW, loadPopOut, savePopOut } from "./lib/threadWindow";
 import { messageMarkdown, type MarkdownHeader } from "./lib/markdown";
 import { printEmails } from "./lib/print";
 import { parseMailto } from "./lib/mailto";
@@ -343,6 +349,24 @@ interface Confirm {
   danger?: boolean;
   run: () => Promise<void> | void;
 }
+
+/** Keys that move in the list, which a conversation's own window doesn't have. */
+const LIST_ACTIONS = new Set<ActionId>([
+  "next",
+  "prev",
+  "open",
+  "sidebar",
+  "search",
+  "modeFocused",
+  "modeCards",
+  "modeSimple",
+  "selectAll",
+  "selectNext",
+  "selectPrev",
+  "toggleDone",
+  "acceptAll",
+  "blockAll",
+]);
 
 /** Batch actions on more emails than this ask first, as Spark's do. */
 const HEAVY_BATCH = 100;
@@ -481,6 +505,9 @@ export default function App() {
   /** The list cursor. In split view it follows the open thread. */
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [openId, setOpenId] = useState<number | null>(null);
+  /** In a conversation's own window: it's open, once the mail's loaded (and it's there). */
+  const threadOpened = useRef(false);
+  const [threadLoaded, setThreadLoaded] = useState(false);
   /** Which emails of the open conversation were unread when it opened: reading starts there. */
   const [openedUnread, setOpenedUnread] = useState<ReadonlySet<number>>(new Set());
   /** The stored messages as last read, brought up to date by `reloadMessages` from what changed since. */
@@ -572,6 +599,8 @@ export default function App() {
   const [theme, setTheme] = useState<ThemePref>(loadTheme);
   /** Settings → Appearance → Minimize old emails. */
   const [minimize, setMinimize] = useState(loadMinimize);
+  /** Settings → Appearance: in the one-column layout, conversations open in windows of their own. */
+  const [alwaysPopOut, setAlwaysPopOut] = useState(loadPopOut);
   /** Settings → Priority: rows the Priority card shows; 0 shows them all. */
   const [priorityLines, setPriorityLines] = useState(loadPriorityLines);
   /** The Priority senders, as stored, whose mail is all Priority. */
@@ -647,7 +676,7 @@ export default function App() {
   const rowOf = (id: number) => model.rowOf.get(id) ?? id;
   const selected = messages.find((m) => m.id === selectedId && model.order.includes(rowOf(m.id))) ?? null;
   /** The Home Screen shows in place of the list and the reader; the calendar covers it. */
-  const homeShown = homeShows(homeSettings, homeSession) && !calendarOpen;
+  const homeShown = THREAD_WINDOW === null && homeShows(homeSettings, homeSession) && !calendarOpen;
   /** What message shortcuts and commands act on. The Home Screen hides the list's cursor. */
   const current = openMessage ?? (homeShown ? null : selected);
   const searching = view.search !== null;
@@ -702,7 +731,9 @@ export default function App() {
   const homeUpdates = useRef(updateHome);
   homeUpdates.current = updateHome;
 
-  useEffect(() => saveHomeSession(homeRef.current), []);
+  useEffect(() => {
+    if (THREAD_WINDOW === null) saveHomeSession(homeRef.current);
+  }, []);
 
   // spark-rs is active while one of its windows has focus (Spark's
   // SparkFocusMonitor): a change counts once it still holds 150 ms later, so
@@ -710,6 +741,8 @@ export default function App() {
   // changes of every window, the meeting pop-up's too. While inactive, the
   // timers run the timeout.
   useEffect(() => {
+    // The main window keeps the Home Screen's session; a conversation's own window has none.
+    if (THREAD_WINDOW !== null) return;
     const here = () => document.visibilityState === "visible" && document.hasFocus();
     let active = here();
     if (!active) homeUpdates.current((s) => deactivateHome(s, Date.now()));
@@ -826,7 +859,15 @@ export default function App() {
         const first = buildList(loaded, { ...INITIAL_VIEW, mode: loadInboxMode("all") }, new Set()).order[0];
         // Not on the Home Screen: opening an email there would show it over it, and read it.
         const home = homeShows(homeSettings, homeRef.current);
-        if (first !== undefined && twoColumns && !home) openThread(first, loaded);
+        if (THREAD_WINDOW !== null) {
+          // This window's conversation, which it closes with.
+          const own = loaded.find((x) => x.id === THREAD_WINDOW);
+          threadOpened.current = own !== undefined;
+          setThreadLoaded(true);
+          if (own) openThread(own.id, loaded);
+        } else if (first !== undefined && twoColumns && !home) {
+          openThread(first, loaded);
+        }
       },
       (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
     );
@@ -844,6 +885,7 @@ export default function App() {
     agentSending,
     openCalendarAt,
     openSettings,
+    otherWindowEdited,
   });
   events.current = {
     reloadMessages,
@@ -856,6 +898,7 @@ export default function App() {
     agentSending,
     openCalendarAt,
     openSettings,
+    otherWindowEdited,
   };
   useEffect(() => {
     const stops = [
@@ -867,11 +910,17 @@ export default function App() {
       onAccountsChanged(() => void events.current.reloadAccounts()),
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
-      onOpenMessage((id) => events.current.openFromNotification(id)),
-      onAgentActivity((e) => showToast(e.text, undefined, ICONS.agent)),
-      onAgentSending((e) => events.current.agentSending(e)),
-      onOpenCalendar((focus) => events.current.openCalendarAt(focus)),
-      onOpenSettings((page) => events.current.openSettings(page)),
+      onMailEdited(() => events.current.otherWindowEdited()),
+      // What clicks on notifications and the meeting pop-up ask for is the main window's.
+      ...(THREAD_WINDOW === null
+        ? [
+            onOpenMessage((id) => events.current.openFromNotification(id)),
+            onAgentActivity((e) => showToast(e.text, undefined, ICONS.agent)),
+            onAgentSending((e) => events.current.agentSending(e)),
+            onOpenCalendar((focus) => events.current.openCalendarAt(focus)),
+            onOpenSettings((page) => events.current.openSettings(page)),
+          ]
+        : []),
     ];
     return () => stops.forEach((stop) => stop());
   }, []);
@@ -889,6 +938,7 @@ export default function App() {
   // The backend keeps the sidebar's folders and the open one in sync.
   const watched = watchedFolderIds(layout, folders, view.folder).join(",");
   useEffect(() => {
+    if (THREAD_WINDOW !== null) return;
     void watchFolders(watched ? watched.split(",").map(Number) : []).catch(() => {});
   }, [watched]);
 
@@ -896,7 +946,7 @@ export default function App() {
   // The backend checks the inboxes.
   const open = listFolderIds(view.folder, folders, accountOf(view.account)).join(",");
   useEffect(() => {
-    if (!open) return;
+    if (!open || THREAD_WINDOW !== null) return;
     const fetchOpen = () => void syncFolders(open.split(",").map(Number)).catch(() => {});
     window.addEventListener("focus", fetchOpen);
     return () => window.removeEventListener("focus", fetchOpen);
@@ -926,7 +976,7 @@ export default function App() {
   }, [settingsPage]);
 
   useEffect(() => {
-    void setBadge(badge, badge > 0 ? badgeIcon(badge) : null).catch(() => {});
+    if (THREAD_WINDOW === null) void setBadge(badge, badge > 0 ? badgeIcon(badge) : null).catch(() => {});
   }, [badge]);
 
   // Email links (mailto:) open a new email: the one spark-rs was started with, and any after,
@@ -935,6 +985,73 @@ export default function App() {
   latestCompose.current = compose;
   const latestSend = useRef(send);
   latestSend.current = send;
+
+  // A conversation's own window closes when it's done with it: closed, or another one open
+  // in its place (Done takes the reader to the next email). Its email's conversation is
+  // looked at again each time, as a sync can join two conversations into one.
+  const ownMessage = THREAD_WINDOW === null ? undefined : byId.get(THREAD_WINDOW);
+  const ownConversation = ownMessage ? (ownMessage.conversation ?? ownMessage.id) : null;
+  useEffect(() => {
+    if (THREAD_WINDOW === null || !threadOpened.current) return;
+    const here = openMessage ? (openMessage.conversation ?? openMessage.id) : null;
+    if (here === null || here !== ownConversation) void closeThreadWindow();
+  }, [openMessage, ownConversation]);
+
+  /** Work a window mustn't close in the middle of: sends being queued, drafts being saved. */
+  const inFlight = useRef(new Set<Promise<unknown>>());
+  function track<T>(work: Promise<T>): Promise<T> {
+    inFlight.current.add(work);
+    void work.finally(() => inFlight.current.delete(work)).catch(() => {});
+    return work;
+  }
+
+  /** Closes this conversation's window once its draft is saved and a send is queued. */
+  async function settleWindow() {
+    if (composer.current.draft) await track(closeComposer());
+    await Promise.allSettled([...inFlight.current]);
+    await draftSaves.current.catch(() => {});
+  }
+  const latestSettle = useRef(settleWindow);
+  latestSettle.current = settleWindow;
+
+  async function closeThreadWindow() {
+    await settleWindow();
+    closeWindow();
+  }
+
+  // The window's own close button: the draft is saved and a send queued first.
+  useEffect(() => {
+    if (THREAD_WINDOW === null) return;
+    return onWindowClose(() => latestSettle.current());
+  }, []);
+
+  /** Another window changed mail: read the changes, coalesced. */
+  const editedTimer = useRef(0);
+  function otherWindowEdited() {
+    clearTimeout(editedTimer.current);
+    editedTimer.current = window.setTimeout(() => {
+      void reloadMessages();
+      void reloadPrioritySenders();
+      void getGatekeeperMode().then(setGatekeeperMode, () => {});
+      reloadPlanned();
+    }, 150);
+  }
+
+  // Another window saved a preference this one shows (grouping, cards, …): take it, so neither
+  // writes its old copy back over the other's.
+  useEffect(() => {
+    const same = <T,>(current: T, next: T) => (JSON.stringify(current) === JSON.stringify(next) ? current : next);
+    const onStorage = () => {
+      setGrouped((g) => same(g, loadGrouped()));
+      setCardPrefs((c) => same(c, loadCardPrefs()));
+      setSeen((s) => same(s, loadSeen()));
+      setMinimize(loadMinimize());
+      setAlwaysPopOut(loadPopOut());
+      setPriorityLines(loadPriorityLines());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
 
   // Links in email: mailto: starts a new email here, as in Spark; an app's link asks first.
   useEffect(() => {
@@ -971,7 +1088,7 @@ export default function App() {
   }, [composerKey, composing]);
   const accountsKnown = accounts.length > 0;
   useEffect(() => {
-    if (!accountsKnown) return;
+    if (!accountsKnown || THREAD_WINDOW !== null) return;
     const open = () =>
       void takeMailto().then((link) => {
         const m = link ? parseMailto(link) : null;
@@ -1437,7 +1554,15 @@ export default function App() {
     if (group) return changeView({ sub: { kind: "group", key: group.key } }, true);
     const m = messages.find((x) => x.id === id);
     if (m && isDraft(m, folders)) void editDraft(m);
+    else if (m && alwaysPopOut && !twoColumns && THREAD_WINDOW === null) popOut(m);
     else openThread(id);
+  }
+
+  /** Spark's "Open Thread in a new Window": the conversation leaves the reader for a window of its own. */
+  function popOut(m: Message) {
+    void openThreadWindow(m.id, m.subject || "No subject").then(() => {
+      if (openId === m.id) setOpenId(null);
+    }, fileError);
   }
 
   /** The cursor moved: split view shows the message there, but a draft only opens when asked. */
@@ -2865,7 +2990,7 @@ export default function App() {
         session: asked,
         // The email as it is then, if it's still the one asked about.
         run: () => {
-          if (composer.current.key === asked) void latestSend.current(true);
+          if (composer.current.key === asked) void track(latestSend.current(true));
         },
       });
       return;
@@ -2971,6 +3096,11 @@ export default function App() {
     setMinimize(on);
   }
 
+  function changePopOut(on: boolean) {
+    savePopOut(on);
+    setAlwaysPopOut(on);
+  }
+
   function changePriorityLines(lines: number) {
     savePriorityLines(lines);
     setPriorityLines(lines);
@@ -2979,7 +3109,12 @@ export default function App() {
   // ---- keyboard ----
 
   function run(action: ActionId) {
+    // A conversation's own window has no list to move in.
+    if (THREAD_WINDOW !== null && LIST_ACTIONS.has(action)) return;
     switch (action) {
+      case "openInNewWindow":
+        if (THREAD_WINDOW === null && current) popOut(current);
+        return;
       case "next":
         return moveCursor(1);
       case "prev":
@@ -3358,6 +3493,18 @@ export default function App() {
                 },
               ]
             : []),
+          ...(THREAD_WINDOW === null
+            ? [
+                {
+                  id: "pop-out",
+                  label: "Open in a New Window",
+                  keywords: "window separate pop out",
+                  Icon: AppWindow,
+                  shortcut: shortcutLabel("openInNewWindow"),
+                  run: () => popOut(m),
+                },
+              ]
+            : []),
           ...(openMessage
             ? [
                 {
@@ -3444,6 +3591,8 @@ export default function App() {
             },
           ]
         : [];
+    // A conversation's own window acts on that conversation only: it has no list.
+    if (THREAD_WINDOW !== null) return [...messageCommands, ...(m ? gatekeeperCommands(m) : [])];
     const waiting = waitingInList();
     return [
       ...messageCommands,
@@ -3673,6 +3822,8 @@ export default function App() {
 
   const threadActions: ThreadActions = {
     ...actions,
+    // A conversation's own window doesn't open another.
+    popOut: THREAD_WINDOW === null ? popOut : undefined,
     inSpam,
     senderPriority,
     prioritySender: (m) => prioritize([m.address], !senderPriority(m)),
@@ -3817,11 +3968,13 @@ export default function App() {
 
   const showList = twoColumns || !openMessage;
   const showReader = twoColumns || openMessage !== null;
-  const readerLeft = sidebarSpace + (twoColumns && !homeShown ? listWidthUsed : 0);
+  const readerLeft = THREAD_WINDOW !== null ? 0 : sidebarSpace + (twoColumns && !homeShown ? listWidthUsed : 0);
 
   return (
     <AccountsContext value={accounts}>
       <div className="flex h-full bg-base-100 text-base-content">
+        {THREAD_WINDOW === null ? (
+          <>
         <Sidebar
           mode={sidebarMode}
           width={sidebarWidth}
@@ -3981,6 +4134,39 @@ export default function App() {
             </section>
           )}
         </main>
+          </>
+        ) : (
+          // A conversation in a window of its own: the reader, filling it.
+          <main className="relative flex min-w-0 flex-1 flex-col">
+            <DragStrip />
+            <CaptionButtons />
+            <section
+              aria-label="Conversation"
+              className="flex min-h-0 flex-1 flex-col pt-8"
+              onPointerDownCapture={() => (scrollPane.current = "reader")}
+            >
+              {openMessage ? (
+                <ThreadView
+                  key={openMessage.id}
+                  message={asThread(openMessage, conversation)}
+                  conversation={conversation}
+                  unread={openedUnread}
+                  minimize={minimize}
+                  singleColumn={false}
+                  summary={summaries.get(openMessage.id)}
+                  aiProvider={aiProvider}
+                  actions={threadActions}
+                  scrollRef={readerScroll}
+                  findRequest={findRequest}
+                />
+              ) : (
+                <div className="grid flex-1 place-items-center text-[13px] text-text-2">
+                  {threadLoaded ? "This email isn't here anymore." : "Loading…"}
+                </div>
+              )}
+            </section>
+          </main>
+        )}
 
         {draft && (
           <Composer
@@ -3999,9 +4185,9 @@ export default function App() {
               )
             }
             onToggleFull={() => setComposerFull((f) => !f)}
-            onClose={() => void closeComposer()}
+            onClose={() => void track(closeComposer())}
             onDiscard={() => void discardComposer()}
-            onSend={() => void send()}
+            onSend={() => void track(send())}
             onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
             onSignatureSettings={() => openSettings("signatures")}
             onTemplateFromDraft={() => {
@@ -4092,6 +4278,8 @@ export default function App() {
             onTheme={changeTheme}
             minimize={minimize}
             onMinimize={changeMinimize}
+            popOut={alwaysPopOut}
+            onPopOut={changePopOut}
             cards={cardPrefs}
             onCards={setCardPrefs}
             priorityLines={priorityLines}
@@ -4145,7 +4333,7 @@ export default function App() {
           />
         )}
 
-        {toast && <UndoToast toast={toast} left={sidebarSpace + 16} onUndo={undoToast} />}
+        {toast && <UndoToast toast={toast} left={THREAD_WINDOW !== null ? 16 : sidebarSpace + 16} onUndo={undoToast} />}
       </div>
     </AccountsContext>
   );
