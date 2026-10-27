@@ -745,6 +745,11 @@ pub fn save_inbox_automation(
                 .filter(|m| !m.is_empty()),
         };
         store.set_automation_settings(&settings).map_err(text)?;
+        // Nothing on, nothing wrong: a worker holding off after a failure
+        // would otherwise leave its problem up until it looks again.
+        if !settings.is_on() {
+            automation.problem(&app, None);
+        }
         view(&store, &automation)?
     };
     let _ = app.emit("mailbox-changed", ());

@@ -694,8 +694,14 @@ export function sidebarCounts(messages: Message[], keys: ListKey[], ctx: ListCon
       counted = listItems(messages, key, ctx);
     } else if (key === "snoozed" || key === "aside") {
       counted = oneEach(listItems(messages, key, ctx));
-    } else if (key === "spam" || folderIdOf(key) !== undefined || autoLabelOf(key)) {
+    } else if (key === "spam" || folderIdOf(key) !== undefined) {
       counted = oneEach(listItems(messages, key, ctx).filter((m) => m.unread && !waiting(m, ctx.gatekeeper)));
+    } else if (autoLabelOf(key)) {
+      // Unread as its rows show it: if any email of the conversation is, a reply without a label of its own too.
+      const conversations = conversationsIn(messages, ctx.folders);
+      const unread = (m: Message) =>
+        conversationOf(conversations, m).some((x) => x.unread && !waiting(x, ctx.gatekeeper));
+      counted = oneEach(listItems(messages, key, ctx)).filter(unread);
     } else continue;
     lists[key] = counted.length;
     if (hasAccountRows(key)) listAccounts[key] = perAccount(counted);
