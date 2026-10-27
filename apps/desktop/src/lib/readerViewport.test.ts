@@ -21,7 +21,7 @@ const places = (p: Partial<Places>): Places => ({
   visible: new Set(),
   known: new Set(),
   loading: new Set(),
-  loaded: new Set(),
+  cached: () => false,
   ...p,
 });
 
@@ -46,9 +46,9 @@ test("Only near bodies mount, and no more than the limit start loading", () => {
   assert.deepEqual(sorted(next), [11, 12, 13, 14]);
 });
 
-test("Bodies that loaded before come back without a turn", () => {
+test("Bodies that would show from the cache come back without a turn", () => {
   const cards = thread(10);
-  const p = places({ near: new Set(range(1, 6)), known: new Set(cards), loaded: new Set([1, 2, 3]), visible: new Set([4]) });
+  const p = places({ near: new Set(range(1, 6)), known: new Set(cards), cached: (id) => id <= 3, visible: new Set([4]) });
   assert.deepEqual(sorted(mountedBodies(cards, new Set(), p, 2)), [1, 2, 3, 4, 5]);
 });
 
@@ -166,6 +166,114 @@ test("A card that collapses lets go of its body and its turn", () => {
   assert.deepEqual(changes.map(sorted), [[1], [2]]);
 });
 
+test("Collapse All while Find is open lets go of the collapsed bodies and their turns", () => {
+  // Review finding UI-1: unmounting, each collapsed body let the cards from
+  // before the collapse mount it again, and it held a turn for good.
+  const s = bodyScheduler(undefined, () => {}, 4);
+  s.cards(thread(5), true);
+  s.place(thread(5).map((id) => ({ id, near: id <= 2, visible: id === 1 })));
+  for (const id of range(1, 4)) s.content(id, "loading");
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3, 4], "the latest waits its turn");
+  // Collapse All keeps the latest open. As React commits it, each collapsed
+  // card's article goes, then its body says so; then the reader passes the
+  // cards still expanded.
+  for (const id of range(1, 4)) {
+    s.forget(id);
+    s.content(id, null);
+  }
+  s.cards([5], true);
+  assert.deepEqual(sorted(s.mounted), [5]);
+  s.place([{ id: 5, near: true, visible: true }]);
+  s.content(5, "loading");
+  s.cards([5]);
+  assert.deepEqual(sorted(s.mounted), [5], "Find closed, it stays");
+  s.content(5, "ready");
+  // One expanded again mounts at once.
+  s.mount(2);
+  s.content(2, "loading");
+  s.cards([2, 5], true);
+  assert.deepEqual(sorted(s.mounted), [2, 5]);
+});
+
+test("A body whose card is no longer expanded goes, loading or not", () => {
+  // Review finding UI-1, its second half: dropped from the cards, a loading
+  // body stayed mounted and kept its turn.
+  const s = bodyScheduler(1, () => {}, 2);
+  s.cards(thread(3));
+  s.content(1, "loading");
+  s.mount(3);
+  s.cards([2, 3]);
+  assert.deepEqual(sorted(s.mounted), [3]);
+  s.place([{ id: 2, near: true }, { id: 3, near: true }]);
+  assert.deepEqual(sorted(s.mounted), [2, 3], "1's load doesn't count");
+});
+
+test("A body that reports is mounted, even just after its card was forgotten", () => {
+  // As Strict Mode tries a card that mounts: its article goes and its body
+  // says so, then the body reports again before the article is placed again.
+  const s = bodyScheduler(undefined, () => {}, 1);
+  s.cards(thread(2));
+  s.place(thread(2).map((id) => ({ id, near: id === 1, visible: id === 1 })));
+  s.content(1, "loading");
+  s.forget(1);
+  s.content(1, null);
+  s.content(1, "loading");
+  assert.deepEqual(sorted(s.mounted), [1]);
+  s.place([{ id: 1, near: true, visible: true }, { id: 2, near: true }]);
+  assert.deepEqual(sorted(s.mounted), [1], "its load holds the turn");
+  s.content(1, "ready");
+  assert.deepEqual(sorted(s.mounted), [1, 2]);
+});
+
+test("Bodies the cache let go of take their turn again, even while Find is open", () => {
+  // Review finding UI-2: a body that had loaded once came back without a
+  // turn, though the cache might have let it go since.
+  /** The content cache: room for 7 of these 8 MiB emails in its 64 MiB, the most recent last. */
+  const kept: number[] = [];
+  const keep = (id: number) => {
+    kept.push(id);
+    if (kept.length > 7) kept.shift();
+  };
+  const s = bodyScheduler(undefined, () => {}, 4, (id) => kept.includes(id));
+  const cards = thread(20);
+  s.cards(cards);
+  // Reading down through them, each body loads as it comes near.
+  for (const at of cards) {
+    const before = s.mounted;
+    s.place(cards.map((id) => ({ id, near: Math.abs(id - at) <= 1, visible: id === at })));
+    for (const id of s.mounted) {
+      if (before.has(id)) continue;
+      s.content(id, "loading");
+      keep(id);
+      s.content(id, "ready");
+    }
+  }
+  assert.deepEqual(kept, range(14, 20));
+  // Opening Find, the ones still cached come back at once; the rest take turns.
+  s.cards(cards, true);
+  const misses = sorted([...s.mounted].filter((id) => !kept.includes(id)));
+  assert.deepEqual(misses, range(10, 13));
+  for (const id of misses) s.content(id, "loading");
+  keep(13);
+  s.content(13, "ready");
+  assert.ok(s.mounted.has(9) && !s.mounted.has(8), "one done, the next starts");
+});
+
+test("A body that loads with embedded images still to fetch keeps its turn", () => {
+  // Review finding UI-3: as its content became ready, a body let go of its
+  // turn before saying it was fetching embedded images, so a fifth started.
+  const s = bodyScheduler(undefined, () => {}, 4);
+  s.cards(thread(5));
+  s.place(thread(5).map((id) => ({ id, near: true, visible: id <= 2 })));
+  for (const id of range(1, 4)) s.content(id, "loading");
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3, 4]);
+  // 1's content arrives, embedding images that aren't cached: its body says both at once.
+  s.content(1, "ready", true);
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3, 4], "5 still waits");
+  s.content(1, "ready", false);
+  assert.deepEqual(sorted(s.mounted), thread(5));
+});
+
 test("Bodies that report before the expanded cards are passed in keep their place", () => {
   const s = bodyScheduler(4, () => {}, 2);
   s.content(4, "ready");
@@ -182,10 +290,9 @@ test("Embedded images count as loading", () => {
   const s = bodyScheduler(undefined, () => {}, 1);
   s.cards(thread(3));
   s.place(thread(3).map((id) => ({ id, near: true, visible: id === 1 })));
-  s.images(1, true);
-  s.content(1, "ready");
+  s.content(1, "ready", true);
   assert.deepEqual(sorted(s.mounted), [1]);
-  s.images(1, false);
+  s.content(1, "ready", false);
   assert.deepEqual(sorted(s.mounted), [1, 2]);
 });
 

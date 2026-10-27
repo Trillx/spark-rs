@@ -44,6 +44,17 @@ function cachedInline(id: number): InlineImages | null {
 }
 
 /**
+ * Whether a message would show from the caches now, loading nothing: its
+ * content is kept and, if `embeds` finds embedded images in its HTML, so are
+ * they. It loads nothing, though what it finds counts as just used: the
+ * reader asks only of emails near the screen, which read the same to show.
+ */
+export function shownFromCache(id: number, embeds: (html: string) => boolean): boolean {
+  const content = contents.get(id);
+  return content !== undefined && (content.html === null || !embeds(content.html) || cachedInline(id) !== null);
+}
+
+/**
  * The images a message's HTML embeds, fetched when `wanted`: null while
  * they load. A failed fetch shows none and is tried again next time.
  */

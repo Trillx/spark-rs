@@ -52,21 +52,21 @@ export interface Places {
   known: ReadonlySet<number>;
   /** Mounted bodies loading, or yet to say whether they are. */
   loading: ReadonlySet<number>;
-  /** Bodies that loaded before: they come back from the cache, so they don't need a turn. */
-  loaded: ReadonlySet<number>;
+  /** Whether a body would show from the cache now, loading nothing: then it doesn't need a turn. */
+  cached: (id: number) => boolean;
 }
 
 /**
  * Which bodies are mounted next. A mounted one stays while it's near, while
  * it loads (so `limit` counts every load in flight, even one scrolled past)
  * and until its place is known. Of `cards` (the expanded ones, oldest first),
- * a near one mounts if it loaded before, or in its turn while fewer than
- * `limit` load. When nothing changes, `mounted` itself comes back.
+ * a near one mounts if it would show from the cache, or in its turn while
+ * fewer than `limit` load. When nothing changes, `mounted` itself comes back.
  */
 export function mountedBodies(
   cards: readonly number[],
   mounted: ReadonlySet<number>,
-  { near, visible, known, loading, loaded }: Places,
+  { near, visible, known, loading, cached }: Places,
   limit = LOADING_LIMIT,
 ): ReadonlySet<number> {
   const next = new Set<number>();
@@ -77,7 +77,7 @@ export function mountedBodies(
   }
   for (const id of mountOrder(cards, visible)) {
     if (next.has(id) || !near.has(id)) continue;
-    if (loaded.has(id)) next.add(id);
+    if (cached(id)) next.add(id);
     else if (inFlight < limit) {
       next.add(id);
       inFlight++;
@@ -98,35 +98,52 @@ export type BodyScheduler = ReturnType<typeof bodyScheduler>;
 /**
  * The reader's bodies as reports come in, calling `onChange` with the new
  * mounted set whenever it changes. The card reading starts at is mounted
- * from the start, without waiting for its place.
+ * from the start, without waiting for its place. `cached` says whether a
+ * body would show from the cache now; left out, none would.
  */
 export function bodyScheduler(
   start: number | undefined,
   onChange: (mounted: ReadonlySet<number>) => void,
   limit = LOADING_LIMIT,
+  cached: (id: number) => boolean = () => false,
 ) {
   let cards: readonly number[] = [];
   /** Every expanded body counts as near (see `cards`). */
   let all = false;
   let mounted: ReadonlySet<number> = new Set(start === undefined ? [] : [start]);
+  /** The mounted set `onChange` last heard of. */
+  let told = mounted;
   const near = new Set<number>();
   const visible = new Set<number>();
   const known = new Set<number>();
+  /**
+   * Cards that left the page or collapsed (see `forget`): whatever `cards`
+   * still says, their bodies don't mount until they're placed again or the
+   * user expands them.
+   */
+  const gone = new Set<number>();
   /** Bodies mounted, but not yet rendered to say whether they're loading: they count as loading. */
   const pending = new Set<number>(mounted);
   const loadingContent = new Set<number>();
   const fetchingImages = new Set<number>();
-  const loaded = new Set<number>();
   const heights = new Map<number, number>();
 
+  /** A body that can't be showing: it's not mounted, and nothing it was loading counts. */
+  const letGo = (id: number) => {
+    pending.delete(id);
+    loadingContent.delete(id);
+    fetchingImages.delete(id);
+    if (mounted.has(id)) mounted = new Set([...mounted].filter((x) => x !== id));
+  };
+
   const run = () => {
+    const present = cards.filter((id) => !gone.has(id));
     const loading = new Set([...pending, ...loadingContent, ...fetchingImages]);
-    const nearNow = all ? new Set([...near, ...cards]) : near;
-    const next = mountedBodies(cards, mounted, { near: nearNow, visible, known, loading, loaded }, limit);
-    if (next === mounted) return;
-    for (const id of next) if (!mounted.has(id) && !loaded.has(id)) pending.add(id);
+    const nearNow = all ? new Set([...near, ...present]) : near;
+    const next = mountedBodies(present, mounted, { near: nearNow, visible, known, loading, cached }, limit);
+    for (const id of next) if (!mounted.has(id) && !cached(id)) pending.add(id);
     mounted = next;
-    onChange(next);
+    if (mounted !== told) onChange((told = mounted));
   };
 
   return {
@@ -134,17 +151,21 @@ export function bodyScheduler(
       return mounted;
     },
     /**
-     * The expanded cards, oldest first. With `everyOne`, each counts as near,
-     * so all their bodies mount in turn and none unmounts: Find in
-     * Conversation searches them all.
+     * The expanded cards, oldest first; any other body goes, loading or not.
+     * With `everyOne`, each counts as near, so all their bodies mount in turn
+     * and none unmounts: Find in Conversation searches them all.
      */
     cards(expanded: readonly number[], everyOne = false) {
       cards = expanded;
       all = everyOne;
+      const open = new Set(expanded);
+      for (const id of [...mounted, ...pending, ...loadingContent, ...fetchingImages]) if (!open.has(id)) letGo(id);
       run();
     },
+    /** Where cards on the page are. */
     place(places: Iterable<Place>) {
       for (const { id, near: isNear, visible: isVisible } of places) {
+        gone.delete(id);
         if (isNear !== undefined) {
           mark(near, id, isNear);
           known.add(id);
@@ -153,32 +174,41 @@ export function bodyScheduler(
       }
       run();
     },
-    /** A card that left the page, or collapsed: its body goes, and its place is unknown until it's seen again. */
+    /**
+     * A card that left the page, or collapsed: its body goes at once, with
+     * the turn it held, and its place is unknown until it's seen again.
+     */
     forget(id: number) {
+      gone.add(id);
       near.delete(id);
       visible.delete(id);
       known.delete(id);
-      pending.delete(id);
-      if (mounted.has(id)) mounted = new Set([...mounted].filter((x) => x !== id));
+      letGo(id);
     },
-    /** A mounted body's content: loading, ready or failed; null once the body unmounts. */
-    content(id: number, status: ContentState["status"] | null) {
+    /**
+     * A mounted body's state, all in one report: its content loading, ready
+     * or failed, and with `images`, ready but fetching its embedded images.
+     * Null once the body unmounts.
+     */
+    content(id: number, status: ContentState["status"] | null, images = false) {
       pending.delete(id);
       mark(loadingContent, id, status === "loading");
-      if (status === "ready") loaded.add(id);
-      run();
-    },
-    /** Whether a mounted body is fetching its embedded images. */
-    images(id: number, fetching: boolean) {
-      mark(fetchingImages, id, fetching);
+      mark(fetchingImages, id, status === "ready" && images);
+      // Only a mounted body reports, so one that does counts, even just after
+      // its card was forgotten: Strict Mode remounts a new card to try it.
+      if (status !== null && !mounted.has(id)) {
+        gone.delete(id);
+        mounted = new Set(mounted).add(id);
+      }
       run();
     },
     /** Mounts a body now, without waiting its turn: for an email the user expands. */
     mount(id: number) {
+      gone.delete(id);
       if (mounted.has(id)) return;
-      if (!loaded.has(id)) pending.add(id);
+      if (!cached(id)) pending.add(id);
       mounted = new Set(mounted).add(id);
-      onChange(mounted);
+      onChange((told = mounted));
     },
     /** A mounted body's height. A hidden reader's zero doesn't count. */
     measure(id: number, height: number) {

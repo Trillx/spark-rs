@@ -50,7 +50,7 @@ const CATEGORIES: { key: Category; label: string }[] = [
 import { isFromYou, useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
-import { useInlineImages, useMessageContent, type ContentState } from "../lib/content";
+import { shownFromCache, useInlineImages, useMessageContent, type ContentState } from "../lib/content";
 import { allowRemoteImages, useRemoteImagesAllowed } from "../lib/remoteImages";
 import {
   laterPresets,
@@ -62,6 +62,7 @@ import {
   type LaterPreset,
 } from "../lib/format";
 import {
+  LOADING_LIMIT,
   OVERSCAN,
   READING_CONTEXT,
   bodyScheduler,
@@ -458,8 +459,13 @@ interface Bodies {
   card: (el: HTMLElement) => () => void;
   /** Ref for a mounted body, measured so its placeholder can take its height. */
   body: (el: HTMLDivElement) => () => void;
+  /**
+   * A body's state, as one report from whatever knows all of it: the card
+   * while its content loads or fails, then what shows the content, with the
+   * embedded images it fetches. Null comes only as the body unmounts, so a
+   * change never lets its turn go in between.
+   */
   content: BodyScheduler["content"];
-  images: BodyScheduler["images"];
   mount: BodyScheduler["mount"];
   height: BodyScheduler["height"];
   /** Starts watching the cards in the reader `root`; returns how to stop. */
@@ -494,7 +500,9 @@ function useBodies(
   all: boolean,
 ): [ReadonlySet<number>, Bodies] {
   const [mounted, setMounted] = useState<ReadonlySet<number>>(() => new Set(start === undefined ? [] : [start]));
-  const [bodies] = useState(() => readerBodies(bodyScheduler(start, setMounted)));
+  const [bodies] = useState(() =>
+    readerBodies(bodyScheduler(start, setMounted, LOADING_LIMIT, (id) => shownFromCache(id, hasInlineImages))),
+  );
   useLayoutEffect(() => bodies.watch(scrollRef.current!), [bodies, scrollRef]);
   useLayoutEffect(() => bodies.update(cards, all));
   return [mounted, bodies];
@@ -542,7 +550,6 @@ function readerBodies(scheduler: BodyScheduler): Bodies {
       };
     },
     content: scheduler.content,
-    images: scheduler.images,
     mount: scheduler.mount,
     height: scheduler.height,
     watch(el) {
@@ -1244,10 +1251,11 @@ function CardContent({
 }) {
   const [state, retry] = useMessageContent(m.id);
   const content = state.status === "ready" ? state.content : null;
+  // Ready, the content is reported by what shows it (see `Bodies`).
   useLayoutEffect(() => {
-    bodies.content(m.id, state.status);
-    return () => bodies.content(m.id, null);
+    if (state.status !== "ready") bodies.content(m.id, state.status);
   }, [bodies, m.id, state.status]);
+  useLayoutEffect(() => () => bodies.content(m.id, null), [bodies, m.id]);
   const hasFiles = (content?.attachments.length ?? 0) > 0;
   useEffect(() => {
     if (!hasFiles || kept.prefetched) return;
@@ -1386,13 +1394,10 @@ function Body({
   const html = content.html;
   const embeds = useMemo(() => html !== null && hasInlineImages(html), [html]);
   const inlineImages = useInlineImages(m.id, embeds);
-  // Fetching embedded images takes a turn among the reader's loads, as the content did.
+  // Fetching embedded images takes a turn among the reader's loads, as the
+  // content did: the content is ready, and its images are what's loading.
   const fetching = embeds && inlineImages === null;
-  useLayoutEffect(() => {
-    if (!fetching) return;
-    bodies.images(m.id, true);
-    return () => bodies.images(m.id, false);
-  }, [bodies, m.id, fetching]);
+  useLayoutEffect(() => bodies.content(m.id, "ready", fetching), [bodies, m.id, fetching]);
   if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} kept={kept} />;
   return (
     <HtmlBody
@@ -1432,6 +1437,11 @@ function InviteBody({
     setRelated(shown);
   };
   const hasBody = content.html !== null || content.text.some((p) => p.trim() !== "");
+  // Showing, the related message reports the content, with its embedded images.
+  const bodyShown = hasBody && related;
+  useLayoutEffect(() => {
+    if (!bodyShown) bodies.content(m.id, "ready");
+  }, [bodies, m.id, bodyShown]);
   return (
     <>
       <InviteCard id={m.id} invite={content.invite!} account={account} />
