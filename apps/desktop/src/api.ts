@@ -612,6 +612,21 @@ export function announceMailEdited() {
   if (isTauri()) void emit("mail-edited", getCurrentWindow().label).catch(() => {});
 }
 
+/** This window saved settings (Settings, +AI): the app's other windows read them again. */
+export function announceSettingsChanged() {
+  if (isTauri()) void emit("settings-changed", getCurrentWindow().label).catch(() => {});
+}
+
+/** Another of the app's windows saved settings. Returns the unsubscribe. */
+export function onSettingsChanged(handler: () => void): () => void {
+  if (!isTauri()) return () => {};
+  const here = getCurrentWindow().label;
+  const stop = listen<string>("settings-changed", (e) => {
+    if (e.payload !== here) handler();
+  });
+  return () => void stop.then((unlisten) => unlisten());
+}
+
 /** Another of the app's windows changed mail. Returns the unsubscribe. */
 export function onMailEdited(handler: () => void): () => void {
   if (!isTauri()) return () => {};
@@ -987,7 +1002,11 @@ export function getPrefs(): Promise<Prefs> {
 
 /** Returns what was saved. Rejects when Windows' sign-in list can't be changed. */
 export function savePrefs(prefs: Prefs): Promise<Prefs> {
-  if (isTauri()) return invoke("save_prefs", { prefs });
+  if (isTauri())
+    return invoke<Prefs>("save_prefs", { prefs }).then((saved) => {
+      announceSettingsChanged();
+      return saved;
+    });
   browserPrefs = { ...prefs };
   return Promise.resolve({ ...prefs });
 }

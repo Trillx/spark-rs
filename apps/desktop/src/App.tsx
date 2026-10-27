@@ -108,6 +108,7 @@ import {
   openThreadWindow,
   closeWindow,
   onSearchInMain,
+  onSettingsChanged,
   onThreadThen,
   onWindowClose,
   searchInMain,
@@ -902,6 +903,7 @@ export default function App() {
     otherWindowEdited,
     searchFromWindow,
     summarizeOpen,
+    reloadAppPrefs,
   });
   events.current = {
     reloadMessages,
@@ -917,6 +919,7 @@ export default function App() {
     otherWindowEdited,
     searchFromWindow,
     summarizeOpen,
+    reloadAppPrefs,
   };
   useEffect(() => {
     const stops = [
@@ -929,6 +932,8 @@ export default function App() {
       onSyncStatus((e) => events.current.syncStatus(e)),
       onSendStatus((e) => events.current.sendStatus(e)),
       onMailEdited(() => events.current.otherWindowEdited()),
+      // Settings saved in another window (an automatic Bcc, the Undo Send delay, …).
+      onSettingsChanged(() => events.current.reloadAppPrefs()),
       // A conversation's own window, asked to summarize it.
       ...(THREAD_WINDOW !== null ? [onThreadThen((style) => events.current.summarizeOpen(style))] : []),
       // What clicks on notifications and the meeting pop-up ask for is the main window's.
@@ -978,6 +983,12 @@ export default function App() {
 
   useEffect(() => {
     if (settingsPage !== null) return;
+    reloadAppPrefs();
+    reloadPlanned();
+  }, [settingsPage]);
+
+  /** The settings this window acts on: the AI provider's name, and how the composer starts and sends. */
+  function reloadAppPrefs() {
     void getAiSettings().then(
       (view) => view && setAiProvider(presetLabel(view.preset)),
       () => {},
@@ -996,8 +1007,7 @@ export default function App() {
         }),
       () => {},
     );
-    reloadPlanned();
-  }, [settingsPage]);
+  }
 
   useEffect(() => {
     if (THREAD_WINDOW === null) void setBadge(badge, badge > 0 ? badgeIcon(badge) : null).catch(() => {});
@@ -1641,6 +1651,8 @@ export default function App() {
   function popOut(m: Message, then?: SummaryStyle) {
     void openThreadWindow(m.id, m.subject || "No subject", then).then(() => {
       if (openId === m.id) setOpenId(null);
+      // The list's cursor goes to it, as opening it here would: keys act on it, not the one before.
+      setSelectedId(m.id);
     }, fileError);
   }
 

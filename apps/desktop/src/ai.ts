@@ -1,4 +1,5 @@
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import { announceSettingsChanged } from "./api";
 import type { AccountId, Message } from "./types";
 
 // Mirrors src-tauri/src/ai/*.rs and crates/ai. The API key goes in once and
@@ -125,7 +126,11 @@ export function getAiSettings(): Promise<AiSettings | null> {
 
 /** `apiKey`: omit to keep the stored key, `""` to delete it. */
 export function saveAiSettings(preset: Preset, config: ProviderConfig, apiKey?: string): Promise<AiSettings> {
-  if (isTauri()) return invoke("save_ai_settings", { preset, config, apiKey: apiKey ?? null });
+  if (isTauri())
+    return invoke<AiSettings>("save_ai_settings", { preset, config, apiKey: apiKey ?? null }).then((saved) => {
+      announceSettingsChanged();
+      return saved;
+    });
   return browserSave(preset, config, apiKey);
 }
 
