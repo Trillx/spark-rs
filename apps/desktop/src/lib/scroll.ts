@@ -25,6 +25,28 @@ export function renderForPaging(scroller: HTMLElement, render: (from: number, to
   };
 }
 
+/** Lists that bring in more past their end, by the element that scrolls. */
+const endless = new WeakMap<HTMLElement, () => void>();
+
+/**
+ * Page Down or End at a list's end, or in a list too short to scroll, moves
+ * nothing, so no scroll says the end was reached: `more` hears of it instead.
+ * Returns the undo.
+ */
+export function pagedPastEnd(scroller: HTMLElement, more: () => void) {
+  endless.set(scroller, more);
+  return () => {
+    if (endless.get(scroller) === more) endless.delete(scroller);
+  };
+}
+
+/** Scrolls to `top`; a list that can't go down that far hears it's at the end. */
+function moveTo(scroller: HTMLElement, top: number) {
+  const was = scroller.scrollTop;
+  scroller.scrollTop = top;
+  if (top > was && scroller.scrollTop - was < 1) endless.get(scroller)?.();
+}
+
 /**
  * Page Down puts the last row that shows (even partly) at the top. Page Up
  * goes back about as far, to the first row that starts within the screen
@@ -43,7 +65,7 @@ export function pageList(scroller: HTMLElement, dir: 1 | -1) {
   } else {
     target = tops.find((top) => top >= scrollTop - clientHeight && top < scrollTop) ?? scrollTop - clientHeight;
   }
-  scroller.scrollTop = Math.max(0, target);
+  moveTo(scroller, Math.max(0, target));
 }
 
 /** A screen at a time, keeping a line of the last one in view. */
@@ -52,5 +74,5 @@ export function pageReader(scroller: HTMLElement, dir: 1 | -1) {
 }
 
 export function scrollToEnd(scroller: HTMLElement, end: "top" | "bottom") {
-  scroller.scrollTop = end === "top" ? 0 : scroller.scrollHeight;
+  moveTo(scroller, end === "top" ? 0 : scroller.scrollHeight);
 }

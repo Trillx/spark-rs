@@ -37,7 +37,8 @@ import {
   type ListView,
 } from "../lib/layout";
 import { LIST_MAX, LIST_MIN, startHorizontalDrag } from "../lib/panes";
-import { LIST_ITEMS, renderForPaging } from "../lib/scroll";
+import { changed, scrolled, type ListNow, type Reach, type Step } from "../lib/reachBack";
+import { LIST_ITEMS, pagedPastEnd, renderForPaging } from "../lib/scroll";
 import { hint, shortcutLabel } from "../lib/shortcuts";
 import {
   anchoredTop,
@@ -128,8 +129,9 @@ export default function MessageList(props: Props) {
   useScrollPlace(scrollRef, listId, view);
   const blocks = useBlockViewport(scrollRef, listId, model.blocks);
   useRowSlide(scrollRef, blocks, listId, model.order);
-  const reachAtEnd = useOlderAtEnd(scrollRef, listId, model, older);
   useCursorInView(scrollRef, blocks, selectedRow, model.order);
+  // After the cursor's: when rows leave and the cursor moves on, the scroll that makes isn't the user's.
+  const reachAtEnd = useOlderAtEnd(scrollRef, listId, model, older, view.sub !== null);
   const row = (m: Message, inPriorityCard = false) => (
     <MessageRow
       key={m.id}
@@ -642,30 +644,74 @@ function nearEnd(el: HTMLElement) {
   return el.scrollHeight - el.scrollTop < 1.5 * el.clientHeight;
 }
 
+/** Scrolled as far down as it goes, or too short to scroll. */
+function atEnd(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 1;
+}
+
 /**
- * Scrolling checks for the end (the returned handler); so does a list that
- * changed and grew, which may still not fill the screen. One that came back
- * the same height doesn't try again on its own, so a reach that found nothing
- * to show waits for the next scroll.
+ * Brings in older mail as `lib/reachBack` decides: after a change, while the
+ * list fills itself; and when the user scrolls toward the end (the returned
+ * handler), or wheels down, pages or presses End at it, which scrolls
+ * nothing. A scroll that rows coming or going make isn't the user's.
  */
 function useOlderAtEnd(
   scrollRef: RefObject<HTMLDivElement | null>,
   listId: string,
   model: ListModel,
   older: Props["older"],
+  sub: boolean,
 ) {
-  const tried = useRef({ listId: "", height: 0 });
-  const reach = (el: HTMLElement, scrolled: boolean) => {
-    if (!older || older.loading || !nearEnd(el)) return;
-    if (!scrolled && tried.current.listId === listId && tried.current.height === el.scrollHeight) return;
-    tried.current = { listId, height: el.scrollHeight };
-    older.onNearEnd();
+  const state = useRef<Reach | null>(null);
+  /** Where the list was at the last scroll, or change of rows: only a scroll down from there is the user's. */
+  const top = useRef(0);
+  const now = (el: HTMLElement): ListNow => ({
+    listId,
+    rows: model.order.length,
+    sub,
+    nearEnd: nearEnd(el),
+    older: older !== null,
+    loading: older?.loading ?? false,
+  });
+  const run = (step: Step) => {
+    state.current = step.state;
+    if (step.reach) older?.onNearEnd();
   };
   const loading = older?.loading ?? false;
   useLayoutEffect(() => {
-    if (scrollRef.current) reach(scrollRef.current, false);
+    const el = scrollRef.current;
+    const was = state.current;
+    if (!el) return;
+    // The scroll that rows coming or going make, or a list opening at its place, or a round going out or coming
+    // back, isn't the user's. The cursor's, when a key moves it and opens an unread email (the rows stay), is.
+    const moved = was?.listId !== listId || was.rows !== model.order.length || was.loading !== loading;
+    if (moved) top.current = el.scrollTop;
+    run(changed(was, now(el)));
   }, [model, listId, older !== null, loading]);
-  return (e: UIEvent<HTMLElement>) => reach(e.currentTarget, true);
+  /** The user scrolled toward the end, as the list last rendered. */
+  const pushed = useRef<(el: HTMLElement) => void>(() => {});
+  useLayoutEffect(() => {
+    pushed.current = (el) => run(scrolled(state.current, now(el)));
+  });
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY > 0 && atEnd(el)) pushed.current(el);
+    };
+    el.addEventListener("wheel", onWheel, { passive: true });
+    const stopPaging = pagedPastEnd(el, () => pushed.current(el));
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      stopPaging();
+    };
+  }, [scrollRef]);
+  return (e: UIEvent<HTMLElement>) => {
+    const el = e.currentTarget;
+    const down = el.scrollTop > top.current;
+    top.current = el.scrollTop;
+    if (down) pushed.current(el);
+  };
 }
 
 /**
