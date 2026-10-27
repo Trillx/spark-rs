@@ -44,6 +44,8 @@ pub const FOLDER_LIMIT: u32 = 200;
 /// Bigger messages are stored without their body.
 const MAX_BODY_BYTES: u32 = 10 * 1024 * 1024;
 const FETCH_BATCH: usize = 25;
+/// Most flag and header observations stored in one transaction.
+const OBSERVE_BATCH: usize = 500;
 /// Most mail one fetch of bodies asks for, by the server's sizes.
 const FETCH_BYTES: u64 = 16 * 1024 * 1024;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -519,21 +521,31 @@ pub async fn sync_folder(
             .await?
             .try_collect()
             .await?;
-        for f in &fetched {
-            if let Some(uid) = f.uid {
-                let (unread, flagged) = read_flags(f);
-                window.push((uid, unread, flagged));
-                if let Some(headers) = f.header() {
-                    header_changes += usize::from(lock(store).observe_reply_to(&Incoming {
-                        account_id: folder.account_id,
-                        mailbox: Some(folder.remote_id.clone()),
-                        uid: Some(uid),
-                        message_id: parse::message_id(headers),
-                        reply_to: parse::reply_to(headers),
-                        ..Default::default()
-                    })?);
+        for chunk in fetched.chunks(OBSERVE_BATCH) {
+            let mut headers = Vec::new();
+            for f in chunk {
+                if let Some(uid) = f.uid {
+                    let (unread, flagged) = read_flags(f);
+                    window.push((uid, unread, flagged));
+                    if let Some(fields) = f.header() {
+                        headers.push(Incoming {
+                            account_id: folder.account_id,
+                            mailbox: Some(folder.remote_id.clone()),
+                            uid: Some(uid),
+                            message_id: parse::message_id(fields),
+                            reply_to: parse::reply_to(fields),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
+            header_changes += lock(store).batch(|b| {
+                let mut changed = 0;
+                for m in &headers {
+                    changed += usize::from(b.observe_reply_to(m)?);
+                }
+                Ok(changed)
+            })?;
         }
     }
 
@@ -542,22 +554,30 @@ pub async fn sync_folder(
         changed: header_changes,
         ..Default::default()
     };
-    let mut members: Vec<(i64, Option<u32>)> = Vec::new();
-    {
-        let store = lock(store);
-        for (uid, unread, flagged) in &window {
-            if let Some(id) = known.get(uid) {
-                store.observe_flags(
+    // Flags of the mail it lists already.
+    let listed: Vec<(u32, bool, bool)> = window
+        .iter()
+        .copied()
+        .filter(|(uid, ..)| known.contains_key(uid))
+        .collect();
+    for chunk in listed.chunks(OBSERVE_BATCH) {
+        lock(store).batch(|b| {
+            for (uid, unread, flagged) in chunk {
+                b.observe_flags(
                     folder.account_id,
                     &folder.remote_id,
                     *uid,
                     *unread,
                     *flagged,
                 )?;
-                members.push((*id, Some(*uid)));
             }
-        }
+            Ok(())
+        })?;
     }
+    let mut members: Vec<(i64, Option<u32>)> = listed
+        .iter()
+        .map(|(uid, ..)| (known[uid], Some(*uid)))
+        .collect();
 
     let new: Vec<u32> = window
         .iter()
@@ -573,47 +593,69 @@ pub async fn sync_folder(
             .await?
             .try_collect()
             .await?;
+        let heads: Vec<Incoming> = heads
+            .iter()
+            .filter_map(|f| {
+                let (unread, flagged) = read_flags(f);
+                Some(Incoming {
+                    account_id: folder.account_id,
+                    mailbox: Some(folder.remote_id.clone()),
+                    uid: Some(f.uid?),
+                    message_id: f.header().and_then(parse::message_id),
+                    reply_to: f.header().and_then(parse::reply_to),
+                    unread,
+                    flagged,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        // Mail stored already (from the inbox, another label) joins the
+        // folder as it is; the rest is downloaded.
+        let mut elsewhere = Vec::new();
         let mut unknown = Vec::new();
-        for f in &heads {
-            let Some(uid) = f.uid else { continue };
-            let message_id = f.header().and_then(parse::message_id);
-            let stored = match &message_id {
-                Some(id) => lock(store).has_message_id(folder.account_id, id)?,
-                None => false,
-            };
-            if !stored {
-                unknown.push(uid);
-                continue;
+        {
+            let store = lock(store);
+            for m in heads {
+                let stored = match &m.message_id {
+                    Some(id) => store.has_message_id(folder.account_id, id)?,
+                    None => false,
+                };
+                if stored {
+                    elsewhere.push(m);
+                } else {
+                    unknown.extend(m.uid);
+                }
             }
-            let (unread, flagged) = read_flags(f);
-            let m = Incoming {
-                account_id: folder.account_id,
-                mailbox: Some(folder.remote_id.clone()),
-                uid: Some(uid),
-                message_id,
-                reply_to: f.header().and_then(parse::reply_to),
-                unread,
-                flagged,
-                ..Default::default()
-            };
-            members.push((
-                added_id(lock(store).add_folder_message(folder.id, &m)?),
-                Some(uid),
-            ));
-            report.changed += 1;
         }
-        for mut m in fetch_messages(session, &unknown, &folder.remote_id).await? {
+        members.extend(add_to_folder(store, folder.id, &elsewhere)?);
+        report.changed += elsewhere.len();
+        let mut fetched = fetch_messages(session, &unknown, &folder.remote_id).await?;
+        for m in &mut fetched {
             m.account_id = folder.account_id;
-            let uid = m.uid;
-            members.push((
-                added_id(lock(store).add_folder_message(folder.id, &m)?),
-                uid,
-            ));
-            report.changed += 1;
         }
+        members.extend(add_to_folder(store, folder.id, &fetched)?);
+        report.changed += fetched.len();
     }
     report.changed += lock(store).set_folder_members(folder.id, &members)?;
     Ok(report)
+}
+
+/// Stores mail a folder sync found, all in one transaction, and returns
+/// each one's stored id and UID for the folder's members.
+fn add_to_folder(
+    store: &Mutex<Store>,
+    folder_id: i64,
+    messages: &[Incoming],
+) -> Result<Vec<(i64, Option<u32>)>> {
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(lock(store).batch(|b| {
+        messages
+            .iter()
+            .map(|m| Ok((added_id(b.add_folder_message(folder_id, m)?), m.uid)))
+            .collect()
+    })?)
 }
 
 fn added_id(added: Added) -> i64 {
@@ -815,22 +857,33 @@ pub async fn sync_inbox(
             .await?
             .try_collect()
             .await?;
-        let store = lock(store);
-        for fetch in &flags {
-            if let Some(uid) = fetch.uid.filter(|uid| known.contains(uid)) {
-                let (unread, flagged) = read_flags(fetch);
-                store.observe_flags(account_id, INBOX, uid, unread, flagged)?;
-                if let Some(headers) = fetch.header() {
-                    report.headers += usize::from(store.observe_reply_to(&Incoming {
+        for chunk in flags.chunks(OBSERVE_BATCH) {
+            let seen: Vec<(u32, bool, bool, Option<Incoming>)> = chunk
+                .iter()
+                .filter_map(|fetch| {
+                    let uid = fetch.uid.filter(|uid| known.contains(uid))?;
+                    let (unread, flagged) = read_flags(fetch);
+                    let headers = fetch.header().map(|headers| Incoming {
                         account_id,
                         mailbox: Some(INBOX.into()),
                         uid: Some(uid),
                         message_id: parse::message_id(headers),
                         reply_to: parse::reply_to(headers),
                         ..Default::default()
-                    })?);
+                    });
+                    Some((uid, unread, flagged, headers))
+                })
+                .collect();
+            report.headers += lock(store).batch(|b| {
+                let mut changed = 0;
+                for (uid, unread, flagged, headers) in &seen {
+                    b.observe_flags(account_id, INBOX, *uid, *unread, *flagged)?;
+                    if let Some(headers) = headers {
+                        changed += usize::from(b.observe_reply_to(headers)?);
+                    }
                 }
-            }
+                Ok(changed)
+            })?;
         }
     }
 
@@ -976,23 +1029,36 @@ pub async fn search_server(
             .await?
             .try_collect()
             .await?;
+        let heads: Vec<(u32, Option<String>)> = heads
+            .iter()
+            .filter_map(|f| Some((f.uid?, f.header().and_then(parse::message_id))))
+            .collect();
         let mut unknown = Vec::new();
-        for f in &heads {
-            let Some(uid) = f.uid else { continue };
-            let stored_already = match f.header().and_then(parse::message_id) {
-                Some(id) => lock(store).has_message_id(account.id, &id)?,
-                None => false,
-            };
-            if !stored_already {
-                unknown.push(uid);
+        {
+            let store = lock(store);
+            for (uid, message_id) in heads {
+                let stored_already = match message_id {
+                    Some(id) => store.has_message_id(account.id, &id)?,
+                    None => false,
+                };
+                if !stored_already {
+                    unknown.push(uid);
+                }
             }
         }
-        for mut m in fetch_messages(session, &unknown, &folder.remote_id).await? {
+        let mut fetched = fetch_messages(session, &unknown, &folder.remote_id).await?;
+        for m in &mut fetched {
             m.account_id = account.id;
-            if let Added::New(_) = lock(store).add_folder_message(folder.id, &m)? {
-                stored += 1;
-            }
         }
+        stored += lock(store).batch(|b| {
+            let mut new = 0;
+            for m in &fetched {
+                if let Added::New(_) = b.add_folder_message(folder.id, m)? {
+                    new += 1;
+                }
+            }
+            Ok(new)
+        })?;
     }
     Ok(stored)
 }
@@ -1005,6 +1071,8 @@ fn newest(found: HashSet<u32>, wanted: impl Fn(u32) -> bool) -> Vec<u32> {
     uids
 }
 
+/// Fetches inbox messages and stores them in one transaction; returns the
+/// ids of those that were new.
 async fn fetch_new(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -1012,14 +1080,20 @@ async fn fetch_new(
     uids: &[u32],
     screen_new_senders: bool,
 ) -> Result<Vec<i64>> {
-    let mut added = Vec::new();
-    for mut m in fetch_messages(session, uids, INBOX).await? {
+    let mut fetched = fetch_messages(session, uids, INBOX).await?;
+    for m in &mut fetched {
         m.account_id = account_id;
-        if let Added::New(id) = lock(store).add_incoming(&m, screen_new_senders)? {
-            added.push(id);
-        }
     }
-    Ok(added)
+    // All of them are stored, or (if one fails) none.
+    Ok(lock(store).batch(|b| {
+        let mut added = Vec::new();
+        for m in &fetched {
+            if let Added::New(id) = b.add_incoming(m, screen_new_senders)? {
+                added.push(id);
+            }
+        }
+        Ok(added)
+    })?)
 }
 
 /// Fetches and parses messages from the selected `mailbox`, with their

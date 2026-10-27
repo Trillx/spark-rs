@@ -3519,3 +3519,299 @@ fn version_21_databases_index_pending_and_snoozed_mail() {
     assert_eq!(indexes(&Store::open(&path).unwrap()).len(), 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Counts the store's commits from now on, statements committed on their
+/// own included.
+fn commits(store: &Store) -> &'static std::sync::atomic::AtomicUsize {
+    use std::ffi::{c_int, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    unsafe extern "C" fn committed(count: *mut c_void) -> c_int {
+        // SAFETY: `count` is the counter below, which is never freed.
+        unsafe { (*count.cast::<AtomicUsize>()).fetch_add(1, SeqCst) };
+        0
+    }
+    let count: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    // SAFETY: the connection is open, and the counter outlives it.
+    unsafe {
+        rusqlite::ffi::sqlite3_commit_hook(
+            store.conn.handle(),
+            Some(committed),
+            std::ptr::from_ref(count).cast_mut().cast(),
+        );
+    }
+    count
+}
+
+#[test]
+fn a_thousand_message_import_commits_once_a_chunk() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (mut store, account) = store_with_account();
+    let commits = commits(&store);
+    let mail: Vec<Incoming> = (1..=1_000)
+        .map(|uid| incoming(account, uid, &format!("s{}@x.com", uid % 40)))
+        .collect();
+    for chunk in mail.chunks(25) {
+        store
+            .batch(|b| {
+                for m in chunk {
+                    b.add_incoming(m, false)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert_eq!(commits.load(SeqCst), 40);
+    assert_eq!(store.messages().unwrap().len(), 1_000);
+    assert_eq!(found(&store, "message 1000").len(), 1);
+
+    // On its own, a message is a commit of its own.
+    store
+        .add_incoming(&incoming(account, 1_001, "a@x.com"), false)
+        .unwrap();
+    assert_eq!(commits.load(SeqCst), 41);
+}
+
+#[test]
+fn flags_the_server_reported_before_write_nothing() {
+    let (mut store, account) = store_with_account();
+    let mail: Vec<Incoming> = (1..=1_000)
+        .map(|uid| incoming(account, uid, "a@x.com"))
+        .collect();
+    store
+        .batch(|b| {
+            for m in &mail {
+                b.add_incoming(m, false)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Every third read elsewhere, every seventh flagged.
+    let flags: Vec<(u32, bool, bool)> = (1..=1_000)
+        .map(|uid| (uid, uid % 3 != 0, uid % 7 == 0))
+        .collect();
+    let reconcile = |store: &mut Store| {
+        let before = store.conn.total_changes();
+        for chunk in flags.chunks(500) {
+            store
+                .batch(|b| {
+                    for (uid, unread, flagged) in chunk {
+                        b.observe_flags(account, "INBOX", *uid, *unread, *flagged)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        store.conn.total_changes() - before
+    };
+    // Only the rows whose flags changed: 333 read, 142 flagged, 47 both.
+    assert_eq!(reconcile(&mut store), 428);
+    assert_eq!(reconcile(&mut store), 0);
+    let read = store
+        .messages()
+        .unwrap()
+        .iter()
+        .filter(|m| !m.unread)
+        .count();
+    assert_eq!(read, 333);
+
+    // The same for a message seen again in full, and Graph's flags.
+    let written = store.conn.total_changes();
+    store
+        .add_incoming(
+            &Incoming {
+                unread: false,
+                ..incoming(account, 3, "a@x.com")
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(store.conn.total_changes(), written);
+    let graph = Incoming {
+        account_id: account,
+        remote_id: Some("g1".into()),
+        from_address: "a@x.com".into(),
+        unread: true,
+        ..Default::default()
+    };
+    let id = new_id(store.add_incoming(&graph, false).unwrap());
+    let written = store.conn.total_changes();
+    assert_eq!(store.add_incoming(&graph, false).unwrap(), Added::Known(id));
+    store
+        .observe_remote_flags(account, "g1", true, false)
+        .unwrap();
+    assert_eq!(store.conn.total_changes(), written);
+    store
+        .observe_remote_flags(account, "g1", false, false)
+        .unwrap();
+    assert_eq!(store.conn.total_changes(), written + 1);
+    assert!(!store.message(id).unwrap().unwrap().unread);
+}
+
+#[test]
+fn a_folder_synced_again_unchanged_writes_nothing() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(account, &[remote("Travel", None, "Travel", None)])
+        .unwrap();
+    let travel = folder_id(&store, "Travel");
+    let listing: Vec<Incoming> = (1..=50)
+        .map(|uid| in_folder(account, "Travel", uid, uid))
+        .collect();
+    let store_listing = |store: &mut Store| {
+        store
+            .batch(|b| {
+                listing
+                    .iter()
+                    .map(|m| match b.add_folder_message(travel, m)? {
+                        Added::New(id) | Added::Known(id) => Ok((id, m.uid)),
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .unwrap()
+    };
+
+    let members = store_listing(&mut store);
+    // The batch listed them in the folder: making them its members again
+    // writes nothing.
+    let written = store.conn.total_changes();
+    assert_eq!(store.set_folder_members(travel, &members).unwrap(), 0);
+    assert_eq!(store.conn.total_changes(), written);
+    assert_eq!(store.folder_member_ids(travel).unwrap().len(), 50);
+
+    let written = store.conn.total_changes();
+    let members = store_listing(&mut store);
+    assert_eq!(store.set_folder_members(travel, &members).unwrap(), 0);
+    assert_eq!(store.conn.total_changes(), written);
+
+    // A new UID for a member is still taken, the one listed last.
+    let first = members[0].0;
+    store
+        .set_folder_members(travel, &[(first, Some(70)), (first, Some(71))])
+        .unwrap();
+    assert_eq!(
+        store.folder_uids(travel).unwrap(),
+        HashMap::from([(71, first)])
+    );
+}
+
+#[test]
+fn a_failed_batch_stores_none_of_its_chunk() {
+    let (mut store, account) = store_with_account();
+    let read = new_id(
+        store
+            .add_incoming(&incoming(account, 10, "old@x.com"), false)
+            .unwrap(),
+    );
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_message_3 BEFORE INSERT ON messages
+             WHEN new.subject = 'Message 3'
+             BEGIN SELECT RAISE(ABORT, 'cannot store message 3'); END;",
+        )
+        .unwrap();
+    let chunk: Vec<Incoming> = (1..=4)
+        .map(|uid| incoming(account, uid, &format!("new{uid}@x.com")))
+        .collect();
+    let store_chunk = |store: &mut Store| {
+        store.batch(|b| {
+            b.observe_flags(account, "INBOX", 10, false, true)?;
+            chunk
+                .iter()
+                .map(|m| b.add_incoming(m, false))
+                .collect::<Result<Vec<_>>>()
+        })
+    };
+    assert!(store_chunk(&mut store).is_err());
+
+    // Nothing of it stayed: not the messages before the failure, their
+    // threading, search index or senders, nor the flags it observed.
+    let ids: Vec<i64> = store.messages().unwrap().iter().map(|m| m.id).collect();
+    assert_eq!(ids, [read]);
+    let count = |sql: &str| -> i64 { store.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        count(&format!(
+            "SELECT COUNT(*) FROM message_keys WHERE message_id != {read}"
+        )),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM gatekeeper_senders WHERE address LIKE 'new%'"),
+        0
+    );
+    assert!(found(&store, "message 2").is_empty());
+    let m = store.message(read).unwrap().unwrap();
+    assert!(m.unread && !m.pinned);
+
+    // Tried again, it's stored whole, once.
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_message_3")
+        .unwrap();
+    let added = store_chunk(&mut store).unwrap();
+    assert!(added.iter().all(|a| matches!(a, Added::New(_))));
+    assert_eq!(store.messages().unwrap().len(), 5);
+    assert_eq!(found(&store, "message 3").len(), 1);
+    assert!(store.message(read).unwrap().unwrap().pinned);
+    assert_eq!(store_chunk(&mut store).unwrap().len(), 4);
+    assert_eq!(store.messages().unwrap().len(), 5, "no duplicates");
+}
+
+#[test]
+fn batched_observations_keep_pending_local_changes() {
+    let (mut store, account) = store_with_account();
+    let mail: Vec<Incoming> = (1..=3)
+        .map(|uid| incoming(account, uid, "a@x.com"))
+        .collect();
+    let ids: Vec<i64> = store
+        .batch(|b| {
+            mail.iter()
+                .map(|m| b.add_incoming(m, false))
+                .collect::<Result<Vec<_>>>()
+        })
+        .unwrap()
+        .into_iter()
+        .map(new_id)
+        .collect();
+    // Read here; and Done here, both not pushed yet.
+    let read = Patch {
+        unread: Some(false),
+        ..Default::default()
+    };
+    store.update(ids[0], &read, 1_000).unwrap();
+    let done = Patch {
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    store.update(ids[1], &done, 1_000).unwrap();
+
+    let observe = |store: &mut Store| {
+        store
+            .batch(|b| {
+                // The server: all still unread, the first flagged.
+                b.observe_flags(account, "INBOX", 1, true, true)?;
+                b.observe_flags(account, "INBOX", 3, true, false)?;
+                // The second seen in the inbox again, in full.
+                b.add_incoming(&mail[1], true)
+            })
+            .unwrap()
+    };
+    assert_eq!(observe(&mut store), Added::Known(ids[1]));
+    assert_eq!(observe(&mut store), Added::Known(ids[1]));
+    let first = store.message(ids[0]).unwrap().unwrap();
+    assert!(!first.unread, "the local read is waiting to be pushed");
+    assert!(first.pinned, "the flag follows the server");
+    assert_eq!(
+        store.message(ids[1]).unwrap().unwrap().state,
+        MessageState::Done
+    );
+    let pending: Vec<i64> = store
+        .pending(account, 9_000, 0)
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(pending, [ids[0], ids[1]]);
+}

@@ -432,6 +432,16 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Sync writes that commit together, so a fetched chunk or page of mail
+/// takes one transaction rather than one per message: see `Store::batch`.
+pub struct Batch<'a> {
+    conn: &'a Connection,
+}
+
+/// Statements kept prepared. A sync runs the same few dozen for every
+/// message; rusqlite keeps 16 by default.
+const STATEMENT_CACHE: usize = 64;
+
 const SCHEMA: &str = "
 CREATE TABLE accounts (
     id INTEGER PRIMARY KEY,
@@ -656,6 +666,7 @@ impl Store {
     fn configure(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
             conn.execute_batch(SCHEMA)?;
@@ -905,6 +916,18 @@ impl Store {
 
     // ---- incoming mail ----
 
+    /// Runs `write` in one transaction: everything it stored commits
+    /// together when it returns `Ok`, and none of it does if it fails. Syncs
+    /// store each fetched chunk or page of mail this way, and move their
+    /// position past a chunk only once its batch has returned. The store is
+    /// locked for everyone else meanwhile, so keep a batch to one chunk.
+    pub fn batch<T>(&mut self, write: impl FnOnce(&Batch) -> Result<T>) -> Result<T> {
+        let tx = self.conn.transaction()?;
+        let written = write(&Batch { conn: &tx })?;
+        tx.commit()?;
+        Ok(written)
+    }
+
     /// Stores a fetched message, or refreshes the stored copy. A message is
     /// recognized by its remote id, its mailbox and UID, or failing those its
     /// Message-ID (it may have left the inbox and come back with a new UID).
@@ -913,66 +936,7 @@ impl Store {
     /// Gatekeeper (see `gatekeeper::arrival`); without it (the first sync)
     /// the sender is accepted.
     pub fn add_incoming(&mut self, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
-        let tx = self.conn.transaction()?;
-        if let Some(id) = find_stored(&tx, m)? {
-            refresh_reply_to(&tx, id, m)?;
-            let (dirty, folder_only): (bool, bool) = tx.query_row(
-                "SELECT changed_at != 0, folder_only FROM messages WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            // First seen by a folder sync (Gmail's All Mail has inbox mail
-            // too): it arrives now, as if it were new.
-            if folder_only && !dirty {
-                let (state, screening) = gatekeeper::arrival(&tx, m, screen_new_senders)?;
-                tx.execute(
-                    "UPDATE messages SET
-                        remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
-                        unread = ?5, pinned = ?6, state = ?7, screening = ?8, folder_only = 0,
-                        remote_place = 'inbox', remote_folder_id = NULL,
-                        remote_unread = ?5, remote_pinned = ?6, changed_at = ?9
-                     WHERE id = ?1",
-                    params![
-                        id,
-                        m.remote_id,
-                        m.mailbox,
-                        m.uid,
-                        m.unread,
-                        m.flagged,
-                        state_str(state),
-                        screening,
-                        arrival_change(state)
-                    ],
-                )?;
-                tx.commit()?;
-                return Ok(Added::New(id));
-            }
-            // Flags follow the server where the user hasn't changed them;
-            // the place does if nothing local is waiting at all (mail
-            // moved back to the inbox elsewhere, even out of Blocked).
-            tx.execute(
-                "UPDATE messages SET
-                    remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
-                    unread = CASE WHEN unread = remote_unread THEN ?5 ELSE unread END,
-                    pinned = CASE WHEN pinned = remote_pinned THEN ?6 ELSE pinned END,
-                    state = CASE WHEN ?7 = 0 AND state IN ('done', 'deleted', 'filed', 'blocked') THEN 'inbox' ELSE state END,
-                    remote_place = 'inbox', remote_folder_id = NULL,
-                    remote_unread = ?5, remote_pinned = ?6, folder_only = 0
-                 WHERE id = ?1",
-                params![id, m.remote_id, m.mailbox, m.uid, m.unread, m.flagged, dirty],
-            )?;
-            tx.commit()?;
-            return Ok(Added::Known(id));
-        }
-
-        let (state, screening) = gatekeeper::arrival(&tx, m, screen_new_senders)?;
-        let id = insert_message(&tx, m, state, screening, Place::Inbox)?;
-        tx.execute(
-            "UPDATE messages SET changed_at = ?2 WHERE id = ?1",
-            params![id, arrival_change(state)],
-        )?;
-        tx.commit()?;
-        Ok(Added::New(id))
+        self.batch(|b| b.add_incoming(m, screen_new_senders))
     }
 
     pub fn has_remote_id(&self, account_id: i64, remote_id: &str) -> Result<bool> {
@@ -1006,7 +970,8 @@ impl Store {
     /// The server's current flags for a message in an IMAP mailbox. A local
     /// flag follows unless the user changed it and the change isn't pushed yet.
     /// (In SET, columns read their old values: `unread = remote_unread` means
-    /// the user hasn't touched it.)
+    /// the user hasn't touched it.) Flags the server reported before change
+    /// nothing, and aren't written again.
     pub fn observe_flags(
         &self,
         account_id: i64,
@@ -1015,23 +980,13 @@ impl Store {
         unread: bool,
         flagged: bool,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE messages SET remote_unread = ?4, remote_pinned = ?5,
-                unread = CASE WHEN unread = remote_unread THEN ?4 ELSE unread END,
-                pinned = CASE WHEN pinned = remote_pinned THEN ?5 ELSE pinned END
-             WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3",
-            params![account_id, mailbox, uid, unread, flagged],
-        )?;
-        Ok(())
+        observe_flags_in(&self.conn, account_id, mailbox, uid, unread, flagged)
     }
 
     /// Header metadata for a message already stored. Flags-only updates
     /// (`reply_to: None`) leave the addresses alone. Returns whether it changed.
     pub fn observe_reply_to(&self, m: &Incoming) -> Result<bool> {
-        match find_stored(&self.conn, m)? {
-            Some(id) => refresh_reply_to(&self.conn, id, m),
-            None => Ok(false),
-        }
+        observe_reply_to_in(&self.conn, m)
     }
 
     /// Messages that left the server's inbox (another client archived or
@@ -1060,14 +1015,7 @@ impl Store {
 
     /// Graph's version of `observe_gone_uids`.
     pub fn observe_gone_remote(&self, account_id: i64, remote_id: &str) -> Result<usize> {
-        self.conn.execute(
-            "UPDATE messages SET
-                state = CASE WHEN changed_at = 0 AND state IN ('inbox', 'snoozed', 'aside')
-                             THEN 'done' ELSE state END,
-                remote_place = CASE WHEN remote_place = 'inbox' THEN 'archive' ELSE remote_place END
-             WHERE account_id = ?1 AND remote_id = ?2",
-            params![account_id, remote_id],
-        )
+        observe_gone_remote_in(&self.conn, account_id, remote_id)
     }
 
     // ---- reading ----
@@ -1565,76 +1513,17 @@ impl Store {
     /// syncs don't toggle it between them. Mail a pending change takes out
     /// of the folder isn't listed in it.
     pub fn add_folder_message(&mut self, folder_id: i64, m: &Incoming) -> Result<Added> {
-        let tx = self.conn.transaction()?;
-        let role: Option<String> =
-            tx.query_row("SELECT role FROM folders WHERE id = ?1", [folder_id], |r| {
-                r.get(0)
-            })?;
-        let (state, place) = FolderRole::placement(role.as_deref().and_then(FolderRole::parse));
-        let home = (place == Place::Folder).then_some(folder_id);
-        let added = if let Some(id) = find_stored(&tx, m)? {
-            refresh_reply_to(&tx, id, m)?;
-            let (dirty, remote_place, mailbox): (bool, String, Option<String>) = tx.query_row(
-                "SELECT changed_at != 0, remote_place, mailbox FROM messages WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            let claim = !dirty
-                && remote_place != "inbox"
-                && (m.uid.is_none() || mailbox.is_none() || mailbox == m.mailbox);
-            if claim {
-                if let (Some(mailbox), Some(uid)) = (&m.mailbox, m.uid) {
-                    // A stale row holding this location would break the unique index.
-                    tx.execute(
-                        "UPDATE messages SET mailbox = NULL, uid = NULL
-                         WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3 AND id != ?4",
-                        params![m.account_id, mailbox, uid, id],
-                    )?;
-                }
-                tx.execute(
-                    "UPDATE messages SET remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
-                        state = ?5, unread = ?6, pinned = ?7,
-                        remote_place = ?8, remote_unread = ?6, remote_pinned = ?7,
-                        home_folder_id = COALESCE(?9, home_folder_id), remote_folder_id = ?9
-                     WHERE id = ?1",
-                    params![
-                        id,
-                        m.remote_id,
-                        m.mailbox,
-                        m.uid,
-                        state_str(state),
-                        m.unread,
-                        m.flagged,
-                        place_str(place),
-                        home
-                    ],
-                )?;
-            }
-            Added::Known(id)
-        } else {
-            let id = insert_message(&tx, m, state, false, place)?;
-            tx.execute(
-                "UPDATE messages SET folder_only = 1, home_folder_id = ?2, remote_folder_id = ?2
-                 WHERE id = ?1",
-                params![id, home],
-            )?;
-            Added::New(id)
-        };
-        let id = match added {
-            Added::New(id) | Added::Known(id) => id,
-        };
-        add_member(&tx, folder_id, id, m.uid)?;
-        if role.as_deref() == Some(FolderRole::Sent.as_str()) {
-            gatekeeper::sent(&tx, id)?;
-        }
-        tx.commit()?;
-        Ok(added)
+        self.batch(|b| b.add_folder_message(folder_id, m))
     }
 
     /// Makes `members` (message ids, with IMAP UIDs) the folder's whole
     /// membership, except for mail a pending change files into the folder
     /// or takes out of it, and drafts saved here and not uploaded yet (the
     /// server can't list them). Returns how many messages left it.
+    ///
+    /// Members already listed with that UID (a folder sync's
+    /// `add_folder_message` listed the mail it stored) aren't written
+    /// again. A message given twice takes the UID given last.
     pub fn set_folder_members(
         &mut self,
         folder_id: i64,
@@ -1642,16 +1531,20 @@ impl Store {
     ) -> Result<usize> {
         let tx = self.conn.transaction()?;
         let wanted: HashSet<i64> = members.iter().map(|(id, _)| *id).collect();
-        let before: Vec<i64> = {
+        // Its members now: id, UID, and whether it's a draft waiting to upload.
+        let before: Vec<(i64, Option<u32>, bool)> = {
             let mut stmt = tx.prepare(
-                "SELECT message_id FROM folder_members WHERE folder_id = ?1
-                 AND message_id NOT IN (SELECT message_id FROM draft_uploads)",
+                "SELECT message_id, uid, message_id IN (SELECT message_id FROM draft_uploads)
+                 FROM folder_members WHERE folder_id = ?1",
             )?;
-            stmt.query_map([folder_id], |r| r.get(0))?
+            stmt.query_map([folder_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<Result<_>>()?
         };
         let mut left = 0;
-        for id in before.iter().filter(|id| !wanted.contains(id)) {
+        for (id, ..) in before
+            .iter()
+            .filter(|(id, _, uploading)| !uploading && !wanted.contains(id))
+        {
             left += tx.execute(
                 &format!(
                     "DELETE FROM folder_members WHERE folder_id = ?1 AND message_id = ?2
@@ -1660,8 +1553,13 @@ impl Store {
                 params![folder_id, id],
             )?;
         }
-        for (id, uid) in members {
-            add_member(&tx, folder_id, *id, *uid)?;
+        let listed: HashMap<i64, Option<u32>> =
+            before.into_iter().map(|(id, uid, _)| (id, uid)).collect();
+        let mut seen = HashSet::new();
+        for (id, uid) in members.iter().rev() {
+            if seen.insert(*id) && listed.get(id) != Some(uid) {
+                add_member(&tx, folder_id, *id, *uid)?;
+            }
         }
         tx.commit()?;
         Ok(left)
@@ -1676,13 +1574,15 @@ impl Store {
         unread: bool,
         flagged: bool,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE messages SET remote_unread = ?3, remote_pinned = ?4,
-                unread = CASE WHEN unread = remote_unread THEN ?3 ELSE unread END,
-                pinned = CASE WHEN pinned = remote_pinned THEN ?4 ELSE pinned END
-             WHERE account_id = ?1 AND remote_id = ?2",
-            params![account_id, remote_id, unread, flagged],
-        )?;
+        self.conn
+            .prepare_cached(
+                "UPDATE messages SET remote_unread = ?3, remote_pinned = ?4,
+                    unread = CASE WHEN unread = remote_unread THEN ?3 ELSE unread END,
+                    pinned = CASE WHEN pinned = remote_pinned THEN ?4 ELSE pinned END
+                 WHERE account_id = ?1 AND remote_id = ?2
+                   AND (remote_unread != ?3 OR remote_pinned != ?4)",
+            )?
+            .execute(params![account_id, remote_id, unread, flagged])?;
         Ok(())
     }
 
@@ -1899,6 +1799,215 @@ impl Store {
     }
 }
 
+impl Batch<'_> {
+    /// `Store::add_incoming`, in the batch.
+    pub fn add_incoming(&self, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
+        add_incoming_in(self.conn, m, screen_new_senders)
+    }
+
+    /// `Store::add_folder_message`, in the batch.
+    pub fn add_folder_message(&self, folder_id: i64, m: &Incoming) -> Result<Added> {
+        add_folder_message_in(self.conn, folder_id, m)
+    }
+
+    /// `Store::observe_flags`, in the batch.
+    pub fn observe_flags(
+        &self,
+        account_id: i64,
+        mailbox: &str,
+        uid: u32,
+        unread: bool,
+        flagged: bool,
+    ) -> Result<()> {
+        observe_flags_in(self.conn, account_id, mailbox, uid, unread, flagged)
+    }
+
+    /// `Store::observe_reply_to`, in the batch.
+    pub fn observe_reply_to(&self, m: &Incoming) -> Result<bool> {
+        observe_reply_to_in(self.conn, m)
+    }
+
+    /// `Store::observe_gone_remote`, in the batch.
+    pub fn observe_gone_remote(&self, account_id: i64, remote_id: &str) -> Result<usize> {
+        observe_gone_remote_in(self.conn, account_id, remote_id)
+    }
+}
+
+/// `Store::add_incoming`, in the caller's transaction.
+fn add_incoming_in(conn: &Connection, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
+    if let Some(id) = find_stored(conn, m)? {
+        refresh_reply_to(conn, id, m)?;
+        let (dirty, folder_only): (bool, bool) = conn
+            .prepare_cached("SELECT changed_at != 0, folder_only FROM messages WHERE id = ?1")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        // First seen by a folder sync (Gmail's All Mail has inbox mail
+        // too): it arrives now, as if it were new.
+        if folder_only && !dirty {
+            let (state, screening) = gatekeeper::arrival(conn, m, screen_new_senders)?;
+            conn.prepare_cached(
+                "UPDATE messages SET
+                    remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
+                    unread = ?5, pinned = ?6, state = ?7, screening = ?8, folder_only = 0,
+                    remote_place = 'inbox', remote_folder_id = NULL,
+                    remote_unread = ?5, remote_pinned = ?6, changed_at = ?9
+                 WHERE id = ?1",
+            )?
+            .execute(params![
+                id,
+                m.remote_id,
+                m.mailbox,
+                m.uid,
+                m.unread,
+                m.flagged,
+                state_str(state),
+                screening,
+                arrival_change(state)
+            ])?;
+            return Ok(Added::New(id));
+        }
+        // Flags follow the server where the user hasn't changed them;
+        // the place does if nothing local is waiting at all (mail
+        // moved back to the inbox elsewhere, even out of Blocked). A
+        // copy as stored already isn't written again: with the server's
+        // flags unchanged, the local ones stay as they are too.
+        conn.prepare_cached(
+            "UPDATE messages SET
+                remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
+                unread = CASE WHEN unread = remote_unread THEN ?5 ELSE unread END,
+                pinned = CASE WHEN pinned = remote_pinned THEN ?6 ELSE pinned END,
+                state = CASE WHEN ?7 = 0 AND state IN ('done', 'deleted', 'filed', 'blocked') THEN 'inbox' ELSE state END,
+                remote_place = 'inbox', remote_folder_id = NULL,
+                remote_unread = ?5, remote_pinned = ?6, folder_only = 0
+             WHERE id = ?1
+               AND NOT (remote_id IS COALESCE(?2, remote_id) AND mailbox IS ?3 AND uid IS ?4
+                        AND remote_unread = ?5 AND remote_pinned = ?6
+                        AND (?7 != 0 OR state NOT IN ('done', 'deleted', 'filed', 'blocked'))
+                        AND remote_place = 'inbox' AND remote_folder_id IS NULL
+                        AND folder_only = 0)",
+        )?
+        .execute(params![id, m.remote_id, m.mailbox, m.uid, m.unread, m.flagged, dirty])?;
+        return Ok(Added::Known(id));
+    }
+
+    let (state, screening) = gatekeeper::arrival(conn, m, screen_new_senders)?;
+    let id = insert_message(conn, m, state, screening, Place::Inbox)?;
+    conn.prepare_cached("UPDATE messages SET changed_at = ?2 WHERE id = ?1")?
+        .execute(params![id, arrival_change(state)])?;
+    Ok(Added::New(id))
+}
+
+/// `Store::add_folder_message`, in the caller's transaction.
+fn add_folder_message_in(conn: &Connection, folder_id: i64, m: &Incoming) -> Result<Added> {
+    let role: Option<String> = conn
+        .prepare_cached("SELECT role FROM folders WHERE id = ?1")?
+        .query_row([folder_id], |r| r.get(0))?;
+    let (state, place) = FolderRole::placement(role.as_deref().and_then(FolderRole::parse));
+    let home = (place == Place::Folder).then_some(folder_id);
+    let added = if let Some(id) = find_stored(conn, m)? {
+        refresh_reply_to(conn, id, m)?;
+        let (dirty, remote_place, mailbox): (bool, String, Option<String>) = conn
+            .prepare_cached(
+                "SELECT changed_at != 0, remote_place, mailbox FROM messages WHERE id = ?1",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let claim = !dirty
+            && remote_place != "inbox"
+            && (m.uid.is_none() || mailbox.is_none() || mailbox == m.mailbox);
+        if claim {
+            if let (Some(mailbox), Some(uid)) = (&m.mailbox, m.uid) {
+                // A stale row holding this location would break the unique index.
+                conn.prepare_cached(
+                    "UPDATE messages SET mailbox = NULL, uid = NULL
+                     WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3 AND id != ?4",
+                )?
+                .execute(params![m.account_id, mailbox, uid, id])?;
+            }
+            // Not written again if it's there already, as the server has it.
+            conn.prepare_cached(
+                "UPDATE messages SET remote_id = COALESCE(?2, remote_id), mailbox = ?3, uid = ?4,
+                    state = ?5, unread = ?6, pinned = ?7,
+                    remote_place = ?8, remote_unread = ?6, remote_pinned = ?7,
+                    home_folder_id = COALESCE(?9, home_folder_id), remote_folder_id = ?9
+                 WHERE id = ?1
+                   AND NOT (remote_id IS COALESCE(?2, remote_id) AND mailbox IS ?3 AND uid IS ?4
+                            AND state = ?5 AND unread = ?6 AND pinned = ?7
+                            AND remote_place = ?8 AND remote_unread = ?6 AND remote_pinned = ?7
+                            AND home_folder_id IS COALESCE(?9, home_folder_id)
+                            AND remote_folder_id IS ?9)",
+            )?
+            .execute(params![
+                id,
+                m.remote_id,
+                m.mailbox,
+                m.uid,
+                state_str(state),
+                m.unread,
+                m.flagged,
+                place_str(place),
+                home
+            ])?;
+        }
+        Added::Known(id)
+    } else {
+        let id = insert_message(conn, m, state, false, place)?;
+        conn.prepare_cached(
+            "UPDATE messages SET folder_only = 1, home_folder_id = ?2, remote_folder_id = ?2
+             WHERE id = ?1",
+        )?
+        .execute(params![id, home])?;
+        Added::New(id)
+    };
+    let id = match added {
+        Added::New(id) | Added::Known(id) => id,
+    };
+    add_member(conn, folder_id, id, m.uid)?;
+    if role.as_deref() == Some(FolderRole::Sent.as_str()) {
+        gatekeeper::sent(conn, id)?;
+    }
+    Ok(added)
+}
+
+/// `Store::observe_flags`. With the server's flags as last seen, the local
+/// ones stay as they are too, so the row isn't written.
+fn observe_flags_in(
+    conn: &Connection,
+    account_id: i64,
+    mailbox: &str,
+    uid: u32,
+    unread: bool,
+    flagged: bool,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE messages SET remote_unread = ?4, remote_pinned = ?5,
+            unread = CASE WHEN unread = remote_unread THEN ?4 ELSE unread END,
+            pinned = CASE WHEN pinned = remote_pinned THEN ?5 ELSE pinned END
+         WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3
+           AND (remote_unread != ?4 OR remote_pinned != ?5)",
+    )?
+    .execute(params![account_id, mailbox, uid, unread, flagged])?;
+    Ok(())
+}
+
+/// `Store::observe_reply_to`.
+fn observe_reply_to_in(conn: &Connection, m: &Incoming) -> Result<bool> {
+    match find_stored(conn, m)? {
+        Some(id) => refresh_reply_to(conn, id, m),
+        None => Ok(false),
+    }
+}
+
+/// `Store::observe_gone_remote`.
+fn observe_gone_remote_in(conn: &Connection, account_id: i64, remote_id: &str) -> Result<usize> {
+    conn.prepare_cached(
+        "UPDATE messages SET
+            state = CASE WHEN changed_at = 0 AND state IN ('inbox', 'snoozed', 'aside')
+                         THEN 'done' ELSE state END,
+            remote_place = CASE WHEN remote_place = 'inbox' THEN 'archive' ELSE remote_place END
+         WHERE account_id = ?1 AND remote_id = ?2",
+    )?
+    .execute(params![account_id, remote_id])
+}
+
 /// The stored copy of a fetched message: by its Graph id, which never
 /// changes (a copy in Sent Items has its own); else by IMAP mailbox and UID,
 /// or failing those its Message-ID (it may have moved and come back with a
@@ -1906,19 +2015,15 @@ impl Store {
 fn find_stored(conn: &Connection, m: &Incoming) -> Result<Option<i64>> {
     if let Some(remote_id) = &m.remote_id {
         return conn
-            .query_row(
-                "SELECT id FROM messages WHERE account_id = ?1 AND remote_id = ?2",
-                params![m.account_id, remote_id],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT id FROM messages WHERE account_id = ?1 AND remote_id = ?2")?
+            .query_row(params![m.account_id, remote_id], |r| r.get(0))
             .optional();
     }
     let by_location = if let (Some(mailbox), Some(uid)) = (&m.mailbox, m.uid) {
-        conn.query_row(
+        conn.prepare_cached(
             "SELECT id FROM messages WHERE account_id = ?1 AND mailbox = ?2 AND uid = ?3",
-            params![m.account_id, mailbox, uid],
-            |r| r.get(0),
-        )
+        )?
+        .query_row(params![m.account_id, mailbox, uid], |r| r.get(0))
         .optional()?
     } else {
         None
@@ -1926,12 +2031,11 @@ fn find_stored(conn: &Connection, m: &Incoming) -> Result<Option<i64>> {
     match (by_location, &m.message_id) {
         (Some(id), _) => Ok(Some(id)),
         (None, Some(message_id)) => conn
-            .query_row(
+            .prepare_cached(
                 "SELECT id FROM messages WHERE account_id = ?1 AND message_id = ?2
                  ORDER BY date DESC LIMIT 1",
-                params![m.account_id, message_id],
-                |r| r.get(0),
-            )
+            )?
+            .query_row(params![m.account_id, message_id], |r| r.get(0))
             .optional(),
         (None, None) => Ok(None),
     }
@@ -1940,14 +2044,13 @@ fn find_stored(conn: &Connection, m: &Incoming) -> Result<Option<i64>> {
 /// Lists a message in a folder, with its UID there, unless a pending change
 /// takes it out of that folder.
 fn add_member(conn: &Connection, folder_id: i64, message_id: i64, uid: Option<u32>) -> Result<()> {
-    conn.execute(
-        &format!(
-            "INSERT INTO folder_members (folder_id, message_id, uid)
-             SELECT ?1, id, ?3 FROM messages WHERE id = ?2 AND NOT ({LEAVING})
-             ON CONFLICT (folder_id, message_id) DO UPDATE SET uid = excluded.uid"
-        ),
-        params![folder_id, message_id, uid],
-    )?;
+    conn.prepare_cached(&format!(
+        "INSERT INTO folder_members (folder_id, message_id, uid)
+         SELECT ?1, id, ?3 FROM messages WHERE id = ?2 AND NOT ({LEAVING})
+         ON CONFLICT (folder_id, message_id) DO UPDATE SET uid = excluded.uid
+            WHERE folder_members.uid IS NOT excluded.uid"
+    ))?
+    .execute(params![folder_id, message_id, uid])?;
     Ok(())
 }
 
@@ -1999,10 +2102,12 @@ fn refresh_reply_to(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
     let Some(recipients) = &m.reply_to else {
         return Ok(false);
     };
-    Ok(conn.execute(
-        "UPDATE messages SET reply_to_list = ?2 WHERE id = ?1 AND reply_to_list != ?2",
-        params![id, json(recipients)],
-    )? > 0)
+    Ok(conn
+        .prepare_cached(
+            "UPDATE messages SET reply_to_list = ?2 WHERE id = ?1 AND reply_to_list != ?2",
+        )?
+        .execute(params![id, json(recipients)])?
+        > 0)
 }
 
 fn insert_message(
@@ -2012,7 +2117,7 @@ fn insert_message(
     screening: bool,
     place: Place,
 ) -> Result<i64> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO messages (
             account_id, remote_id, mailbox, uid, message_id, thread_id, in_reply_to, refs,
             from_name, from_address, to_list, cc_list, subject, snippet, date,
@@ -2024,36 +2129,36 @@ fn insert_message(
                  -- The sender's category if the user chose one, else what its headers say.
                  COALESCE((SELECT category FROM sender_categories WHERE address = ?10), ?19),
                  ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19)",
-        params![
-            m.account_id,
-            m.remote_id,
-            m.mailbox,
-            m.uid,
-            m.message_id,
-            m.thread_id,
-            m.in_reply_to,
-            m.references,
-            m.from_name,
-            m.from_address,
-            json(&m.to),
-            json(&m.cc),
-            m.subject,
-            m.snippet,
-            m.date,
-            m.text,
-            m.html,
-            json(&m.attachments),
-            category_str(m.category),
-            state_str(state),
-            m.unread,
-            m.flagged,
-            screening,
-            place_str(place),
-            json(&m.bcc),
-            m.invite,
-            json(m.reply_to.as_deref().unwrap_or_default()),
-        ],
-    )?;
+    )?
+    .execute(params![
+        m.account_id,
+        m.remote_id,
+        m.mailbox,
+        m.uid,
+        m.message_id,
+        m.thread_id,
+        m.in_reply_to,
+        m.references,
+        m.from_name,
+        m.from_address,
+        json(&m.to),
+        json(&m.cc),
+        m.subject,
+        m.snippet,
+        m.date,
+        m.text,
+        m.html,
+        json(&m.attachments),
+        category_str(m.category),
+        state_str(state),
+        m.unread,
+        m.flagged,
+        screening,
+        place_str(place),
+        json(&m.bcc),
+        m.invite,
+        json(m.reply_to.as_deref().unwrap_or_default()),
+    ])?;
     let id = conn.last_insert_rowid();
     let threading = conversations::Threading {
         message_id: m.message_id.as_deref(),

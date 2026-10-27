@@ -50,6 +50,8 @@ const MAX_PAGE: usize = 1000;
 /// More new messages than this in a folder are fetched in one listing
 /// rather than one by one.
 const FETCH_ONE_BY_ONE: usize = 10;
+/// Most messages of a folder's listing stored in one transaction.
+const STORE_BATCH: usize = 50;
 /// Well-known folders: their role, or `None` for ones left out of the list.
 /// Folders inside the inbox are listed at the top.
 const WELL_KNOWN: [(&str, Option<FolderRole>); 8] = [
@@ -240,6 +242,16 @@ struct DeltaPage {
     delta_link: Option<String>,
 }
 
+/// What a delta page says about one message, ready to store.
+enum Delta {
+    Gone(String),
+    /// `flags` is false when only its headers changed.
+    Changed {
+        incoming: Box<Incoming>,
+        flags: bool,
+    },
+}
+
 pub struct Graph {
     token: String,
     base: String,
@@ -370,31 +382,64 @@ impl Graph {
                 }
                 other => other?,
             };
+            // New mail is completed (attachments, invites) before the page
+            // is stored, in one transaction.
+            let known: HashSet<String> = {
+                let store = lock(store);
+                let mut known = HashSet::new();
+                for m in &page.value {
+                    if m.removed.is_none()
+                        && m.is_read.is_some()
+                        && store.has_remote_id(account_id, &m.id)?
+                    {
+                        known.insert(m.id.clone());
+                    }
+                }
+                known
+            };
+            let mut changes = Vec::with_capacity(page.value.len());
             for m in page.value {
                 missing.remove(&m.id);
                 if m.removed.is_some() {
-                    report.gone += lock(store).observe_gone_remote(account_id, &m.id)?;
+                    changes.push(Delta::Gone(m.id));
                     continue;
                 }
                 let mut incoming = to_incoming(account_id, &m);
-                report.headers += usize::from(lock(store).observe_reply_to(&incoming)?);
                 // A header-only delta must not overwrite the stored flags.
-                if m.is_read.is_none() {
-                    continue;
-                }
-                if !lock(store).has_remote_id(account_id, &m.id)? {
+                let flags = m.is_read.is_some();
+                if flags && !known.contains(&m.id) {
                     self.complete(&m, &mut incoming).await;
                 }
-                if let spark_store::Added::New(id) = lock(store).add_incoming(&incoming, !first)? {
-                    report.new.push(id);
-                }
+                changes.push(Delta::Changed {
+                    incoming: Box::new(incoming),
+                    flags,
+                });
             }
+            lock(store).batch(|b| {
+                for change in &changes {
+                    match change {
+                        Delta::Gone(remote_id) => {
+                            report.gone += b.observe_gone_remote(account_id, remote_id)?;
+                        }
+                        Delta::Changed { incoming, flags } => {
+                            report.headers += usize::from(b.observe_reply_to(incoming)?);
+                            if *flags && let Added::New(id) = b.add_incoming(incoming, !first)? {
+                                report.new.push(id);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })?;
             match (page.next_link, page.delta_link) {
                 (Some(next), _) => url = next,
                 (None, Some(delta)) => {
-                    for remote_id in &missing {
-                        report.gone += lock(store).observe_gone_remote(account_id, remote_id)?;
-                    }
+                    lock(store).batch(|b| {
+                        for remote_id in &missing {
+                            report.gone += b.observe_gone_remote(account_id, remote_id)?;
+                        }
+                        Ok(())
+                    })?;
                     state.delta_link = Some(delta);
                     state.reply_to_selected = true;
                     return Ok(report);
@@ -530,39 +575,47 @@ impl Graph {
 
         let mut changed = 0;
         let mut members = Vec::new();
-        for listed in &listing {
-            let unread = !listed.is_read.unwrap_or(false);
-            let flagged = listed
-                .flag
-                .as_ref()
-                .is_some_and(|f| f.flag_status == "flagged");
-            let incoming = if known.contains(&listed.id) {
-                Incoming {
-                    account_id,
-                    remote_id: Some(listed.id.clone()),
-                    reply_to: listed
-                        .reply_to
-                        .as_ref()
-                        .map(|recipients| recipients.iter().filter_map(display).collect()),
-                    unread,
-                    flagged,
-                    ..Default::default()
-                }
-            } else if let Some(m) = full.get(&listed.id) {
-                let mut incoming = to_incoming(account_id, m);
-                self.complete(m, &mut incoming).await;
-                incoming
-            } else {
-                continue;
-            };
-            changed += usize::from(lock(store).observe_reply_to(&incoming)?);
-            let id = match lock(store).add_folder_message(folder.id, &incoming)? {
-                Added::New(id) | Added::Known(id) => id,
-            };
-            if !before.contains(&id) {
-                changed += 1;
+        for chunk in listing.chunks(STORE_BATCH) {
+            let mut incomings = Vec::with_capacity(chunk.len());
+            for listed in chunk {
+                let unread = !listed.is_read.unwrap_or(false);
+                let flagged = listed
+                    .flag
+                    .as_ref()
+                    .is_some_and(|f| f.flag_status == "flagged");
+                incomings.push(if known.contains(&listed.id) {
+                    Incoming {
+                        account_id,
+                        remote_id: Some(listed.id.clone()),
+                        reply_to: listed
+                            .reply_to
+                            .as_ref()
+                            .map(|recipients| recipients.iter().filter_map(display).collect()),
+                        unread,
+                        flagged,
+                        ..Default::default()
+                    }
+                } else if let Some(m) = full.get(&listed.id) {
+                    let mut incoming = to_incoming(account_id, m);
+                    self.complete(m, &mut incoming).await;
+                    incoming
+                } else {
+                    continue;
+                });
             }
-            members.push((id, None));
+            lock(store).batch(|b| {
+                for incoming in &incomings {
+                    changed += usize::from(b.observe_reply_to(incoming)?);
+                    let id = match b.add_folder_message(folder.id, incoming)? {
+                        Added::New(id) | Added::Known(id) => id,
+                    };
+                    if !before.contains(&id) {
+                        changed += 1;
+                    }
+                    members.push((id, None));
+                }
+                Ok(())
+            })?;
         }
         changed += lock(store).set_folder_members(folder.id, &members)?;
         Ok(Some(changed))
@@ -682,16 +735,24 @@ impl Graph {
             let full = self
                 .unknown_in_full(&messages, offset, &page.value, &known)
                 .await?;
+            let mut incomings = Vec::new();
             for listed in &page.value {
                 let Some(m) = full.get(&listed.id) else {
                     continue;
                 };
                 let mut incoming = to_incoming(account_id, m);
                 self.complete(m, &mut incoming).await;
-                if let Added::New(_) = lock(store).add_incoming(&incoming, false)? {
-                    stored += 1;
-                }
+                incomings.push(incoming);
             }
+            stored += lock(store).batch(|b| {
+                let mut new = 0;
+                for incoming in &incomings {
+                    if let Added::New(_) = b.add_incoming(incoming, false)? {
+                        new += 1;
+                    }
+                }
+                Ok(new)
+            })?;
             offset += page.value.len();
             if let Some(oldest) = page
                 .value
@@ -801,22 +862,28 @@ impl Graph {
                 }
             }
         }
-        let mut stored = 0;
+        let mut found = Vec::new();
         for (listed, folder) in wanted {
             let Some(m) = full.get(&listed.id) else {
                 continue;
             };
             let mut incoming = to_incoming(account_id, m);
             self.complete(m, &mut incoming).await;
-            let added = match folder {
-                None => lock(store).add_incoming(&incoming, false)?,
-                Some(folder) => lock(store).add_folder_message(folder.id, &incoming)?,
-            };
-            if let Added::New(_) = added {
-                stored += 1;
-            }
+            found.push((incoming, folder));
         }
-        Ok(stored)
+        Ok(lock(store).batch(|b| {
+            let mut stored = 0;
+            for (incoming, folder) in &found {
+                let added = match folder {
+                    None => b.add_incoming(incoming, false)?,
+                    Some(folder) => b.add_folder_message(folder.id, incoming)?,
+                };
+                if let Added::New(_) = added {
+                    stored += 1;
+                }
+            }
+            Ok(stored)
+        })?)
     }
 
     /// Creates a folder, in `parent` (a folder id) or at the top; returns its id.
@@ -2308,6 +2375,101 @@ pub(crate) mod tests {
         let stored = graph.older_inbox(&store, account_id, &mut fresh).await;
         assert_eq!(stored.unwrap(), 0);
         assert_eq!(fresh, SyncState::default());
+    }
+
+    /// A stand-in delta query of two pages. The first has new mail (`n1`),
+    /// a stored message removed (`s1`) and one whose Reply-To alone changed
+    /// (`s2`); the second new mail with an attachment (`n2`) and a stored
+    /// message read elsewhere (`s3`), which has one too.
+    fn delta(path: &str) -> Option<Value> {
+        let full = |id: &str, read: bool| {
+            json!({
+                "id": id, "subject": format!("Message {id}"), "isRead": read,
+                "receivedDateTime": iso_date(NEWEST), "hasAttachments": id != "n1",
+                "from": { "emailAddress": { "name": "Ana", "address": "ana@contoso.com" } },
+                "body": { "contentType": "text", "content": "Hi" },
+            })
+        };
+        Some(
+            match path.split_once('?').map_or(path, |(route, _)| route) {
+                "/delta1" => json!({
+                    "value": [
+                        full("n1", false),
+                        { "id": "s1", "@removed": { "reason": "deleted" } },
+                        { "id": "s2", "replyTo": [
+                            { "emailAddress": { "name": "Desk", "address": "desk@contoso.com" } }
+                        ] },
+                    ],
+                    "@odata.nextLink": "/delta2",
+                }),
+                "/delta2" => json!({
+                    "value": [full("n2", false), full("s3", true)],
+                    "@odata.deltaLink": "/delta3",
+                }),
+                "/me/messages/n2/attachments" => json!({ "value": [
+                { "id": "a1", "name": "plan.pdf", "contentType": "application/pdf", "size": 10 }
+            ] }),
+                _ => return None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_inbox_delta_is_stored_a_page_at_a_time() {
+        let (base, seen) = stand_in(delta).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let stored: Vec<i64> = ["s1", "s2", "s3"]
+            .into_iter()
+            .map(|id| {
+                let m = Incoming {
+                    account_id,
+                    remote_id: Some(id.into()),
+                    from_address: "ana@contoso.com".into(),
+                    unread: true,
+                    date: NEWEST,
+                    ..Default::default()
+                };
+                match lock(&store).add_incoming(&m, false).unwrap() {
+                    Added::New(id) | Added::Known(id) => id,
+                }
+            })
+            .collect();
+        let mut state = SyncState {
+            delta_link: Some("/delta1".into()),
+            reply_to_selected: true,
+            ..Default::default()
+        };
+
+        let report = graph.sync_inbox(&store, account_id, &mut state).await;
+        let report = report.unwrap();
+        assert_eq!(report.new.len(), 2);
+        assert_eq!((report.gone, report.headers), (1, 1));
+        assert_eq!(state.delta_link.as_deref(), Some("/delta3"));
+        let s = lock(&store);
+        let message = |id| s.message(id).unwrap().unwrap();
+        assert_eq!(message(stored[0]).state, spark_store::MessageState::Done);
+        assert_eq!(
+            s.content(stored[1]).unwrap().unwrap().reply_to,
+            ["Desk <desk@contoso.com>"]
+        );
+        assert!(message(stored[1]).unread, "only its headers changed");
+        assert!(!message(stored[2]).unread);
+        let n2 = s
+            .messages()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.subject == "Message n2")
+            .unwrap();
+        assert_eq!(n2.attachment.as_deref(), Some("plan.pdf"));
+        // Only new mail is completed: s3's attachments aren't asked for.
+        let paths = seen.lock().unwrap().clone();
+        let asked: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.contains("/attachments"))
+            .collect();
+        assert_eq!(asked.len(), 1, "{paths:?}");
+        assert!(asked[0].starts_with("/me/messages/n2/"));
     }
 
     /// A stand-in mailbox for searches. "invoice" finds, newest first, `i3`
