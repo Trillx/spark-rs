@@ -167,7 +167,7 @@ struct GraphEventDetails {
     body: Option<GraphBody>,
 }
 
-/// An event's times, people and description as Graph has them
+/// An event's times, people and description (HTML) as Graph has them
 /// (`Graph::event_details`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EventDetails {
@@ -278,9 +278,10 @@ pub fn new_event_body(draft: &EventDraft, zone: Zone) -> serde_json::Value {
 /// The Graph fields to change for event `before` to say what `draft` says:
 /// only those that differ, so the rest stays as Outlook has it. `details`
 /// are the event's as Graph has them now (`Graph::event_details`): its
-/// rooms, and the meeting text after its notes, stay. With `shift`, the
-/// times move by as much as the draft's moved from `before`'s, from
-/// `details`' (the series' first occurrence, for every occurrence).
+/// rooms, and the Teams meeting Outlook put after its notes, stay. With
+/// `shift`, `details`' times (the series' first occurrence, for every
+/// occurrence) move by as much as the draft's moved from `before`'s, start
+/// and end each.
 pub fn changed_event_body(
     draft: &EventDraft,
     before: &Event,
@@ -294,8 +295,10 @@ pub fn changed_event_body(
     }
     if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
         let (start, end) = if shift {
-            let start = details.start + (draft.start - before.start);
-            (start, start + (draft.end - draft.start))
+            (
+                details.start + (draft.start - before.start),
+                details.end + (draft.end - before.end),
+            )
         } else {
             (draft.start, draft.end)
         };
@@ -310,23 +313,13 @@ pub fn changed_event_body(
         );
     }
     if draft.notes.trim() != before.notes.as_deref().unwrap_or_default() {
-        // The Teams text Outlook added after the notes stays.
-        let kept = without_boilerplate(&details.body);
-        let tail = details
-            .body
-            .trim()
-            .strip_prefix(kept.as_str())
-            .unwrap_or_default()
-            .trim();
-        let content = [draft.notes.trim(), tail]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        body.insert(
-            "body".into(),
-            json!({ "contentType": "text", "content": content }),
-        );
+        // A Teams meeting's joining details stay as Outlook wrote them:
+        // without them, Outlook turns the meeting off.
+        let content = match with_notes(&details.body, draft.notes.trim()) {
+            Some(html) => json!({ "contentType": "html", "content": html }),
+            None => json!({ "contentType": "text", "content": draft.notes.trim() }),
+        };
+        body.insert("body".into(), content);
     }
     let key = |p: &Person| p.address.trim().to_lowercase();
     let wanted: Vec<String> = draft.attendees.iter().map(key).collect();
@@ -364,6 +357,76 @@ pub fn changed_event_body(
         body.insert("onlineMeetingProvider".into(), json!("teamsForBusiness"));
     }
     body.into()
+}
+
+/// `html`, an event's description, with `notes` in place of what comes
+/// before the Teams meeting Outlook put in it (found by its rule of
+/// underscores or its `-::~:~::~` marker): everything from the top-level
+/// element holding that on stays as it is. `None` if there's no meeting in
+/// it.
+fn with_notes(html: &str, notes: &str) -> Option<String> {
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr",
+    ];
+    let lower = html.to_ascii_lowercase();
+    let marker = [lower.find(&"_".repeat(20)), lower.find("-::~:~::~")]
+        .into_iter()
+        .flatten()
+        .min()?;
+    let body = lower
+        .find("<body")
+        .and_then(|at| lower[at..].find('>').map(|end| at + end + 1))
+        .unwrap_or(0);
+    if marker < body {
+        return None;
+    }
+    // The element at the top of the body that the meeting starts in.
+    let mut depth = 0usize;
+    let mut top = marker;
+    let mut at = body;
+    while let Some(open) = lower[at..marker].find('<').map(|i| at + i) {
+        let Some(close) = lower[open..].find('>').map(|i| open + i) else {
+            break;
+        };
+        let tag = &lower[open + 1..close];
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if !tag.starts_with('!') && !tag.ends_with('/') && !VOID.contains(&name.as_str()) {
+            if depth == 0 {
+                top = open;
+            }
+            depth += 1;
+        }
+        at = close + 1;
+        if at >= marker {
+            break;
+        }
+    }
+    let cut = if depth > 0 { top } else { marker };
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let lines: String = notes
+        .lines()
+        .map(|l| match l.trim_end() {
+            "" => "<div><br></div>".to_owned(),
+            l => format!("<div>{}</div>", escape(l)),
+        })
+        .collect();
+    let gap = if lines.is_empty() {
+        ""
+    } else {
+        "<div><br></div>"
+    };
+    Some(format!("{}{lines}{gap}{}", &html[..body], &html[cut..]))
 }
 
 fn attendee(p: &Person) -> serde_json::Value {
@@ -564,8 +627,7 @@ impl Graph {
                         path(id)
                     ),
                 )
-                .header("Prefer", "outlook.timezone=\"UTC\"")
-                .header("Prefer", "outlook.body-content-type=\"text\""),
+                .header("Prefer", "outlook.timezone=\"UTC\""),
             )
             .await?;
         let all_day = e.is_all_day;
@@ -971,7 +1033,12 @@ mod tests {
                 json!({ "type": "required", "emailAddress": { "name": "Kai", "address": "kai@contoso.com" } }),
                 json!({ "type": "resource", "emailAddress": { "name": "Room 4", "address": "room4@contoso.com" } }),
             ],
-            body: "Agenda\n\n________________________________________________________________________________\nMicrosoft Teams meeting\nJoin: https://teams.microsoft.com/l/x".into(),
+            body: format!(
+                "<html><head><style>p {{ margin: 0 }}</style></head><body><div>Agenda</div>\r\n<div>Second line</div>\r\n\
+                 <div style=\"width:100%\"><span style=\"opacity:.36\">{}</span>\
+                 <div class=\"me-email-text\">Microsoft Teams meeting <a href=\"https://teams.microsoft.com/l/x\">Join</a></div></div></body></html>",
+                "_".repeat(80)
+            ),
         };
         let unchanged = EventDraft {
             title: before.title.clone(),
@@ -1040,11 +1107,25 @@ mod tests {
             ],
             "rooms and kinds kept"
         );
+        assert_eq!(body["body"]["contentType"], "html");
         let content = body["body"]["content"].as_str().unwrap();
-        assert!(content.starts_with("New agenda\n\n____"), "{content}");
-        assert!(
-            content.ends_with("Join: https://teams.microsoft.com/l/x"),
-            "{content}"
+        let meeting = &details.body[details.body.find("<div style=\"width:100%\">").unwrap()..];
+        assert_eq!(
+            content,
+            format!(
+                "<html><head><style>p {{ margin: 0 }}</style></head><body><div>New agenda</div><div><br></div>{meeting}"
+            ),
+            "the meeting stays as Outlook wrote it"
+        );
+        // Without a meeting in it, the notes are the description.
+        let plain = EventDetails {
+            body: "<html><body><p>Old</p></body></html>".into(),
+            ..details.clone()
+        };
+        let body = changed_event_body(&draft, &before, &plain, PACIFIC, false);
+        assert_eq!(
+            body["body"],
+            json!({ "contentType": "text", "content": "New agenda" })
         );
 
         // Every occurrence: the series moves from its own first time.
@@ -1052,7 +1133,7 @@ mod tests {
         let series = EventDetails {
             start: series_start,
             end: series_start + 900_000,
-            ..details
+            ..details.clone()
         };
         let body = changed_event_body(&draft, &before, &series, PACIFIC, true);
         assert_eq!(
@@ -1062,6 +1143,18 @@ mod tests {
         assert_eq!(
             body["end"]["dateTime"],
             pacific(series_start + 4_500_000).as_str()
+        );
+        // One occurrence was made shorter than the rest; moving it moves the
+        // series' own start and end, which keep their length.
+        let long_series = EventDetails {
+            start: series_start,
+            end: series_start + 3_600_000,
+            ..series.clone()
+        };
+        let body = changed_event_body(&draft, &before, &long_series, PACIFIC, true);
+        assert_eq!(
+            body["end"]["dateTime"],
+            pacific(series_start + 7_200_000).as_str()
         );
     }
 

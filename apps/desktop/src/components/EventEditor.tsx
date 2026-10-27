@@ -115,7 +115,10 @@ export default function EventEditor({
     const asked = () => document.querySelector("[aria-modal]") !== null;
     const onPointer = (e: PointerEvent) => {
       if (asked() || ref.current?.contains(e.target as Node)) return;
-      latestClose.current();
+      // A time still being typed counts: it's taken in first, then the change is looked at.
+      const typing = document.activeElement;
+      if (typing instanceof HTMLElement && ref.current?.contains(typing)) typing.blur();
+      window.setTimeout(() => latestClose.current());
     };
     // Capture, so Esc closes the editor and not the calendar; a list or picker open in it closes first.
     const onKey = (e: KeyboardEvent) => {
@@ -402,6 +405,8 @@ function IconRow({ Icon, children }: { Icon: typeof Video; children: ReactNode }
 /** A time of day: typed ("9:30", "930", "9:30pm"), or picked from the quarter hours. */
 function TimeField({ label, value, onChange }: { label: string; value: number; onChange: (t: number) => void }) {
   const [text, setText] = useState<string | null>(null);
+  /** What's typed, as of now: a pick from the list replaces it before the field's blur reads it. */
+  const typed = useRef<string | null>(null);
   const [invalid, setInvalid] = useState(false);
   const list = useRef<HTMLUListElement>(null);
   const day = dayOf(value);
@@ -411,12 +416,17 @@ function TimeField({ label, value, onChange }: { label: string; value: number; o
     if (text !== null) list.current?.querySelector("[aria-selected='true']")?.scrollIntoView({ block: "center" });
   }, [text !== null]);
 
+  const edit = (next: string | null) => {
+    typed.current = next;
+    setText(next);
+  };
   const commit = () => {
-    if (text === null) return;
-    const minutes = parseTime(text);
+    const now = typed.current;
+    if (now === null) return;
+    const minutes = parseTime(now);
     setInvalid(minutes === null);
     if (minutes !== null && minutes !== current) onChange(atMinutes(day, minutes));
-    setText(null);
+    edit(null);
   };
 
   return (
@@ -429,17 +439,17 @@ function TimeField({ label, value, onChange }: { label: string; value: number; o
         }`}
         value={text ?? formatTime(value)}
         onFocus={(e) => {
-          setText(formatTime(value));
+          edit(formatTime(value));
           e.target.select();
         }}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => edit(e.target.value)}
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
             e.currentTarget.blur();
           } else if (e.key === "Escape") {
-            setText(null);
+            edit(null);
             e.currentTarget.blur();
           }
         }}
@@ -461,7 +471,7 @@ function TimeField({ label, value, onChange }: { label: string; value: number; o
               aria-selected={m === current}
               className={`flex h-7 cursor-default items-center px-3 hover:bg-primary/10 ${m === current ? "font-semibold text-primary" : ""}`}
               onClick={() => {
-                setText(null);
+                edit(null);
                 setInvalid(false);
                 if (m !== current) onChange(atMinutes(day, m));
                 (document.activeElement as HTMLElement | null)?.blur();
