@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use serde::Serialize;
-use spark_mail::engine::inbox_has_older;
+use spark_mail::engine::{folder_has_older, inbox_has_older};
 use spark_mail::{Engine, Error, Round, Untrusted};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
@@ -427,6 +427,8 @@ async fn work(
             };
             // Only inbox syncs move it.
             let had_older = (fetch || older_inbox).then(|| has_older(&engine, account_id));
+            let folders_were = (!round.folders.is_empty() || !round.older_folders.is_empty())
+                .then(|| folder_reach(&engine, account_id));
             match engine.run_round(account_id, &round).await {
                 Ok(report) => {
                     retry_at = None;
@@ -464,6 +466,11 @@ async fn work(
                         last_sync,
                         certificate: certificate_of(&e),
                     });
+                    // A folder synced before it failed may have changed what the
+                    // sidebar shows of it, which a report would have said.
+                    if folders_were.is_some_and(|were| were != folder_reach(&engine, account_id)) {
+                        let _ = app.emit("folders-changed", ());
+                    }
                 }
             }
             // The account's `hasOlder` flipped, e.g. with its first sync.
@@ -484,6 +491,17 @@ async fn work(
 
 fn has_older(engine: &Engine, account_id: i64) -> bool {
     matches!(engine.store().account(account_id), Ok(Some(a)) if inbox_has_older(&a))
+}
+
+/// What the UI shows of an account's folder syncs (`FolderView`): whether
+/// each folder synced yet, and has older mail to reach back for.
+fn folder_reach(engine: &Engine, account_id: i64) -> Vec<(i64, bool, bool)> {
+    let folders = engine.store().folders().unwrap_or_default();
+    folders
+        .iter()
+        .filter(|f| f.account_id == account_id)
+        .map(|f| (f.id, f.synced_at.is_some(), folder_has_older(f)))
+        .collect()
 }
 
 /// Network errors are usually just being offline.

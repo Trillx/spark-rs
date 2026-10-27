@@ -3543,6 +3543,40 @@ fn commits(store: &Store) -> &'static std::sync::atomic::AtomicUsize {
     count
 }
 
+/// Counts the rows written to the database from now on, leaving out the
+/// temporary tables that keep track of them (`changes`' log), which
+/// `total_changes` counts too.
+fn rows_written(store: &Store) -> &'static std::sync::atomic::AtomicUsize {
+    use std::ffi::{CStr, c_char, c_int, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    unsafe extern "C" fn written(
+        count: *mut c_void,
+        _: c_int,
+        db: *const c_char,
+        _: *const c_char,
+        _: i64,
+    ) {
+        // SAFETY: SQLite passes the database's name, and `count` is the
+        // counter below, which is never freed.
+        unsafe {
+            if CStr::from_ptr(db) == c"main" {
+                (*count.cast::<AtomicUsize>()).fetch_add(1, SeqCst);
+            }
+        }
+    }
+    let count: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    // SAFETY: the connection is open, and the counter outlives it.
+    unsafe {
+        rusqlite::ffi::sqlite3_update_hook(
+            store.conn.handle(),
+            Some(written),
+            std::ptr::from_ref(count).cast_mut().cast(),
+        );
+    }
+    count
+}
+
 #[test]
 fn a_thousand_message_import_commits_once_a_chunk() {
     use std::sync::atomic::Ordering::SeqCst;
@@ -3575,7 +3609,10 @@ fn a_thousand_message_import_commits_once_a_chunk() {
 
 #[test]
 fn flags_the_server_reported_before_write_nothing() {
+    use std::sync::atomic::Ordering::SeqCst;
+
     let (mut store, account) = store_with_account();
+    let rows = rows_written(&store);
     let mail: Vec<Incoming> = (1..=1_000)
         .map(|uid| incoming(account, uid, "a@x.com"))
         .collect();
@@ -3592,7 +3629,7 @@ fn flags_the_server_reported_before_write_nothing() {
         .map(|uid| (uid, uid % 3 != 0, uid % 7 == 0))
         .collect();
     let reconcile = |store: &mut Store| {
-        let before = store.conn.total_changes();
+        let before = rows.load(SeqCst);
         for chunk in flags.chunks(500) {
             store
                 .batch(|b| {
@@ -3603,7 +3640,7 @@ fn flags_the_server_reported_before_write_nothing() {
                 })
                 .unwrap();
         }
-        store.conn.total_changes() - before
+        rows.load(SeqCst) - before
     };
     // Only the rows whose flags changed: 333 read, 142 flagged, 47 both.
     assert_eq!(reconcile(&mut store), 428);
@@ -3617,7 +3654,7 @@ fn flags_the_server_reported_before_write_nothing() {
     assert_eq!(read, 333);
 
     // The same for a message seen again in full, and Graph's flags.
-    let written = store.conn.total_changes();
+    let written = rows.load(SeqCst);
     store
         .add_incoming(
             &Incoming {
@@ -3627,7 +3664,7 @@ fn flags_the_server_reported_before_write_nothing() {
             true,
         )
         .unwrap();
-    assert_eq!(store.conn.total_changes(), written);
+    assert_eq!(rows.load(SeqCst), written);
     let graph = Incoming {
         account_id: account,
         remote_id: Some("g1".into()),
@@ -3636,16 +3673,16 @@ fn flags_the_server_reported_before_write_nothing() {
         ..Default::default()
     };
     let id = new_id(store.add_incoming(&graph, false).unwrap());
-    let written = store.conn.total_changes();
+    let written = rows.load(SeqCst);
     assert_eq!(store.add_incoming(&graph, false).unwrap(), Added::Known(id));
     store
         .observe_remote_flags(account, "g1", true, false)
         .unwrap();
-    assert_eq!(store.conn.total_changes(), written);
+    assert_eq!(rows.load(SeqCst), written);
     store
         .observe_remote_flags(account, "g1", false, false)
         .unwrap();
-    assert_eq!(store.conn.total_changes(), written + 1);
+    assert_eq!(rows.load(SeqCst), written + 1);
     assert!(!store.message(id).unwrap().unwrap().unread);
 }
 

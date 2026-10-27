@@ -18,8 +18,8 @@ use spark_mail::{Error, Service, Untrusted};
 use spark_mail::{signature, trackers};
 use spark_store::{
     Account, AccountKind, Category, Change, Contact, DraftFile, DueReminder, Folder, FolderRole,
-    GatekeeperMode, MessageState, OutboxFile, Patch, PriorityUndo, SavedFile, SenderStatus, Store,
-    now_ms,
+    GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo, SavedFile, SenderStatus,
+    Store, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -88,6 +88,23 @@ pub struct Message {
     /// The calendar invite it carries, by kind ("invitation", "reply", …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_kind: Option<String>,
+}
+
+/// The message list's changes since the UI's `mark`: every message (`full`)
+/// the first time, in the demo, and when the store can't tell what changed
+/// (see `Store::message_changes`); else the changed ones, and the ids of
+/// those no longer listed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageChanges {
+    /// `messages` is every message: they replace the list.
+    pub full: bool,
+    pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gone: Vec<i64>,
+    /// What to ask from next time; none in the demo, which lists it all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark: Option<Mark>,
 }
 
 /// Mail scheduled with Send Later, for the Scheduled list.
@@ -399,13 +416,44 @@ pub fn list_accounts(mailbox: State<'_, Mailbox>) -> Result<Vec<AccountView>, St
         .collect())
 }
 
+/// What changed in the message list since `since`, or every message; see
+/// `MessageChanges`. On the main thread like `update_message`, so the UI
+/// gets their answers in the order it asked: a list read before an update
+/// can't come back after the updated message and put back what it was.
 #[tauri::command]
-pub fn list_messages(mailbox: State<'_, Mailbox>) -> Result<Vec<Message>, String> {
+pub fn message_changes(
+    mailbox: State<'_, Mailbox>,
+    since: Option<Mark>,
+) -> Result<MessageChanges, String> {
     if !mailbox.live() {
-        return Ok(mailbox.demo.list());
+        return Ok(MessageChanges {
+            full: true,
+            messages: mailbox.demo.list(),
+            gone: Vec::new(),
+            mark: None,
+        });
     }
-    let messages = mailbox.live.engine.store().messages().map_err(text)?;
-    Ok(messages.into_iter().map(from_store).collect())
+    changes_since(&mailbox.live.engine.store(), since).map_err(text)
+}
+
+fn changes_since(store: &Store, since: Option<Mark>) -> spark_store::Result<MessageChanges> {
+    if let Some(since) = since
+        && let Some(changes) = store.message_changes(&since)?
+    {
+        return Ok(MessageChanges {
+            full: false,
+            messages: changes.messages.into_iter().map(from_store).collect(),
+            gone: changes.gone,
+            mark: Some(changes.mark),
+        });
+    }
+    let (messages, mark) = store.messages_marked()?;
+    Ok(MessageChanges {
+        full: true,
+        messages: messages.into_iter().map(from_store).collect(),
+        gone: Vec::new(),
+        mark,
+    })
 }
 
 /// The ids of the stored messages whose words start with those of `query`,
@@ -2525,5 +2573,144 @@ mod tests {
         assert_eq!(json["folders"], serde_json::json!([4]));
         assert!(json.get("folder").is_none());
         assert_eq!(json["to"], serde_json::json!(["Me <me@x.com>"]));
+    }
+
+    fn arrived(account: i64, n: u32) -> spark_store::Incoming {
+        spark_store::Incoming {
+            account_id: account,
+            mailbox: Some("INBOX".into()),
+            uid: Some(n),
+            message_id: Some(format!("<{n}@example.test>")),
+            from_name: "Ana Ruiz".into(),
+            from_address: "ana@x.test".into(),
+            to: vec!["Me <me@example.test>".into()],
+            subject: format!("Message {n}"),
+            snippet: format!("About {n}"),
+            date: 1_000 + n as i64,
+            unread: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_ui_reads_everything_once_then_only_what_changed() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = draft_account(&store).id;
+        store.add_incoming(&arrived(account, 1), false).unwrap();
+        let first = changes_since(&store, None).unwrap();
+        assert!(first.full);
+        assert_eq!(first.messages.len(), 1);
+        let json = serde_json::to_value(&first).unwrap();
+        assert_eq!(json["full"], true);
+        assert!(json.get("gone").is_none());
+        assert!(json["mark"].is_object());
+        let mark: Mark = serde_json::from_value(json["mark"].clone()).unwrap();
+
+        let spark_store::Added::New(id) = store.add_incoming(&arrived(account, 2), false).unwrap()
+        else {
+            panic!("expected new mail");
+        };
+        store.remove_messages(&[first.messages[0].id]).unwrap();
+        let next = changes_since(&store, Some(mark)).unwrap();
+        assert!(!next.full);
+        assert_eq!(
+            next.messages,
+            [from_store(store.message(id).unwrap().unwrap())]
+        );
+        assert_eq!(next.gone, [first.messages[0].id]);
+        let json = serde_json::to_value(&next).unwrap();
+        assert_eq!(json["full"], false);
+        assert_eq!(json["gone"], serde_json::json!([first.messages[0].id]));
+
+        // A mark the store can't follow reads everything again.
+        let other = Store::open_in_memory().unwrap();
+        assert!(changes_since(&other, next.mark).unwrap().full);
+    }
+
+    /// The audit's case (PERF-01): what the UI is sent for one new message
+    /// in a 50,000-message mailbox, reading everything as before, and
+    /// following the changes.
+    #[test]
+    #[ignore = "a measurement: cargo test -p spark-desktop -- --ignored --nocapture"]
+    fn measure_what_one_new_message_sends() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = draft_account(&store).id;
+        let folders: Vec<spark_store::RemoteFolder> = ["Travel", "Receipts", "Projects"]
+            .into_iter()
+            .map(|name| spark_store::RemoteFolder {
+                remote_id: name.into(),
+                parent: None,
+                name: name.into(),
+                role: None,
+                selectable: true,
+            })
+            .collect();
+        store.replace_folders(account, &folders).unwrap();
+        let folder_ids: Vec<i64> = store.folders().unwrap().iter().map(|f| f.id).collect();
+        let message = |n: u32| spark_store::Incoming {
+            from_name: format!("Sender {}", n % 2_000),
+            from_address: format!("sender{}@d{}.test", n % 2_000, n % 50),
+            to: vec![
+                "Me <me@example.test>".into(),
+                format!("Other {} <o{}@x.test>", n % 300, n % 300),
+            ],
+            subject: format!(
+                "{}Quarterly planning notes, part {}",
+                if n.is_multiple_of(3) { "" } else { "Re: " },
+                n - n % 3
+            ),
+            snippet:
+                "Hi team, here are the notes from today's meeting. We agreed to move the launch \
+                      to next month and to review the budget on Friday."
+                    .into(),
+            in_reply_to: (!n.is_multiple_of(3)).then(|| format!("<{}@example.test>", n - 1)),
+            attachments: if n.is_multiple_of(7) {
+                vec![spark_store::Attachment {
+                    name: "notes.pdf".into(),
+                    mime: "application/pdf".into(),
+                    size: 120_000,
+                    remote_id: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            ..arrived(account, n)
+        };
+        store
+            .batch(|b| {
+                for n in 1..=50_000 {
+                    let m = message(n);
+                    b.add_incoming(&m, false)?;
+                    if n.is_multiple_of(5) {
+                        b.add_folder_message(folder_ids[n as usize % 3], &m)?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mark = changes_since(&store, None).unwrap().mark;
+        store.add_incoming(&message(50_001), true).unwrap();
+        // What `list_messages` sent.
+        let listed: Vec<Message> = store
+            .messages()
+            .unwrap()
+            .into_iter()
+            .map(from_store)
+            .collect();
+        let before = serde_json::to_vec(&listed).unwrap();
+        let after = changes_since(&store, mark).unwrap();
+        assert!(!after.full);
+        let after_bytes = serde_json::to_vec(&after).unwrap();
+        println!(
+            "before (list_messages): {} rows, {} bytes",
+            listed.len(),
+            before.len()
+        );
+        println!(
+            "after (message_changes): {} rows, {} gone, {} bytes",
+            after.messages.len(),
+            after.gone.len(),
+            after_bytes.len()
+        );
     }
 }

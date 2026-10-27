@@ -66,16 +66,16 @@ pub(crate) fn link(
         }
     }
     let target = found.first().map_or(id, |&first| first.min(id));
-    conn.execute(
-        "UPDATE messages SET conversation = ?1 WHERE id = ?2",
-        params![target, id],
-    )?;
+    // Kept prepared: every message stored gets here, and preparing a write
+    // to `messages` compiles its triggers too (`changes`).
+    conn.prepare_cached("UPDATE messages SET conversation = ?1 WHERE id = ?2")?
+        .execute(params![target, id])?;
     let merged: Vec<i64> = found.into_iter().filter(|&c| c != target).collect();
     for &from in &merged {
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE messages SET conversation = ?1 WHERE account_id = ?2 AND conversation = ?3",
-            params![target, account_id, from],
-        )?;
+        )?
+        .execute(params![target, account_id, from])?;
     }
     Ok((target, merged))
 }

@@ -119,6 +119,26 @@ export interface Message {
   inviteKind?: "invitation" | "reply" | "cancellation" | "proposal";
 }
 
+/** How far a read of the message list got, to ask `messageChanges` from. Only the app's backend reads it. */
+export interface MessageMark {
+  log: number;
+  seq: number;
+  elsewhere: number;
+}
+
+/**
+ * What changed in the message list since a mark: the changed messages that are listed, and the ids of those no
+ * longer listed. `full` when `messages` is every message instead: the first time, in the demo, and when the store
+ * can't tell what changed (after a restart, or spark-cli wrote).
+ */
+export interface MessageChanges {
+  full: boolean;
+  messages: Message[];
+  gone?: number[];
+  /** What to ask from next time; absent in the demo. */
+  mark?: MessageMark;
+}
+
 /** Mail scheduled with Send Later; `id` is its outbox id. */
 export interface ScheduledView {
   id: number;

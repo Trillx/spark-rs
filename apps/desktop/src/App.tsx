@@ -85,8 +85,8 @@ import {
   getPrioritySenders,
   listAccounts,
   listFolders,
-  listMessages,
   loadOlder,
+  messageChanges,
   onAccountsChanged,
   onAgentActivity,
   onAgentSending,
@@ -195,6 +195,7 @@ import {
   type PreviewFilter,
 } from "./lib/homeScreen";
 import { decidableDomain, domain, forSenders, predict } from "./lib/gatekeeper";
+import { coalesce, mailboxCopy } from "./lib/mailboxCopy";
 import { loadPriorityLines, savePriorityLines } from "./lib/priority";
 import {
   formatFullDate,
@@ -482,6 +483,20 @@ export default function App() {
   const [openId, setOpenId] = useState<number | null>(null);
   /** Which emails of the open conversation were unread when it opened: reading starts there. */
   const [openedUnread, setOpenedUnread] = useState<ReadonlySet<number>>(new Set());
+  /** The stored messages as last read, brought up to date by `reloadMessages` from what changed since. */
+  const [mailbox] = useState(mailboxCopy);
+  const shownMessages = useRef(messages);
+  shownMessages.current = messages;
+  /** One read at a time; asked meanwhile, it reads once more after. Resolves to the list as shown. */
+  const [refreshMessages] = useState(() =>
+    coalesce(async () => {
+      const next = mailbox.apply(await messageChanges(mailbox.mark), shownMessages.current);
+      setMessages(next);
+      setOpenId((id) => (id !== null && mailbox.get(id) ? id : null));
+      setSelectedId((id) => (id !== null && mailbox.get(id) ? id : null));
+      return next;
+    }),
+  );
   const [folders, setFolders] = useState<FolderView[]>([]);
   const [layout, setLayout] = useState<SidebarLayout>(loadLayout);
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() => (layout.locked ? "locked" : "rail"));
@@ -801,11 +816,10 @@ export default function App() {
     void reloadFolders();
     void getGatekeeperMode().then(setGatekeeperMode, () => {});
     void reloadPrioritySenders();
-    void Promise.all([listAccounts(), listMessages()]).then(
+    void Promise.all([listAccounts(), refreshMessages()]).then(
       ([loadedAccountList, loaded]) => {
         loadedAccounts.current = accountSet(loadedAccountList);
         setAccounts(loadedAccountList);
-        setMessages(loaded);
         const first = buildList(loaded, { ...INITIAL_VIEW, mode: loadInboxMode("all") }, new Set()).order[0];
         // Not on the Home Screen: opening an email there would show it over it, and read it.
         const home = homeShows(homeSettings, homeRef.current);
@@ -980,13 +994,17 @@ export default function App() {
 
   // ---- data ----
 
-  /** The list is scrolled near its end: bring in older mail, as Spark does. */
+  /**
+   * The list is scrolled near its end: bring in older mail, as Spark does. The accounts and folders aren't read
+   * again: a round that changes what they show (`hasOlder`, a folder's first sync) says so with its events, before
+   * `loadOlder` resolves. The sidebar counts come from the messages.
+   */
   function reachBack() {
     if (!older || reaching.current) return;
     reaching.current = true;
     setLoadingOlder(true);
     void loadOlder(older.accounts, older.folders)
-      .then(() => Promise.all([reloadMessages(), reloadAccounts(), reloadFolders()]))
+      .then(reloadMessages)
       .catch(() => {})
       .finally(() => {
         reaching.current = false;
@@ -1030,15 +1048,13 @@ export default function App() {
     void listReminders().then(setReminders, () => {});
   }
 
-  /** Reloads the list, keeping the cursor and open thread while their messages still exist. */
+  /**
+   * Brings the list up to date with the store from what changed since it was read, keeping the cursor and open
+   * thread while their messages still exist.
+   */
   function reloadMessages() {
-    return listMessages().then(
-      (loaded) => {
-        const ids = new Set(loaded.map((m) => m.id));
-        setMessages(loaded);
-        setOpenId((id) => (id !== null && ids.has(id) ? id : null));
-        setSelectedId((id) => (id !== null && ids.has(id) ? id : null));
-      },
+    return refreshMessages().then(
+      () => {},
       (error) => showToast(`Couldn't load your mail: ${String(error)}`, undefined, ICONS.error),
     );
   }
@@ -1425,10 +1441,9 @@ export default function App() {
 
   /** A notification was clicked: show its message in the Inbox, closing what covers it. */
   function openFromNotification(id: number) {
-    void listMessages().then(
+    void refreshMessages().then(
       (loaded) => {
-        setMessages(loaded);
-        const m = loaded.find((x) => x.id === id);
+        const m = mailbox.get(id);
         if (!m) return;
         setSettingsPage(null);
         setPalette(null);

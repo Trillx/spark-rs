@@ -25,7 +25,9 @@ import type {
   InviteCard,
   InvitePerson,
   Message,
+  MessageChanges,
   MessageContent,
+  MessageMark,
   MessagePatch,
   OutgoingDraft,
   PopupMeeting,
@@ -168,10 +170,11 @@ export function syncNow(): Promise<void> {
 
 // ---- messages ----
 
-export function listMessages(): Promise<Message[]> {
-  if (isTauri()) return invoke("list_messages");
+/** What changed in the message list since `since` (null: read every message); see `MessageChanges`. */
+export function messageChanges(since: MessageMark | null): Promise<MessageChanges> {
+  if (isTauri()) return invoke("message_changes", { since });
   wakeSnoozed();
-  return Promise.resolve(structuredClone(browserMailbox));
+  return Promise.resolve({ full: true, messages: structuredClone(browserMailbox) });
 }
 
 /**
@@ -1002,7 +1005,7 @@ function on<T>(event: string, handler: (payload: T) => void, ready?: () => void)
   return () => void stop.then((unlisten) => unlisten());
 }
 
-/** Messages were added, changed or removed: reload `listMessages`. */
+/** Messages were added, changed or removed: ask `messageChanges`. */
 export const onMailboxChanged = (handler: () => void) => on<null>("mailbox-changed", handler);
 
 /** The folder list changed, or a folder synced for the first time: reload `listFolders`. */

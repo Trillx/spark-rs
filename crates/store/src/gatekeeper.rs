@@ -514,11 +514,11 @@ pub(crate) fn arrival(
 /// mail waiting there changes: a decision would have moved it already.
 /// (Through the sender index: a first sync gets here for most senders.)
 fn release(conn: &Connection, address: &str) -> Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE messages SET screening = 0
          WHERE account_id IN (SELECT id FROM accounts) AND from_address = ?1 AND screening = 1",
-        [address],
-    )?;
+    )?
+    .execute([address])?;
     Ok(())
 }
 

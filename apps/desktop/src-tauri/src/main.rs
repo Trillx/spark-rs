@@ -81,7 +81,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             mailbox::list_accounts,
-            mailbox::list_messages,
+            mailbox::message_changes,
             mailbox::search_messages,
             mailbox::search_servers,
             mailbox::suggest_contacts,

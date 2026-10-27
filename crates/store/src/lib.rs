@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 mod calendar;
+mod changes;
 mod contacts;
 mod conversations;
 mod drafts;
@@ -29,6 +30,7 @@ mod signatures;
 mod templates;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
+pub use changes::{Changes, Mark};
 pub use contacts::Contact;
 pub use drafts::{DraftCopy, DraftFile, DraftRemoval, DraftSave, DraftUpload, SavedFile};
 pub use gatekeeper::{
@@ -433,6 +435,8 @@ pub struct Store {
     conn: Connection,
     /// Who to suggest as a recipient, kept between queries (see `contacts`).
     people: RefCell<Option<contacts::People>>,
+    /// Names this opening's log of changed messages (see `changes`).
+    log: i64,
 }
 
 /// Sync writes that commit together, so a fetched chunk or page of mail
@@ -654,6 +658,9 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      (SELECT remind_at FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
      json_extract(invite, '$.kind')";
 
+/// The messages the list shows: all but drafts waiting in the outbox to be sent.
+const LISTED: &str = "id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)";
+
 const FOLDER_COLUMNS: &str = "f.id, f.account_id, f.remote_id, p.id, f.name, f.role, f.selectable, \
      f.sync_state, f.synced_at";
 
@@ -819,9 +826,11 @@ impl Store {
             tx.commit()?;
         }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
+        conn.execute_batch(&changes::WATCH_MESSAGES)?;
         Ok(Self {
             conn,
             people: RefCell::default(),
+            log: changes::new_log(),
         })
     }
 
@@ -1027,13 +1036,11 @@ impl Store {
 
     // ---- reading ----
 
-    /// Every message, newest first, without bodies. Drafts waiting in the
-    /// outbox to be sent aren't listed.
+    /// Every message, newest first (then in the order stored), without
+    /// bodies. Drafts waiting in the outbox to be sent aren't listed.
     pub fn messages(&self) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages
-             WHERE id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
-             ORDER BY date DESC"
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE {LISTED} ORDER BY date DESC, id"
         ))?;
         stmt.query_map([], message_row)?.collect()
     }
