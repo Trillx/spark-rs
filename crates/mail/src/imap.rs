@@ -165,6 +165,23 @@ pub struct SyncState {
     /// How much of each message reaching back asks the server for.
     #[serde(default)]
     pub heads: Heads,
+    /// The inbox as the last sync that left nothing to fetch found it
+    /// (`sync_inbox`). Until that changes, nothing came into the inbox or
+    /// left it, so a sync needn't list it from the floor up again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<Seen>,
+}
+
+/// What a sync found of the inbox (`SyncState::seen`): its UIDNEXT and how
+/// many messages it held as it was selected, and the floor then. Mail that
+/// comes in takes a UID and so moves UIDNEXT; mail that leaves lowers the
+/// count. With both as they were, the inbox is as it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Seen {
+    pub uid_next: u32,
+    pub exists: u32,
+    pub floor: u32,
 }
 
 /// How much of each message reaching back asks for: it comes without its
@@ -924,10 +941,12 @@ pub async fn sync_inbox(
         state.floor = None;
         state.modseq = None;
         state.window = None;
+        state.seen = None;
         state.reply_to_pending.clear();
     }
 
     let first = state.floor.is_none();
+    let known = lock(store).uids(account_id, INBOX)?;
     let (floor, present, complete) = match state.floor {
         Some(floor) => {
             // Mail only ever comes in above the floor (UIDs only grow), so
@@ -936,12 +955,7 @@ pub async fn sync_inbox(
                 || lowest_uid(session, mailbox.exists)
                     .await?
                     .is_none_or(|lowest| lowest >= floor);
-            // "floor:*" also matches the newest message if that's below it.
-            let present: HashSet<u32> = uid_search(session, format!("UID {floor}:*"))
-                .await?
-                .into_iter()
-                .filter(|uid| *uid >= floor)
-                .collect();
+            let present = present_from(session, &mailbox, state.seen, floor, &known).await?;
             (floor, present, complete)
         }
         // The newest messages, by sequence number.
@@ -969,7 +983,6 @@ pub async fn sync_inbox(
             (floor, present, mailbox.exists <= limit)
         }
     };
-    let known = lock(store).uids(account_id, INBOX)?;
 
     let mut new: Vec<u32> = present.difference(&known).copied().collect();
     new.sort_unstable();
@@ -1038,7 +1051,54 @@ pub async fn sync_inbox(
     }
     state.floor = Some(floor);
     state.complete = complete;
+    // Mail the server wouldn't give is to be asked for again.
+    state.seen = match mailbox.uid_next {
+        Some(uid_next) if report.skipped == 0 => Some(Seen {
+            uid_next,
+            exists: mailbox.exists,
+            floor,
+        }),
+        _ => None,
+    };
     Ok(report)
+}
+
+/// The inbox's UIDs from the floor up, `mailbox` as selected now. If the
+/// last sync (`seen`) left nothing to fetch and nothing came or went since,
+/// they're the ones stored (`known`), and the server isn't asked. If mail
+/// only came (as many more messages as UIDs taken), only for the new ones.
+/// Otherwise, for all of them: with a year of mail, hundreds of kilobytes.
+async fn present_from(
+    session: &mut Session,
+    mailbox: &async_imap::types::Mailbox,
+    seen: Option<Seen>,
+    floor: u32,
+    known: &HashSet<u32>,
+) -> Result<HashSet<u32>> {
+    let stored = || -> HashSet<u32> { known.iter().copied().filter(|uid| *uid >= floor).collect() };
+    let from = match (seen, mailbox.uid_next) {
+        (Some(seen), Some(uid_next)) if seen.floor == floor => {
+            let came = uid_next.checked_sub(seen.uid_next);
+            let grew = mailbox.exists.checked_sub(seen.exists);
+            match (came, grew) {
+                (Some(0), Some(0)) => return Ok(stored()),
+                (Some(came), Some(grew)) if came == grew => Some(seen.uid_next),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let start = from.unwrap_or(floor);
+    // "start:*" also matches the newest message if that's below it.
+    let mut present: HashSet<u32> = uid_search(session, format!("UID {start}:*"))
+        .await?
+        .into_iter()
+        .filter(|uid| *uid >= start)
+        .collect();
+    if from.is_some() {
+        present.extend(stored());
+    }
+    Ok(present)
 }
 
 /// Reaches further back in the inbox: fetches the newest `OLDER_STEP`

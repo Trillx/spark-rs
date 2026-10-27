@@ -718,6 +718,7 @@ fn headers_asked_once(tallies: &[(&str, Tally)]) {
 async fn inbox_polls_without_condstore() {
     let tallies = inbox_scenarios(false).await;
     headers_asked_once(&tallies);
+    // Nothing came or went: the tracked UIDs aren't listed again.
     let quiet = &tallies[1].1.commands;
     assert_eq!(
         quiet,
@@ -725,9 +726,15 @@ async fn inbox_polls_without_condstore() {
             "CAPABILITY",
             "SELECT \"INBOX\"",
             "FETCH 1 (UID)",
-            "UID SEARCH UID 6003:*",
             "UID FETCH 6003:* (UID FLAGS)"
         ]
+    );
+    // Mail went: they are. Mail came: only the new ones are.
+    assert!(tallies[3].1.asked("UID SEARCH UID 6003:*"));
+    assert!(
+        tallies[4]
+            .1
+            .asked(&format!("UID SEARCH UID {}:*", ON_SERVER * SPACING + 1))
     );
     let k = TRACKED as usize;
     check(
@@ -737,11 +744,11 @@ async fn inbox_polls_without_condstore() {
             // CAPABILITY (for CONDSTORE, every poll), the lowest UID, the
             // tracked UIDs, their headers, their flags.
             ("old cache, first poll", 7, 1 + k + k + k),
-            ("quiet poll", 5, 1 + k + k),
-            ("one flag change", 5, 1 + k + k),
+            ("quiet poll", 4, 1 + k),
+            ("one flag change", 4, 1 + k),
             ("one expunge", 5, 1 + (k - 1) + (k - 1)),
-            // The new one's size and body, and its flags with the rest.
-            ("one arrival", 7, 1 + k + 2 + k),
+            // The new one's UID, size and body, and its flags with the rest.
+            ("one arrival", 7, 1 + 1 + 2 + k),
             // Two searches below the floor (200 UIDs and 400, a third of
             // them in the inbox) and 100 heads, without their bodies.
             ("one older page", 5, 1 + 200 + OLDER_STEP),
@@ -761,7 +768,7 @@ async fn inbox_polls_with_condstore() {
     assert_eq!(first[..2], ["CAPABILITY", "SELECT \"INBOX\" (CONDSTORE)"]);
     let quiet = &tallies[1].1.commands;
     assert_eq!(quiet[0], "SELECT \"INBOX\" (CONDSTORE)");
-    assert!(quiet[3].starts_with("UID FETCH 6003:* (UID FLAGS) (CHANGEDSINCE "));
+    assert!(quiet[2].starts_with("UID FETCH 6003:* (UID FLAGS) (CHANGEDSINCE "));
     let k = TRACKED as usize;
     check(
         "with CONDSTORE",
@@ -770,10 +777,10 @@ async fn inbox_polls_with_condstore() {
             // As without; then, with a modseq kept, no more CAPABILITY.
             ("old cache, first poll", 7, 1 + k + k + k),
             // Flags only of what changed.
-            ("quiet poll", 4, 1 + k),
-            ("one flag change", 4, 1 + k + 1),
+            ("quiet poll", 3, 1),
+            ("one flag change", 3, 1 + 1),
             ("one expunge", 4, 1 + (k - 1)),
-            ("one arrival", 6, 1 + k + 2 + 1),
+            ("one arrival", 6, 1 + 1 + 2 + 1),
             ("one older page", 5, 1 + 200 + OLDER_STEP),
             ("UIDVALIDITY change", 26, 3 * FIRST_SYNC_LIMIT),
         ],
@@ -1036,10 +1043,41 @@ async fn a_refused_lowest_uid_check_leaves_the_inbox_incomplete() {
 #[tokio::test]
 async fn a_refused_search_takes_no_mail_for_gone() {
     let mut cached = Cached::synced(false).await;
+    // Mail left, so the sync lists what's there.
+    cached.stand_in.with(INBOX, |b| b.expunge(ON_SERVER - 1));
     cached.refused("UID SEARCH UID", "NO", false).await;
     let report = cached.sync().await.unwrap();
-    assert_eq!(report.gone, 0);
-    assert_eq!(cached.in_inbox(), TRACKED as usize);
+    assert_eq!(report.gone, 1);
+    assert_eq!(cached.in_inbox(), TRACKED as usize - 1);
+}
+
+/// Mail that came as other mail went leaves the count as it was, but not
+/// UIDNEXT: the sync lists the inbox whole, and sees both.
+#[tokio::test]
+async fn mail_that_comes_as_other_mail_goes_is_seen() {
+    let mut cached = Cached::synced(true).await;
+    cached.stand_in.with(INBOX, |b| {
+        b.expunge(ON_SERVER - 1);
+        b.arrive(ON_SERVER + 1);
+    });
+    let report = cached.sync().await.unwrap();
+    assert_eq!((report.new.len(), report.gone), (1, 1), "{report:?}");
+    assert!(cached.stand_in.take_tally().asked("UID SEARCH UID 6003:*"));
+    // Then nothing came or went: it isn't listed again.
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report, SyncReport::default());
+    assert!(!cached.stand_in.take_tally().asked("UID SEARCH"));
+    // Reaching back lowers the floor: the next sync lists it from there.
+    cached.older().await.unwrap();
+    cached.stand_in.take_tally();
+    cached.sync().await.unwrap();
+    let floor = cached.state.floor.unwrap();
+    assert!(
+        cached
+            .stand_in
+            .take_tally()
+            .asked(&format!("UID SEARCH UID {floor}:*"))
+    );
 }
 
 /// The modseq stays put when CHANGEDSINCE is refused, so the next sync
