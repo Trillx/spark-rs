@@ -5,6 +5,7 @@ import { cssIsRemote, isRemoteUrl, srcsetIsRemote } from "../lib/remoteImages";
 import { cidKey } from "../lib/richText";
 import { useDarkTheme } from "../lib/theme";
 import type { InlineImages } from "../types";
+import { ImageViewer, type ViewedImage } from "./ImageViewer";
 
 // Email HTML is untrusted. It renders in an iframe sandboxed without
 // `allow-scripts` (so nothing in it runs, submits or opens windows) under its
@@ -17,6 +18,7 @@ import type { InlineImages } from "../types";
 // `emailScheme`): in its own dark design if it has one, on a white sheet if
 // it's built to stay light, and otherwise with its colors adapted to the dark
 // card (`adaptColors`). A reply's quote of earlier mail folds behind "•••".
+// Double-clicking a picture opens it in the viewer (`ImageViewer`).
 
 /** A runaway layout (e.g. `100vh` content) stops growing here. */
 const MAX_FRAME_HEIGHT = 50_000;
@@ -144,7 +146,7 @@ function linkify(text: string): ReactNode[] {
  * images show once `inlineImages` has them; until then they're blank. While
  * `remoteImages` is off, an email that loads anything from the web gets the
  * bar to show it or open the setting. A reply's quote folds away unless
- * `quotes` is off.
+ * `quotes` is off. Double-clicking a picture opens it over the window.
  */
 export function HtmlBody({
   html,
@@ -186,6 +188,7 @@ export function HtmlBody({
   const quoteShownRef = useRef(quoteShown);
   quoteShownRef.current = quoteShown;
   const wiredRef = useRef<{ doc: Document; measure: () => void } | null>(null);
+  const [viewing, setViewing] = useState<{ images: ViewedImage[]; start: number } | null>(null);
 
   useEffect(() => {
     const frameEl = frameRef.current;
@@ -211,12 +214,16 @@ export function HtmlBody({
         const remote = showsRemote(doc);
         setShown((s) => (s?.frame === frame && s.remote === remote ? s : { frame, remote }));
       };
-      [measure, unwire] = wireFrame(doc, (h) => {
-        const capped = Math.min(h, MAX_FRAME_HEIGHT);
-        if (kept) kept.height = capped;
-        setHeight(capped);
-        check();
-      });
+      [measure, unwire] = wireFrame(
+        doc,
+        (h) => {
+          const capped = Math.min(h, MAX_FRAME_HEIGHT);
+          if (kept) kept.height = capped;
+          setHeight(capped);
+          check();
+        },
+        (images, start) => setViewing({ images, start }),
+      );
       wiredRef.current = { doc, measure };
       showQuote(doc, quoteShownRef.current);
       const card = frame.adapt;
@@ -277,6 +284,7 @@ export function HtmlBody({
         />
       </div>
       {frame.quoted && <QuoteToggle shown={quoteShown} onToggle={toggleQuote} />}
+      {viewing && <ImageViewer images={viewing.images} start={viewing.start} onClose={() => setViewing(null)} />}
     </>
   );
 }
@@ -667,11 +675,32 @@ function cssColor({ r, g, b }: Rgb) {
 }
 
 /**
- * Sizes the frame to its document and routes its clicks and keys to the app.
+ * A picture the viewer can open: loaded (an embedded one that hasn't arrived,
+ * or a blocked one from the web, hasn't), shown, more than a spacer, and not
+ * a link, which a click opens instead.
+ */
+function viewable(img: HTMLImageElement) {
+  return (
+    img.complete &&
+    img.naturalWidth > 2 &&
+    img.naturalHeight > 2 &&
+    /^(?:data|https?):/i.test(img.currentSrc) &&
+    !img.closest("a[href]") &&
+    img.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+  );
+}
+
+/**
+ * Sizes the frame to its document and routes its clicks and keys to the app,
+ * and a double-clicked picture to `openImage` with the others it shows.
  * Returns [measure, unwire]. Listeners added from here run even though the
  * frame can't run scripts of its own.
  */
-function wireFrame(doc: Document, setHeight: (height: number) => void): [() => void, () => void] {
+function wireFrame(
+  doc: Document,
+  setHeight: (height: number) => void,
+  openImage: (images: ViewedImage[], start: number) => void,
+): [() => void, () => void] {
   const root = doc.documentElement;
   /** Forwarded events start at the <iframe>, as if the frame were part of the page. */
   const host = doc.defaultView?.frameElement ?? document.body;
@@ -710,6 +739,18 @@ function wireFrame(doc: Document, setHeight: (height: number) => void): [() => v
   };
   // Open menus close on an outside pointerdown, which a click in the frame wouldn't send.
   const onPointer = () => host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  const onDoubleClick = (e: MouseEvent) => {
+    const target = e.target as Element | null;
+    if (target?.tagName !== "IMG" || !viewable(target as HTMLImageElement)) return;
+    e.preventDefault();
+    // The double click selected the picture.
+    doc.getSelection()?.removeAllRanges();
+    const images = [...doc.images].filter(viewable);
+    openImage(
+      images.map((img) => ({ src: img.currentSrc, alt: img.alt.trim() })),
+      images.indexOf(target as HTMLImageElement),
+    );
+  };
 
   // Image load/error events don't bubble, but they do pass the document while capturing.
   doc.addEventListener("load", measure, true);
@@ -718,6 +759,7 @@ function wireFrame(doc: Document, setHeight: (height: number) => void): [() => v
   doc.addEventListener("auxclick", onClick);
   doc.addEventListener("keydown", onKey);
   doc.addEventListener("pointerdown", onPointer);
+  doc.addEventListener("dblclick", onDoubleClick);
   measure();
 
   return [
@@ -730,6 +772,7 @@ function wireFrame(doc: Document, setHeight: (height: number) => void): [() => v
       doc.removeEventListener("auxclick", onClick);
       doc.removeEventListener("keydown", onKey);
       doc.removeEventListener("pointerdown", onPointer);
+      doc.removeEventListener("dblclick", onDoubleClick);
     },
   ];
 }
