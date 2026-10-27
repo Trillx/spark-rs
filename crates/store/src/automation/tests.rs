@@ -336,6 +336,34 @@ fn with_drafts_folder(store: &mut Store, account: i64) {
         .unwrap();
 }
 
+/// Saves draft `id` again with `text`, as the composer would.
+fn resave(store: &mut Store, account: i64, id: i64, text: &str) {
+    store
+        .save_draft(
+            Some(id),
+            &DraftSave {
+                account_id: account,
+                draft: "{}",
+                send_later: None,
+                from_name: "Me",
+                from_address: "me@example.com",
+                to: &["a@x.com".to_owned()],
+                cc: &[],
+                bcc: &[],
+                subject: "Re: Message 1",
+                snippet: text,
+                text,
+                html: None,
+                in_reply_to: Some("1@example.com"),
+                references: None,
+                attachments: &[],
+                files: &[],
+            },
+            NOW,
+        )
+        .unwrap();
+}
+
 fn save_reply(store: &mut Store, account: i64, in_reply_to: &str, text: &str) -> i64 {
     store
         .save_draft(
@@ -397,7 +425,12 @@ fn auto_drafts_show_on_the_email_they_reply_to() {
     // Untouched: cleaned up after the period. Edited: kept.
     assert_eq!(store.untouched_auto_drafts(NOW + 1).unwrap(), [draft]);
     assert!(store.untouched_auto_drafts(NOW).unwrap().is_empty());
+    // Another option picked: saved saying it, and still untouched.
+    resave(&mut store, account, draft, "I can't make it.");
     assert!(store.auto_draft_chosen(draft, 1).unwrap());
+    assert_eq!(store.auto_draft(draft).unwrap().unwrap().chosen, 1);
+    assert_eq!(store.untouched_auto_drafts(NOW + 1).unwrap(), [draft]);
+    resave(&mut store, account, draft, "I can't make it, sorry.");
     assert!(store.untouched_auto_drafts(NOW + 1).unwrap().is_empty());
     assert!(store.auto_draft_chosen(draft, 5).is_err());
 
@@ -487,6 +520,133 @@ fn a_removed_account_leaves_the_settings() {
         })
         .unwrap();
     assert!(!store.automation_settings().unwrap().labels(again.id));
+}
+
+#[test]
+fn cleanup_keeps_a_draft_the_user_added_to() {
+    let (mut store, account) = store();
+    with_drafts_folder(&mut store, account);
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let options = vec![DraftOption {
+        title: String::new(),
+        body: "Tuesday works.".into(),
+    }];
+    let draft = save_reply(
+        &mut store,
+        account,
+        "1@example.com",
+        "Tuesday works.\n\n-- \nMe",
+    );
+    store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
+    assert_eq!(store.untouched_auto_drafts(NOW + 1).unwrap(), [draft]);
+    // Added to, the start still matches: it's edited all the same.
+    resave(
+        &mut store,
+        account,
+        draft,
+        "Tuesday works. Please bring the signed contract.\n\n-- \nMe",
+    );
+    assert!(store.untouched_auto_drafts(NOW + 1).unwrap().is_empty());
+}
+
+#[test]
+fn a_label_the_user_took_off_stays_off() {
+    let (mut store, account) = store();
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - DAY));
+    let settings = on(account);
+    store.set_automation_settings(&settings).unwrap();
+    let news = Verdict {
+        label: Some(AutoLabel::News),
+        needs_reply: false,
+    };
+    store
+        .record_verdict(id, news, &settings, true, NOW)
+        .unwrap();
+    assert!(store.set_auto_label(id, None, true).unwrap());
+    assert_eq!(store.auto_label(id).unwrap(), None);
+    // Labels off and on again: the past week is labeled, but not this one.
+    store
+        .set_automation_settings(&AutomationSettings::default())
+        .unwrap();
+    store.set_automation_settings(&settings).unwrap();
+    assert_eq!(store.auto_label(id).unwrap(), None);
+    // A verdict recorded again doesn't bring it back either.
+    store
+        .record_verdict(id, news, &settings, true, NOW)
+        .unwrap();
+    assert_eq!(store.auto_label(id).unwrap(), None);
+    assert!(
+        store
+            .label_pushes(account)
+            .unwrap()
+            .iter()
+            .all(|p| !p.adding)
+    );
+    // Still the user's to give one.
+    assert!(
+        store
+            .set_auto_label(id, Some(AutoLabel::Fyi), true)
+            .unwrap()
+    );
+    assert_eq!(store.auto_label(id).unwrap(), Some(AutoLabel::Fyi));
+}
+
+#[test]
+fn turning_labels_on_leaves_deleted_mail_alone() {
+    let (mut store, account) = store();
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - DAY));
+    let drafts_only = AutomationSettings {
+        draft_accounts: [(account, NOW)].into(),
+        ..Default::default()
+    };
+    store.set_automation_settings(&drafts_only).unwrap();
+    let news = Verdict {
+        label: Some(AutoLabel::News),
+        needs_reply: false,
+    };
+    store
+        .record_verdict(id, news, &drafts_only, true, NOW)
+        .unwrap();
+    store
+        .update(
+            id,
+            &crate::Patch {
+                state: Some(crate::MessageState::Deleted),
+                ..Default::default()
+            },
+            NOW,
+        )
+        .unwrap();
+    store.set_automation_settings(&on(account)).unwrap();
+    assert_eq!(store.auto_label(id).unwrap(), None);
+    assert!(!store.has_label_work(account).unwrap());
+}
+
+#[test]
+fn the_label_queue_is_read_from_the_queue_not_the_mailbox() {
+    let (store, account) = store();
+    for query in [LABEL_WORK, LABEL_PUSHES] {
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map([account], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        let table = plan
+            .iter()
+            .find(|p| {
+                ["SCAN p", "SEARCH p", "SCAN m", "SEARCH m"]
+                    .iter()
+                    .any(|t| p.starts_with(t))
+            })
+            .unwrap();
+        assert!(
+            table.starts_with("SCAN p"),
+            "starts from the queue: {plan:?}"
+        );
+    }
 }
 
 #[test]

@@ -1197,26 +1197,48 @@ impl Graph {
     }
 
     /// Message `id`'s Outlook categories.
-    pub async fn categories(&self, id: &str) -> Result<Vec<String>> {
+    /// Message `id`'s Outlook categories, with the version of the message
+    /// they're from (its ETag) for `set_categories`.
+    pub async fn categories(&self, id: &str) -> Result<(Vec<String>, Option<String>)> {
         #[derive(Deserialize)]
         struct Categories {
             #[serde(default)]
             categories: Vec<String>,
+            #[serde(rename = "@odata.etag")]
+            etag: Option<String>,
         }
         let url = format!("/me/messages/{}?$select=categories", path(id));
         let found: Categories = self
             .json_patiently(|| self.request(Method::GET, &url))
             .await?;
-        Ok(found.categories)
+        Ok((found.categories, found.etag))
     }
 
-    /// Gives message `id` these Outlook categories, in place of its own.
-    pub async fn set_categories(&self, id: &str, categories: &[String]) -> Result<()> {
+    /// Gives message `id` these Outlook categories in place of its own, if
+    /// it's still at `version`. Returns false when it changed meanwhile
+    /// (another app added a category, say): read it again and redo.
+    pub async fn set_categories(
+        &self,
+        id: &str,
+        categories: &[String],
+        version: Option<&str>,
+    ) -> Result<bool> {
         let url = format!("/me/messages/{}", path(id));
         let body = json!({ "categories": categories });
-        self.send_patiently(|| self.request(Method::PATCH, &url).json(&body))
+        let response = self
+            .answered_patiently(|| {
+                let request = self.request(Method::PATCH, &url).json(&body);
+                match version {
+                    Some(version) => request.header("If-Match", version),
+                    None => request,
+                }
+            })
             .await?;
-        Ok(())
+        if response.status() == StatusCode::PRECONDITION_FAILED {
+            return Ok(false);
+        }
+        checked(response).await?;
+        Ok(true)
     }
 
     /// Deletes a folder with its subfolders (Outlook keeps them in Deleted Items).
@@ -2742,6 +2764,7 @@ pub(crate) mod tests {
         pub(crate) prefer: Vec<String>,
         pub(crate) at: std::time::Instant,
         pub(crate) body: String,
+        pub(crate) if_match: Option<String>,
     }
 
     /// A stand-in's answer: its status (0 drops the connection unanswered),
@@ -2834,10 +2857,13 @@ pub(crate) mod tests {
                     let method = first.next().unwrap_or_default().to_owned();
                     let path = first.next().unwrap_or("/").to_owned();
                     let mut prefer = Vec::new();
+                    let mut if_match = None;
                     let mut length = 0;
                     for (name, value) in lines.filter_map(|l| l.split_once(':')) {
                         if name.eq_ignore_ascii_case("prefer") {
                             prefer.push(value.trim().to_owned());
+                        } else if name.eq_ignore_ascii_case("if-match") {
+                            if_match = Some(value.trim().to_owned());
                         } else if name.eq_ignore_ascii_case("content-length") {
                             length = value.trim().parse().unwrap_or(0);
                         }
@@ -2855,6 +2881,7 @@ pub(crate) mod tests {
                         prefer,
                         at: std::time::Instant::now(),
                         body: String::from_utf8_lossy(&buf[end..end + length]).into_owned(),
+                        if_match,
                     };
                     let attempt = {
                         let mut attempts = seen.attempts.lock().unwrap();

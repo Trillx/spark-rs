@@ -1970,7 +1970,7 @@ fn uid_is_current(
 
 /// The newest message in `mailbox` with exactly `p`'s Message-ID, leaving
 /// the mailbox selected. `None` if it isn't there or the mailbox is gone.
-async fn search(
+pub(crate) async fn search(
     session: &mut Session,
     mailbox: &str,
     p: &Pending,

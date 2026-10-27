@@ -17,6 +17,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, Store, json, now_ms, refused};
 
+/// Account `?1`'s queued labels. The queue is short and the account's mail
+/// isn't: CROSS JOIN keeps SQLite reading the queue, not the mailbox.
+pub(crate) const LABEL_PUSHES: &str = "SELECT p.message_id, p.name, p.adding FROM label_pushes p
+     CROSS JOIN messages m ON m.id = p.message_id
+     WHERE m.account_id = ?1 ORDER BY p.rowid";
+
+/// Whether account `?1` has queued labels, read the same way.
+pub(crate) const LABEL_WORK: &str = "SELECT EXISTS (SELECT 1 FROM label_pushes p
+     CROSS JOIN messages m ON m.id = p.message_id WHERE m.account_id = ?1)";
+
+/// What `auto_labels` keeps for an email whose label the user took off:
+/// none shows, and inbox automation doesn't give it one again.
+const TAKEN_OFF: &str = "";
+
 /// For a query about email `?1`: `o`, the email (its account, its
 /// conversation `c`, its date), and `members`, the ids of its conversation's
 /// emails. Looked up by account and conversation, as indexed; the email a
@@ -378,8 +392,8 @@ impl Store {
         let mut changed = false;
         if let (Some(account), Some(label)) = (account, verdict.label)
             && settings.applies(account, label)
-            // A label the user chose stays.
-            && label_of(&tx, id)?.is_none()
+            // A label the user chose, or took off, stays as they left it.
+            && !has_label_row(&tx, id)?
         {
             changed = set_label(&tx, id, Some(label), push)?;
         }
@@ -439,8 +453,8 @@ impl Store {
     }
 
     /// Shows `label` on an email instead of the one it has (`None` takes it
-    /// off), as the user chose. With `push` the server's copy follows.
-    /// Returns whether anything changed.
+    /// off), as the user chose: inbox automation leaves it that way. With
+    /// `push` the server's copy follows. Returns whether anything changed.
     pub fn set_auto_label(
         &mut self,
         id: i64,
@@ -457,6 +471,13 @@ impl Store {
             return Err(refused("That email is gone."));
         }
         let changed = set_label(&tx, id, label, push)?;
+        if label.is_none() {
+            tx.execute(
+                "INSERT INTO auto_labels (message_id, label) VALUES (?1, ?2)
+                 ON CONFLICT (message_id) DO UPDATE SET label = excluded.label",
+                params![id, TAKEN_OFF],
+            )?;
+        }
         tx.commit()?;
         Ok(changed)
     }
@@ -492,11 +513,7 @@ impl Store {
 
     /// Labels waiting to go to account `account_id`'s server.
     pub fn label_pushes(&self, account_id: i64) -> Result<Vec<LabelPush>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT p.message_id, p.name, p.adding FROM label_pushes p
-             JOIN messages m ON m.id = p.message_id
-             WHERE m.account_id = ?1 ORDER BY p.rowid",
-        )?;
+        let mut stmt = self.conn.prepare_cached(LABEL_PUSHES)?;
         stmt.query_map([account_id], |r| {
             Ok(LabelPush {
                 message_id: r.get(0)?,
@@ -507,13 +524,11 @@ impl Store {
         .collect()
     }
 
+    /// Asked on every sync round, mostly with nothing queued.
     pub fn has_label_work(&self, account_id: i64) -> Result<bool> {
-        self.conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM label_pushes p JOIN messages m ON m.id = p.message_id
-                            WHERE m.account_id = ?1)",
-            [account_id],
-            |r| r.get(0),
-        )
+        self.conn
+            .prepare_cached(LABEL_WORK)?
+            .query_row([account_id], |r| r.get(0))
     }
 
     /// The server has `push` now, or can't take it: it's off the queue,
@@ -526,8 +541,8 @@ impl Store {
         Ok(())
     }
 
-    /// Keeps a draft inbox automation wrote, replying to `message_id`;
-    /// `chosen` is the option it says.
+    /// Keeps a draft inbox automation wrote, replying to `message_id`, once
+    /// it's saved; `chosen` is the option it says.
     pub fn add_auto_draft(
         &self,
         draft_id: i64,
@@ -536,10 +551,7 @@ impl Store {
         chosen: usize,
         now: i64,
     ) -> Result<()> {
-        let written = options
-            .get(chosen)
-            .map(|o| o.body.as_str())
-            .unwrap_or_default();
+        let written = saved_text(&self.conn, draft_id)?;
         self.conn.execute(
             "INSERT INTO auto_drafts (draft_id, message_id, options, chosen, written, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -551,7 +563,7 @@ impl Store {
                 message_id,
                 json(options),
                 chosen as i64,
-                normalized(written),
+                written,
                 now
             ],
         )?;
@@ -582,23 +594,24 @@ impl Store {
             .optional()
     }
 
-    /// The draft says option `chosen` now, as written.
+    /// The draft was saved saying option `chosen`: what it says now is what
+    /// it was written as.
     pub fn auto_draft_chosen(&self, draft_id: i64, chosen: usize) -> Result<bool> {
         let Some(draft) = self.auto_draft(draft_id)? else {
             return Ok(false);
         };
-        let Some(option) = draft.options.get(chosen) else {
+        if chosen >= draft.options.len() {
             return Err(refused("That draft has no such option."));
-        };
+        }
         self.conn.execute(
             "UPDATE auto_drafts SET chosen = ?2, written = ?3 WHERE draft_id = ?1",
-            params![draft_id, chosen as i64, normalized(&option.body)],
+            params![draft_id, chosen as i64, saved_text(&self.conn, draft_id)?],
         )?;
         Ok(true)
     }
 
-    /// Auto-drafts written before `before` that still say what they were
-    /// written with, for the cleanup: drafts the user edited stay.
+    /// Auto-drafts written before `before` that still say exactly what they
+    /// were written with, for the cleanup: drafts the user edited stay.
     pub fn untouched_auto_drafts(&self, before: i64) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT a.draft_id, a.written, m.text_body FROM auto_drafts a
@@ -616,7 +629,7 @@ impl Store {
         let mut untouched = Vec::new();
         for row in rows {
             let (id, written, text) = row?;
-            if normalized(&text).starts_with(&written) {
+            if normalized(&text) == written {
                 untouched.push(id);
             }
         }
@@ -785,6 +798,16 @@ fn settings(conn: &Connection) -> Result<AutomationSettings> {
         .unwrap_or_default())
 }
 
+/// Whether email `id` has a label the user or AI gave it, or one the user
+/// took off.
+fn has_label_row(conn: &Connection, id: i64) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM auto_labels WHERE message_id = ?1)",
+        [id],
+        |r| r.get(0),
+    )
+}
+
 fn label_of(conn: &Connection, id: i64) -> Result<Option<AutoLabel>> {
     let label: Option<String> = conn
         .query_row(
@@ -839,6 +862,7 @@ fn apply_checked(
             "SELECT m.id, c.label, a.kind FROM automation_checked c
              JOIN messages m ON m.id = c.message_id JOIN accounts a ON a.id = m.account_id
              WHERE m.account_id = ?1 AND m.date >= ?2 AND c.label IS NOT NULL
+               AND m.state NOT IN ('deleted', 'blocked')
                AND NOT EXISTS (SELECT 1 FROM auto_labels l WHERE l.message_id = m.id)",
         )?;
         stmt.query_map(params![account_id, since], |r| {
@@ -864,6 +888,16 @@ fn auto_draft_row(r: &rusqlite::Row) -> Result<AutoDraft> {
         chosen: r.get::<_, i64>(3)?.max(0) as usize,
         created_at: r.get(4)?,
     })
+}
+
+/// Draft `id`'s whole text as saved, signature and all, normalized.
+fn saved_text(conn: &Connection, id: i64) -> Result<String> {
+    let text: Option<String> = conn
+        .query_row("SELECT text_body FROM messages WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(normalized(&text.unwrap_or_default()))
 }
 
 /// Text without its whitespace differences, to compare a draft with what
