@@ -892,6 +892,147 @@ fn version_23_databases_gain_the_reply_queue() {
 }
 
 #[test]
+fn cleanup_keeps_a_draft_given_a_file_or_other_recipients() {
+    let (mut store, account) = store();
+    with_drafts_folder(&mut store, account);
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let options = vec![DraftOption {
+        title: String::new(),
+        body: "Yes.".into(),
+    }];
+    let save = |store: &mut Store, existing: Option<i64>, to: &str, files: &[crate::Attachment]| {
+        store
+            .save_draft(
+                existing,
+                &DraftSave {
+                    account_id: account,
+                    draft: "{}",
+                    send_later: None,
+                    from_name: "Me",
+                    from_address: "me@example.com",
+                    to: &[to.to_owned()],
+                    cc: &[],
+                    bcc: &[],
+                    subject: "Re: Message 1",
+                    snippet: "Yes.",
+                    text: "Yes.",
+                    html: None,
+                    in_reply_to: Some("1@example.com"),
+                    references: None,
+                    attachments: files,
+                    files: &[],
+                },
+                NOW,
+            )
+            .unwrap()
+    };
+    let draft = save(&mut store, None, "a@x.com", &[]);
+    store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
+    assert_eq!(store.untouched_auto_drafts(NOW + 1).unwrap(), [draft]);
+    // The same text, with Bob added.
+    save(&mut store, Some(draft), "a@x.com, bob@x.com", &[]);
+    assert!(store.untouched_auto_drafts(NOW + 1).unwrap().is_empty());
+    assert!(!store.auto_draft_untouched(draft).unwrap());
+
+    let other = add(&mut store, &incoming(account, 2, "c@x.com", NOW));
+    let draft = save(&mut store, None, "c@x.com", &[]);
+    store
+        .add_auto_draft(draft, other, &options, 0, NOW)
+        .unwrap();
+    // The same text, with a file.
+    let file = crate::Attachment {
+        name: "plan.pdf".into(),
+        mime: "application/pdf".into(),
+        size: 3,
+        remote_id: None,
+    };
+    save(&mut store, Some(draft), "c@x.com", &[file]);
+    assert!(store.untouched_auto_drafts(NOW + 1).unwrap().is_empty());
+}
+
+#[test]
+fn turning_drafts_on_writes_replies_ai_just_said_were_needed() {
+    let (mut store, account) = store();
+    let labels_only = AutomationSettings {
+        label_accounts: [(account, NOW - DAY)].into(),
+        ..Default::default()
+    };
+    store.set_automation_settings(&labels_only).unwrap();
+    let recent = add(
+        &mut store,
+        &incoming(account, 1, "a@x.com", NOW - 10 * 60_000),
+    );
+    let old = add(&mut store, &incoming(account, 2, "b@x.com", NOW - DAY));
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    for id in [recent, old] {
+        store
+            .record_verdict(id, respond, &labels_only, true, NOW)
+            .unwrap();
+    }
+    let mut both = labels_only.clone();
+    both.draft_accounts.insert(account, NOW);
+    assert!(store.draft_candidates(&both, NOW, 10).unwrap().is_empty());
+    store.set_automation_settings(&both).unwrap();
+    // Within the hour before: due. Older: no.
+    assert_eq!(store.draft_candidates(&both, NOW, 10).unwrap(), [recent]);
+}
+
+#[test]
+fn version_24_databases_gain_server_versions() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v24-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v24.sqlite");
+    let _ = std::fs::remove_file(&path);
+    Store::open(&path)
+        .unwrap()
+        .conn
+        .execute_batch(
+            "ALTER TABLE auto_drafts DROP COLUMN server_version;
+             PRAGMA user_version = 24;",
+        )
+        .unwrap();
+    let (mut store, account) = {
+        let store = Store::open(&path).unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Microsoft,
+                email: "me@contoso.com",
+                name: "Me",
+                label: "Work",
+                config: "{}",
+            })
+            .unwrap()
+            .id;
+        (store, account)
+    };
+    with_drafts_folder(&mut store, account);
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let draft = save_reply(&mut store, account, "1@example.com", "Yes.");
+    let options = [DraftOption {
+        title: String::new(),
+        body: "Yes.".into(),
+    }];
+    store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
+    assert_eq!(store.auto_draft_server_version(draft).unwrap(), None);
+    store.auto_draft_uploaded(draft, Some("v1")).unwrap();
+    assert_eq!(
+        store.auto_draft_server_version(draft).unwrap().as_deref(),
+        Some("v1")
+    );
+    drop(store);
+    // Opening it again changes nothing.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.auto_draft_server_version(draft).unwrap().as_deref(),
+        Some("v1")
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn labels_have_ids_and_names() {
     for label in AutoLabel::ALL {
         assert_eq!(AutoLabel::parse(label.as_str()), Some(label));

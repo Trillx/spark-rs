@@ -855,6 +855,12 @@ impl Store {
             tx.pragma_update(None, "user_version", 24)?;
             tx.commit()?;
         }
+        if version < 25 {
+            let tx = conn.unchecked_transaction()?;
+            automation::add_server_version(&tx)?;
+            tx.pragma_update(None, "user_version", 25)?;
+            tx.commit()?;
+        }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
         conn.execute_batch(&changes::WATCH_MESSAGES)?;
         conn.execute_batch(drafts::WATCH_SENDS)?;

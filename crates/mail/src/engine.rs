@@ -1150,10 +1150,11 @@ impl Engine {
             .keeping(standing))
     }
 
-    /// Whether saved draft `id` was changed on the server by another app
-    /// since it was put there, so it's no longer what this app saved: one
-    /// edited in Outlook. IMAP servers keep an edited draft as a new message,
-    /// so theirs never are; neither is a draft not on the server yet.
+    /// Whether auto-draft `id` was changed on the server by another app
+    /// since this app put it there: one edited in Outlook, whose version
+    /// isn't the one recorded as it went up (or wasn't recorded). IMAP
+    /// servers keep an edited draft as a new message, so theirs never are;
+    /// neither is a draft not on the server yet.
     pub async fn draft_changed_elsewhere(&self, id: i64) -> Result<bool> {
         let (account_id, remote) = {
             let store = self.store();
@@ -1173,10 +1174,15 @@ impl Engine {
         let Some(remote) = remote else {
             return Ok(false);
         };
-        self.syncing_graph(account_id, &client_id, &tenant)
+        let Some(ours) = self.store().auto_draft_server_version(id)? else {
+            return Ok(true);
+        };
+        let now = self
+            .syncing_graph(account_id, &client_id, &tenant)
             .await?
-            .changed_since_made(&remote)
-            .await
+            .change_key(&remote)
+            .await?;
+        Ok(now.as_deref() != Some(ours.as_str()))
     }
 
     /// Sends the account's drafts whose time has come.
@@ -3213,30 +3219,24 @@ mod tests {
     #[tokio::test]
     async fn a_draft_edited_in_outlook_is_told_from_an_untouched_one() {
         let (base, _) = crate::graph::tests::serve(|asked, _| match asked.path.as_str() {
-            "/me/messages/edited?$select=createdDateTime,lastModifiedDateTime" => {
-                Answer::json(serde_json::json!({
-                    "createdDateTime": "2026-10-20T09:00:00Z",
-                    "lastModifiedDateTime": "2026-10-22T16:30:00Z"
-                }))
+            "/me/messages/edited?$select=changeKey" => {
+                Answer::json(serde_json::json!({ "changeKey": "v2" }))
             }
-            "/me/messages/untouched?$select=createdDateTime,lastModifiedDateTime" => {
-                Answer::json(serde_json::json!({
-                    "createdDateTime": "2026-10-20T09:00:00Z",
-                    "lastModifiedDateTime": "2026-10-20T09:00:04.1234567Z"
-                }))
+            "/me/messages/untouched?$select=changeKey"
+            | "/me/messages/unrecorded?$select=changeKey" => {
+                Answer::json(serde_json::json!({ "changeKey": "v1" }))
             }
             _ => Answer::status(404),
         })
         .await;
         let (engine, account) = microsoft_engine(base);
-        let mut ids = Vec::new();
-        for remote in ["edited", "untouched", "gone"] {
+        let add = |remote: Option<&str>| {
             let added = engine
                 .store()
                 .add_incoming(
                     &Incoming {
                         account_id: account,
-                        remote_id: Some(remote.into()),
+                        remote_id: remote.map(str::to_owned),
                         subject: "Re: Lunch".into(),
                         ..Default::default()
                     },
@@ -3244,30 +3244,38 @@ mod tests {
                 )
                 .unwrap();
             let Added::New(id) = added else { panic!("new") };
+            id
+        };
+        let original = add(Some("original"));
+        let option = [spark_store::DraftOption {
+            title: String::new(),
+            body: "Sure.".into(),
+        }];
+        let mut ids = Vec::new();
+        for (remote, version) in [
+            (Some("edited"), Some("v1")),
+            (Some("untouched"), Some("v1")),
+            (Some("unrecorded"), None),
+            (Some("gone"), Some("v1")),
+            (None, None),
+        ] {
+            let id = add(remote);
+            let store = engine.store();
+            store.add_auto_draft(id, original, &option, 0, 1).unwrap();
+            store.auto_draft_uploaded(id, version).unwrap();
             ids.push(id);
         }
+        // Outlook changed it since it went up.
         assert!(engine.draft_changed_elsewhere(ids[0]).await.unwrap());
         assert!(!engine.draft_changed_elsewhere(ids[1]).await.unwrap());
+        // Put there before versions were kept: can't tell, so it's kept.
+        assert!(engine.draft_changed_elsewhere(ids[2]).await.unwrap());
         assert!(matches!(
-            engine.draft_changed_elsewhere(ids[2]).await,
+            engine.draft_changed_elsewhere(ids[3]).await,
             Err(Error::Gone)
         ));
         // Not on the server yet: nothing else can have changed it.
-        let local = engine
-            .store()
-            .add_incoming(
-                &Incoming {
-                    account_id: account,
-                    subject: "Re: Lunch".into(),
-                    ..Default::default()
-                },
-                false,
-            )
-            .unwrap();
-        let Added::New(local) = local else {
-            panic!("new")
-        };
-        assert!(!engine.draft_changed_elsewhere(local).await.unwrap());
+        assert!(!engine.draft_changed_elsewhere(ids[4]).await.unwrap());
     }
 
     /// A Microsoft account signed in to the Graph stand-in at `base`, with

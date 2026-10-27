@@ -43,8 +43,8 @@ pub(crate) const LABEL_WORK: &str = "SELECT EXISTS (SELECT 1 FROM label_pushes p
      CROSS JOIN messages m ON m.id = p.message_id WHERE m.account_id = ?1)";
 
 /// What `auto_drafts.written` says of a draft changed in another app: no
-/// draft's text matches it (`normalized` leaves no line breaks), so it's
-/// never cleaned up, and its other options can't be picked over it.
+/// saved draft matches it (`saved_text` is JSON), so it's never cleaned
+/// up, and its other options can't be picked over it.
 const EDITED_ELSEWHERE: &str = "\n";
 
 /// What `auto_labels` keeps for an email whose label the user took off:
@@ -141,6 +141,22 @@ pub(crate) fn add_draft_queue(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS automation_draft_due ON automation_checked(draft_due)
              WHERE draft_due IS NOT NULL;",
     )
+}
+
+/// Version 25: the version of an auto-draft's server copy as this app put
+/// it there (Graph's changeKey), to tell whether another app changed it
+/// since. Adds only what's missing, so it's safe to run again over itself.
+pub(crate) fn add_server_version(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('auto_drafts')
+                        WHERE name = 'server_version')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE auto_drafts ADD COLUMN server_version TEXT;")?;
+    }
+    Ok(())
 }
 
 /// Spark's Auto-Labels.
@@ -359,6 +375,19 @@ impl Store {
                 apply_checked(&tx, settings, account, on - LABEL_BACKFILL_MS)?;
             }
         }
+        // Mail AI said needs a reply, from just before Auto-Drafts came on:
+        // due now, as if it had been on when AI looked.
+        for (&account, &on) in &settings.draft_accounts {
+            if !before.drafts(account) {
+                tx.execute(
+                    "UPDATE automation_checked SET draft_due = ?2, draft_failures = 0
+                     WHERE needs_reply = 1 AND draft_due IS NULL
+                       AND message_id IN (SELECT id FROM messages
+                                          WHERE account_id = ?1 AND date >= ?3)",
+                    params![account, on, on - DRAFT_GRACE_MS],
+                )?;
+            }
+        }
         tx.commit()
     }
 
@@ -506,6 +535,30 @@ impl Store {
             params![id, due, failures],
         )?;
         Ok(())
+    }
+
+    /// Draft `draft_id` was put on the server as `version` (Graph's
+    /// changeKey): if it's an auto-draft, that's the copy that's its own.
+    pub fn auto_draft_uploaded(&self, draft_id: i64, version: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE auto_drafts SET server_version = ?2 WHERE draft_id = ?1",
+            params![draft_id, version],
+        )?;
+        Ok(())
+    }
+
+    /// The version of auto-draft `draft_id`'s server copy as this app last
+    /// put it there, if it did.
+    pub fn auto_draft_server_version(&self, draft_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT server_version FROM auto_drafts WHERE draft_id = ?1",
+                [draft_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Auto-draft `draft_id` was changed in another app (Outlook): it's the
@@ -748,22 +801,17 @@ impl Store {
     /// were written with, for the cleanup: drafts the user edited stay.
     pub fn untouched_auto_drafts(&self, before: i64) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT a.draft_id, a.written, m.text_body FROM auto_drafts a
+            "SELECT a.draft_id, a.written FROM auto_drafts a
              JOIN messages m ON m.id = a.draft_id
              WHERE a.created_at < ?1
                AND a.draft_id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)",
         )?;
-        let rows = stmt.query_map([before], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([before], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_>>()?;
         let mut untouched = Vec::new();
-        for row in rows {
-            let (id, written, text) = row?;
-            if normalized(&text) == written {
+        for (id, written) in rows {
+            if saved_text(&self.conn, id)? == written {
                 untouched.push(id);
             }
         }
@@ -1024,14 +1072,33 @@ fn auto_draft_row(r: &rusqlite::Row) -> Result<AutoDraft> {
     })
 }
 
-/// Draft `id`'s whole text as saved, signature and all, normalized.
+/// Draft `id` as saved, to tell one the user hasn't touched from one they
+/// have: its whole text (signature and all) without whitespace differences,
+/// who it's to, its subject and its files.
 fn saved_text(conn: &Connection, id: i64) -> Result<String> {
-    let text: Option<String> = conn
-        .query_row("SELECT text_body FROM messages WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
+    type Saved = (String, String, String, String, String, String);
+    let saved: Option<Saved> = conn
+        .query_row(
+            "SELECT text_body, to_list, cc_list, bcc_list, subject, attachments
+             FROM messages WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
         .optional()?;
-    Ok(normalized(&text.unwrap_or_default()))
+    Ok(saved
+        .map(|(text, to, cc, bcc, subject, files)| {
+            json(&(normalized(&text), to, cc, bcc, subject.trim(), files))
+        })
+        .unwrap_or_default())
 }
 
 /// Text without its whitespace differences, to compare a draft with what

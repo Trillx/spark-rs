@@ -247,6 +247,16 @@ impl Me {
     }
 }
 
+/// A draft as `Graph::save_draft` left it on the server.
+#[derive(Debug)]
+pub struct SavedDraft {
+    pub id: String,
+    /// Its Message-ID, without brackets.
+    pub message_id: Option<String>,
+    /// Its changeKey as saved.
+    pub version: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphMessage {
@@ -275,6 +285,8 @@ pub struct GraphMessage {
     pub internet_message_id: Option<String>,
     pub conversation_id: Option<String>,
     pub inference_classification: Option<String>,
+    /// Its version: every change to it changes this.
+    pub change_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1293,30 +1305,19 @@ impl Graph {
     }
 
     /// Message `id`'s Outlook categories.
-    /// Whether message `id` was changed a while after it was made: Outlook
-    /// edits a draft in place, which moves its last change on.
-    pub async fn changed_since_made(&self, id: &str) -> Result<bool> {
+    /// Message `id`'s version now (its changeKey): Outlook editing a draft
+    /// in place changes it.
+    pub async fn change_key(&self, id: &str) -> Result<Option<String>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct Times {
-            created_date_time: String,
-            last_modified_date_time: String,
+        struct Version {
+            change_key: Option<String>,
         }
-        let url = format!(
-            "/me/messages/{}?$select=createdDateTime,lastModifiedDateTime",
-            path(id)
-        );
-        let times: Times = self
+        let url = format!("/me/messages/{}?$select=changeKey", path(id));
+        let version: Version = self
             .json_patiently(|| self.request(Method::GET, &url))
             .await?;
-        let (Some(made), Some(changed)) = (
-            parse_iso_date(&times.created_date_time),
-            parse_iso_date(&times.last_modified_date_time),
-        ) else {
-            // Can't tell: as if it was.
-            return Ok(true);
-        };
-        Ok(changed - made > CHANGED_AFTER_MS)
+        Ok(version.change_key)
     }
 
     /// Message `id`'s Outlook categories, with the version of the message
@@ -2180,7 +2181,7 @@ impl Graph {
         update: Option<&str>,
         draft: &Draft,
         files: &[AttachmentData],
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<SavedDraft> {
         let bodies = draft.draft_bodies(Some(OUTLOOK_BODY));
         let message = draft_message(draft, &bodies);
         let update = update.filter(|_| bodies.images.is_empty());
@@ -2192,7 +2193,13 @@ impl Graph {
                 )
                 .await
             {
-                Ok(m) => return Ok((m.id, m.internet_message_id.as_deref().map(bare_id))),
+                Ok(m) => {
+                    return Ok(SavedDraft {
+                        message_id: m.internet_message_id.as_deref().map(bare_id),
+                        version: m.change_key,
+                        id: m.id,
+                    });
+                }
                 Err(Error::Gone) => {}
                 Err(e) => return Err(e),
             }
@@ -2215,10 +2222,17 @@ impl Graph {
             let _ = self.send(self.request(Method::DELETE, &draft_path)).await;
             return Err(e);
         }
-        Ok((
-            created.id,
-            created.internet_message_id.as_deref().map(bare_id),
-        ))
+        // Each file attached moved its version on: the one now is its own.
+        let version = if bodies.images.is_empty() && files.is_empty() {
+            created.change_key
+        } else {
+            self.change_key(&created.id).await.ok().flatten()
+        };
+        Ok(SavedDraft {
+            message_id: created.internet_message_id.as_deref().map(bare_id),
+            version,
+            id: created.id,
+        })
     }
 
     /// A message's internet headers, as name and value.
@@ -2614,10 +2628,6 @@ pub(crate) fn iso_date(ms: i64) -> String {
         t % 60
     )
 }
-
-/// How long after a message is made that a change to it is someone else's:
-/// saving it can take Graph a moment to settle.
-const CHANGED_AFTER_MS: i64 = 2 * 60_000;
 
 /// Unix ms from `2026-10-21T14:00:00Z` or with fractional seconds.
 pub(crate) fn parse_iso_date(s: &str) -> Option<i64> {

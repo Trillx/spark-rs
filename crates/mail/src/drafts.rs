@@ -711,13 +711,16 @@ pub async fn push_graph(
             .and_then(|c| c.remote_id.as_deref())
             .filter(|_| files.is_empty() && upload.attachments.is_empty());
         match graph.save_draft(update, &draft, &files).await {
-            Ok((remote_id, message_id)) => {
+            Ok(saved) => {
                 let copy = DraftCopy {
-                    remote_id: Some(remote_id),
-                    message_id,
+                    remote_id: Some(saved.id),
+                    message_id: saved.message_id,
                     ..Default::default()
                 };
-                lock(store).draft_uploaded(&upload, &copy, &described(&files))?;
+                let store = &mut lock(store);
+                store.draft_uploaded(&upload, &copy, &described(&files))?;
+                // An auto-draft's own copy, to tell it from one Outlook changed.
+                store.auto_draft_uploaded(upload.message_id, saved.version.as_deref())?;
                 report.uploaded += 1;
             }
             Err(e @ (Error::Network { .. } | Error::Auth(_))) => return Err(e),
@@ -797,6 +800,86 @@ fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_auto_drafts_server_copy_keeps_its_version() {
+        use crate::graph::tests::{Answer, serve};
+        use spark_store::{AccountKind, Added, DraftOption, Incoming, NewAccount, RemoteFolder};
+        let (base, _) = serve(
+            |asked, _| match (asked.method.as_str(), asked.path.as_str()) {
+                ("POST", "/me/messages") => Answer::json(serde_json::json!({
+                    "id": "AAMkD",
+                    "internetMessageId": "<d@contoso.com>",
+                    "changeKey": "CQAAABYAAAD"
+                })),
+                _ => Answer::status(404),
+            },
+        )
+        .await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Microsoft,
+                email: "me@contoso.com",
+                name: "Me",
+                label: "Work",
+                config: "{}",
+            })
+            .unwrap();
+        store
+            .replace_folders(
+                account.id,
+                &[RemoteFolder {
+                    remote_id: "drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let Added::New(original) = store
+            .add_incoming(
+                &Incoming {
+                    account_id: account.id,
+                    remote_id: Some("AAMkO".into()),
+                    from_address: "dana@contoso.com".into(),
+                    subject: "Lunch".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        else {
+            panic!("new");
+        };
+        let draft = Draft {
+            account: account.id,
+            to: "dana@contoso.com".into(),
+            subject: "Re: Lunch".into(),
+            body: "Sure.".into(),
+            ..Default::default()
+        };
+        let id = save(&mut store, &account, &draft, &[], 1).unwrap();
+        let option = [DraftOption {
+            title: String::new(),
+            body: "Sure.".into(),
+        }];
+        store.add_auto_draft(id, original, &option, 0, 1).unwrap();
+        let store = Mutex::new(store);
+        let graph = Graph::with_base(&base, "token");
+        let report = push_graph(&graph, &store, &account, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(
+            lock(&store)
+                .auto_draft_server_version(id)
+                .unwrap()
+                .as_deref(),
+            Some("CQAAABYAAAD")
+        );
+    }
 
     #[test]
     fn send_later_survives_restart_and_draft_upload_without_queueing_delivery() {
