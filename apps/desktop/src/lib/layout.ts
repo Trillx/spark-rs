@@ -13,7 +13,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { AccountId, AccountView, BadgeCount, FolderView, GatekeeperMode, Message } from "../types";
-import { asThread, conversationOf, indexConversations, participantNames } from "./conversation";
+import { inLabelList } from "./autoLabels";
+import { asThread, conversationOf, indexConversations, participantNames, type Conversations } from "./conversation";
 import { datePeriod, futurePeriod } from "./format";
 import { showsRecipients } from "./recipients";
 import type { ActionId } from "./shortcuts";
@@ -381,8 +382,18 @@ function rowIds(blocks: ListBlock[]) {
  * flags of the whole conversation (see `asThread`). `read` holds the emails
  * read during this visit to the list.
  */
+/** `messages` by conversation, worked out once for them: the sidebar counts each Auto-Label list. */
+const indexed = new WeakMap<Message[], { folders: FolderView[]; conversations: Conversations }>();
+function conversationsIn(messages: Message[], folders: FolderView[]): Conversations {
+  const known = indexed.get(messages);
+  if (known?.folders === folders) return known.conversations;
+  const conversations = indexConversations(messages, folders);
+  indexed.set(messages, { folders, conversations });
+  return conversations;
+}
+
 function listRows(messages: Message[], read: ReadonlySet<number>, ctx: ListContext) {
-  const conversations = indexConversations(messages, ctx.folders);
+  const conversations = conversationsIn(messages, ctx.folders);
   const own = new Set(ctx.accounts.map((a) => a.email.toLowerCase()));
   /** The emails each row stands for, by row id. */
   const members = new Map<number, number[]>();
@@ -464,7 +475,12 @@ export function listItems(
     return smart ? live.filter((m) => matchesQuery(m, smart.query, ctx.hits, read)).sort(newestFirst) : [];
   }
   const label = autoLabelOf(key);
-  if (label) return live.filter((m) => m.autoLabel === label && !waiting(m, ctx.gatekeeper)).sort(newestFirst);
+  if (label) {
+    const conversations = conversationsIn(messages, ctx.folders);
+    return live
+      .filter((m) => !waiting(m, ctx.gatekeeper) && inLabelList(label, m, conversationOf(conversations, m)))
+      .sort(newestFirst);
+  }
   return live.filter(inFolders(listFolderIds(key, ctx.folders))).sort(newestFirst);
 }
 

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AutoLabel, Message } from "../types.ts";
-import { AUTO_LABELS, AUTO_LABEL_ORDER, conversationLabel } from "./autoLabels.ts";
+import { AUTO_LABELS, AUTO_LABEL_ORDER, conversationLabel, inLabelList } from "./autoLabels.ts";
 
 const mail = (id: number, autoLabel?: AutoLabel): Message => ({
   id,
@@ -26,6 +26,17 @@ test("a conversation shows its newest email's label", () => {
   assert.equal(conversationLabel([mail(1, "fyi"), mail(2)]), "fyi");
   assert.equal(conversationLabel([mail(1), mail(2)]), undefined);
   assert.equal(conversationLabel([]), undefined);
+});
+
+test("a thread is in the list of the label its row shows", () => {
+  // A request, then "never mind, handled it", then the user's own reply.
+  const thread = [mail(1, "toRespond"), mail(2, "actioned"), mail(3)];
+  const listed = (label: AutoLabel) => thread.filter((m) => inLabelList(label, m, thread)).map((m) => m.id);
+  assert.deepEqual(listed("toRespond"), []);
+  assert.deepEqual(listed("actioned"), [1, 2]);
+  const alone = mail(4, "fyi");
+  assert.ok(inLabelList("fyi", alone, [alone]));
+  assert.ok(!inLabelList("fyi", mail(5), [mail(5)]));
 });
 
 test("every label has a name and a color, in Spark's order", () => {

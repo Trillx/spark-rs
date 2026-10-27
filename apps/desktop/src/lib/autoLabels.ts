@@ -25,3 +25,12 @@ export function conversationLabel(conversation: readonly Message[]): AutoLabel |
   }
   return undefined;
 }
+
+/**
+ * Whether email `m` of `conversation` is in `label`'s list. Lists go by the
+ * label rows show, the conversation's, so a thread that moved on (a request,
+ * then "never mind") is in one list, not both.
+ */
+export function inLabelList(label: AutoLabel, m: Message, conversation: readonly Message[]): boolean {
+  return m.autoLabel !== undefined && conversationLabel(conversation) === label;
+}

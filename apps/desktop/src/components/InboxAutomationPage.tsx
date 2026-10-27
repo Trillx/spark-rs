@@ -45,9 +45,15 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
   const latest = useRef<InboxAutomation | null>(null);
   const saving = useRef<Promise<unknown>>(Promise.resolve());
   const saves = useRef(0);
+  /**
+   * The worker's problem as it last said, once it has. It says so on every change, so this is newer than
+   * a save's answer, which can be read before a woken worker finds out.
+   */
+  const heard = useRef<{ problem?: string } | null>(null);
   const show = (v: InboxAutomation) => {
-    latest.current = v;
-    setView(v);
+    const shown = heard.current ? { ...v, problem: heard.current.problem } : v;
+    latest.current = shown;
+    setView(shown);
   };
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [instruction, setInstruction] = useState("");
@@ -69,7 +75,8 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
   useEffect(
     () =>
       onAutomationProblem((problem) => {
-        if (latest.current) show({ ...latest.current, problem: problem ?? undefined });
+        heard.current = { problem: problem ?? undefined };
+        if (latest.current) show(latest.current);
       }),
     [],
   );
