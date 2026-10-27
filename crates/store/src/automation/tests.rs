@@ -419,6 +419,28 @@ fn turning_drafts_on_leaves_mail_already_answered() {
 }
 
 #[test]
+fn turning_labels_on_after_a_reply_doesnt_say_to_respond() {
+    let (mut store, account) = store();
+    let drafts_only = AutomationSettings {
+        draft_accounts: [(account, NOW)].into(),
+        ..Default::default()
+    };
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
+    store.set_automation_settings(&drafts_only).unwrap();
+    store
+        .record_verdict(id, respond, &drafts_only, true, NOW)
+        .unwrap();
+    // Answered before Sent synced, then Auto-Labels turned on.
+    store.user_replied(id, &drafts_only, true, NOW).unwrap();
+    store.set_automation_settings(&on(account)).unwrap();
+    assert_eq!(store.auto_label(id).unwrap(), Some(AutoLabel::Actioned));
+}
+
+#[test]
 fn a_reply_sent_with_actioned_off_leaves_no_label() {
     let (mut store, account) = store();
     let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
@@ -580,8 +602,7 @@ fn an_auto_draft_deleted_in_another_app_answers_nothing() {
     later.in_reply_to = Some("<1@example.com>".into());
     let later = add(&mut store, &later);
     assert!(store.conversation_has_draft(later).unwrap());
-    // Uploaded, then deleted in Outlook: sync takes it out of Drafts here,
-    // and its row stays (in Deleted Items).
+    // Uploaded, then out of Drafts here after a sync, its row left behind.
     store
         .conn
         .execute_batch(&format!(
@@ -590,6 +611,23 @@ fn an_auto_draft_deleted_in_another_app_answers_nothing() {
         ))
         .unwrap();
     assert!(store.message(draft).unwrap().is_some());
+    // Drafts holds more than its listing here: it may only be past it.
+    let drafts = store
+        .folders()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.role == Some(FolderRole::Drafts))
+        .unwrap()
+        .id;
+    assert!(store.conversation_has_draft(later).unwrap());
+    store
+        .set_folder_synced(drafts, r#"{"limit":200,"complete":false}"#, NOW)
+        .unwrap();
+    assert!(store.conversation_has_draft(later).unwrap());
+    // Drafts was listed whole: it was deleted, in Outlook say.
+    store
+        .set_folder_synced(drafts, r#"{"limit":200,"complete":true}"#, NOW)
+        .unwrap();
     assert!(!store.conversation_has_draft(later).unwrap());
 }
 

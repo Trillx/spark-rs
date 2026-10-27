@@ -690,7 +690,8 @@ impl Store {
     /// find. To respond becomes Actioned (no label, if that's off); its mail
     /// from before then that AI hasn't looked at yet won't be, and is
     /// Actioned too; and none of it needs a reply any more, nor gets one
-    /// when Auto-Drafts comes on. Returns the emails whose label changed.
+    /// when Auto-Drafts comes on, nor To respond when Auto-Labels does.
+    /// Returns the emails whose label changed.
     pub fn user_replied(
         &mut self,
         id: i64,
@@ -758,12 +759,18 @@ impl Store {
         tx.execute(
             &format!(
                 "WITH {MEMBERS}
-                 UPDATE automation_checked SET draft_due = NULL, needs_reply = 0
-                 WHERE (draft_due IS NOT NULL OR needs_reply = 1) AND message_id IN
+                 UPDATE automation_checked SET draft_due = NULL, needs_reply = 0,
+                     label = CASE WHEN label = ?3 THEN ?4 ELSE label END
+                 WHERE (draft_due IS NOT NULL OR needs_reply = 1 OR label = ?3) AND message_id IN
                      (SELECT m.id FROM members JOIN messages m ON m.id = members.id
                       WHERE m.date <= ?2)"
             ),
-            params![id, at],
+            params![
+                id,
+                at,
+                AutoLabel::ToRespond.as_str(),
+                AutoLabel::Actioned.as_str()
+            ],
         )?;
         tx.commit()?;
         Ok(changed)
@@ -900,8 +907,10 @@ impl Store {
     }
 
     /// Whether a draft already answers the conversation of email `id`: an
-    /// auto-draft, or one of the user's replying to any of its emails. One
-    /// deleted in another app (out of Drafts there, so here) doesn't.
+    /// auto-draft, or one of the user's replying to any of its emails. An
+    /// auto-draft out of Drafts here was deleted in another app if the
+    /// account's Drafts was listed whole (`complete` in its sync state);
+    /// otherwise it may only be past the newest a listing holds, and counts.
     pub fn conversation_has_draft(&self, id: i64) -> Result<bool> {
         self.conn.query_row(
             &format!(
@@ -909,8 +918,13 @@ impl Store {
                       drafts AS (SELECT message_id AS id FROM draft_uploads
                                  UNION SELECT fm.message_id FROM folder_members fm
                                  JOIN folders f ON f.id = fm.folder_id WHERE f.role = 'drafts')
-                 SELECT EXISTS (SELECT 1 FROM auto_drafts a JOIN members ON members.id = a.message_id
-                                JOIN drafts ON drafts.id = a.draft_id)
+                 SELECT EXISTS (SELECT 1 FROM auto_drafts a JOIN members ON members.id = a.message_id, o
+                                WHERE a.draft_id IN (SELECT id FROM drafts)
+                                   OR NOT EXISTS (SELECT 1 FROM folders f
+                                                  WHERE f.account_id = o.account_id AND f.role = 'drafts'
+                                                    AND CASE WHEN json_valid(f.sync_state)
+                                                        THEN json_extract(f.sync_state, '$.complete')
+                                                        END IS 1))
                      OR EXISTS (SELECT 1 FROM drafts JOIN messages d ON d.id = drafts.id, o
                                 WHERE d.account_id = o.account_id
                                   AND trim(d.in_reply_to, '<> ') IN
