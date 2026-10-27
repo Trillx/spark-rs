@@ -1147,6 +1147,35 @@ impl Engine {
             .keeping(standing))
     }
 
+    /// Whether saved draft `id` was changed on the server by another app
+    /// since it was put there, so it's no longer what this app saved: one
+    /// edited in Outlook. IMAP servers keep an edited draft as a new message,
+    /// so theirs never are; neither is a draft not on the server yet.
+    pub async fn draft_changed_elsewhere(&self, id: i64) -> Result<bool> {
+        let (account_id, remote) = {
+            let store = self.store();
+            let Some(message) = store.message(id)? else {
+                return Err(Error::Gone);
+            };
+            let remote = store.pending_for(id)?.and_then(|p| p.remote_id);
+            (message.account_id, remote)
+        };
+        let account = self.account(account_id)?;
+        let AccountConfig::Microsoft {
+            client_id, tenant, ..
+        } = config(&account)?
+        else {
+            return Ok(false);
+        };
+        let Some(remote) = remote else {
+            return Ok(false);
+        };
+        self.syncing_graph(account_id, &client_id, &tenant)
+            .await?
+            .changed_since_made(&remote)
+            .await
+    }
+
     /// Sends the account's drafts whose time has come.
     pub async fn send_due(&self, account_id: i64) -> Result<Vec<SendOutcome>> {
         let due = self.store().claim_due_sends(account_id, now_ms())?;
@@ -3176,6 +3205,66 @@ mod tests {
             },
         );
         engine
+    }
+
+    #[tokio::test]
+    async fn a_draft_edited_in_outlook_is_told_from_an_untouched_one() {
+        let (base, _) = crate::graph::tests::serve(|asked, _| match asked.path.as_str() {
+            "/me/messages/edited?$select=createdDateTime,lastModifiedDateTime" => {
+                Answer::json(serde_json::json!({
+                    "createdDateTime": "2026-10-20T09:00:00Z",
+                    "lastModifiedDateTime": "2026-10-22T16:30:00Z"
+                }))
+            }
+            "/me/messages/untouched?$select=createdDateTime,lastModifiedDateTime" => {
+                Answer::json(serde_json::json!({
+                    "createdDateTime": "2026-10-20T09:00:00Z",
+                    "lastModifiedDateTime": "2026-10-20T09:00:04.1234567Z"
+                }))
+            }
+            _ => Answer::status(404),
+        })
+        .await;
+        let (engine, account) = microsoft_engine(base);
+        let mut ids = Vec::new();
+        for remote in ["edited", "untouched", "gone"] {
+            let added = engine
+                .store()
+                .add_incoming(
+                    &Incoming {
+                        account_id: account,
+                        remote_id: Some(remote.into()),
+                        subject: "Re: Lunch".into(),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+            let Added::New(id) = added else { panic!("new") };
+            ids.push(id);
+        }
+        assert!(engine.draft_changed_elsewhere(ids[0]).await.unwrap());
+        assert!(!engine.draft_changed_elsewhere(ids[1]).await.unwrap());
+        assert!(matches!(
+            engine.draft_changed_elsewhere(ids[2]).await,
+            Err(Error::Gone)
+        ));
+        // Not on the server yet: nothing else can have changed it.
+        let local = engine
+            .store()
+            .add_incoming(
+                &Incoming {
+                    account_id: account,
+                    subject: "Re: Lunch".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let Added::New(local) = local else {
+            panic!("new")
+        };
+        assert!(!engine.draft_changed_elsewhere(local).await.unwrap());
     }
 
     /// A Microsoft account signed in to the Graph stand-in at `base`, with

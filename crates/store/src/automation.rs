@@ -17,6 +17,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, Store, json, now_ms, refused};
 
+/// Account `?1`'s mail to look at (`Store::automation_candidates`). The `+`
+/// keeps SQLite off the (account, conversation) index, which would visit
+/// all the account's mail every minute; the date index reaches only what's
+/// recent.
+pub(crate) const CANDIDATES: &str = "SELECT m.id, m.account_id, m.date FROM messages m
+             WHERE +m.account_id = ?1 AND m.state = 'inbox' AND m.folder_only = 0 AND m.date >= ?2
+               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = m.from_address COLLATE NOCASE)
+               AND NOT EXISTS (SELECT 1 FROM automation_checked c WHERE c.message_id = m.id
+                               AND (c.checked_at IS NOT NULL OR c.retry_at > ?3))
+               AND NOT EXISTS (SELECT 1 FROM draft_uploads d WHERE d.message_id = m.id)
+               AND NOT EXISTS (SELECT 1 FROM folder_members fm JOIN folders f ON f.id = fm.folder_id
+                               WHERE fm.message_id = m.id AND f.role = 'drafts')
+               AND m.id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
+             ORDER BY m.date DESC LIMIT ?4";
+
 /// Account `?1`'s queued labels. The queue is short and the account's mail
 /// isn't: CROSS JOIN keeps SQLite reading the queue, not the mailbox.
 pub(crate) const LABEL_PUSHES: &str = "SELECT p.message_id, p.name, p.adding FROM label_pushes p
@@ -26,6 +41,11 @@ pub(crate) const LABEL_PUSHES: &str = "SELECT p.message_id, p.name, p.adding FRO
 /// Whether account `?1` has queued labels, read the same way.
 pub(crate) const LABEL_WORK: &str = "SELECT EXISTS (SELECT 1 FROM label_pushes p
      CROSS JOIN messages m ON m.id = p.message_id WHERE m.account_id = ?1)";
+
+/// What `auto_drafts.written` says of a draft changed in another app: no
+/// draft's text matches it (`normalized` leaves no line breaks), so it's
+/// never cleaned up, and its other options can't be picked over it.
+const EDITED_ELSEWHERE: &str = "\n";
 
 /// What `auto_labels` keeps for an email whose label the user took off:
 /// none shows, and inbox automation doesn't give it one again.
@@ -353,18 +373,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Candidate>> {
         let mut found: Vec<(Candidate, i64)> = Vec::new();
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT m.id, m.account_id, m.date FROM messages m
-             WHERE m.account_id = ?1 AND m.state = 'inbox' AND m.folder_only = 0 AND m.date >= ?2
-               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.email = m.from_address COLLATE NOCASE)
-               AND NOT EXISTS (SELECT 1 FROM automation_checked c WHERE c.message_id = m.id
-                               AND (c.checked_at IS NOT NULL OR c.retry_at > ?3))
-               AND NOT EXISTS (SELECT 1 FROM draft_uploads d WHERE d.message_id = m.id)
-               AND NOT EXISTS (SELECT 1 FROM folder_members fm JOIN folders f ON f.id = fm.folder_id
-                               WHERE fm.message_id = m.id AND f.role = 'drafts')
-               AND m.id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
-             ORDER BY m.date DESC LIMIT ?4",
-        )?;
+        let mut stmt = self.conn.prepare_cached(CANDIDATES)?;
         for (account, since) in settings.since() {
             let rows = stmt.query_map(params![account, since, now, limit as i64], |r| {
                 let candidate = Candidate {
@@ -487,6 +496,16 @@ impl Store {
             "UPDATE automation_checked SET draft_due = ?2, draft_failures = ?3
              WHERE message_id = ?1",
             params![id, due, failures],
+        )?;
+        Ok(())
+    }
+
+    /// Auto-draft `draft_id` was changed in another app (Outlook): it's the
+    /// user's now, kept from cleanup and from picking another option.
+    pub fn auto_draft_edited_elsewhere(&self, draft_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE auto_drafts SET written = ?2 WHERE draft_id = ?1",
+            params![draft_id, EDITED_ELSEWHERE],
         )?;
         Ok(())
     }

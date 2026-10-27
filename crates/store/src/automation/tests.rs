@@ -647,6 +647,17 @@ fn the_label_queue_is_read_from_the_queue_not_the_mailbox() {
             "starts from the queue: {plan:?}"
         );
     }
+    // Looking for new mail reads the recent mail by date, not the account.
+    let plan: Vec<String> = store
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {CANDIDATES}"))
+        .unwrap()
+        .query_map(params![account, NOW, NOW, 8], |r| r.get(3))
+        .unwrap()
+        .collect::<Result<_>>()
+        .unwrap();
+    let messages = plan.iter().find(|p| p.contains(" m ")).unwrap();
+    assert!(messages.contains("messages_date"), "{plan:?}");
 }
 
 #[test]
@@ -759,6 +770,23 @@ fn an_option_can_be_picked_only_while_the_draft_is_untouched() {
     store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
     assert!(store.auto_draft_untouched(draft).unwrap());
     resave(&mut store, account, draft, "Yes, see you there.");
+    assert!(!store.auto_draft_untouched(draft).unwrap());
+}
+
+#[test]
+fn a_draft_changed_in_another_app_is_kept() {
+    let (mut store, account) = store();
+    with_drafts_folder(&mut store, account);
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let options = vec![DraftOption {
+        title: String::new(),
+        body: "Yes.".into(),
+    }];
+    let draft = save_reply(&mut store, account, "1@example.com", "Yes.");
+    store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
+    assert_eq!(store.untouched_auto_drafts(NOW + 1).unwrap(), [draft]);
+    store.auto_draft_edited_elsewhere(draft).unwrap();
+    assert!(store.untouched_auto_drafts(NOW + 1).unwrap().is_empty());
     assert!(!store.auto_draft_untouched(draft).unwrap());
 }
 

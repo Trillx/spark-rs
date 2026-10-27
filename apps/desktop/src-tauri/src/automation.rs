@@ -71,7 +71,7 @@ pub fn start(app: &AppHandle) {
         loop {
             let wait = round(&app).await;
             if cleaned.is_none_or(|at| at.elapsed() >= CLEANUP_EVERY) {
-                cleanup(&app);
+                cleanup(&app).await;
                 cleaned = Some(std::time::Instant::now());
             }
             // After the provider failed, new mail doesn't cut the wait short.
@@ -512,23 +512,45 @@ fn email(store: &Store, id: i64) -> spark_store::Result<Option<Email>> {
     }))
 }
 
-/// Deletes auto-drafts the user hasn't touched for the days Settings says.
-fn cleanup(app: &AppHandle) {
+/// Deletes auto-drafts the user hasn't touched for the days Settings says:
+/// not here, and not on the server (Outlook edits a Microsoft draft in
+/// place, so the server is asked first).
+async fn cleanup(app: &AppHandle) {
     let mailbox = app.state::<Mailbox>();
     if !mailbox.live() {
         return;
     }
-    let mut store = mailbox.live.engine.store();
-    let Ok(settings) = store.automation_settings() else {
-        return;
+    let engine = mailbox.live.engine.clone();
+    let candidates = {
+        let store = engine.store();
+        let Some(days) = store
+            .automation_settings()
+            .ok()
+            .and_then(|s| s.cleanup_days)
+        else {
+            return;
+        };
+        let before = now_ms() - i64::from(days) * 86_400_000;
+        store.untouched_auto_drafts(before).unwrap_or_default()
     };
-    let Some(days) = settings.cleanup_days else {
-        return;
-    };
-    let before = now_ms() - i64::from(days) * 86_400_000;
     let mut removed = false;
-    for id in store.untouched_auto_drafts(before).unwrap_or_default() {
-        if store.draft_reserved(id).unwrap_or(true) {
+    for id in candidates {
+        match engine.draft_changed_elsewhere(id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = engine.store().auto_draft_edited_elsewhere(id) {
+                    eprintln!("spark-rs: inbox automation: {e}");
+                }
+                continue;
+            }
+            // Can't tell now (offline, or gone from the server): next time.
+            Err(_) => continue,
+        }
+        // Asked again: it may have been edited or sent while the server was asked.
+        let mut store = engine.store();
+        if store.draft_reserved(id).unwrap_or(true)
+            || !store.auto_draft_untouched(id).unwrap_or(false)
+        {
             continue;
         }
         match store.discard_draft(id) {
@@ -536,7 +558,6 @@ fn cleanup(app: &AppHandle) {
             Err(e) => eprintln!("spark-rs: couldn't clean up auto-draft {id}: {e}"),
         }
     }
-    drop(store);
     if removed {
         let _ = app.emit("mailbox-changed", ());
     }

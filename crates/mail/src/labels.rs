@@ -63,6 +63,13 @@ pub async fn push_imap(
             Some(p) => imap::find(session, store, state, p).await?,
             None => None,
         };
+        // Not where it was known to be (its label renamed or deleted in
+        // another app, say): All Mail has it whatever its labels.
+        if found.is_none()
+            && let (Some(p), Some(all)) = (&pending, &state.archive)
+        {
+            found = imap::search(session, all, p).await?;
+        }
         let mut done = false;
         for push in &pushes {
             let Some((_, uid)) = found else {
@@ -376,6 +383,11 @@ mod tests {
 
     /// An account of `kind` with one inbox email, UID 10, `<1@example.com>`.
     fn one_email(kind: spark_store::AccountKind) -> (Store, i64, i64) {
+        email_in(kind, "INBOX", 10)
+    }
+
+    /// `one_email`, known to be at `uid` in `mailbox`.
+    fn email_in(kind: spark_store::AccountKind, mailbox: &str, uid: u32) -> (Store, i64, i64) {
         use spark_store::{Added, Incoming, NewAccount};
         let mut store = Store::open_in_memory().unwrap();
         let account = store
@@ -392,8 +404,8 @@ mod tests {
                 &Incoming {
                     account_id: account.id,
                     remote_id: Some("AAMk1".into()),
-                    mailbox: Some("INBOX".into()),
-                    uid: Some(10),
+                    mailbox: Some(mailbox.into()),
+                    uid: Some(uid),
                     message_id: Some("<1@example.com>".into()),
                     from_address: "dana@example.com".into(),
                     subject: "Budget".into(),
@@ -437,7 +449,12 @@ mod tests {
                 } else {
                     reply(command)
                 };
-                let answer = format!("{untagged}{tag} OK done\r\n");
+                // "NO" refuses the command.
+                let answer = if untagged == "NO" {
+                    format!("{tag} NO [NONEXISTENT] no such mailbox\r\n")
+                } else {
+                    format!("{untagged}{tag} OK done\r\n")
+                };
                 if io.get_mut().write_all(answer.as_bytes()).await.is_err() {
                     break;
                 }
@@ -513,6 +530,67 @@ mod tests {
                 .any(|c| c.starts_with("UID STORE 10 +X-GM-LABELS"))
         );
         assert!(commands.iter().any(|c| c == "SELECT \"[Gmail]/All Mail\""));
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.starts_with("UID STORE 77 +X-GM-LABELS (\"News\")"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gmail_message_not_where_it_was_is_found_in_all_mail() {
+        use spark_store::{AccountKind, AutoLabel};
+        // Known only in a label's mailbox, which was deleted in Gmail since.
+        let (mut store, account, id) = email_in(AccountKind::Gmail, "Old label", 5);
+        store
+            .set_auto_label(id, Some(AutoLabel::News), true)
+            .unwrap();
+        let store = Mutex::new(store);
+        let selected = std::sync::Mutex::new(String::new());
+        let (mut session, server) = scripted_gmail(move |command| {
+            if let Some(mailbox) = command.strip_prefix("SELECT ") {
+                if mailbox == "\"Old label\"" {
+                    return "NO".into();
+                }
+                *selected.lock().unwrap() = mailbox.to_owned();
+            }
+            if let Some(basic) = gmail_basics(command) {
+                return basic;
+            }
+            let in_all_mail = *selected.lock().unwrap() == "\"[Gmail]/All Mail\"";
+            if command.starts_with("UID SEARCH ") {
+                if in_all_mail {
+                    "* SEARCH 77\r\n".into()
+                } else {
+                    "* SEARCH\r\n".into()
+                }
+            } else if command.starts_with("UID FETCH 77 ") {
+                let header = "Message-ID: <1@example.com>\r\n\r\n";
+                format!(
+                    "* 5 FETCH (UID 77 BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{header})\r\n",
+                    header.len()
+                )
+            } else if command.starts_with("UID STORE 77 ") {
+                "* 5 FETCH (UID 77 X-GM-LABELS (News))\r\n".into()
+            } else {
+                String::new()
+            }
+        })
+        .await;
+        let state = SyncState {
+            uid_validity: Some(1),
+            archive: Some("[Gmail]/All Mail".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            push_imap(&mut session, &store, &state, account)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!store.lock().unwrap().has_label_work(account).unwrap());
+        drop(session);
+        let commands = server.await.unwrap();
         assert!(
             commands
                 .iter()

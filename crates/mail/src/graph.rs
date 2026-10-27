@@ -1245,6 +1245,32 @@ impl Graph {
     }
 
     /// Message `id`'s Outlook categories.
+    /// Whether message `id` was changed a while after it was made: Outlook
+    /// edits a draft in place, which moves its last change on.
+    pub async fn changed_since_made(&self, id: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Times {
+            created_date_time: String,
+            last_modified_date_time: String,
+        }
+        let url = format!(
+            "/me/messages/{}?$select=createdDateTime,lastModifiedDateTime",
+            path(id)
+        );
+        let times: Times = self
+            .json_patiently(|| self.request(Method::GET, &url))
+            .await?;
+        let (Some(made), Some(changed)) = (
+            parse_iso_date(&times.created_date_time),
+            parse_iso_date(&times.last_modified_date_time),
+        ) else {
+            // Can't tell: as if it was.
+            return Ok(true);
+        };
+        Ok(changed - made > CHANGED_AFTER_MS)
+    }
+
     /// Message `id`'s Outlook categories, with the version of the message
     /// they're from (its ETag) for `set_categories`.
     pub async fn categories(&self, id: &str) -> Result<(Vec<String>, Option<String>)> {
@@ -2446,6 +2472,10 @@ pub(crate) fn iso_date(ms: i64) -> String {
         t % 60
     )
 }
+
+/// How long after a message is made that a change to it is someone else's:
+/// saving it can take Graph a moment to settle.
+const CHANGED_AFTER_MS: i64 = 2 * 60_000;
 
 /// Unix ms from `2026-10-21T14:00:00Z` or with fractional seconds.
 pub(crate) fn parse_iso_date(s: &str) -> Option<i64> {
