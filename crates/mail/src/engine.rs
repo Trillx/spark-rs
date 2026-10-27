@@ -621,8 +621,8 @@ impl Engine {
         Ok(senders)
     }
 
-    /// The Sent folder had mail to `found` of the `asked`: they're accepted.
-    /// Returns how many.
+    /// The Sent folder had mail to `found` of the `asked`: they're accepted,
+    /// unless decided about meanwhile. Returns how many were.
     fn written_to(&self, account_id: i64, asked: &[String], found: &[String]) -> Result<usize> {
         let now = now_ms();
         {
@@ -640,10 +640,11 @@ impl Engine {
             }
         }
         let store = self.store();
+        let mut accepted = 0;
         for address in found {
-            store.accept_sender(address, now)?;
+            accepted += usize::from(store.accept_sender(address, now)?);
         }
-        Ok(found.len())
+        Ok(accepted)
     }
 
     /// The account's Sent folder, as an IMAP mailbox name.

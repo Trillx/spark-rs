@@ -3165,3 +3165,40 @@ fn a_new_accounts_own_address_leaves_the_gatekeeper() {
         .unwrap();
     assert!(!store.message(from_home).unwrap().unwrap().screening);
 }
+
+#[test]
+fn writing_to_someone_at_a_blocked_domain_keeps_them_blocked() {
+    let (mut store, account) = store_with_account();
+    decide(
+        &mut store,
+        Screen::Domain("vendor.org".into()),
+        Some(Decision::Blocked),
+        1,
+    );
+    // The user writes to Ann, or a Sent search says they had, after the block.
+    store.accept_sender("ann@vendor.org", 2).unwrap();
+    assert_eq!(store.sender_status("ann@vendor.org").unwrap().sender, None);
+    assert_eq!(
+        arrive(&mut store, account, 1, "ann@vendor.org").state,
+        MessageState::Blocked
+    );
+}
+
+#[test]
+fn undoing_an_accept_puts_a_new_senders_snoozed_mail_back_in_the_gatekeeper() {
+    let (mut store, account) = store_with_account();
+    let snoozed = arrive(&mut store, account, 1, "new@x.com").id;
+    let later = Patch {
+        state: Some(MessageState::Snoozed),
+        snoozed_until: Some(100),
+        ..Default::default()
+    };
+    store.update(snoozed, &later, 1).unwrap();
+    arrive(&mut store, account, 2, "new@x.com");
+    let undo = decide(&mut store, sender("new@x.com"), Some(Decision::Accepted), 2);
+    assert!(!store.message(snoozed).unwrap().unwrap().screening);
+    store.decide(&undo, 3).unwrap();
+    store.wake_snoozed(101).unwrap();
+    let woke = store.message(snoozed).unwrap().unwrap();
+    assert_eq!((woke.state, woke.screening), (MessageState::Inbox, true));
+}

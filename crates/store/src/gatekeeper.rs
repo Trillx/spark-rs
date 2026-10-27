@@ -327,16 +327,18 @@ impl Store {
     }
 
     /// Accepts someone without asking, e.g. someone the user wrote to,
-    /// unless the user decided about them already.
-    pub fn accept_sender(&self, address: &str, now: i64) -> Result<()> {
-        if self.conn.execute(
-            "INSERT OR IGNORE INTO gatekeeper_senders (address, status) VALUES (?1, 'accepted')",
-            [address],
-        )? > 0
-        {
-            resettle(&self.conn, address, now)?;
+    /// unless the user decided about them, or their domain, already (as in
+    /// Spark, which skips senders with a status). Returns whether it did.
+    pub fn accept_sender(&self, address: &str, now: i64) -> Result<bool> {
+        if decided(&self.conn, address)?.is_some() {
+            return Ok(false);
         }
-        Ok(())
+        self.conn.execute(
+            "INSERT INTO gatekeeper_senders (address, status) VALUES (?1, 'accepted')",
+            [address],
+        )?;
+        resettle(&self.conn, address, now)?;
+        Ok(true)
     }
 
     /// Senders waiting in the Gatekeeper, in any account, with no decision
@@ -585,8 +587,10 @@ fn resettle(conn: &Connection, address: &str, now: i64) -> Result<()> {
         params![address, now],
     )?;
     if screened {
+        // Their mail in the server's inbox, snoozed or set aside too, waits again.
         conn.execute(
-            "UPDATE messages SET screening = 1 WHERE from_address = ?1 AND state = 'inbox'",
+            "UPDATE messages SET screening = 1
+             WHERE from_address = ?1 AND state IN ('inbox', 'snoozed', 'aside')",
             [address],
         )?;
     } else {
