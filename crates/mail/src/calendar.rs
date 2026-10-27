@@ -605,7 +605,6 @@ pub fn series_from(
         let ms = parse_iso_date(&format!("{}Z", wall.get(..19).unwrap_or(wall)))?;
         Some((ms, zone.wall_at(ms)))
     };
-    let clock = |w: &str| parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
     let first = date_in(zone, draft.start, draft.all_day);
     let all_day = if draft.all_day != before.all_day {
         draft.all_day
@@ -639,14 +638,19 @@ pub fn series_from(
             }
         };
         let end = match (&own, user && draft.end != before.end) {
-            // As long as the series is on its own clock (Sunday 0:00 to
-            // 4:00), not in hours that passed (five, the night clocks went
-            // back).
+            // The series' own end as Outlook has it now, on the new day (as
+            // many days after its start's as it is), on its own clock: a
+            // start moved here leaves it where it is.
             (Some(((_, wall), (_, to_wall))), false) => {
-                match (clock(&start), clock(wall), clock(to_wall)) {
-                    (Some(t), Some(from), Some(to)) => utc_wall(t + (to - from)),
-                    _ => zone.wall_at(draft.end),
-                }
+                let days = recurrence::days_between(
+                    wall.get(..10).unwrap_or_default(),
+                    to_wall.get(..10).unwrap_or_default(),
+                );
+                format!(
+                    "{}{}",
+                    recurrence::add_days(&first, days),
+                    to_wall.get(10..).unwrap_or_default()
+                )
             }
             _ => zone.wall_at(draft.end),
         };
@@ -700,11 +704,60 @@ fn with_notes(html: &str, notes: &str) -> Option<String> {
 }
 
 /// `html`, an event's description, without the Teams meeting Outlook put in
-/// it (`with_notes`): its notes, for a new meeting to get joining details
-/// of its own. `None` if there's no meeting in it.
+/// it (`with_notes`), for a new meeting to get joining details of its own:
+/// its notes, and anything after the meeting. The meeting runs from where it
+/// starts to the end of the element holding its last rule or marker. `None`
+/// if there's no meeting in it.
 fn before_meeting(html: &str) -> Option<String> {
     let (_, cut) = meeting_in(html)?;
-    Some(html[..cut].to_owned())
+    let lower = html.to_ascii_lowercase();
+    let last = [lower.rfind(&"_".repeat(20)), lower.rfind("-::~:~::~")]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(cut);
+    // Element by element from the meeting's first, to past its last marker.
+    let mut end = cut;
+    while end <= last {
+        match lower[end..].find('<').map(|i| end + i) {
+            Some(at) if lower[at..].starts_with("</") => break,
+            Some(at) => end = element_end(&lower, at),
+            None => return Some(html[..cut].to_owned()),
+        }
+    }
+    Some(format!("{}{}", &html[..cut], &html[end..]))
+}
+
+/// Where the element that starts at `start` in `lower` (lowercased HTML)
+/// ends: past its closing tag, or its own end for a void or self-closing one.
+fn element_end(lower: &str, start: usize) -> usize {
+    const VOID: &[&str] = &[
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr",
+    ];
+    let mut depth = 0usize;
+    let mut at = start;
+    while let Some(open) = lower[at..].find('<').map(|i| at + i) {
+        let Some(close) = lower[open..].find('>').map(|i| open + i + 1) else {
+            return lower.len();
+        };
+        let tag = &lower[open + 1..close - 1];
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if !tag.starts_with('!') && !tag.ends_with('/') && !VOID.contains(&name.as_str()) {
+            depth += 1;
+        }
+        at = close;
+        if depth == 0 {
+            return at;
+        }
+    }
+    lower.len()
 }
 
 /// Where the notes in `html` (an event's description) start, and where the
@@ -2217,6 +2270,44 @@ mod tests {
             body["body"],
             json!({ "contentType": "text", "content": "" })
         );
+    }
+
+    #[test]
+    fn all_future_keeps_what_comes_after_a_teams_meeting() {
+        let rule = "_".repeat(80);
+        let html = format!(
+            "<html><body><div>Agenda</div><div><span>{rule}</span></div><div>Teams meeting, join here</div>\
+             <div><span>{rule}</span></div><div>Parking: level 2</div></body></html>"
+        );
+        let kept = before_meeting(&html).unwrap();
+        assert_eq!(
+            kept,
+            "<html><body><div>Agenda</div><div>Parking: level 2</div></body></html>"
+        );
+    }
+
+    #[test]
+    fn all_future_keeps_an_end_the_user_didnt_move() {
+        let master = json!({
+            "subject": "Review",
+            "start": { "dateTime": "2026-10-13T16:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-10-13T17:00:00.0000000", "timeZone": "UTC" }
+        });
+        let start = parse_iso_date("2026-11-03T16:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Review".into(),
+            start,
+            end: start + 3_600_000,
+            ..Default::default()
+        };
+        // Its top edge dragged down to 9:30; the end stays at 10:00.
+        let later = EventDraft {
+            start: start + 1_800_000,
+            ..before.clone()
+        };
+        let body = series_from(&master, &later, &before, PACIFIC, json!(null));
+        assert_eq!(body["start"]["dateTime"], "2026-11-03T09:30:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-03T10:00:00");
     }
 
     #[test]

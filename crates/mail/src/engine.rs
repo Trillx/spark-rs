@@ -2640,29 +2640,27 @@ async fn series_clock(
         .filter(|z| !z.is_empty())
         .unwrap_or(zone.name)
         .to_owned();
+    // Where the occurrence is now, on this clock and in UTC, both from
+    // Graph: how far apart the clocks are comes from the same moment, not
+    // from the copy stored here, which Outlook may have moved since.
     let (wall, original) = graph.start_in(id, &name).await?;
+    let (utc, _) = graph.start_in(id, "UTC").await?;
     let current = wall.get(..10).unwrap_or_default().to_owned();
     let naive = |w: &str| graph::parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
+    let now = naive(&utc).unwrap_or(start);
     let shift = if all_day || name == zone.name {
         0
     } else {
-        match (naive(&wall), naive(&(zone.wall)(start))) {
+        match (naive(&wall), naive(&(zone.wall)(now))) {
             (Some(there), Some(here)) => (there - here) / 60_000,
             _ => 0,
         }
     };
-    // Moved on its own: the day it was to be on, on this clock. Graph gives
-    // that in UTC; how far this clock is from UTC comes from where the
-    // occurrence is now, in both.
-    let day = match original {
-        Some(original) => {
-            let (utc, _) = graph.start_in(id, "UTC").await?;
-            match (naive(&wall), naive(&utc)) {
-                (Some(there), Some(utc)) => calendar::utc_wall(original + (there - utc)),
-                _ => wall,
-            }
-        }
-        None => wall,
+    // Moved on its own: the day it was to be on, on this clock, from its
+    // original start (UTC's).
+    let day = match (original, naive(&wall)) {
+        (Some(original), Some(there)) => calendar::utc_wall(original + (there - now)),
+        _ => wall,
     }
     .get(..10)
     .unwrap_or_default()
