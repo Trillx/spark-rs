@@ -1405,10 +1405,16 @@ fn what_a_sync_couldnt_fetch_is_filled_in_later_and_nothing_else() {
         remote_id: Some("a1".into()),
     };
     let invite = r#"{"kind":"invitation"}"#;
-    assert!(
+    assert_eq!(
         store
-            .fill_in_remote(account, "r1", std::slice::from_ref(&plan), Some(invite))
-            .unwrap()
+            .fill_in_remote(
+                account,
+                "r1",
+                Some(std::slice::from_ref(&plan)),
+                Some(Some(invite))
+            )
+            .unwrap(),
+        Some(true)
     );
     let content = store.content(id).unwrap().unwrap();
     assert_eq!(content.attachments, std::slice::from_ref(&plan));
@@ -1423,21 +1429,27 @@ fn what_a_sync_couldnt_fetch_is_filled_in_later_and_nothing_else() {
     );
     assert_eq!(store.pending_for(id).unwrap().map(|p| p.id), Some(id));
 
-    // Nothing to fill in leaves what's there; another account's or a
-    // message not stored isn't.
-    assert!(store.fill_in_remote(account, "r1", &[], None).unwrap());
+    // Nothing to fill in leaves what's there; the same again changes
+    // nothing; another account's or a message not stored isn't.
+    assert_eq!(
+        store.fill_in_remote(account, "r1", None, None).unwrap(),
+        Some(false)
+    );
+    let same = Some(std::slice::from_ref(&plan));
+    assert_eq!(
+        store.fill_in_remote(account, "r1", same, None).unwrap(),
+        Some(false)
+    );
     let content = store.content(id).unwrap().unwrap();
     assert_eq!(content.attachments, std::slice::from_ref(&plan));
     assert_eq!(content.invite.as_deref(), Some(invite));
-    assert!(
-        !store
-            .fill_in_remote(account, "r9", std::slice::from_ref(&plan), None)
-            .unwrap()
+    assert_eq!(
+        store.fill_in_remote(account, "r9", same, None).unwrap(),
+        None
     );
-    assert!(
-        !store
-            .fill_in_remote(account + 1, "r1", &[plan], None)
-            .unwrap()
+    assert_eq!(
+        store.fill_in_remote(account + 1, "r1", same, None).unwrap(),
+        None
     );
 }
 
@@ -1618,11 +1630,11 @@ fn content_filled_in_later_is_a_change_to_the_list() {
     let invite = r#"{"kind":"invitation","ics":"BEGIN:VCALENDAR"}"#;
     let rev = |store: &Store| store.message(other).unwrap().unwrap().content_rev;
     store
-        .fill_in_remote(account, "AAMk-2", &[], Some(invite))
+        .fill_in_remote(account, "AAMk-2", None, Some(Some(invite)))
         .unwrap();
     assert_eq!(rev(&store), 1);
     store
-        .fill_in_remote(account, "AAMk-2", &[], Some(invite))
+        .fill_in_remote(account, "AAMk-2", None, Some(Some(invite)))
         .unwrap();
     assert_eq!(rev(&store), 1);
 }
@@ -1766,6 +1778,49 @@ fn a_blocked_senders_archived_mail_moved_into_the_inbox_goes_to_blocked() {
         Place::Blocked,
         "it moves to Blocked there"
     );
+}
+
+#[test]
+fn a_repair_that_finds_nothing_clears_what_a_listing_told() {
+    let (mut store, account) = store_with_account();
+    let listed = Incoming {
+        remote_id: Some("AAMk-3".into()),
+        mailbox: None,
+        uid: None,
+        ..head(account, 3)
+    };
+    let id = new_id(store.add_incoming(&listed, false).unwrap());
+    let rev = |store: &Store| store.message(id).unwrap().unwrap().content_rev;
+    // It has no files after all; its invite is still to come.
+    assert_eq!(
+        store
+            .fill_in_remote(account, "AAMk-3", Some(&[]), None)
+            .unwrap(),
+        Some(true)
+    );
+    let content = store.content(id).unwrap().unwrap();
+    assert!(content.attachments.is_empty());
+    assert!(content.invite.is_some());
+    let m = store.message(id).unwrap().unwrap();
+    assert_eq!(m.attachment, None);
+    assert_eq!(rev(&store), 1);
+    assert_eq!(
+        store
+            .fill_in_remote(account, "AAMk-3", Some(&[]), None)
+            .unwrap(),
+        Some(false)
+    );
+    assert_eq!(rev(&store), 1);
+    // Nor an invite.
+    assert_eq!(
+        store
+            .fill_in_remote(account, "AAMk-3", None, Some(None))
+            .unwrap(),
+        Some(true)
+    );
+    assert!(store.content(id).unwrap().unwrap().invite.is_none());
+    assert_eq!(store.message(id).unwrap().unwrap().invite_kind, None);
+    assert_eq!(rev(&store), 2);
 }
 
 #[test]

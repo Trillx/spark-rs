@@ -1310,36 +1310,54 @@ impl Store {
     }
 
     /// Fills in what a sync stored message `remote_id` of `account_id`
-    /// without, as the server couldn't give it then: its `attachments`,
-    /// unless there are none, and the `invite` it carries, if any. Nothing
-    /// else of it changes, so what the user changed stays as it is. Returns
-    /// whether the message is stored.
+    /// without, as the server couldn't give it then: its `attachments` and
+    /// the `invite` it carries, each where it's given (`Some`). No files,
+    /// or no invite, is an answer too: what a listing told of them, which
+    /// mail stored without its body shows till then (`Body::Missing`),
+    /// goes. Nothing else of it changes, so what the user changed stays as
+    /// it is. Returns whether any of it changed, or `None` if the message
+    /// isn't stored.
     pub fn fill_in_remote(
         &self,
         account_id: i64,
         remote_id: &str,
-        attachments: &[Attachment],
-        invite: Option<&str>,
-    ) -> Result<bool> {
-        let stored = self
+        attachments: Option<&[Attachment]>,
+        invite: Option<Option<&str>>,
+    ) -> Result<Option<bool>> {
+        let Some(before): Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT content_rev FROM messages WHERE account_id = ?1 AND remote_id = ?2",
+            )?
+            .query_row(params![account_id, remote_id], |r| r.get(0))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let after: i64 = self
             .conn
             .prepare_cached(
                 "UPDATE messages SET
-                    attachments = CASE WHEN ?3 THEN attachments ELSE ?4 END,
-                    invite = COALESCE(?5, invite),
+                    attachments = CASE WHEN ?3 THEN ?4 ELSE attachments END,
+                    invite = CASE WHEN ?5 THEN ?6 ELSE invite END,
                     content_rev = content_rev
-                        + (CASE WHEN ?3 THEN attachments ELSE ?4 END IS NOT attachments
-                           OR COALESCE(?5, invite) IS NOT invite)
-                 WHERE account_id = ?1 AND remote_id = ?2",
+                        + (CASE WHEN ?3 THEN ?4 ELSE attachments END IS NOT attachments
+                           OR CASE WHEN ?5 THEN ?6 ELSE invite END IS NOT invite)
+                 WHERE account_id = ?1 AND remote_id = ?2
+                 RETURNING content_rev",
             )?
-            .execute(params![
-                account_id,
-                remote_id,
-                attachments.is_empty(),
-                json(attachments),
-                invite
-            ])?;
-        Ok(stored > 0)
+            .query_row(
+                params![
+                    account_id,
+                    remote_id,
+                    attachments.is_some(),
+                    attachments.map(json),
+                    invite.is_some(),
+                    invite.flatten()
+                ],
+                |r| r.get(0),
+            )?;
+        Ok(Some(after != before))
     }
 
     /// Records the answer sent to the invite message `id` carries.

@@ -1516,6 +1516,16 @@ impl Graph {
             .complete_all(new.into_iter().zip(incomings).collect())
             .await;
         let mut store = lock(store);
+        // New ones the background download stored meanwhile, without their
+        // bodies: filled in like those stored before.
+        let mut i = 0;
+        while i < found.len() {
+            let remote_id = found[i].0.remote_id.as_deref().unwrap_or_default();
+            match store.bodyless_remote(account_id, remote_id)? {
+                Some(id) => whole.push((found.remove(i).0, id)),
+                None => i += 1,
+            }
+        }
         for (incoming, id) in &mut whole {
             keep_listed(&store, *id, incoming, &repairs)?;
         }
@@ -2982,22 +2992,24 @@ fn listed_for_repair(b: &Batch, account_id: i64, repairs: Vec<Repair>) -> spark_
 /// it was stored (`now`), it's given up on. Returns whether the stored
 /// message changed.
 fn repaired(store: &mut Store, account_id: i64, asked: &Repair, parts: Parts, now: i64) -> bool {
-    let came = !parts.attachments.is_empty() || parts.invite.is_some();
-    let stored = if came {
+    // What Graph answered for, none at all too: then what the message's
+    // listing told of it goes (`keep_listed`).
+    let settled = asked.missing.without(parts.missing);
+    let filled = if settled.any() {
         match store.fill_in_remote(
             account_id,
             &asked.id,
-            &parts.attachments,
-            parts.invite.as_deref(),
+            settled.attachments.then_some(&parts.attachments[..]),
+            settled.invite.then_some(parts.invite.as_deref()),
         ) {
-            Ok(stored) => stored,
+            Ok(filled) => filled,
             // Left on the list as it was, for the next round.
             Err(_) => return false,
         }
     } else {
-        true
+        Some(false)
     };
-    let settled = asked.missing.without(parts.missing);
+    let stored = filled.is_some();
     let change = |list: &mut Vec<Repair>| {
         let Some(at) = list.iter().position(|r| r.id == asked.id) else {
             return;
@@ -3026,7 +3038,7 @@ fn repaired(store: &mut Store, account_id: i64, asked: &Repair, parts: Parts, no
     };
     // Left as it was if this fails: what came is fetched again.
     let _ = store.batch(|b| change_repairs(b, account_id, change));
-    came && stored
+    filled == Some(true)
 }
 
 /// Unix ms `ms` down to its whole second, as `iso_date` writes it.
@@ -5081,6 +5093,94 @@ pub(crate) mod tests {
             .await;
         assert_eq!(again.unwrap(), 0);
         assert_eq!(seen.take().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_search_counts_a_body_it_fills_in_of_mail_stored_meanwhile() {
+        let (store, account_id) = searched_store();
+        let store = Arc::new(store);
+        // As the search fetches i20, new to it, the background download
+        // stores it without its body.
+        let during = store.clone();
+        let (base, _) = serve(move |asked, attempt| {
+            if asked.path.starts_with("/me/messages/i20?") && attempt == 0 {
+                let head = Incoming {
+                    account_id,
+                    remote_id: Some("i20".into()),
+                    subject: "Invoice i20".into(),
+                    body: Body::Missing,
+                    ..Default::default()
+                };
+                lock(&during).add_incoming(&head, false).unwrap();
+            }
+            match searchable(asked) {
+                Some(json) => Answer::json(json),
+                None => Answer::status(404),
+            }
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let state = searchable_state(&base);
+        let query = Query::parse("invoice");
+        let stored = graph
+            .search_server(&store, account_id, &state, &query)
+            .await;
+        assert_eq!(stored.unwrap(), 2 + 1, "the new ones, and i20's body");
+        let i20 = titled(&store, "Invoice i20").unwrap();
+        let content = lock(&store).content(i20.id).unwrap().unwrap();
+        assert!(!content.body_missing);
+        assert_eq!(content.text, "The invoice");
+    }
+
+    #[tokio::test]
+    async fn a_file_the_repair_finds_gone_leaves_no_stand_in() {
+        // i301's files can't be listed when it's opened; by the repair,
+        // the file was taken out of it.
+        let (base, _) = serve(|asked, attempt| {
+            if asked.path.starts_with("/me/messages/i301/attachments") {
+                return match attempt {
+                    0 => Answer::status(500),
+                    _ => Answer::json(json!({ "value": [] })),
+                };
+            }
+            attached(asked, attempt)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(250) + 1_800_000),
+            ..Default::default()
+        };
+        graph
+            .older_inbox(&store, account_id, &mut state)
+            .await
+            .unwrap();
+        let i301 = titled(&store, "Message i301").unwrap();
+        assert!(
+            graph
+                .fetch_body(&store, account_id, i301.id, "i301")
+                .await
+                .unwrap()
+        );
+        let message = || lock(&store).message(i301.id).unwrap().unwrap();
+        assert_eq!(message().attachment.as_deref(), Some(UNLISTED_ATTACHMENT));
+        assert_eq!(repair_list(&store, account_id).len(), 1);
+
+        let now = spark_store::now_ms();
+        assert_eq!(graph.repair(&store, account_id, now).await, 1);
+        assert!(repair_list(&store, account_id).is_empty());
+        assert!(
+            lock(&store)
+                .content(i301.id)
+                .unwrap()
+                .unwrap()
+                .attachments
+                .is_empty()
+        );
+        assert_eq!(message().attachment, None);
+        assert_eq!(message().content_rev, 2, "its body, then this");
     }
 
     #[test]
