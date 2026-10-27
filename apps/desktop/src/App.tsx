@@ -893,7 +893,7 @@ export default function App() {
     openCalendarAt,
     openSettings,
     otherWindowEdited,
-    searchFor,
+    searchFromWindow,
   });
   events.current = {
     reloadMessages,
@@ -907,7 +907,7 @@ export default function App() {
     openCalendarAt,
     openSettings,
     otherWindowEdited,
-    searchFor,
+    searchFromWindow,
   };
   useEffect(() => {
     const stops = [
@@ -928,7 +928,7 @@ export default function App() {
             onAgentSending((e) => events.current.agentSending(e)),
             onOpenCalendar((focus) => events.current.openCalendarAt(focus)),
             onOpenSettings((page) => events.current.openSettings(page)),
-            onSearchInMain((query) => events.current.searchFor(query)),
+            onSearchInMain((query) => events.current.searchFromWindow(query)),
           ]
         : []),
     ];
@@ -2515,6 +2515,17 @@ export default function App() {
   }
 
   /** Opens a search for `query`, keeping the thread open; it counts as a recent search. */
+  /** A search a conversation's own window asked for: shown here, over whatever covered the list. */
+  function searchFromWindow(query: string) {
+    setSettingsPage(null);
+    setPalette(null);
+    setCalendarOpen(false);
+    closeSidebar();
+    // In one column the reader covers the list the results are in.
+    if (!twoColumns) setOpenId(null);
+    searchFor(query);
+  }
+
   function searchFor(query: string) {
     startHomeSession();
     setRecentSearches((r) => rememberSearch(r, query));

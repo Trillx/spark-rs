@@ -272,6 +272,8 @@ export default function ThreadView({
     count.current = conversation.length;
     const newest = conversation[conversation.length - 1];
     if (!grew || !atEnd.current || !newest) return;
+    // Reading's start no longer holds: the newest email does.
+    stopHolding.current();
     scrollRef.current
       ?.querySelector(`[data-message="${newest.id}"]`)
       ?.scrollIntoView({ block: "start", behavior: "smooth" });
