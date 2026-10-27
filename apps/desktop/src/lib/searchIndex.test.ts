@@ -64,6 +64,9 @@ test("only new mail or changed words change what the index finds", () => {
   assert.equal(indexChanged(before, changed({ subject: "Plans" })), true);
   assert.equal(indexChanged(before, changed({ to: ["Zoë Ortiz <zoe@example.com>"] })), true);
   assert.equal(indexChanged(before, changed({ timestamp: 9_000 })), true);
+  // Older mail that got its body, its row as it was.
+  assert.equal(indexChanged(before, changed({ contentRev: 1 })), true);
+  assert.equal(indexChanged(before, changed({ contentRev: 0 })), false, "none is 0");
 });
 
 test("typing fast asks the index once, for the text it rests on", async (t) => {

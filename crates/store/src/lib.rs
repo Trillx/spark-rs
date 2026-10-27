@@ -302,6 +302,11 @@ pub struct Message {
     pub auto_label: Option<AutoLabel>,
     /// The newest draft inbox automation wrote in reply to it, by id.
     pub auto_draft: Option<i64>,
+    /// How many times its content was filled in after it was stored: its
+    /// body (`Store::fill_in_body`), or attachments and an invite the
+    /// server couldn't give then (`Store::fill_in_remote`). A body read
+    /// before, or what a search found in it, is out of date when it moves.
+    pub content_rev: i64,
 }
 
 /// A reminder in the Inbox, on the email it came back as.
@@ -697,7 +702,8 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      (SELECT remind_at FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
      json_extract(invite, '$.kind'), \
      (SELECT label FROM auto_labels WHERE message_id = messages.id), \
-     (SELECT draft_id FROM auto_drafts WHERE message_id = messages.id ORDER BY created_at DESC, draft_id DESC LIMIT 1)";
+     (SELECT draft_id FROM auto_drafts WHERE message_id = messages.id ORDER BY created_at DESC, draft_id DESC LIMIT 1), \
+     content_rev";
 
 /// The messages the list shows: all but drafts waiting in the outbox to be sent.
 const LISTED: &str = "id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)";
@@ -892,6 +898,16 @@ impl Store {
                  ALTER TABLE messages ADD COLUMN body_missing INTEGER NOT NULL DEFAULT 0;",
             )?;
             tx.pragma_update(None, "user_version", 26)?;
+            tx.commit()?;
+        }
+        if version < 27 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "-- Counts what was filled in of its content after it was stored
+                 -- (`Message::content_rev`).
+                 ALTER TABLE messages ADD COLUMN content_rev INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            tx.pragma_update(None, "user_version", 27)?;
             tx.commit()?;
         }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
@@ -1291,7 +1307,10 @@ impl Store {
             .prepare_cached(
                 "UPDATE messages SET
                     attachments = CASE WHEN ?3 THEN attachments ELSE ?4 END,
-                    invite = COALESCE(?5, invite)
+                    invite = COALESCE(?5, invite),
+                    content_rev = content_rev
+                        + (CASE WHEN ?3 THEN attachments ELSE ?4 END IS NOT attachments
+                           OR COALESCE(?5, invite) IS NOT invite)
                  WHERE account_id = ?1 AND remote_id = ?2",
             )?
             .execute(params![
@@ -2411,7 +2430,8 @@ fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
     Ok(conn
         .prepare_cached(
             "UPDATE messages SET text_body = ?2, html_body = ?3, attachments = ?4, invite = ?5,
-                snippet = CASE WHEN ?6 = '' THEN snippet ELSE ?6 END, body_missing = 0
+                snippet = CASE WHEN ?6 = '' THEN snippet ELSE ?6 END, body_missing = 0,
+                content_rev = content_rev + 1
              WHERE id = ?1 AND body_missing != 0",
         )?
         .execute(params![
@@ -2657,6 +2677,7 @@ fn message_row(r: &Row) -> Result<Message> {
             .as_deref()
             .and_then(AutoLabel::parse),
         auto_draft: r.get(26)?,
+        content_rev: r.get(27)?,
     })
 }
 

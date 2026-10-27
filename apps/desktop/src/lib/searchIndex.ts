@@ -12,7 +12,8 @@ const sameList = (a: string[] = [], b: string[] = []) => a.length === b.length &
 
 /**
  * Whether two versions of a message read the same to the index: sender, recipients, subject and text. The list
- * doesn't have the text or Cc, but only drafts change those, and a draft saved again has a new date.
+ * doesn't have the text or Cc, but only drafts change those, and a draft saved again has a new date, and older mail
+ * that gets its body moves its `contentRev`.
  */
 const indexedSame = (a: Message, b: Message) =>
   a === b ||
@@ -21,11 +22,13 @@ const indexedSame = (a: Message, b: Message) =>
     a.snippet === b.snippet &&
     a.from === b.from &&
     a.address === b.address &&
+    (a.contentRev ?? 0) === (b.contentRev ?? 0) &&
     sameList(a.to, b.to));
 
 /**
  * Whether the index may find other messages of `after` than it did of `before`: there's mail new to the list, or
- * a message's sender, recipients, subject or text changed. New flags or places, and mail that's gone, can't.
+ * a message's sender, recipients, subject or text changed (its body filled in, too). New flags or places, and mail
+ * that's gone, can't.
  */
 export function indexChanged(before: readonly Message[], after: readonly Message[]): boolean {
   if (before === after) return false;

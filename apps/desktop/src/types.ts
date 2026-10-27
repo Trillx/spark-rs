@@ -121,6 +121,12 @@ export interface Message {
   autoLabel?: AutoLabel;
   /** The draft inbox automation wrote in reply to it, by id. */
   autoDraft?: number;
+  /**
+   * How many times its content was filled in after it was stored: its body (older mail comes without one), or files
+   * and an invite the server couldn't give then. A body read before, and what searches found, are out of date when
+   * it moves. None is 0.
+   */
+  contentRev?: number;
 }
 
 /** Spark's Auto-Labels (AutoLabel in the store's automation.rs). */

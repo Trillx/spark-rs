@@ -91,6 +91,7 @@ pub mod tests {
             invite_kind: None,
             auto_label: None,
             auto_draft: None,
+            content_rev: 0,
         }
     }
 

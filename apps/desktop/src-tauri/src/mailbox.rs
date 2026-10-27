@@ -94,6 +94,15 @@ pub struct Message {
     /// The draft inbox automation wrote in reply to it, by id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_draft: Option<i64>,
+    /// How many times its content was filled in after it was stored
+    /// (`spark_store::Message::content_rev`): a body read before, and what
+    /// searches found, are out of date when it moves.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub content_rev: i64,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// The message list's changes since the UI's `mark`: every message (`full`)
@@ -394,6 +403,7 @@ fn from_store(m: spark_store::Message) -> Message {
         invite_kind: m.invite_kind,
         auto_label: m.auto_label,
         auto_draft: m.auto_draft,
+        content_rev: m.content_rev,
     }
 }
 
@@ -3033,6 +3043,7 @@ mod tests {
             invite_kind: None,
             auto_label: None,
             auto_draft: None,
+            content_rev: 0,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["muted"], true);

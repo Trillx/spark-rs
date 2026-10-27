@@ -1191,6 +1191,8 @@ fn version_23_databases_gain_the_reply_queue() {
                  ALTER TABLE automation_checked DROP COLUMN draft_failures;
                  ALTER TABLE automation_checked DROP COLUMN draft_due;
                  ALTER TABLE messages DROP COLUMN body_missing;
+                 DROP TRIGGER temp.log_message_changed;
+                 ALTER TABLE messages DROP COLUMN content_rev;
                  PRAGMA user_version = 23;",
             )
             .unwrap();
@@ -1336,6 +1338,8 @@ fn version_24_databases_gain_server_versions() {
         .execute_batch(
             "ALTER TABLE auto_drafts DROP COLUMN server_version;
              ALTER TABLE messages DROP COLUMN body_missing;
+             DROP TRIGGER temp.log_message_changed;
+             ALTER TABLE messages DROP COLUMN content_rev;
              PRAGMA user_version = 24;",
         )
         .unwrap();

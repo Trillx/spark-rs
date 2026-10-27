@@ -98,12 +98,14 @@ export function mailboxCopy(): MailboxCopy {
 }
 
 /**
- * Whether a message's stored content changed between two reads of it, so a body kept from before is stale: a sync
- * filled in the attachments or invite it was stored without, as the server couldn't give them then. Its being read,
- * pinned or moved doesn't change it.
+ * Whether a message's stored content changed between two reads of it, so a body kept from before is stale: older
+ * mail got its body, or a sync filled in the attachments or invite it was stored without, as the server couldn't
+ * give them then (`contentRev`). Its being read, pinned or moved doesn't change it.
  */
 const contentChanged = (was: Message, now: Message) =>
-  was.attachment !== now.attachment || was.inviteKind !== now.inviteKind;
+  was.attachment !== now.attachment ||
+  was.inviteKind !== now.inviteKind ||
+  (was.contentRev ?? 0) !== (now.contentRev ?? 0);
 
 /**
  * The ids of messages in `changes` whose stored content changed since `copy` read them (`contentChanged`), for their

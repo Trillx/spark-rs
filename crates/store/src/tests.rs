@@ -1580,6 +1580,54 @@ fn mail_fetched_whole_elsewhere_fills_in_the_body_stored_without_it() {
 }
 
 #[test]
+fn content_filled_in_later_is_a_change_to_the_list() {
+    let (mut store, account) = store_with_account();
+    // Whole, it lists as it did without its body: the same preview, file
+    // and (no) invite.
+    let listed = Incoming {
+        invite: None,
+        ..head(account, 1)
+    };
+    let id = new_id(store.add_incoming(&listed, false).unwrap());
+    let (messages, mark) = store.messages_marked().unwrap();
+    assert_eq!(messages[0].content_rev, 0);
+    let whole = Incoming {
+        snippet: listed.snippet.clone(),
+        attachments: listed.attachments.clone(),
+        ..whole(account, 1)
+    };
+    assert!(store.fill_in_body(id, &whole).unwrap());
+    let changes = store.message_changes(&mark.unwrap()).unwrap().unwrap();
+    assert_eq!(changes.messages.len(), 1);
+    assert_eq!(changes.messages[0].content_rev, 1);
+    assert_eq!(
+        Message {
+            content_rev: 0,
+            ..changes.messages[0].clone()
+        },
+        messages[0],
+        "nothing else of its row changed"
+    );
+
+    // An invite a repair fills in moves it again; one it already has doesn't.
+    let graph = Incoming {
+        remote_id: Some("AAMk-2".into()),
+        ..head(account, 2)
+    };
+    let other = new_id(store.add_incoming(&graph, false).unwrap());
+    let invite = r#"{"kind":"invitation","ics":"BEGIN:VCALENDAR"}"#;
+    let rev = |store: &Store| store.message(other).unwrap().unwrap().content_rev;
+    store
+        .fill_in_remote(account, "AAMk-2", &[], Some(invite))
+        .unwrap();
+    assert_eq!(rev(&store), 1);
+    store
+        .fill_in_remote(account, "AAMk-2", &[], Some(invite))
+        .unwrap();
+    assert_eq!(rev(&store), 1);
+}
+
+#[test]
 fn what_a_folder_sync_knows_of_stored_mail_leaves_its_body_to_come() {
     let (mut store, account) = store_with_account();
     store
@@ -3773,6 +3821,9 @@ fn version_21_databases_index_pending_and_snoozed_mail() {
             "DROP INDEX messages_pending;
              DROP INDEX messages_due_snooze;
              ALTER TABLE messages DROP COLUMN body_missing;
+             -- This opening's change log watches it.
+             DROP TRIGGER temp.log_message_changed;
+             ALTER TABLE messages DROP COLUMN content_rev;
              PRAGMA user_version = 21;",
         )
         .unwrap();
@@ -3827,6 +3878,8 @@ fn version_25_databases_have_every_body() {
             .conn
             .execute_batch(
                 "ALTER TABLE messages DROP COLUMN body_missing;
+                 DROP TRIGGER temp.log_message_changed;
+                 ALTER TABLE messages DROP COLUMN content_rev;
                  PRAGMA user_version = 25;",
             )
             .unwrap();
@@ -3834,6 +3887,7 @@ fn version_25_databases_have_every_body() {
     };
     let store = Store::open(&path).unwrap();
     assert!(!store.content(id).unwrap().unwrap().body_missing);
+    assert_eq!(store.message(id).unwrap().unwrap().content_rev, 0);
     drop(store);
     // Reopening a migrated database doesn't add the column twice.
     assert!(

@@ -183,6 +183,22 @@ test("a body goes stale as a sync fills in its message's files or invite, not as
   assert.deepEqual(staleContent(full(next, 3), copy), []);
 });
 
+test("a body goes stale as its content is filled in, though its row reads as before", () => {
+  // n1, older mail, whose MIME failed when it was opened: its invite was only a hint, read as none. n2's file name
+  // was only a stand-in.
+  const copy = mailboxCopy();
+  const listed = [{ ...mail(1), inviteKind: "invitation" as const }, { ...mail(2), attachment: "Attachment" }];
+  const shown = copy.apply(full(ordered(listed)), []);
+  // A repair brings n1's calendar text, and n2 gets its body with a file of that name.
+  const changes = changed(2, [
+    { ...listed[0], contentRev: 1 },
+    { ...listed[1], contentRev: 1 },
+  ]);
+  assert.deepEqual(staleContent(changes, copy), [1, 2]);
+  copy.apply(changes, shown);
+  assert.deepEqual(staleContent(changed(3, [{ ...listed[0], contentRev: 1, unread: false }]), copy), []);
+});
+
 test("a reader's body loaded before its files were filled in is read again, and the old load isn't kept", async () => {
   // The store's n2: stored without its file, which a later round fills in.
   let stored = { attachments: [] as string[] };
