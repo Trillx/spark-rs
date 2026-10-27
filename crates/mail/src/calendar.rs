@@ -374,8 +374,13 @@ pub fn changed_event_body(
     );
     // A monthly or yearly series moved to another date goes by the date it
     // went to (the 1st, the second Tuesday), from its own first day as many
-    // months before, so its rhythm (every third month) stays.
+    // months before, so its rhythm (every third month) stays. One whose rule
+    // the editor can't show ("the last weekday") keeps its days: its first
+    // stays on its date, moved only by the hours.
     let by_date = shift && days != 0 && recurrence::by_date(&details.recurrence);
+    let kept = by_date && Repeat::from_graph(&details.recurrence).is_none();
+    let by_date = by_date && !kept;
+    let unmoved = if kept { days * DAY_MS } else { 0 };
     if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
         // The series' own first time moves by as much as this occurrence's
         // did on the clock (days and hours), so its own length stays and a
@@ -386,9 +391,9 @@ pub fn changed_event_body(
             if !shift {
                 zone.time(now, draft.all_day)
             } else if draft.all_day {
-                zone.time(series + (now - was), true)
+                zone.time(series + (now - was) - unmoved, true)
             } else {
-                let at = clock(series) + (clock(now) - clock(was));
+                let at = clock(series) + (clock(now) - clock(was)) - unmoved;
                 json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
             }
         };
@@ -419,8 +424,8 @@ pub fn changed_event_body(
         }
         // Only the ones that changed, so a start moved in Outlook meanwhile
         // stays when only the end changes; all day or back changes both, and
-        // so does a series lined up on another date, its end with it.
-        let both = draft.all_day != before.all_day || by_date;
+        // so does a series moved by date, its end with it.
+        let both = draft.all_day != before.all_day || by_date || kept;
         if both || draft.start != before.start {
             body.insert("start".into(), start);
         }
@@ -647,29 +652,39 @@ pub fn series_from(
     } else {
         let user = !draft.all_day && !before.all_day;
         let own = master_times.filter(|_| master["isAllDay"] != true);
-        let start = match (&own, user && draft.start != before.start) {
-            (_, true) | (None, _) => zone.wall_at(draft.start),
-            (Some(((_, wall), _)), false) => {
-                format!("{first}{}", wall.get(10..).unwrap_or_default())
-            }
+        let user_start = user && draft.start != before.start;
+        let user_end = user && draft.end != before.end;
+        let (here, here_end) = (zone.wall_at(draft.start), zone.wall_at(draft.end));
+        let time = |wall: &str| wall.get(10..).unwrap_or_default().to_owned();
+        let between = |from: &str, to: &str| {
+            recurrence::days_between(
+                from.get(..10).unwrap_or_default(),
+                to.get(..10).unwrap_or_default(),
+            )
         };
-        let end = match (&own, user && draft.end != before.end) {
-            // The series' own end as Outlook has it now, on the new day (as
-            // many days after its start's as it is), on its own clock: a
-            // start moved here leaves it where it is.
-            (Some(((_, wall), (_, to_wall))), false) => {
-                let days = recurrence::days_between(
-                    wall.get(..10).unwrap_or_default(),
-                    to_wall.get(..10).unwrap_or_default(),
-                );
-                format!(
-                    "{}{}",
-                    recurrence::add_days(first, days),
-                    to_wall.get(10..).unwrap_or_default()
-                )
-            }
-            _ => zone.wall_at(draft.end),
+        // Each time the user's where they changed it, else the series' own
+        // as Outlook has it now, on its own clock, from its new first day.
+        // The end is as many days after the start as the series' is, or as
+        // the editor's is once a time moved here (a start dragged back a day
+        // keeps it a day longer).
+        let (start_time, end_time, days) = match &own {
+            Some(((_, wall), (_, to_wall))) => (
+                if user_start { time(&here) } else { time(wall) },
+                if user_end {
+                    time(&here_end)
+                } else {
+                    time(to_wall)
+                },
+                if user_start || user_end {
+                    between(&here, &here_end)
+                } else {
+                    between(wall, to_wall)
+                },
+            ),
+            None => (time(&here), time(&here_end), between(&here, &here_end)),
         };
+        let start = format!("{first}{start_time}");
+        let end = format!("{}{end_time}", recurrence::add_days(first, days));
         (start, end)
     };
     body.insert(
@@ -2245,6 +2260,22 @@ mod tests {
         );
         assert_eq!(body["start"]["dateTime"], "2026-11-03T09:30:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T10:30:00");
+        // Its start dragged back to the day before, its end kept: a day
+        // longer, ending where Outlook has it, the day after it starts.
+        let longer = EventDraft {
+            start: start - 86_400_000,
+            ..before.clone()
+        };
+        let body = series_from(
+            &master,
+            &longer,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, longer.start, longer.all_day),
+            json!(null),
+        );
+        assert_eq!(body["start"]["dateTime"], "2026-11-02T09:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-03T11:00:00");
     }
 
     #[test]
@@ -2602,6 +2633,39 @@ mod tests {
         let body = changed_event_body(&longer, &before, &details, PACIFIC, true);
         assert_eq!(body["start"]["dateTime"], "2027-02-14T10:00:00");
         assert_eq!(body["end"]["dateTime"], "2027-02-15T11:00:00");
+
+        // The last weekday, three times from October 30, a rule the editor
+        // can't show: November 30's moved to December 1, an hour later, for
+        // all of them. Its days stay; only the hour moves.
+        let series_start = parse_iso_date("2026-10-30T16:00:00Z").unwrap();
+        let details = EventDetails {
+            start: series_start,
+            end: series_start + 3_600_000,
+            recurrence: json!({
+                "pattern": { "type": "relativeMonthly", "interval": 1, "index": "last",
+                    "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"] },
+                "range": { "type": "numbered", "startDate": "2026-10-30", "numberOfOccurrences": 3, "recurrenceTimeZone": "Pacific Standard Time" }
+            }),
+            ..Default::default()
+        };
+        let occurrence = parse_iso_date("2026-11-30T16:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Close".into(),
+            start: occurrence,
+            end: occurrence + 3_600_000,
+            ..Default::default()
+        };
+        let to = occurrence + 86_400_000 + 3_600_000;
+        let draft = EventDraft {
+            start: to,
+            end: to + 3_600_000,
+            ..before.clone()
+        };
+        let body = changed_event_body(&draft, &before, &details, PACIFIC, true);
+        assert_eq!(body["start"]["dateTime"], "2026-10-30T10:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-10-30T11:00:00");
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-10-30");
+        assert_eq!(body["recurrence"]["pattern"], details.recurrence["pattern"]);
     }
 
     #[tokio::test]

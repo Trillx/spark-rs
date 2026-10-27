@@ -1729,31 +1729,36 @@ impl Engine {
         // From here on, the series' own clock: the new series is written
         // there, as the old one was, so its days and dates mean the same.
         let zone = clock.zone(zone);
+        let rule = if draft.repeat != before.repeat {
+            draft.repeat.as_ref()
+        } else {
+            None
+        };
+        // A monthly or yearly rule the editor can't show ("the last weekday")
+        // keeps its days, so the new series does too, from where this one is.
+        let kept =
+            rule.is_none() && recurrence::by_date(&old) && Repeat::from_graph(&old).is_none();
         // The day it goes to there, and how far the user moved it. One not
         // moved here stays on the day Outlook has it now, which may be
         // another than the copy here says (made all-day there since). An
         // all-day one goes by as many days from where it is on the series'
         // clock: its date here is UTC's, a day off for a series 13 hours from
         // it.
-        let (from, moved) = if (draft.start, draft.all_day) == (before.start, before.all_day) {
-            (clock.current.clone(), 0)
-        } else if draft.all_day && before.all_day {
-            let moved = (draft.start - before.start).div_euclid(86_400_000);
-            (recurrence::add_days(&clock.current, moved), moved)
-        } else {
-            let from = calendar::date_in(zone, draft.start, draft.all_day);
-            let moved = recurrence::days_between(
-                &calendar::date_in(zone, before.start, before.all_day),
-                &from,
-            );
-            (from, moved)
-        };
+        let (from, moved) =
+            if kept || (draft.start, draft.all_day) == (before.start, before.all_day) {
+                (clock.current.clone(), 0)
+            } else if draft.all_day && before.all_day {
+                let moved = (draft.start - before.start).div_euclid(86_400_000);
+                (recurrence::add_days(&clock.current, moved), moved)
+            } else {
+                let from = calendar::date_in(zone, draft.start, draft.all_day);
+                let moved = recurrence::days_between(
+                    &calendar::date_in(zone, before.start, before.all_day),
+                    &from,
+                );
+                (from, moved)
+            };
         let days = recurrence::days_between(&clock.current, &from);
-        let rule = if draft.repeat != before.repeat {
-            draft.repeat.as_ref()
-        } else {
-            None
-        };
         let mut new = recurrence::changed(
             &old,
             rule,
