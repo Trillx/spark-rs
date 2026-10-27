@@ -1874,11 +1874,13 @@ impl Engine {
     ) -> Result<Option<String>> {
         let account = self.account(account_id)?;
         // An IMAP reply quotes the email it answers: one stored without its
-        // body gets it first, if its server gives it.
+        // body gets it first. Offline, it waits to be sent with it; one the
+        // server no longer has, or can't give, quotes what's stored.
         if let Some(id) = draft.reply_to
             && matches!(config(&account)?, AccountConfig::Imap { .. })
+            && let Err(e @ Error::Network { .. }) = self.fetch_body(id).await
         {
-            let _ = self.fetch_body(id).await;
+            return Err(e);
         }
         let original = draft
             .reply_to
@@ -4570,6 +4572,48 @@ mod tests {
         let round = engine.run(account.id, false).await;
         assert!(matches!(round, Err(Error::Network { .. })), "{round:?}");
         assert!(!engine.backfill_due(account.id));
+    }
+
+    #[tokio::test]
+    async fn an_imap_reply_to_mail_without_its_body_waits_to_quote_it() {
+        // The IMAP server isn't there; the SMTP server would take it.
+        let (smtp, delivery) = smtp_delivery(250).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp);
+        let original = store_head(
+            &mut store,
+            account.id,
+            42,
+            b"Message-ID: <older@example.com>\r\n\r\n",
+        );
+        let draft = Draft {
+            account: account.id,
+            to: "ana@example.com".into(),
+            subject: "Re: Files".into(),
+            body: "Thanks".into(),
+            reply_to: Some(original),
+            ..Default::default()
+        };
+        let id = store
+            .queue_send(account.id, &to_json(&draft), 0, &[])
+            .unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let outcomes = engine.send_due(account.id).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].result, Ok(false)),
+            "kept to send with its quote: {:?}",
+            outcomes[0].result
+        );
+        let mut store = engine.store();
+        assert!(
+            store
+                .claim_due_sends(account.id, now_ms())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.cancel_send(id).unwrap(), "still queued");
+        delivery.abort();
     }
 
     #[tokio::test]

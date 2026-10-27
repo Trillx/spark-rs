@@ -3025,7 +3025,14 @@ export default function App() {
         session,
         run: add,
       });
-    }, () => {});
+    }, (error) => {
+      // Older mail that couldn't be downloaded: its files would be left out without a word.
+      if (!current()) return;
+      showToast(`Couldn't add the attachments: ${String(error)}`, () => withReplied(m), ICONS.error, {
+        actionLabel: "Try again",
+        duration: ERROR_TOAST_MS,
+      });
+    });
   }
 
   /** A quick-reply chip: a reply your AI provider writes, or without one set up, a stock line. */
@@ -3152,11 +3159,29 @@ export default function App() {
    * The sender plus everyone else on To and Cc, minus this account's own
    * address. On an email you sent, its own To and Cc.
    */
+  /**
+   * The content of an email being answered or forwarded, or `null` once the user is told why it can't be had, with
+   * Try again (`retry`). Older mail downloads its body first: offline, a forward would quote only its preview and go
+   * without its files, and Reply All would leave out its Cc.
+   */
+  async function contentToAnswer(m: Message, what: string, retry: () => void) {
+    try {
+      return await loadContent(m.id);
+    } catch (error) {
+      showToast(`Couldn't ${what}: ${String(error)}`, retry, ICONS.error, {
+        actionLabel: "Try again",
+        duration: ERROR_TOAST_MS,
+      });
+      return null;
+    }
+  }
+
   async function replyAll(m: Message) {
-    const content = await loadContent(m.id).catch(() => null);
+    const content = await contentToAnswer(m, "reply to all", () => void replyAll(m));
+    if (!content) return;
     const recipients = replyRecipients(
       // The refreshed list owns Reply-To; the cached body may predate a sync.
-      { ...m, to: content?.to ?? m.to, cc: content?.cc },
+      { ...m, to: content.to, cc: content.cc },
       accounts.find((a) => a.id === m.account)?.email,
       true,
     );
@@ -3176,9 +3201,10 @@ export default function App() {
   }
 
   async function forward(m: Message) {
-    const content = await loadContent(m.id).catch(() => null);
-    const text = content?.text ?? m.body ?? [m.snippet];
-    const to = (content?.to ?? []).filter((r) => r !== "You");
+    const content = await contentToAnswer(m, "forward", () => void forward(m));
+    if (!content) return;
+    const text = content.text;
+    const to = content.to.filter((r) => r !== "You");
     const header = [
       "---------- Forwarded message ----------",
       `From: ${m.from} <${m.address}>`,
@@ -3195,7 +3221,7 @@ export default function App() {
       replyTo: m.id,
       forward: true,
       // The original's files go along; they're fetched from the server when it's sent.
-      attachments: (content?.attachments ?? []).map((a, index) => ({
+      attachments: content.attachments.map((a, index) => ({
         kind: "message" as const,
         message: m.id,
         index,
