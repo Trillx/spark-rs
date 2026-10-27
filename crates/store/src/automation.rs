@@ -42,10 +42,10 @@ pub(crate) const LABEL_PUSHES: &str = "SELECT p.message_id, p.name, p.adding FRO
 pub(crate) const LABEL_WORK: &str = "SELECT EXISTS (SELECT 1 FROM label_pushes p
      CROSS JOIN messages m ON m.id = p.message_id WHERE m.account_id = ?1)";
 
-/// What `auto_drafts.written` says of a draft changed in another app: no
-/// saved draft matches it (`saved_text` is JSON), so it's never cleaned
-/// up, and its other options can't be picked over it.
-const EDITED_ELSEWHERE: &str = "\n";
+/// What `auto_drafts.written` says of a draft the user changed, here or in
+/// another app: no saved draft matches it (`saved_text` is JSON), so it's
+/// never cleaned up, and its other options can't be picked over it.
+const EDITED: &str = "\n";
 
 /// What `auto_labels` keeps for an email whose label the user took off:
 /// none shows, and inbox automation doesn't give it one again.
@@ -144,8 +144,8 @@ pub(crate) fn add_draft_queue(conn: &Connection) -> Result<()> {
 }
 
 /// Version 25: the version of an auto-draft's server copy as this app put
-/// it there (Graph's changeKey), to tell whether another app changed it
-/// since. Adds only what's missing, so it's safe to run again over itself.
+/// it there (Graph's changeKey; for IMAP, where it went), to tell whether
+/// another app changed it since. Adds only what's missing, so it's safe to run again over itself.
 pub(crate) fn add_server_version(conn: &Connection) -> Result<()> {
     let has: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM pragma_table_info('auto_drafts')
@@ -538,7 +538,8 @@ impl Store {
     }
 
     /// Draft `draft_id` was put on the server as `version` (Graph's
-    /// changeKey): if it's an auto-draft, that's the copy that's its own.
+    /// changeKey; for IMAP, its mailbox and UID): if it's an auto-draft,
+    /// that's the copy that's its own.
     pub fn auto_draft_uploaded(&self, draft_id: i64, version: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE auto_drafts SET server_version = ?2 WHERE draft_id = ?1",
@@ -561,12 +562,13 @@ impl Store {
             .flatten())
     }
 
-    /// Auto-draft `draft_id` was changed in another app (Outlook): it's the
-    /// user's now, kept from cleanup and from picking another option.
-    pub fn auto_draft_edited_elsewhere(&self, draft_id: i64) -> Result<()> {
+    /// The user changed draft `draft_id`, in the composer or another app:
+    /// if it's an auto-draft, it's theirs now, kept from cleanup and from
+    /// picking another option over it.
+    pub fn auto_draft_edited(&self, draft_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE auto_drafts SET written = ?2 WHERE draft_id = ?1",
-            params![draft_id, EDITED_ELSEWHERE],
+            params![draft_id, EDITED],
         )?;
         Ok(())
     }

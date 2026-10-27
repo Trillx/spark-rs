@@ -1153,30 +1153,47 @@ impl Engine {
     }
 
     /// Whether auto-draft `id` was changed on the server by another app
-    /// since this app put it there: one edited in Outlook, whose version
-    /// isn't the one recorded as it went up (or wasn't recorded). IMAP
-    /// servers keep an edited draft as a new message, so theirs never are;
-    /// neither is a draft not on the server yet.
+    /// since this app put it there: its version isn't the one recorded as it
+    /// went up, or none was. On Microsoft that's its changeKey, as Outlook
+    /// edits drafts in place. On IMAP an edit is a new message, which sync
+    /// may take for this one when it keeps the Message-ID (Roundcube does),
+    /// so it's where the copy is. A draft not on the server yet wasn't.
     pub async fn draft_changed_elsewhere(&self, id: i64) -> Result<bool> {
-        let (account_id, remote) = {
+        let (account_id, remote, at, ours) = {
             let store = self.store();
-            let Some(message) = store.message(id)? else {
+            if store.message(id)?.is_none() {
+                return Err(Error::Gone);
+            }
+            let Some(at) = store.location(id)? else {
                 return Err(Error::Gone);
             };
-            let remote = store.pending_for(id)?.and_then(|p| p.remote_id);
-            (message.account_id, remote)
+            let remote = at.remote_id.clone();
+            (
+                at.account_id,
+                remote,
+                at,
+                store.auto_draft_server_version(id)?,
+            )
         };
         let account = self.account(account_id)?;
         let AccountConfig::Microsoft {
             client_id, tenant, ..
         } = config(&account)?
         else {
-            return Ok(false);
+            let now = at
+                .mailbox
+                .as_deref()
+                .zip(at.uid)
+                .map(|(mailbox, uid)| drafts::imap_version(mailbox, uid));
+            return Ok(match (now, ours) {
+                (None, None) => false,
+                (now, ours) => now != ours,
+            });
         };
         let Some(remote) = remote else {
             return Ok(false);
         };
-        let Some(ours) = self.store().auto_draft_server_version(id)? else {
+        let Some(ours) = ours else {
             return Ok(true);
         };
         let now = self
@@ -3320,6 +3337,56 @@ mod tests {
         ));
         // Not on the server yet: nothing else can have changed it.
         assert!(!engine.draft_changed_elsewhere(ids[4]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_imap_draft_replaced_in_another_app_is_told_from_its_own_copy() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, Server::new("127.0.0.1", 25));
+        let add = |store: &mut Store, mailbox: Option<&str>, uid: Option<u32>| {
+            let added = store
+                .add_incoming(
+                    &Incoming {
+                        account_id: account.id,
+                        mailbox: mailbox.map(str::to_owned),
+                        uid,
+                        message_id: Some(format!("<{uid:?}@example.com>")),
+                        subject: "Re: Lunch".into(),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+            let Added::New(id) = added else { panic!("new") };
+            id
+        };
+        let original = add(&mut store, Some("INBOX"), Some(1));
+        let option = [spark_store::DraftOption {
+            title: String::new(),
+            body: "Sure.".into(),
+        }];
+        let mut ids = Vec::new();
+        for (uid, recorded) in [
+            // Where this app put it.
+            (Some(5), Some(5)),
+            // Replaced by another app keeping its Message-ID: a new UID.
+            (Some(20), Some(5)),
+            // Put there before where it went was kept.
+            (Some(7), None),
+            // Not on the server yet.
+            (None, None),
+        ] {
+            let id = add(&mut store, uid.map(|_| "Drafts"), uid);
+            store.add_auto_draft(id, original, &option, 0, 1).unwrap();
+            let version = recorded.map(|uid| drafts::imap_version("Drafts", uid));
+            store.auto_draft_uploaded(id, version.as_deref()).unwrap();
+            ids.push(id);
+        }
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        assert!(!engine.draft_changed_elsewhere(ids[0]).await.unwrap());
+        assert!(engine.draft_changed_elsewhere(ids[1]).await.unwrap());
+        assert!(engine.draft_changed_elsewhere(ids[2]).await.unwrap());
+        assert!(!engine.draft_changed_elsewhere(ids[3]).await.unwrap());
     }
 
     /// A Microsoft account signed in to the Graph stand-in at `base`, with

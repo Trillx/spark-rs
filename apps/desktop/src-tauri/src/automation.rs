@@ -577,7 +577,7 @@ async fn cleanup(app: &AppHandle) {
         match engine.draft_changed_elsewhere(id).await {
             Ok(false) => {}
             Ok(true) => {
-                if let Err(e) = engine.store().auto_draft_edited_elsewhere(id) {
+                if let Err(e) = engine.store().auto_draft_edited(id) {
                     eprintln!("spark-rs: inbox automation: {e}");
                 }
                 continue;

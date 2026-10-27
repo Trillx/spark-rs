@@ -820,7 +820,7 @@ fn a_draft_changed_in_another_app_is_kept() {
     let draft = save_reply(&mut store, account, "1@example.com", "Yes.");
     store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
     assert_eq!(store.untouched_auto_drafts(NOW + 1).unwrap(), [draft]);
-    store.auto_draft_edited_elsewhere(draft).unwrap();
+    store.auto_draft_edited(draft).unwrap();
     assert!(store.untouched_auto_drafts(NOW + 1).unwrap().is_empty());
     assert!(!store.auto_draft_untouched(draft).unwrap());
 }

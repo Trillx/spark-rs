@@ -605,8 +605,18 @@ async fn upload_imap(
         remote_id: None,
         message_id: Some(message_id),
     };
-    lock(store).draft_uploaded(upload, &copy, &described(&files))?;
+    let store = &mut lock(store);
+    store.draft_uploaded(upload, &copy, &described(&files))?;
+    // An auto-draft's own copy: another app replacing it moves it to a new UID.
+    let at = uid.map(|uid| imap_version(mailbox, uid));
+    store.auto_draft_uploaded(upload.message_id, at.as_deref())?;
     Ok(None)
+}
+
+/// An IMAP draft copy's version as `Store::auto_draft_uploaded` keeps it:
+/// where it is. IMAP messages don't change; an edit is a new message.
+pub(crate) fn imap_version(mailbox: &str, uid: u32) -> String {
+    format!("{uid} {mailbox}")
 }
 
 /// Deletes a draft's server copy by its verified Message-ID. A UID without

@@ -1970,13 +1970,15 @@ fn save_live(
     draft: &Draft,
     read_file: impl Fn(&str, &str) -> io::Result<LocalCopy>,
 ) -> Result<i64, String> {
+    // A save from the composer is the user's change: an auto-draft is theirs
+    // now, whatever changed (closing an unchanged draft doesn't save it).
     save_live_if(
         engine,
         snapshots,
         draft,
         read_file,
         |_| Ok(()),
-        |_, _| Ok(()),
+        |store, id| store.auto_draft_edited(id).map_err(text),
     )
 }
 
@@ -2285,6 +2287,79 @@ mod tests {
         assert_eq!(engine.store().draft_files(id).unwrap(), files);
         let retry = queue_live(&engine, &recovered).unwrap();
         assert_eq!(engine.store().outbox_files(retry).unwrap(), files);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_from_the_composer_makes_an_auto_draft_the_users() {
+        let (engine, account) = engine();
+        engine
+            .store()
+            .replace_folders(
+                account.id,
+                &[spark_store::RemoteFolder {
+                    remote_id: "Drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let dir = attachment_dir("composer-edit");
+        let file = dir.join("plan.txt");
+        std::fs::write(&file, b"plan").unwrap();
+        let draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            body: "Tuesday works.".into(),
+            ..Default::default()
+        };
+        let id = save_live_if(
+            &engine,
+            &SavedFiles::default(),
+            &draft,
+            read_local,
+            |_| Ok(()),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let option = [spark_store::DraftOption {
+            title: String::new(),
+            body: "Tuesday works.".into(),
+        }];
+        engine
+            .store()
+            .add_auto_draft(id, id, &option, 0, 1)
+            .unwrap();
+        assert!(engine.store().auto_draft_untouched(id).unwrap());
+        // On the server now, as the next round puts it there.
+        {
+            let mut store = engine.store();
+            let upload = store.draft_uploads(account.id, i64::MAX).unwrap().remove(0);
+            let copy = spark_store::DraftCopy {
+                mailbox: Some("Drafts".into()),
+                uid: Some(5),
+                ..Default::default()
+            };
+            store.draft_uploaded(&upload, &copy, &[]).unwrap();
+        }
+        assert!(engine.store().auto_draft_untouched(id).unwrap());
+        // The same text, with a file added in the composer.
+        let edited = Draft {
+            draft_id: Some(id),
+            attachments: vec![file_attachment(&file, 4)],
+            ..draft
+        };
+        save_live(&engine, &SavedFiles::default(), &edited, read_local).unwrap();
+        assert!(!engine.store().auto_draft_untouched(id).unwrap());
+        assert!(
+            engine
+                .store()
+                .untouched_auto_drafts(i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
