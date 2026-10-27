@@ -336,12 +336,21 @@ pub fn changed_event_body(
                 json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
             }
         };
-        body.insert(
-            "start".into(),
-            moved(details.start, before.start, draft.start),
-        );
-        body.insert("end".into(), moved(details.end, before.end, draft.end));
-        body.insert("isAllDay".into(), json!(draft.all_day));
+        // Only the ones that changed, so a start moved in Outlook meanwhile
+        // stays when only the end changes; all day or back changes both.
+        let both = draft.all_day != before.all_day;
+        if both || draft.start != before.start {
+            body.insert(
+                "start".into(),
+                moved(details.start, before.start, draft.start),
+            );
+        }
+        if both || draft.end != before.end {
+            body.insert("end".into(), moved(details.end, before.end, draft.end));
+        }
+        if both {
+            body.insert("isAllDay".into(), json!(draft.all_day));
+        }
     }
     if draft.location.trim() != before.location.trim() {
         body.insert(
@@ -1173,14 +1182,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            [
-                "attendees",
-                "body",
-                "end",
-                "isAllDay",
-                "isReminderOn",
-                "start"
-            ],
+            ["attendees", "body", "end", "isReminderOn", "start"],
             "{body}"
         );
         assert_eq!(body["start"]["dateTime"], "2026-10-27T10:00:00");
@@ -1316,6 +1318,43 @@ mod tests {
             ["sam@contoso.com", "room4@contoso.com", "alex@contoso.com"],
             "Kai stays off"
         );
+    }
+
+    #[test]
+    fn a_new_end_leaves_the_start_as_outlook_has_it() {
+        let start = parse_iso_date("2026-10-27T16:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Review".into(),
+            start,
+            end: start + 3_600_000,
+            ..Default::default()
+        };
+        // Outlook moved the start to 9:30 meanwhile; the editor changes only the end.
+        let details = EventDetails {
+            start: start + 1_800_000,
+            end: start + 3_600_000,
+            ..Default::default()
+        };
+        let longer = EventDraft {
+            end: start + 5_400_000,
+            ..before.clone()
+        };
+        let body = changed_event_body(&longer, &before, &details, PACIFIC, false);
+        assert_eq!(
+            body,
+            json!({ "end": { "dateTime": "2026-10-27T10:30:00", "timeZone": "Pacific Standard Time" } })
+        );
+        // Going all day changes both, and says so.
+        let all_day = EventDraft {
+            all_day: true,
+            start: parse_iso_date("2026-10-27T00:00:00Z").unwrap(),
+            end: parse_iso_date("2026-10-28T00:00:00Z").unwrap(),
+            ..before.clone()
+        };
+        let body = changed_event_body(&all_day, &before, &details, PACIFIC, false);
+        assert_eq!(body["isAllDay"], true);
+        assert_eq!(body["start"]["dateTime"], "2026-10-27T00:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-10-28T00:00:00");
     }
 
     #[test]
