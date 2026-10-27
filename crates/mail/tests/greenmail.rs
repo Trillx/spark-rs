@@ -1981,6 +1981,8 @@ async fn imap_inbox_downloads_a_year_in_the_background() {
         let content = match n {
             120 => with_file(&id, &subject),
             121 => invitation(&id, &subject),
+            // Found by a word only its body has.
+            122 => raw(&id, &subject).replace(" body", " quetzal"),
             _ => raw(&id, &subject),
         };
         let date = days_ago(330 - 2 * n as i64);
@@ -2093,6 +2095,46 @@ async fn imap_inbox_downloads_a_year_in_the_background() {
             .unwrap()
             .unwrap()
             .body_missing
+    );
+
+    // A copy in a folder (as in a Gmail label) joins it as it is, without
+    // its body, which opening it still downloads.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    other.create("Projects").await.unwrap();
+    other
+        .append("Projects", None, None, raw("year140@x.com", "Year 140"))
+        .await
+        .unwrap();
+    let _ = other.logout().await;
+    let list = Round {
+        list_folders: true,
+        ..Default::default()
+    };
+    engine.run_round(account.id, &list).await.unwrap();
+    let projects = Round {
+        folders: vec![folder_id(&engine, "Projects")],
+        ..Default::default()
+    };
+    engine.run_round(account.id, &projects).await.unwrap();
+    let copied = find(&engine, "Year 140");
+    assert_eq!(copied.folders, [folder_id(&engine, "Projects")]);
+    let content = engine.store().content(copied.id).unwrap().unwrap();
+    assert!(
+        content.body_missing && content.text.is_empty(),
+        "{content:?}"
+    );
+
+    // A server search finds one by its body: it gets it, for the store's
+    // search to find too.
+    assert!(found(&engine, "quetzal").is_empty());
+    assert_eq!(
+        engine.search_server(account.id, "quetzal").await.unwrap(),
+        1
+    );
+    assert_eq!(found(&engine, "quetzal"), ["Year 122"]);
+    assert_eq!(
+        engine.search_server(account.id, "quetzal").await.unwrap(),
+        0
     );
 
     // Opened, an email gets its body, files and invite; what the user did
