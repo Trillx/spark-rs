@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+mod automation;
 mod calendar;
 mod changes;
 mod contacts;
@@ -29,6 +30,10 @@ mod search;
 mod signatures;
 mod templates;
 
+pub use automation::{
+    AutoDraft, AutoLabel, AutomationSettings, Candidate, DRAFT_GRACE_MS, DraftInstruction,
+    DraftOption, LABEL_BACKFILL_MS, LabelPush, Verdict,
+};
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use changes::{Changes, Mark};
 pub use contacts::Contact;
@@ -273,6 +278,10 @@ pub struct Message {
     /// The calendar invite it carries, by kind ("invitation", "reply",
     /// "cancellation", "proposal"), for the Invitations and Responses cards.
     pub invite_kind: Option<String>,
+    /// The Auto-Label it shows (see `automation`).
+    pub auto_label: Option<AutoLabel>,
+    /// The newest draft inbox automation wrote in reply to it, by id.
+    pub auto_draft: Option<i64>,
 }
 
 /// A reminder in the Inbox, on the email it came back as.
@@ -659,7 +668,9 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      returned_at, EXISTS (SELECT 1 FROM muted WHERE muted.conversation = COALESCE(messages.conversation, messages.id)), \
      (SELECT id FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
      (SELECT remind_at FROM reminders WHERE message_row = messages.id AND state = 'due' ORDER BY remind_at LIMIT 1), \
-     json_extract(invite, '$.kind')";
+     json_extract(invite, '$.kind'), \
+     (SELECT label FROM auto_labels WHERE message_id = messages.id), \
+     (SELECT draft_id FROM auto_drafts WHERE message_id = messages.id ORDER BY created_at DESC, draft_id DESC LIMIT 1)";
 
 /// The messages the list shows: all but drafts waiting in the outbox to be sent.
 const LISTED: &str = "id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)";
@@ -828,6 +839,12 @@ impl Store {
             tx.pragma_update(None, "user_version", 22)?;
             tx.commit()?;
         }
+        if version < 23 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(automation::SCHEMA_AUTOMATION)?;
+            tx.pragma_update(None, "user_version", 23)?;
+            tx.commit()?;
+        }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
         conn.execute_batch(&changes::WATCH_MESSAGES)?;
         conn.execute_batch(drafts::WATCH_SENDS)?;
@@ -904,10 +921,13 @@ impl Store {
     }
 
     /// Removes the account and everything stored for it.
+    /// Removes an account with its mail, and takes it out of the inbox
+    /// automation settings: an account added later can get its id.
     pub fn remove_account(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM accounts WHERE id = ?1", [id])?;
-        Ok(())
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
+        automation::forget_account(&tx, id)?;
+        tx.commit()
     }
 
     pub fn rename_account(&self, id: i64, label: &str) -> Result<()> {
@@ -2369,6 +2389,11 @@ fn message_row(r: &Row) -> Result<Message> {
             _ => None,
         },
         invite_kind: r.get(24)?,
+        auto_label: r
+            .get::<_, Option<String>>(25)?
+            .as_deref()
+            .and_then(AutoLabel::parse),
+        auto_draft: r.get(26)?,
     })
 }
 

@@ -51,6 +51,8 @@ pub struct Changes {
 /// - `muted`: every message of the conversation.
 /// - `reminders`: the email a reminder comes due on, or stops being due on.
 /// - `outbox`: the draft it holds back from the list while it's sent.
+/// - `auto_labels`: the message whose Auto-Label it is.
+/// - `auto_drafts`: the message an auto-draft replies to.
 ///
 /// Rows removed by foreign keys (an account, a folder) fire these too. A
 /// column added to `MESSAGE_COLUMNS` must be watched here.
@@ -119,7 +121,16 @@ pub(crate) static WATCH_MESSAGES: LazyLock<String> = LazyLock::new(|| {
          CREATE TEMP TRIGGER log_send_queued AFTER INSERT ON main.outbox BEGIN {} END;
          CREATE TEMP TRIGGER log_send_ended AFTER DELETE ON main.outbox BEGIN {} END;
          CREATE TEMP TRIGGER log_send_changed
-         AFTER UPDATE OF draft_message ON main.outbox BEGIN {} END;",
+         AFTER UPDATE OF draft_message ON main.outbox BEGIN {} END;
+
+         CREATE TEMP TRIGGER log_label_added AFTER INSERT ON main.auto_labels BEGIN {} END;
+         CREATE TEMP TRIGGER log_label_removed AFTER DELETE ON main.auto_labels BEGIN {} END;
+         CREATE TEMP TRIGGER log_label_changed AFTER UPDATE ON main.auto_labels BEGIN {} END;
+
+         CREATE TEMP TRIGGER log_auto_draft_added AFTER INSERT ON main.auto_drafts BEGIN {} END;
+         CREATE TEMP TRIGGER log_auto_draft_removed AFTER DELETE ON main.auto_drafts BEGIN {} END;
+         CREATE TEMP TRIGGER log_auto_draft_changed
+         AFTER UPDATE OF message_id, draft_id, created_at ON main.auto_drafts BEGIN {} END;",
         log("NEW.id", None),
         log("OLD.id", None),
         listed.join(", "),
@@ -140,6 +151,12 @@ pub(crate) static WATCH_MESSAGES: LazyLock<String> = LazyLock::new(|| {
         log_some("NEW.draft_message", None),
         log_some("OLD.draft_message", None),
         log_some("NEW.draft_message", Some("OLD.draft_message")),
+        log("NEW.message_id", None),
+        log("OLD.message_id", None),
+        log("NEW.message_id", Some("OLD.message_id")),
+        log("NEW.message_id", None),
+        log("OLD.message_id", None),
+        log("NEW.message_id", Some("OLD.message_id")),
     )
 });
 

@@ -1196,6 +1196,29 @@ impl Graph {
         Ok(())
     }
 
+    /// Message `id`'s Outlook categories.
+    pub async fn categories(&self, id: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Categories {
+            #[serde(default)]
+            categories: Vec<String>,
+        }
+        let url = format!("/me/messages/{}?$select=categories", path(id));
+        let found: Categories = self
+            .json_patiently(|| self.request(Method::GET, &url))
+            .await?;
+        Ok(found.categories)
+    }
+
+    /// Gives message `id` these Outlook categories, in place of its own.
+    pub async fn set_categories(&self, id: &str, categories: &[String]) -> Result<()> {
+        let url = format!("/me/messages/{}", path(id));
+        let body = json!({ "categories": categories });
+        self.send_patiently(|| self.request(Method::PATCH, &url).json(&body))
+            .await?;
+        Ok(())
+    }
+
     /// Deletes a folder with its subfolders (Outlook keeps them in Deleted Items).
     pub async fn delete_folder(&self, id: &str) -> Result<()> {
         self.send(self.request(Method::DELETE, &format!("/me/mailFolders/{}", path(id))))
@@ -2718,6 +2741,7 @@ pub(crate) mod tests {
         /// Its `Prefer` headers.
         pub(crate) prefer: Vec<String>,
         pub(crate) at: std::time::Instant,
+        pub(crate) body: String,
     }
 
     /// A stand-in's answer: its status (0 drops the connection unanswered),
@@ -2830,6 +2854,7 @@ pub(crate) mod tests {
                         path,
                         prefer,
                         at: std::time::Instant::now(),
+                        body: String::from_utf8_lossy(&buf[end..end + length]).into_owned(),
                     };
                     let attempt = {
                         let mut attempts = seen.attempts.lock().unwrap();

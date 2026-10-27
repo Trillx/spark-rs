@@ -758,7 +758,7 @@ async fn still_there(session: &mut Session, uid: u32) -> Result<bool> {
 }
 
 /// Whether the server has `mailbox`.
-async fn exists(session: &mut Session, mailbox: &str) -> Result<bool> {
+pub(crate) async fn exists(session: &mut Session, mailbox: &str) -> Result<bool> {
     let names: Vec<_> = session
         .list(Some(""), Some(mailbox))
         .await?
@@ -1701,7 +1701,7 @@ pub async fn push(
 /// known location if that folder still exists; else found by Message-ID
 /// (mail that left the inbox), or for filed mail, in a folder that lists it.
 /// `None` if the server no longer has it.
-async fn find(
+pub(crate) async fn find(
     session: &mut Session,
     store: &Mutex<Store>,
     state: &SyncState,

@@ -24,6 +24,7 @@ use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
 use crate::imap::{self, Server};
 use crate::invite::{self, Answer, Invite};
+use crate::labels;
 use crate::oauth::{self, App};
 use crate::unsubscribe::{self, Unsubscribed};
 use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
@@ -495,6 +496,7 @@ impl Engine {
         // Saves settle like other changes, so a burst of them goes up once.
         let settled = now_ms() - SETTLE_MS;
         let draft_work = self.store().has_draft_work(account_id, settled)?;
+        let label_work = self.store().has_label_work(account_id)?;
         let folders: Vec<Folder> = self
             .store()
             .folders()?
@@ -507,6 +509,7 @@ impl Engine {
             .collect();
         if pending.is_empty()
             && !draft_work
+            && !label_work
             && !round.fetch
             && !round.older_inbox
             && !round.list_folders
@@ -531,6 +534,9 @@ impl Engine {
                         drafts::push_imap(&mut session, &self.store, &account, &state, settled)
                             .await?;
                     report.drafts_pushed(pushed);
+                }
+                if label_work {
+                    labels::push_imap(&mut session, &self.store, &state, account_id).await?;
                 }
                 if round.fetch {
                     let sync =
@@ -598,6 +604,9 @@ impl Engine {
                 if draft_work {
                     let pushed = drafts::push_graph(&graph, &self.store, &account, settled).await?;
                     report.drafts_pushed(pushed);
+                }
+                if label_work {
+                    labels::push_graph(&graph, &self.store, account_id).await?;
                 }
                 // Its repair list is the store's: syncs and searches add to
                 // it as they go, and `save_state` leaves it be.
