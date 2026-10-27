@@ -569,7 +569,12 @@ pub fn series_from(
     let note = json!({ "contentType": "text", "content": draft.notes.trim() });
     let changed_note = draft.notes.trim() != before.notes.trim();
     let description =
-        if html.trim().is_empty() || (master["isOnlineMeeting"] == true && changed_note) {
+        if changed_note && (html.trim().is_empty() || master["isOnlineMeeting"] == true) {
+            note
+        } else if html.trim().is_empty() && master["body"]["content"].is_string() {
+            // Cleared in Outlook since the editor opened: it stays clear.
+            json!({ "contentType": "text", "content": "" })
+        } else if html.trim().is_empty() {
             note
         } else if master["isOnlineMeeting"] == true {
             // The series' notes as Outlook has them now (they may have changed
@@ -590,60 +595,68 @@ pub fn series_from(
     body.insert("body".into(), description);
     // Its times: the user's where they changed them; else the series' own
     // as Outlook has them now (they may have changed since the editor
-    // opened), on its new first day.
+    // opened, all day or not too), on its new first day.
     let master_time = |key: &str| {
-        let ms = master[key]["dateTime"]
-            .as_str()
-            .and_then(|t| parse_iso_date(&format!("{}Z", t.get(..19).unwrap_or(t))))?;
+        let wall = master[key]["dateTime"].as_str()?;
+        let ms = parse_iso_date(&format!("{}Z", wall.get(..19).unwrap_or(wall)))?;
         Some((ms, zone.wall_at(ms)))
     };
-    let (start, end) = match (master_time("start"), master_time("end")) {
-        (Some((_, wall)), Some((_, to_wall))) if !draft.all_day && !before.all_day => {
-            let start = if draft.start != before.start {
-                zone.wall_at(draft.start)
-            } else {
-                format!(
-                    "{}{}",
-                    date_in(zone, draft.start, false),
-                    wall.get(10..).unwrap_or_default()
-                )
-            };
-            let end = if draft.end != before.end {
-                zone.wall_at(draft.end)
-            } else {
-                // As long as the series is on its own clock (Sunday 0:00 to
-                // 4:00), not in hours that passed (five, the night clocks
-                // went back).
-                let clock = |w: &str| parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
-                match (clock(&start), clock(&wall), clock(&to_wall)) {
+    let clock = |w: &str| parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
+    let first = date_in(zone, draft.start, draft.all_day);
+    let all_day = if draft.all_day != before.all_day {
+        draft.all_day
+    } else {
+        master["isAllDay"].as_bool().unwrap_or(draft.all_day)
+    };
+    let master_times = master_time("start").zip(master_time("end"));
+    let (start, end) = if all_day {
+        // As many days as the series has now, unless the user changed its end.
+        let days = if draft.all_day && before.all_day && draft.end != before.end {
+            (draft.end - draft.start).div_euclid(DAY_MS).max(1)
+        } else {
+            master_times
+                .filter(|_| master["isAllDay"] == true)
+                .map(|((from, _), (to, _))| {
+                    ((to - from) as f64 / DAY_MS as f64).round().max(1.0) as i64
+                })
+                .unwrap_or_else(|| (draft.end - draft.start).div_euclid(DAY_MS).max(1))
+        };
+        (
+            format!("{first}T00:00:00"),
+            format!("{}T00:00:00", recurrence::add_days(&first, days)),
+        )
+    } else {
+        let user = !draft.all_day && !before.all_day;
+        let own = master_times.filter(|_| master["isAllDay"] != true);
+        let start = match (&own, user && draft.start != before.start) {
+            (_, true) | (None, _) => zone.wall_at(draft.start),
+            (Some(((_, wall), _)), false) => {
+                format!("{first}{}", wall.get(10..).unwrap_or_default())
+            }
+        };
+        let end = match (&own, user && draft.end != before.end) {
+            // As long as the series is on its own clock (Sunday 0:00 to
+            // 4:00), not in hours that passed (five, the night clocks went
+            // back).
+            (Some(((_, wall), (_, to_wall))), false) => {
+                match (clock(&start), clock(wall), clock(to_wall)) {
                     (Some(t), Some(from), Some(to)) => utc_wall(t + (to - from)),
                     _ => zone.wall_at(draft.end),
                 }
-            };
-            (
-                json!({ "dateTime": start, "timeZone": zone.name }),
-                json!({ "dateTime": end, "timeZone": zone.name }),
-            )
-        }
-        // All day: as many days as the series has now, unless the user
-        // changed its end.
-        (Some((from, _)), Some((to, _)))
-            if draft.all_day && before.all_day && draft.end == before.end =>
-        {
-            let days = ((to - from) as f64 / DAY_MS as f64).round().max(1.0) as i64;
-            (
-                zone.time(draft.start, true),
-                zone.time(draft.start + days * DAY_MS, true),
-            )
-        }
-        _ => (
-            zone.time(draft.start, draft.all_day),
-            zone.time(draft.end, draft.all_day),
-        ),
+            }
+            _ => zone.wall_at(draft.end),
+        };
+        (start, end)
     };
-    body.insert("start".into(), start);
-    body.insert("end".into(), end);
-    body.insert("isAllDay".into(), json!(draft.all_day));
+    body.insert(
+        "start".into(),
+        json!({ "dateTime": start, "timeZone": zone.name }),
+    );
+    body.insert(
+        "end".into(),
+        json!({ "dateTime": end, "timeZone": zone.name }),
+    );
+    body.insert("isAllDay".into(), json!(all_day));
     body.insert("recurrence".into(), recurrence);
     body.into()
 }
@@ -2166,6 +2179,40 @@ mod tests {
         let body = series_from(&master, &renoted, &before, EASTERN, json!(null));
         assert_eq!(body["start"]["dateTime"], "2026-11-08T00:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-08T04:00:00");
+    }
+
+    #[test]
+    fn all_future_keeps_what_outlook_changed_that_the_user_didnt() {
+        // All day when the editor opened, with notes; in Outlook now, 9:00
+        // to 10:00 with no description.
+        let master = json!({
+            "subject": "Standup",
+            "isAllDay": false,
+            "body": { "contentType": "html", "content": "" },
+            "start": { "dateTime": "2026-10-13T16:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-10-13T17:00:00.0000000", "timeZone": "UTC" }
+        });
+        let day = parse_iso_date("2026-11-03T00:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Standup".into(),
+            start: day,
+            end: day + DAY_MS,
+            all_day: true,
+            notes: "Old notes".into(),
+            ..Default::default()
+        };
+        let renamed = EventDraft {
+            title: "Daily standup".into(),
+            ..before.clone()
+        };
+        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        assert_eq!(body["isAllDay"], false);
+        assert_eq!(body["start"]["dateTime"], "2026-11-03T09:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-03T10:00:00");
+        assert_eq!(
+            body["body"],
+            json!({ "contentType": "text", "content": "" })
+        );
     }
 
     #[test]
