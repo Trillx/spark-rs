@@ -6,7 +6,8 @@ SilentInstall silent
 !include "${HOOKS_FILE}"
 OutFile "${OUTPUT_FILE}"
 Section
-  Call SparkStopCli
+  Push spark-cli.exe
+  Call SparkStop
   IfErrors failed passed
   failed:
     SetErrorLevel 1

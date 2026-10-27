@@ -55,9 +55,18 @@ try {
     New-Item -ItemType Directory -Force $data | Out-Null
     $sentinel = Join-Path $data 'installer-smoke.txt'
     Set-Content $sentinel 'Keep mail data during updates and ordinary uninstalls'
+    # Updates must also close the app, here running in the background as
+    # agents start it. Restart Manager couldn't, so the installer failed.
+    $app = Start-Process "$dir/spark-desktop.exe" -ArgumentList '--background' -PassThru
+    Start-Sleep -Seconds 5
+    if ($app.HasExited) {
+        Write-Host "::warning::spark-rs exited ($($app.ExitCode)) on its own; skipping the running-app check"
+    }
     Install-Spark -Flags @('/S', '/UPDATE')
     Write-Host 'Update returned without terminating the parent shell'
+    if (!$app.WaitForExit(10000)) { throw 'Update did not close the running app' }
     Install-Spark -Flags @('/S', '/UPDATE')
+    if (Get-ChildItem $dir -Filter 'spark-desktop.exe.*.old') { throw 'Updates left the old app behind' }
     if ($agent.HasExited) { throw 'Update ended the running CLI' }
     $agent.StandardInput.WriteLine('{"jsonrpc":"2.0","id":1,"method":"ping"}')
     $reply = $agent.StandardOutput.ReadLineAsync()
@@ -79,6 +88,7 @@ try {
     if (!(Test-Path $sentinel)) { throw 'Ordinary uninstall deleted app data' }
     Write-Host 'Install, CLI replacement and uninstall checks passed'
 } finally {
+    if ($app -and !$app.HasExited) { $app.Kill(); $app.WaitForExit() }
     if (!$agent.HasExited) { $agent.Kill() }
     $agent.Dispose()
     if (!$otherAgent.HasExited) { $otherAgent.Kill(); $otherAgent.WaitForExit() }
