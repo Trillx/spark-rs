@@ -439,6 +439,8 @@ impl Store {
 
     /// Up to `limit` emails a reply is due for (`record_verdict`), newest
     /// first, in accounts with Auto-Drafts on and since it was turned on.
+    /// Mail from senders waiting in the Gatekeeper waits too, unless the
+    /// settings draft for them: once the sender is accepted, it's due.
     /// Whether one is still wanted is for the caller to check again.
     pub fn draft_candidates(
         &self,
@@ -451,12 +453,18 @@ impl Store {
             "SELECT c.message_id, m.date FROM automation_checked c
              CROSS JOIN messages m ON m.id = c.message_id
              WHERE c.draft_due IS NOT NULL AND c.draft_due <= ?3
-               AND m.account_id = ?1 AND m.date >= ?2
+               AND m.account_id = ?1 AND m.date >= ?2 AND (m.screening = 0 OR ?5)
              ORDER BY m.date DESC LIMIT ?4",
         )?;
         for (&account, &on) in &settings.draft_accounts {
             let rows = stmt.query_map(
-                params![account, on - DRAFT_GRACE_MS, now, limit as i64],
+                params![
+                    account,
+                    on - DRAFT_GRACE_MS,
+                    now,
+                    limit as i64,
+                    settings.gatekeeper_drafts
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             for row in rows {

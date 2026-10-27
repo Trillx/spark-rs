@@ -87,16 +87,25 @@ export default function AutoDraftCard({ draft: d, actions }: { draft: Message; a
           {to.shown.length ? `To: ${to.shown.join(", ")}${to.more > 0 ? ` +${to.more}` : ""}` : ""}
         </span>
         <div className="flex shrink-0 items-center gap-1.5">
-          <button className="btn btn-ghost btn-sm h-7 min-h-7 rounded-md px-3 text-xs" onClick={() => actions.remove(d)}>
+          {/* Not while another reply is being put in: they'd act on the one before. */}
+          <button
+            className="btn btn-ghost btn-sm h-7 min-h-7 rounded-md px-3 text-xs"
+            disabled={choosing !== null}
+            onClick={() => actions.remove(d)}
+          >
             Delete
           </button>
-          <button className="btn btn-ghost btn-sm h-7 min-h-7 rounded-md px-3 text-xs" onClick={() => actions.edit(d)}>
+          <button
+            className="btn btn-ghost btn-sm h-7 min-h-7 rounded-md px-3 text-xs"
+            disabled={choosing !== null}
+            onClick={() => actions.edit(d)}
+          >
             Edit
           </button>
           <span className="h-5 w-px bg-hairline" />
           <button
             className="btn btn-primary btn-sm h-7 min-h-7 rounded-md px-3 text-xs"
-            disabled={saved === null}
+            disabled={saved === null || choosing !== null}
             onClick={() => actions.send(d)}
           >
             Send

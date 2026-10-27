@@ -195,9 +195,13 @@ async fn round(app: &AppHandle) -> Duration {
             let Some(settings) = saved_settings(&engine) else {
                 return LOOK_EVERY;
             };
-            if !should_draft(&engine.store(), &settings, id).unwrap_or(false) {
-                let _ = engine.store().draft_settled(id);
-                continue;
+            match wanted(&engine.store(), &settings, id) {
+                Ok(Wanted::Yes) => {}
+                Ok(Wanted::Later) | Err(_) => continue,
+                Ok(Wanted::No) => {
+                    let _ = engine.store().draft_settled(id);
+                    continue;
+                }
             }
             // Being written on request already.
             if !automation.writing.lock().unwrap().insert(id) {
@@ -209,6 +213,8 @@ async fn round(app: &AppHandle) -> Duration {
             let store = engine.store();
             let settled = match result {
                 Ok(_) | Err(Failed::Nothing | Failed::Unwanted) => store.draft_settled(id),
+                // Still due, for when its sender is accepted.
+                Err(Failed::Later) => Ok(()),
                 Err(Failed::Email(message)) => {
                     eprintln!("spark-rs: inbox automation: no draft for email {id}: {message}");
                     store.draft_failed(id, now_ms())
@@ -276,25 +282,38 @@ fn next_batch(
     }))
 }
 
+/// Whether a reply to an email is wanted now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wanted {
+    Yes,
+    /// Not yet: its sender waits in the Gatekeeper, and the settings don't
+    /// draft for them until they're accepted.
+    Later,
+    No,
+}
+
 /// Whether email `id` gets a reply drafted: it needs one, its account has
 /// Auto-Drafts on since before it came, and nothing answers it already.
-fn should_draft(
-    store: &Store,
-    settings: &AutomationSettings,
-    id: i64,
-) -> spark_store::Result<bool> {
+fn wanted(store: &Store, settings: &AutomationSettings, id: i64) -> spark_store::Result<Wanted> {
     let Some(m) = store.message(id)? else {
-        return Ok(false);
+        return Ok(Wanted::No);
     };
     let Some(&since) = settings.draft_accounts.get(&m.account_id) else {
-        return Ok(false);
+        return Ok(Wanted::No);
     };
-    Ok(m.state == MessageState::Inbox
-        && m.date >= since - DRAFT_GRACE_MS
-        && (!m.screening || settings.gatekeeper_drafts)
-        && !store.is_auto_draft_excluded(&m.from_address)?
-        && !store.conversation_has_draft(id)?
-        && !store.answered_after(id)?)
+    if m.state != MessageState::Inbox
+        || m.date < since - DRAFT_GRACE_MS
+        || store.is_auto_draft_excluded(&m.from_address)?
+        || store.conversation_has_draft(id)?
+        || store.answered_after(id)?
+    {
+        return Ok(Wanted::No);
+    }
+    Ok(if m.screening && !settings.gatekeeper_drafts {
+        Wanted::Later
+    } else {
+        Wanted::Yes
+    })
 }
 
 /// Who wants a reply written.
@@ -318,6 +337,8 @@ enum Failed {
     /// By the time it was written, it wasn't wanted: the user answered or
     /// drafted a reply, or turned Auto-Drafts off.
     Unwanted,
+    /// By the time it was written, its sender was waiting in the Gatekeeper.
+    Later,
 }
 
 /// Writes the user's reply to email `id`, saves it in Drafts and keeps its
@@ -399,8 +420,10 @@ fn save_draft(
     let mut store = engine.store();
     if asked == Asked::Worker {
         let settings = store.automation_settings().map_err(failed)?;
-        if !should_draft(&store, &settings, id).map_err(failed)? {
-            return Err(Failed::Unwanted);
+        match wanted(&store, &settings, id).map_err(failed)? {
+            Wanted::Yes => {}
+            Wanted::Later => return Err(Failed::Later),
+            Wanted::No => return Err(Failed::Unwanted),
         }
     }
     let message = store
@@ -756,7 +779,7 @@ pub async fn auto_draft_reply(
             Ok(draft)
         }
         Err(Failed::Provider(message) | Failed::Email(message)) => Err(message),
-        Err(Failed::Nothing | Failed::Unwanted) => Err(NOTHING_TO_DRAFT.into()),
+        Err(Failed::Nothing | Failed::Unwanted | Failed::Later) => Err(NOTHING_TO_DRAFT.into()),
     }
 }
 
@@ -828,24 +851,20 @@ pub async fn choose_auto_draft_option(
         .options
         .get(index)
         .ok_or("That draft has no such option.")?;
+    // Every save changes it: one made while the draft is read below (a
+    // composer adding a file, say) means what's read is out of date.
+    let read_at = engine.store().draft_saved_at(id).map_err(text)?;
     let mut draft = crate::mailbox::open_live(&engine, id).await?;
     draft.body = option.body.clone();
     draft.body_html = None;
     draft.draft_id = Some(id);
     let account = draft.account;
+    let windows = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::mailbox::save_saved_draft_if(
             &engine,
             &draft,
-            |store| {
-                if store.draft_reserved(id).map_err(text)? {
-                    Err("This draft is being sent.".into())
-                } else if !store.auto_draft_untouched(id).map_err(text)? {
-                    Err("This draft was edited, so its other replies are gone.".into())
-                } else {
-                    Ok(())
-                }
-            },
+            |store| may_pick(store, id, read_at, windows.state::<Editing>().holds(id)),
             |store, _| store.auto_draft_chosen(id, index).map(|_| ()).map_err(text),
         )
     })
@@ -854,6 +873,24 @@ pub async fn choose_auto_draft_option(
     let _ = app.emit("mailbox-changed", ());
     mailbox.live.nudge(account);
     Ok(())
+}
+
+/// Whether auto-draft `id`, read when it was last saved at `read_at`, may
+/// say another option now (while the store is held for the save): not while
+/// it's sent or open in a composer (`held`), once edited, or if it was saved
+/// again since it was read.
+fn may_pick(store: &Store, id: i64, read_at: Option<i64>, held: bool) -> Result<(), String> {
+    if store.draft_reserved(id).map_err(text)? {
+        Err("This draft is being sent.".into())
+    } else if held {
+        Err("This draft is open in the composer: pick a reply there.".into())
+    } else if !store.auto_draft_untouched(id).map_err(text)? {
+        Err("This draft was edited, so its other replies are gone.".into())
+    } else if store.draft_saved_at(id).map_err(text)? != read_at {
+        Err("This draft changed just now. Try again.".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Leaves a sender's mail alone (`excluded`), or no longer does.
@@ -1022,6 +1059,80 @@ mod tests {
             options()
         );
         assert!(store.conversation_has_draft(id).unwrap());
+    }
+
+    #[test]
+    fn another_option_is_picked_only_over_the_draft_as_it_was_read() {
+        let (engine, _, id) = one_email();
+        let Ok(draft_id) = save_draft(&engine, id, &options(), Asked::User) else {
+            panic!("saved");
+        };
+        let read_at = engine.store().draft_saved_at(draft_id).unwrap();
+        assert!(read_at.is_some());
+        assert_eq!(may_pick(&engine.store(), draft_id, read_at, false), Ok(()));
+        // A composer has it open.
+        assert!(may_pick(&engine.store(), draft_id, read_at, true).is_err());
+        // Saved again since it was read (a file added, the text the same).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut again = engine.open_draft(draft_id).unwrap().unwrap();
+        again.draft_id = Some(draft_id);
+        {
+            let mut store = engine.store();
+            let account = store.account(again.account).unwrap().unwrap();
+            spark_mail::drafts::save(&mut store, &account, &again, &[], now_ms()).unwrap();
+        }
+        assert!(may_pick(&engine.store(), draft_id, read_at, false).is_err());
+    }
+
+    #[test]
+    fn a_reply_for_a_new_sender_waits_for_them() {
+        let (engine, account, known) = one_email();
+        let settings = AutomationSettings {
+            draft_accounts: [(account, now_ms() - 60_000)].into(),
+            ..Default::default()
+        };
+        engine.store().set_automation_settings(&settings).unwrap();
+        assert_eq!(
+            wanted(&engine.store(), &settings, known).unwrap(),
+            Wanted::Yes
+        );
+        // Someone new, waiting in the Gatekeeper.
+        let added = engine
+            .store()
+            .add_incoming(
+                &spark_store::Incoming {
+                    account_id: account,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(2),
+                    message_id: Some("<2@new.example>".into()),
+                    from_address: "someone@new.example".into(),
+                    subject: "Hello".into(),
+                    date: now_ms(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        let spark_store::Added::New(id) = added else {
+            panic!("new");
+        };
+        assert!(engine.store().message(id).unwrap().unwrap().screening);
+        assert_eq!(
+            wanted(&engine.store(), &settings, id).unwrap(),
+            Wanted::Later
+        );
+        assert!(matches!(
+            save_draft(&engine, id, &options(), Asked::Worker),
+            Err(Failed::Later)
+        ));
+        let for_new_senders = AutomationSettings {
+            gatekeeper_drafts: true,
+            ..settings
+        };
+        assert_eq!(
+            wanted(&engine.store(), &for_new_senders, id).unwrap(),
+            Wanted::Yes
+        );
     }
 
     #[test]

@@ -748,6 +748,41 @@ fn replies_due_wait_until_written_or_given_up() {
 }
 
 #[test]
+fn a_reply_for_a_new_sender_waits_until_they_are_accepted() {
+    let (mut store, account) = store();
+    let settings = on(account);
+    let mut screened = incoming(account, 1, "new@x.com", NOW);
+    screened.message_id = Some("1@example.com".into());
+    let id = match store.add_incoming(&screened, true).unwrap() {
+        crate::Added::New(id) => id,
+        other => panic!("{other:?}"),
+    };
+    assert!(store.message(id).unwrap().unwrap().screening);
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    store
+        .record_verdict(id, respond, &settings, true, NOW)
+        .unwrap();
+    // Waiting in the Gatekeeper: no reply yet, but it isn't forgotten.
+    assert!(
+        store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let mut for_new_senders = settings.clone();
+    for_new_senders.gatekeeper_drafts = true;
+    assert_eq!(
+        store.draft_candidates(&for_new_senders, NOW, 10).unwrap(),
+        [id]
+    );
+    store.accept_sender("new@x.com", NOW).unwrap();
+    assert_eq!(store.draft_candidates(&settings, NOW, 10).unwrap(), [id]);
+}
+
+#[test]
 fn an_option_can_be_picked_only_while_the_draft_is_untouched() {
     let (mut store, account) = store();
     with_drafts_folder(&mut store, account);
