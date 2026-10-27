@@ -1782,8 +1782,9 @@ impl Engine {
             }
         };
         // Its files (an agenda) go with it, those Graph takes in one go (up
-        // to 3 MB each).
+        // to 3 MB each); an update then sends them to the people invited.
         if master["hasAttachments"] == true {
+            let mut copied = false;
             for file in graph.event_attachments(&series).await.unwrap_or_default() {
                 let small = file["size"].as_u64().is_some_and(|s| s <= 3_000_000);
                 if file["@odata.type"] == "#microsoft.graph.fileAttachment"
@@ -1798,8 +1799,14 @@ impl Engine {
                         "isInline": file["isInline"],
                         "contentId": file["contentId"],
                     });
-                    let _ = graph.add_attachment(&created, &copy).await;
+                    copied |= graph.add_attachment(&created, &copy).await.is_ok();
                 }
+            }
+            if copied {
+                let subject = body["subject"].clone();
+                let _ = graph
+                    .update_event(&created, &serde_json::json!({ "subject": subject }))
+                    .await;
             }
         }
         Ok(())
@@ -2554,27 +2561,26 @@ async fn series_clock(
         .to_owned();
     let (wall, original) = graph.start_in(id, &name).await?;
     let current = wall.get(..10).unwrap_or_default().to_owned();
+    let naive = |w: &str| graph::parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
     let shift = if all_day || name == zone.name {
         0
     } else {
-        let at = |w: &str| graph::parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
-        match (at(&wall), at(&(zone.wall)(start))) {
+        match (naive(&wall), naive(&(zone.wall)(start))) {
             (Some(there), Some(here)) => (there - here) / 60_000,
             _ => 0,
         }
     };
-    // Moved on its own: the day it was to be on, on this clock (an all-day
-    // one's date, wherever it was made).
+    // Moved on its own: the day it was to be on, on this clock. Graph gives
+    // that in UTC; how far this clock is from UTC comes from where the
+    // occurrence is now, in both.
     let day = match original {
-        Some(original) if all_day => {
-            calendar::utc_wall((original + 43_200_000).div_euclid(86_400_000) * 86_400_000)
+        Some(original) => {
+            let (utc, _) = graph.start_in(id, "UTC").await?;
+            match (naive(&wall), naive(&utc)) {
+                (Some(there), Some(utc)) => calendar::utc_wall(original + (there - utc)),
+                _ => wall,
+            }
         }
-        Some(original) => Zone {
-            name: &name,
-            wall: zone.wall,
-            shift,
-        }
-        .wall_at(original),
         None => wall,
     }
     .get(..10)
