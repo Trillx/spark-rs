@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use async_imap::types::Fetch;
+use futures_util::TryStreamExt;
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
 use spark_store::{
@@ -165,6 +167,18 @@ impl Report {
             self.arrived = new;
         }
     }
+}
+
+/// What `Engine::delete_own_draft` did with an auto-draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnDraft {
+    /// Deleted here and, as this app put it there, on the server.
+    Deleted,
+    /// Its copy on the server isn't the one this app put there: another app
+    /// changed or replaced it, so it's the user's.
+    Changed,
+    /// Not now: `may` said no, or this server can't delete only that copy.
+    Kept,
 }
 
 /// The outcome of one queued draft.
@@ -1152,56 +1166,133 @@ impl Engine {
             .keeping(standing))
     }
 
-    /// Whether auto-draft `id` was changed on the server by another app
-    /// since this app put it there: its version isn't the one recorded as it
-    /// went up, or none was. On Microsoft that's its changeKey, as Outlook
-    /// edits drafts in place. On IMAP an edit is a new message, which sync
-    /// may take for this one when it keeps the Message-ID (Roundcube does),
-    /// so it's where the copy is. A draft not on the server yet wasn't.
-    pub async fn draft_changed_elsewhere(&self, id: i64) -> Result<bool> {
-        let (account_id, remote, at, ours) = {
+    /// Deletes auto-draft `id`, here and on the server, if the server's copy
+    /// is still exactly the one this app put there (`Store::auto_draft_uploaded`):
+    /// on Microsoft, the same changeKey, as Outlook edits drafts in place;
+    /// on IMAP, the only message with its Message-ID in its mailbox, at the
+    /// UID it went to, as an edit there is a new message that may keep the
+    /// Message-ID (Roundcube does). `may` decides last, with the store held.
+    /// Only that copy goes: never one that replaced it.
+    pub async fn delete_own_draft(
+        &self,
+        id: i64,
+        may: impl FnOnce(&Store) -> bool,
+    ) -> Result<OwnDraft> {
+        let (at, ours) = {
             let store = self.store();
-            if store.message(id)?.is_none() {
-                return Err(Error::Gone);
-            }
             let Some(at) = store.location(id)? else {
                 return Err(Error::Gone);
             };
-            let remote = at.remote_id.clone();
-            (
-                at.account_id,
-                remote,
-                at,
-                store.auto_draft_server_version(id)?,
-            )
+            (at, store.auto_draft_server_version(id)?)
         };
-        let account = self.account(account_id)?;
-        let AccountConfig::Microsoft {
-            client_id, tenant, ..
-        } = config(&account)?
-        else {
-            let now = at
-                .mailbox
-                .as_deref()
-                .zip(at.uid)
-                .map(|(mailbox, uid)| drafts::imap_version(mailbox, uid));
-            return Ok(match (now, ours) {
-                (None, None) => false,
-                (now, ours) => now != ours,
-            });
-        };
-        let Some(remote) = remote else {
-            return Ok(false);
-        };
-        let Some(ours) = ours else {
-            return Ok(true);
-        };
-        let now = self
-            .syncing_graph(account_id, &client_id, &tenant)
-            .await?
-            .change_key(&remote)
-            .await?;
-        Ok(now.as_deref() != Some(ours.as_str()))
+        let account = self.account(at.account_id)?;
+        // One change to the server at a time, as rounds make theirs.
+        let turn = self.turn(account.id);
+        let _turn = turn.lock().await;
+        match config(&account)? {
+            AccountConfig::Microsoft {
+                client_id, tenant, ..
+            } => {
+                if let Some(remote) = &at.remote_id {
+                    let Some(ours) = ours else {
+                        return Ok(OwnDraft::Changed);
+                    };
+                    let now = self
+                        .syncing_graph(account.id, &client_id, &tenant)
+                        .await?
+                        .change_key(remote)
+                        .await?;
+                    if now.as_deref() != Some(ours.as_str()) {
+                        return Ok(OwnDraft::Changed);
+                    }
+                }
+                // Its copy goes by its Graph id with the next round.
+                let mut store = self.store();
+                if !may(&store) {
+                    return Ok(OwnDraft::Kept);
+                }
+                store.discard_draft(id)?;
+                Ok(OwnDraft::Deleted)
+            }
+            AccountConfig::Imap {
+                username,
+                imap: server,
+                ..
+            } => {
+                let Some(mailbox) = at.mailbox.clone() else {
+                    // Never uploaded: only here.
+                    let mut store = self.store();
+                    if !may(&store) {
+                        return Ok(OwnDraft::Kept);
+                    }
+                    store.discard_draft(id)?;
+                    return Ok(OwnDraft::Deleted);
+                };
+                let uid = ours
+                    .as_deref()
+                    .and_then(|version| drafts::imap_uid(version, &mailbox));
+                let (Some(uid), Some(message_id)) = (uid, at.message_id.clone()) else {
+                    // Uploaded, but where to wasn't learned: can't tell.
+                    return Ok(OwnDraft::Changed);
+                };
+                let password = self.password(account.id)?;
+                let mut session = imap::login(&server, &username, &password).await?;
+                let deleted = self
+                    .delete_own_imap_copy(&mut session, id, &mailbox, uid, &message_id, may)
+                    .await;
+                let _ = session.logout().await;
+                deleted
+            }
+        }
+    }
+
+    /// `delete_own_draft` on IMAP: draft `id`'s copy at `uid` of `mailbox`.
+    async fn delete_own_imap_copy(
+        &self,
+        session: &mut imap::Session,
+        id: i64,
+        mailbox: &str,
+        uid: u32,
+        message_id: &str,
+        may: impl FnOnce(&Store) -> bool,
+    ) -> Result<OwnDraft> {
+        // Without UIDPLUS, an expunge could take other clients' deleted mail.
+        if !session.capabilities().await?.has_str("UIDPLUS") {
+            return Ok(OwnDraft::Kept);
+        }
+        match session.select(mailbox).await {
+            Ok(_) => {}
+            Err(async_imap::error::Error::No(_)) => return Ok(OwnDraft::Changed),
+            Err(e) => return Err(e.into()),
+        }
+        if imap::find_message_id(session, message_id).await? != [uid] {
+            return Ok(OwnDraft::Changed);
+        }
+        {
+            let store = self.store();
+            if !may(&store) {
+                return Ok(OwnDraft::Kept);
+            }
+            // Gone from here now, with nothing queued that would look for
+            // its copy by Message-ID: that copy goes below, by its UID.
+            store.remove_messages(&[id])?;
+        }
+        let set = uid.to_string();
+        let deleted: async_imap::error::Result<()> = async {
+            let _: Vec<Fetch> = session
+                .uid_store(&set, "+FLAGS.SILENT (\\Deleted)")
+                .await?
+                .try_collect()
+                .await?;
+            let _: Vec<_> = session.uid_expunge(&set).await?.try_collect().await?;
+            Ok(())
+        }
+        .await;
+        // Left on the server, it comes back as a draft of the user's.
+        if let Err(e) = deleted {
+            eprintln!("spark-rs: couldn't delete an auto-draft's copy on the server: {e}");
+        }
+        Ok(OwnDraft::Deleted)
     }
 
     /// Sends the account's drafts whose time has come.
@@ -3282,8 +3373,82 @@ mod tests {
         engine
     }
 
+    /// Saves an auto-draft replying to a new email in `account`, uploaded
+    /// as `copy` (unless it's `None`) with `version` recorded for it.
+    fn own_draft(
+        store: &mut Store,
+        account: i64,
+        copy: Option<spark_store::DraftCopy>,
+        version: Option<&str>,
+    ) -> i64 {
+        let folders = [RemoteFolder {
+            remote_id: "Drafts".into(),
+            parent: None,
+            name: "Drafts".into(),
+            role: Some(FolderRole::Drafts),
+            selectable: true,
+        }];
+        if store.folders().unwrap().is_empty() {
+            store.replace_folders(account, &folders).unwrap();
+        }
+        let Added::New(original) = store
+            .add_incoming(
+                &Incoming {
+                    account_id: account,
+                    from_address: "ana@example.com".into(),
+                    subject: "Lunch".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        else {
+            panic!("new")
+        };
+        let id = store
+            .save_draft(
+                None,
+                &spark_store::DraftSave {
+                    account_id: account,
+                    draft: "{}",
+                    send_later: None,
+                    from_name: "Me",
+                    from_address: "me@example.com",
+                    to: &["ana@example.com".to_owned()],
+                    cc: &[],
+                    bcc: &[],
+                    subject: "Re: Lunch",
+                    snippet: "Sure.",
+                    text: "Sure.",
+                    html: None,
+                    in_reply_to: None,
+                    references: None,
+                    attachments: &[],
+                    files: &[],
+                },
+                1,
+            )
+            .unwrap();
+        let option = [spark_store::DraftOption {
+            title: String::new(),
+            body: "Sure.".into(),
+        }];
+        store.add_auto_draft(id, original, &option, 0, 1).unwrap();
+        if let Some(copy) = copy {
+            let upload = store
+                .draft_uploads(account, i64::MAX)
+                .unwrap()
+                .into_iter()
+                .find(|u| u.message_id == id)
+                .unwrap();
+            store.draft_uploaded(&upload, &copy, &[]).unwrap();
+            store.auto_draft_uploaded(id, version).unwrap();
+        }
+        id
+    }
+
     #[tokio::test]
-    async fn a_draft_edited_in_outlook_is_told_from_an_untouched_one() {
+    async fn only_a_microsoft_draft_still_as_this_app_put_it_is_deleted() {
         let (base, _) = crate::graph::tests::serve(|asked, _| match asked.path.as_str() {
             "/me/messages/edited?$select=changeKey" => {
                 Answer::json(serde_json::json!({ "changeKey": "v2" }))
@@ -3296,102 +3461,162 @@ mod tests {
         })
         .await;
         let (engine, account) = microsoft_engine(base);
-        let add = |remote: Option<&str>| {
-            let added = engine
-                .store()
-                .add_incoming(
-                    &Incoming {
-                        account_id: account,
-                        remote_id: remote.map(str::to_owned),
-                        subject: "Re: Lunch".into(),
-                        ..Default::default()
-                    },
-                    false,
-                )
-                .unwrap();
-            let Added::New(id) = added else { panic!("new") };
-            id
+        let copy = |remote: &str| spark_store::DraftCopy {
+            remote_id: Some(remote.into()),
+            ..Default::default()
         };
-        let original = add(Some("original"));
-        let option = [spark_store::DraftOption {
-            title: String::new(),
-            body: "Sure.".into(),
-        }];
-        let mut ids = Vec::new();
-        for (remote, version) in [
-            (Some("edited"), Some("v1")),
-            (Some("untouched"), Some("v1")),
-            (Some("unrecorded"), None),
-            (Some("gone"), Some("v1")),
-            (None, None),
-        ] {
-            let id = add(remote);
-            let store = engine.store();
-            store.add_auto_draft(id, original, &option, 0, 1).unwrap();
-            store.auto_draft_uploaded(id, version).unwrap();
-            ids.push(id);
+        let ids: Vec<i64> = {
+            let mut store = engine.store();
+            vec![
+                own_draft(&mut store, account, Some(copy("untouched")), Some("v1")),
+                own_draft(&mut store, account, Some(copy("edited")), Some("v1")),
+                own_draft(&mut store, account, Some(copy("unrecorded")), None),
+                own_draft(&mut store, account, Some(copy("gone")), Some("v1")),
+                own_draft(&mut store, account, None, None),
+            ]
+        };
+        // `may` saying no keeps even an untouched one.
+        assert_eq!(
+            engine.delete_own_draft(ids[0], |_| false).await.unwrap(),
+            OwnDraft::Kept
+        );
+        assert!(engine.store().message(ids[0]).unwrap().is_some());
+        assert_eq!(
+            engine.delete_own_draft(ids[0], |_| true).await.unwrap(),
+            OwnDraft::Deleted
+        );
+        assert!(engine.store().message(ids[0]).unwrap().is_none());
+        // Outlook changed it since it went up, or its version wasn't kept.
+        for id in [ids[1], ids[2]] {
+            assert_eq!(
+                engine.delete_own_draft(id, |_| true).await.unwrap(),
+                OwnDraft::Changed
+            );
+            assert!(engine.store().message(id).unwrap().is_some());
         }
-        // Outlook changed it since it went up.
-        assert!(engine.draft_changed_elsewhere(ids[0]).await.unwrap());
-        assert!(!engine.draft_changed_elsewhere(ids[1]).await.unwrap());
-        // Put there before versions were kept: can't tell, so it's kept.
-        assert!(engine.draft_changed_elsewhere(ids[2]).await.unwrap());
         assert!(matches!(
-            engine.draft_changed_elsewhere(ids[3]).await,
+            engine.delete_own_draft(ids[3], |_| true).await,
             Err(Error::Gone)
         ));
-        // Not on the server yet: nothing else can have changed it.
-        assert!(!engine.draft_changed_elsewhere(ids[4]).await.unwrap());
+        // Not on the server yet: only here.
+        assert_eq!(
+            engine.delete_own_draft(ids[4], |_| true).await.unwrap(),
+            OwnDraft::Deleted
+        );
+        assert!(engine.store().message(ids[4]).unwrap().is_none());
+    }
+
+    /// A scripted IMAP server: `reply` gives the untagged lines for each
+    /// command (without its tag); every command then gets OK. Returns where
+    /// it is, and the commands it saw once the session ends.
+    async fn scripted_imap(
+        reply: impl Fn(&str) -> String + Send + 'static,
+    ) -> (Server, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = Server {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            security: imap::Security::Plain,
+            trusted_cert: None,
+        };
+        let task = tokio::spawn(async move {
+            let mut commands = Vec::new();
+            let Ok((stream, _)) = listener.accept().await else {
+                return commands;
+            };
+            let mut io = BufReader::new(stream);
+            let _ = io.get_mut().write_all(b"* OK scripted\r\n").await;
+            loop {
+                let mut line = String::new();
+                if io.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let (tag, command) = line.trim_end().split_once(' ').unwrap_or(("*", ""));
+                commands.push(command.to_owned());
+                let untagged = match command {
+                    "CAPABILITY" => "* CAPABILITY IMAP4rev1 UIDPLUS\r\n".to_owned(),
+                    "LOGOUT" => "* BYE\r\n".to_owned(),
+                    _ => reply(command),
+                };
+                let answer = format!("{untagged}{tag} OK done\r\n");
+                if io.get_mut().write_all(answer.as_bytes()).await.is_err() || command == "LOGOUT" {
+                    break;
+                }
+            }
+            commands
+        });
+        (server, task)
+    }
+
+    /// Drafts holds `<own@example.com>` at `uid`.
+    fn drafts_holding(uid: u32) -> impl Fn(&str) -> String + Send + 'static {
+        move |command| {
+            if command.starts_with("SELECT ") {
+                "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n".into()
+            } else if command.starts_with("UID SEARCH ") {
+                format!("* SEARCH {uid}\r\n")
+            } else if command.starts_with("UID FETCH ") {
+                let header = "Message-ID: <own@example.com>\r\n\r\n";
+                format!(
+                    "* 1 FETCH (UID {uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{header})\r\n",
+                    header.len()
+                )
+            } else {
+                String::new()
+            }
+        }
     }
 
     #[tokio::test]
-    async fn an_imap_draft_replaced_in_another_app_is_told_from_its_own_copy() {
-        let mut store = Store::open_in_memory().unwrap();
-        let account = test_account(&mut store, Server::new("127.0.0.1", 25));
-        let add = |store: &mut Store, mailbox: Option<&str>, uid: Option<u32>| {
-            let added = store
-                .add_incoming(
-                    &Incoming {
-                        account_id: account.id,
-                        mailbox: mailbox.map(str::to_owned),
-                        uid,
-                        message_id: Some(format!("<{uid:?}@example.com>")),
-                        subject: "Re: Lunch".into(),
-                        ..Default::default()
-                    },
-                    false,
-                )
-                .unwrap();
-            let Added::New(id) = added else { panic!("new") };
-            id
+    async fn only_an_imap_draft_still_as_this_app_put_it_is_deleted() {
+        let copy = |uid: Option<u32>| spark_store::DraftCopy {
+            mailbox: Some("Drafts".into()),
+            uid,
+            message_id: Some("own@example.com".into()),
+            ..Default::default()
         };
-        let original = add(&mut store, Some("INBOX"), Some(1));
-        let option = [spark_store::DraftOption {
-            title: String::new(),
-            body: "Sure.".into(),
-        }];
-        let mut ids = Vec::new();
-        for (uid, recorded) in [
-            // Where this app put it.
-            (Some(5), Some(5)),
-            // Replaced by another app keeping its Message-ID: a new UID.
-            (Some(20), Some(5)),
-            // Put there before where it went was kept.
-            (Some(7), None),
-            // Not on the server yet.
-            (None, None),
-        ] {
-            let id = add(&mut store, uid.map(|_| "Drafts"), uid);
-            store.add_auto_draft(id, original, &option, 0, 1).unwrap();
-            let version = recorded.map(|uid| drafts::imap_version("Drafts", uid));
-            store.auto_draft_uploaded(id, version.as_deref()).unwrap();
-            ids.push(id);
+        let version = drafts::imap_version("Drafts", 5);
+        for (server_has, expected) in [(5, OwnDraft::Deleted), (20, OwnDraft::Changed)] {
+            let (server, commands) = scripted_imap(drafts_holding(server_has)).await;
+            let mut store = Store::open_in_memory().unwrap();
+            let account = imap_account(&store, &server, 1);
+            let id = own_draft(&mut store, account.id, Some(copy(Some(5))), Some(&version));
+            let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+            // Another app replaced UID 5 with an edited UID 20, keeping the
+            // Message-ID, before a sync saw it: it stays, there and here.
+            assert_eq!(
+                engine.delete_own_draft(id, |_| true).await.unwrap(),
+                expected
+            );
+            let commands = commands.await.unwrap();
+            let expunged: Vec<_> = commands
+                .iter()
+                .filter(|c| c.starts_with("UID EXPUNGE"))
+                .collect();
+            if expected == OwnDraft::Deleted {
+                assert_eq!(expunged, ["UID EXPUNGE 5"]);
+                assert!(engine.store().message(id).unwrap().is_none());
+                assert!(
+                    engine
+                        .store()
+                        .draft_removals(account.id)
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert!(expunged.is_empty(), "{commands:?}");
+                assert!(engine.store().message(id).unwrap().is_some());
+            }
         }
+        // Uploaded, but its UID was never learned: kept without asking.
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &Server::new("127.0.0.1", 9), 1);
+        let id = own_draft(&mut store, account.id, Some(copy(None)), None);
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
-        assert!(!engine.draft_changed_elsewhere(ids[0]).await.unwrap());
-        assert!(engine.draft_changed_elsewhere(ids[1]).await.unwrap());
-        assert!(engine.draft_changed_elsewhere(ids[2]).await.unwrap());
-        assert!(!engine.draft_changed_elsewhere(ids[3]).await.unwrap());
+        assert_eq!(
+            engine.delete_own_draft(id, |_| true).await.unwrap(),
+            OwnDraft::Changed
+        );
     }
 
     /// A Microsoft account signed in to the Graph stand-in at `base`, with

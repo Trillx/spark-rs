@@ -619,6 +619,12 @@ pub(crate) fn imap_version(mailbox: &str, uid: u32) -> String {
     format!("{uid} {mailbox}")
 }
 
+/// The UID in an `imap_version` of a copy in `mailbox`.
+pub(crate) fn imap_uid(version: &str, mailbox: &str) -> Option<u32> {
+    let (uid, at) = version.split_once(' ')?;
+    (at == mailbox).then(|| uid.parse().ok()).flatten()
+}
+
 /// Deletes a draft's server copy by its verified Message-ID. A UID without
 /// generation metadata is insufficient; an already missing copy is fine.
 async fn remove_imap(session: &mut Session, copy: &DraftCopy, uidplus: bool) -> Result<()> {

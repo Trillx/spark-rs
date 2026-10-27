@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use spark_ai::{AiClient, ChatRequest, StopReason};
 use spark_mail::draft::Draft;
-use spark_mail::{Engine, signature};
+use spark_mail::{Engine, OwnDraft, signature};
 use spark_store::{
     AccountKind, AutoLabel, AutomationSettings, Candidate, Category, DRAFT_GRACE_MS,
     DraftInstruction, DraftOption, MessageState, Store, now_ms,
@@ -551,9 +551,9 @@ fn email(store: &Store, id: i64) -> spark_store::Result<Option<Email>> {
     }))
 }
 
-/// Deletes auto-drafts the user hasn't touched for the days Settings says:
-/// not here, and not on the server (Outlook edits a Microsoft draft in
-/// place, so the server is asked first).
+/// Deletes auto-drafts the user hasn't touched for the days Settings says,
+/// here and on the server: only those whose server copy is still the one
+/// this app put there (`Engine::delete_own_draft`).
 async fn cleanup(app: &AppHandle) {
     let mailbox = app.state::<Mailbox>();
     if !mailbox.live() {
@@ -574,27 +574,21 @@ async fn cleanup(app: &AppHandle) {
     };
     let mut removed = false;
     for id in candidates {
-        match engine.draft_changed_elsewhere(id).await {
-            Ok(false) => {}
-            Ok(true) => {
+        // Asked again as it goes: it may have been edited, opened, sent, or
+        // the settings changed while the server was asked.
+        let may = |store: &Store| {
+            let held = app.state::<Editing>().holds(id);
+            may_clean(store, id, held, now_ms()).unwrap_or(false)
+        };
+        match engine.delete_own_draft(id, may).await {
+            Ok(OwnDraft::Deleted) => removed = true,
+            Ok(OwnDraft::Changed) => {
                 if let Err(e) = engine.store().auto_draft_edited(id) {
                     eprintln!("spark-rs: inbox automation: {e}");
                 }
-                continue;
             }
-            // Can't tell now (offline, or gone from the server): next time.
-            Err(_) => continue,
-        }
-        // Asked again: it may have been edited, opened, sent, or the
-        // settings changed while the server was asked.
-        let mut store = engine.store();
-        let held = app.state::<Editing>().holds(id);
-        if !may_clean(&store, id, held, now_ms()).unwrap_or(false) {
-            continue;
-        }
-        match store.discard_draft(id) {
-            Ok(gone) => removed |= gone,
-            Err(e) => eprintln!("spark-rs: couldn't clean up auto-draft {id}: {e}"),
+            // Not now, or can't tell (offline, gone from the server): next time.
+            Ok(OwnDraft::Kept) | Err(_) => {}
         }
     }
     if removed {
