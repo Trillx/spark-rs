@@ -1321,6 +1321,16 @@ impl Engine {
 
     /// Sends the account's drafts whose time has come.
     pub async fn send_due(&self, account_id: i64) -> Result<Vec<SendOutcome>> {
+        self.send_due_each(account_id, |_| {}).await
+    }
+
+    /// `send_due`, telling `each` how each send went as soon as it's done:
+    /// a reply that's gone is answered then, not once the others are too.
+    pub async fn send_due_each(
+        &self,
+        account_id: i64,
+        mut each: impl FnMut(&SendOutcome),
+    ) -> Result<Vec<SendOutcome>> {
         let due = self.store().claim_due_sends(account_id, now_ms())?;
         let mut outcomes = Vec::new();
         for (id, json) in due {
@@ -1390,12 +1400,14 @@ impl Engine {
                     Err(e)
                 }
             };
-            outcomes.push(SendOutcome {
+            let outcome = SendOutcome {
                 id,
                 draft_id,
                 reply_to,
                 result,
-            });
+            };
+            each(&outcome);
+            outcomes.push(outcome);
         }
         Ok(outcomes)
     }
@@ -2580,6 +2592,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
+            smtp_session(socket, code).await;
+        });
+        (
+            Server {
+                host: "127.0.0.1".into(),
+                port,
+                security: imap::Security::Plain,
+                trusted_cert: None,
+            },
+            task,
+        )
+    }
+
+    /// One SMTP conversation that takes a message, answering RCPT with `code`.
+    async fn smtp_session(socket: TcpStream, code: u16) {
+        {
             let mut stream = BufReader::new(socket);
             stream
                 .get_mut()
@@ -2615,16 +2643,7 @@ mod tests {
                 };
                 stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
             }
-        });
-        (
-            Server {
-                host: "127.0.0.1".into(),
-                port,
-                security: imap::Security::Plain,
-                trusted_cert: None,
-            },
-            task,
-        )
+        }
     }
 
     fn test_account(store: &mut Store, smtp: Server) -> Account {
@@ -2775,6 +2794,56 @@ mod tests {
         assert!(matches!(outcomes[0].result, Ok(true)));
         assert_eq!(outcomes[0].reply_to, Some(original));
         delivery.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_send_is_heard_as_soon_as_its_done() {
+        // The second send's server greets it only once the first is heard.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smtp = Server {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            security: imap::Security::Plain,
+            trusted_cert: None,
+        };
+        let (go, gate) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            smtp_session(first, 250).await;
+            let (second, _) = listener.accept().await.unwrap();
+            let _ = gate.await;
+            smtp_session(second, 250).await;
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp);
+        for subject in ["Re: Lunch?", "Re: Dinner?"] {
+            let draft = Draft {
+                account: account.id,
+                to: "recipient@example.com".into(),
+                subject: subject.into(),
+                body: "Yes.".into(),
+                ..Default::default()
+            };
+            store
+                .queue_send(account.id, &to_json(&draft), 0, &[])
+                .unwrap();
+        }
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let mut go = Some(go);
+        let mut heard = 0;
+        let sent = engine.send_due_each(account.id, |outcome| {
+            assert!(matches!(outcome.result, Ok(true)));
+            heard += 1;
+            if let Some(go) = go.take() {
+                let _ = go.send(());
+            }
+        });
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(10), sent)
+            .await
+            .expect("the first send was heard before the second went")
+            .unwrap();
+        assert_eq!((outcomes.len(), heard), (2, 2));
+        server.await.unwrap();
     }
 
     #[tokio::test]

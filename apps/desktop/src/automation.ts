@@ -107,20 +107,26 @@ export function chooseAutoDraftOption(id: number, index: number): Promise<void> 
   return invoke<void>("choose_auto_draft_option", { id, index }).then(announceMailEdited);
 }
 
+/** `value`, once the app's other windows are told the settings changed (an open Settings reads them again). */
+function announced<T>(value: T): T {
+  announceSettingsChanged();
+  return value;
+}
+
 /** Leaves a sender's mail alone (`excluded`), or no longer does. Resolves to the list. */
 export function setAutoDraftExcluded(address: string, excluded: boolean): Promise<string[]> {
   if (!isTauri()) return Promise.reject(DESKTOP_ONLY);
-  return invoke("set_auto_draft_excluded", { address, excluded });
+  return invoke<string[]>("set_auto_draft_excluded", { address, excluded }).then(announced);
 }
 
 export function addDraftInstruction(text: string, account?: AccountId): Promise<DraftInstruction[]> {
   if (!isTauri()) return Promise.reject(DESKTOP_ONLY);
-  return invoke("add_draft_instruction", { text, account: account ?? null });
+  return invoke<DraftInstruction[]>("add_draft_instruction", { text, account: account ?? null }).then(announced);
 }
 
 export function removeDraftInstruction(id: number): Promise<DraftInstruction[]> {
   if (!isTauri()) return Promise.reject(DESKTOP_ONLY);
-  return invoke("remove_draft_instruction", { id });
+  return invoke<DraftInstruction[]>("remove_draft_instruction", { id }).then(announced);
 }
 
 /** Why inbox automation isn't working changed (`null`: it works now). Returns the unsubscribe. */

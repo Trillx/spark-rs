@@ -338,6 +338,7 @@ fn wanted(store: &Store, settings: &AutomationSettings, id: i64) -> spark_store:
         || store.is_auto_draft_excluded(&m.from_address)?
         || store.conversation_has_draft(id)?
         || store.answered_after(id)?
+        || store.written_after(id)?
     {
         return Ok(Wanted::No);
     }
@@ -1291,6 +1292,59 @@ mod tests {
                 .draft_candidates(&settings, now_ms(), 10)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_reply_is_for_the_newest_email_of_a_conversation() {
+        let (engine, account, request) = one_email();
+        let settings = AutomationSettings {
+            draft_accounts: [(account, now_ms() - 60_000)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            wanted(&engine.store(), &settings, request).unwrap(),
+            Wanted::Yes
+        );
+        // "Never mind, sorted it": the request's reply isn't wanted now; the
+        // newer email's is up to what AI says of it.
+        let message = engine.store().message(request).unwrap().unwrap();
+        let added = engine
+            .store()
+            .add_incoming(
+                &spark_store::Incoming {
+                    account_id: account,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(2),
+                    message_id: Some("<2@x.com>".into()),
+                    in_reply_to: Some("<1@x.com>".into()),
+                    from_address: message.from_address.clone(),
+                    subject: format!("Re: {}", message.subject),
+                    date: message.date + 1000,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let spark_store::Added::New(never_mind) = added else {
+            panic!("new");
+        };
+        assert_eq!(
+            engine
+                .store()
+                .message(never_mind)
+                .unwrap()
+                .unwrap()
+                .conversation,
+            message.conversation
+        );
+        assert_eq!(
+            wanted(&engine.store(), &settings, request).unwrap(),
+            Wanted::No
+        );
+        assert_eq!(
+            wanted(&engine.store(), &settings, never_mind).unwrap(),
+            Wanted::Yes
         );
     }
 

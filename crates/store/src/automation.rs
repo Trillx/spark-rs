@@ -929,6 +929,25 @@ impl Store {
         answered_after(&self.conn, id)
     }
 
+    /// Whether someone else wrote in email `id`'s conversation after it (a
+    /// request, then "never mind"): a reply is for the newest, as AI found
+    /// it, not this one.
+    pub fn written_after(&self, id: i64) -> Result<bool> {
+        self.conn.query_row(
+            &format!(
+                "WITH {MEMBERS}
+                 SELECT EXISTS (
+                     SELECT 1 FROM members JOIN messages m ON m.id = members.id, o
+                     WHERE m.id != ?1 AND m.date > o.date AND m.state NOT IN ('deleted', 'blocked')
+                       AND NOT EXISTS (SELECT 1 FROM accounts a
+                                       WHERE a.email = m.from_address COLLATE NOCASE)
+                       AND {NOT_DRAFT})"
+            ),
+            [id],
+            |r| r.get(0),
+        )
+    }
+
     /// Up to `limit` emails of email `id`'s conversation from before it,
     /// oldest first, drafts left out: what a reply to it reads first.
     pub fn conversation_before(&self, id: i64, limit: usize) -> Result<Vec<i64>> {

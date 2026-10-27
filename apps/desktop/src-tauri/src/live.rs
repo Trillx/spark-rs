@@ -449,16 +449,18 @@ async fn work(
             break;
         }
 
-        match engine.send_due(account_id).await {
+        // Answered once it's gone, not when it was queued (Undo and Send
+        // Later can still take it back), and before the next one goes.
+        let answered = |outcome: &spark_mail::engine::SendOutcome| {
+            if matches!(outcome.result, Ok(true))
+                && let Some(original) = outcome.reply_to
+            {
+                crate::automation::replied(&app, original);
+            }
+        };
+        match engine.send_due_each(account_id, answered).await {
             Ok(outcomes) => {
                 for outcome in outcomes {
-                    // Answered once it's gone, not when it was queued: Undo
-                    // and Send Later can still take it back.
-                    if matches!(outcome.result, Ok(true))
-                        && let Some(original) = outcome.reply_to
-                    {
-                        crate::automation::replied(&app, original);
-                    }
                     let event = match outcome.result {
                         Ok(true) => SendEvent {
                             id: outcome.id,
