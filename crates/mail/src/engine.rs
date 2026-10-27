@@ -1655,17 +1655,7 @@ impl Engine {
                 .event(event_id)?
                 .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
             let master = serde_json::json!({ "recurrence": details.recurrence });
-            Some(
-                series_clock(
-                    &graph,
-                    &stored.remote_id,
-                    stored.start,
-                    event.all_day,
-                    &master,
-                    zone,
-                )
-                .await?,
-            )
+            Some(series_clock(&graph, &stored.remote_id, stored.start, &master, zone).await?)
         } else {
             None
         };
@@ -1707,15 +1697,7 @@ impl Engine {
         let graph = self.calendar_graph(stored.account_id).await?;
         let master = graph.event_json(&series, calendar::MASTER_SELECT).await?;
         let old = master["recurrence"].clone();
-        let clock = series_clock(
-            &graph,
-            &stored.remote_id,
-            stored.start,
-            event.all_day,
-            &master,
-            zone,
-        )
-        .await?;
+        let clock = series_clock(&graph, &stored.remote_id, stored.start, &master, zone).await?;
         let split = clock.day.clone();
         if begins_on(&graph, &series, &old, &split, &clock.name).await? {
             return self
@@ -1930,16 +1912,7 @@ impl Engine {
             .event_json(&series, "recurrence,originalStartTimeZone")
             .await?;
         let old = &master["recurrence"];
-        let all_day = Event::from_json(&stored.data).all_day;
-        let clock = series_clock(
-            &graph,
-            &stored.remote_id,
-            stored.start,
-            all_day,
-            &master,
-            zone,
-        )
-        .await?;
+        let clock = series_clock(&graph, &stored.remote_id, stored.start, &master, zone).await?;
         let split = clock.day;
         if old.is_null() || begins_on(&graph, &series, old, &split, &clock.name).await? {
             return graph.delete_event(&series).await;
@@ -2630,7 +2603,6 @@ async fn series_clock(
     graph: &Graph,
     id: &str,
     start: i64,
-    all_day: bool,
     master: &serde_json::Value,
     zone: Zone<'_>,
 ) -> Result<SeriesClock> {
@@ -2640,11 +2612,12 @@ async fn series_clock(
         .filter(|z| !z.is_empty())
         .unwrap_or(zone.name)
         .to_owned();
-    // Where the occurrence is now, on this clock and in UTC, both from
-    // Graph: how far apart the clocks are comes from the same moment, not
-    // from the copy stored here, which Outlook may have moved since.
-    let (wall, original) = graph.start_in(id, &name).await?;
-    let (utc, _) = graph.start_in(id, "UTC").await?;
+    // Where the occurrence is now, on this clock and in UTC, and whether
+    // it's all-day, all from Graph: how far apart the clocks are comes from
+    // the same moment, not from the copy stored here, which Outlook may have
+    // moved or made all-day (or not) since.
+    let (wall, original, all_day) = graph.start_in(id, &name).await?;
+    let (utc, _, _) = graph.start_in(id, "UTC").await?;
     let current = wall.get(..10).unwrap_or_default().to_owned();
     let naive = |w: &str| graph::parse_iso_date(&format!("{}Z", w.get(..19).unwrap_or(w)));
     let now = naive(&utc).unwrap_or(start);
@@ -4791,5 +4764,59 @@ mod tests {
         let held = engine.search_server(account_id, "invoice").await;
         assert!(matches!(held, Err(Error::Network { .. })), "{held:?}");
         assert!(seen.take().is_empty());
+    }
+
+    /// A Tokyo series' occurrence, at 09:00 there (00:00 UTC) on October 15,
+    /// all-day or not as `all_day` says, as Graph tells it in the zone asked.
+    async fn tokyo_occurrence(all_day: bool) -> String {
+        let (base, _) = crate::graph::tests::serve(move |asked: &Asked, _| {
+            if asked.path != "/me/events/occ1?$select=start,originalStart,isAllDay" {
+                return Answer::status(404);
+            }
+            let utc = asked.prefer.iter().any(|p| p.contains("\"UTC\""));
+            let start = match (all_day, utc) {
+                (true, _) => "2026-10-15T00:00:00.0000000",
+                (false, true) => "2026-10-15T00:00:00.0000000",
+                (false, false) => "2026-10-15T09:00:00.0000000",
+            };
+            Answer::json(serde_json::json!({
+                "start": { "dateTime": start },
+                "isAllDay": all_day,
+            }))
+        })
+        .await;
+        base
+    }
+
+    #[tokio::test]
+    async fn a_series_clock_goes_by_whether_outlook_has_it_all_day_now() {
+        fn pacific(ms: i64) -> String {
+            calendar::utc_wall(ms - 7 * 3_600_000)
+        }
+        let zone = Zone {
+            name: "Pacific Standard Time",
+            wall: pacific,
+            shift: 0,
+        };
+        let master = serde_json::json!({
+            "recurrence": { "range": { "recurrenceTimeZone": "Tokyo Standard Time" } }
+        });
+        // Stored as all-day, since made 09:00 to 10:00 in Outlook: Tokyo is
+        // 16 hours ahead.
+        let graph = Graph::with_base(&tokyo_occurrence(false).await, "token");
+        let start = graph::parse_iso_date("2026-10-15T00:00:00Z").unwrap();
+        let clock = series_clock(&graph, "occ1", start, &master, zone)
+            .await
+            .unwrap();
+        assert_eq!(
+            (clock.shift, clock.current.as_str()),
+            (16 * 60, "2026-10-15")
+        );
+        // Made all-day in Outlook: its date is the same on every clock.
+        let graph = Graph::with_base(&tokyo_occurrence(true).await, "token");
+        let clock = series_clock(&graph, "occ1", start, &master, zone)
+            .await
+            .unwrap();
+        assert_eq!((clock.shift, clock.current.as_str()), (0, "2026-10-15"));
     }
 }

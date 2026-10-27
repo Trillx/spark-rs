@@ -1032,21 +1032,25 @@ impl Graph {
     }
 
     /// Event `id`'s start as wall-clock time ("2026-10-27T09:30:00") in the
-    /// Windows time zone `zone`, and for an occurrence of a series, when it
-    /// was to start before it was moved on its own (Unix ms).
-    pub async fn start_in(&self, id: &str, zone: &str) -> Result<(String, Option<i64>)> {
+    /// Windows time zone `zone`, for an occurrence of a series when it was
+    /// to start before it was moved on its own (Unix ms), and whether it's
+    /// all-day now.
+    pub async fn start_in(&self, id: &str, zone: &str) -> Result<(String, Option<i64>, bool)> {
         let event: serde_json::Value = self
             .json(
                 self.request(
                     Method::GET,
-                    &format!("/me/events/{}?$select=start,originalStart", path(id)),
+                    &format!(
+                        "/me/events/{}?$select=start,originalStart,isAllDay",
+                        path(id)
+                    ),
                 )
                 .header("Prefer", format!("outlook.timezone=\"{zone}\"")),
             )
             .await?;
         let start = event["start"]["dateTime"].as_str().unwrap_or_default();
         let original = event["originalStart"].as_str().and_then(parse_iso_date);
-        Ok((start.to_owned(), original))
+        Ok((start.to_owned(), original, event["isAllDay"] == true))
     }
 
     /// The days ("2026-10-27") of series `id`'s first and last occurrences
@@ -2495,8 +2499,8 @@ mod tests {
                 "/me/events/ser1/instances?page=2" => {
                     json!({ "value": [{ "start": { "dateTime": "2026-10-20T09:30:00.0000000" } }] })
                 }
-                "/me/events/occ1?$select=start,originalStart" => {
-                    json!({ "start": { "dateTime": "2026-10-28T00:30:00.0000000", "timeZone": "Tokyo Standard Time" } })
+                "/me/events/occ1?$select=start,originalStart,isAllDay" => {
+                    json!({ "start": { "dateTime": "2026-10-28T00:30:00.0000000", "timeZone": "Tokyo Standard Time" }, "isAllDay": false })
                 }
                 _ => return None,
             })
@@ -2518,7 +2522,7 @@ mod tests {
         );
         assert_eq!(
             graph.start_in("occ1", "Tokyo Standard Time").await.unwrap(),
-            ("2026-10-28T00:30:00.0000000".to_owned(), None)
+            ("2026-10-28T00:30:00.0000000".to_owned(), None, false)
         );
     }
 
