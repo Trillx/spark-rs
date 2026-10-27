@@ -152,6 +152,15 @@ pub struct Report {
     pub reconciled: usize,
 }
 
+/// A round that failed part way (`Engine::run_round`): why, and what it
+/// did before then, which stays done. Mail it brought in is stored, so the
+/// next round doesn't bring it in again: it's told of now or never.
+#[derive(Debug)]
+pub struct CutShort {
+    pub error: Error,
+    pub report: Box<Report>,
+}
+
 impl Report {
     /// Whether the message list needs reloading.
     pub fn changed(&self) -> bool {
@@ -605,6 +614,7 @@ impl Engine {
             },
         )
         .await
+        .map_err(|cut| cut.error)
     }
 
     /// `run`, plus reaching back for older mail, listing the account's
@@ -614,9 +624,23 @@ impl Engine {
     /// Reaching back for older inbox mail moves the sync position, which a
     /// round reads at its start and writes at its end: so it happens here,
     /// in the account's round, and not on a connection of its own.
-    pub async fn run_round(&self, account_id: i64, round: &Round) -> Result<Report> {
+    ///
+    /// A round that fails part way says what it did before (`CutShort`).
+    pub async fn run_round(&self, account_id: i64, round: &Round) -> Result<Report, CutShort> {
         let turn = self.turn(account_id);
         let _turn = turn.lock().await;
+        let mut report = Report::default();
+        match self.round(account_id, round, &mut report).await {
+            Ok(()) => Ok(report),
+            Err(error) => Err(CutShort {
+                error,
+                report: Box::new(report),
+            }),
+        }
+    }
+
+    /// `run_round`'s work, telling `report` of it as it goes.
+    async fn round(&self, account_id: i64, round: &Round, report: &mut Report) -> Result<()> {
         let account = self.account(account_id)?;
         let now = now_ms();
         let pending = self.store().pending(account_id, now, SETTLE_MS)?;
@@ -660,9 +684,8 @@ impl Engine {
             && !round.list_folders
             && folders.is_empty()
         {
-            return Ok(Report::default());
+            return Ok(());
         }
-        let mut report = Report::default();
         match config(&account)? {
             AccountConfig::Imap {
                 username,
@@ -730,10 +753,10 @@ impl Engine {
                             report.folders_changed = true;
                         }
                         Ok(r) => {
-                            self.folder_synced(folder, &to_json(&folder_state), &mut report)?;
+                            self.folder_synced(folder, &to_json(&folder_state), report)?;
                             report.folder_changes += r.changed;
                         }
-                        Err(e) => folder_failed(folder, e, &mut report)?,
+                        Err(e) => folder_failed(folder, e, report)?,
                     }
                 }
                 let waiting = self.waiting_senders(account_id, round, &report.arrived)?;
@@ -797,7 +820,7 @@ impl Engine {
                         .await
                     {
                         Ok(Some(changed)) => {
-                            self.folder_synced(folder, &to_json(&folder_state), &mut report)?;
+                            self.folder_synced(folder, &to_json(&folder_state), report)?;
                             report.folder_changes += changed;
                         }
                         Ok(None) => {
@@ -808,7 +831,7 @@ impl Engine {
                             }
                             report.folders_changed = true;
                         }
-                        Err(e) => folder_failed(folder, e, &mut report)?,
+                        Err(e) => folder_failed(folder, e, report)?,
                     }
                 }
                 let waiting = self.waiting_senders(account_id, round, &report.arrived)?;
@@ -829,7 +852,7 @@ impl Engine {
                 }
             }
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Whether the account's background download has a step to take now
@@ -6213,6 +6236,56 @@ mod tests {
         assert_eq!(n2_listings(seen.take()), 0);
         assert_eq!(files(&engine), whole(1..=5, &[2]));
         assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta3"));
+    }
+
+    #[tokio::test]
+    async fn a_round_cut_short_by_a_folder_says_what_mail_it_brought_in() {
+        // The inbox brings in new mail, then the connection drops as a
+        // folder syncs.
+        let inbox = inbox(|_| None);
+        let (base, _) = graph::tests::serve(move |asked, attempt| {
+            if asked.path.starts_with("/me/mailFolders/f1/") {
+                return Answer::status(0);
+            }
+            inbox(asked, attempt)
+        })
+        .await;
+        let (engine, account_id) = microsoft_engine(base);
+        let folder = {
+            let mut store = engine.store();
+            store.set_sync_state(account_id, AT_DELTA1).unwrap();
+            store
+                .replace_folders(
+                    account_id,
+                    &[RemoteFolder {
+                        remote_id: "f1".into(),
+                        parent: None,
+                        name: "Projects".into(),
+                        role: None,
+                        selectable: true,
+                    }],
+                )
+                .unwrap();
+            store.folders().unwrap()[0].id
+        };
+        let round = Round {
+            fetch: true,
+            folders: vec![folder],
+            ..Default::default()
+        };
+        let cut = engine.run_round(account_id, &round).await.unwrap_err();
+        assert!(
+            matches!(cut.error, Error::Network { .. }),
+            "{:?}",
+            cut.error
+        );
+        assert_eq!((cut.report.new, cut.report.arrived.len()), (4, 4));
+        assert!(cut.report.changed());
+
+        // The next round doesn't bring them in again: they're told of then
+        // or never.
+        let cut = engine.run_round(account_id, &round).await.unwrap_err();
+        assert_eq!((cut.report.new, cut.report.arrived.len()), (1, 1));
     }
 
     #[tokio::test]

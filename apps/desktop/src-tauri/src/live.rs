@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 use serde::Serialize;
+use spark_mail::engine::Report;
 use spark_mail::engine::{folder_has_older, inbox_has_older};
-use spark_mail::{Engine, Error, Round, Untrusted, Watch};
+use spark_mail::{CutShort, Engine, Error, Round, Untrusted, Watch};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter};
@@ -566,20 +567,11 @@ async fn work(
                     for e in &report.folder_errors {
                         eprintln!("spark-rs: syncing a folder of account {account_id}: {e}");
                     }
-                    if report.folders_changed {
-                        let _ = app.emit("folders-changed", ());
-                    }
-                    if report.changed() {
-                        let _ = app.emit("mailbox-changed", ());
-                        // It hears what the background changed too.
-                        untold.held = false;
-                    }
-                    if !report.arrived.is_empty() {
-                        notify::new_mail(&app, &engine, account_id, &report.arrived);
-                        crate::automation::wake(&app);
-                    }
+                    tell(&app, &engine, account_id, &report, &mut untold);
                 }
-                Err(e) => {
+                Err(CutShort { error: e, report }) => {
+                    // Mail it brought in before it failed is told of now or never.
+                    tell(&app, &engine, account_id, &report, &mut untold);
                     // IDLE's connection may be the one too many.
                     if e.is_connection_limit() && watcher.watching.load(Ordering::Relaxed) {
                         watcher.give_way.store(true, Ordering::Relaxed);
@@ -593,7 +585,10 @@ async fn work(
                     });
                     // A folder synced before it failed may have changed what the
                     // sidebar shows of it, which a report would have said.
-                    if folders_were.is_some_and(|were| were != folder_reach(&engine, account_id)) {
+                    if !report.folders_changed
+                        && folders_were
+                            .is_some_and(|were| were != folder_reach(&engine, account_id))
+                    {
                         let _ = app.emit("folders-changed", ());
                     }
                 }
@@ -856,6 +851,22 @@ impl Untold {
             self.told = Some(now);
         }
         due
+    }
+}
+
+/// Tells the UI, and the user of new mail, what a round changed.
+fn tell(app: &AppHandle, engine: &Engine, account_id: i64, report: &Report, untold: &mut Untold) {
+    if report.folders_changed {
+        let _ = app.emit("folders-changed", ());
+    }
+    if report.changed() {
+        let _ = app.emit("mailbox-changed", ());
+        // It hears what the background changed too.
+        untold.held = false;
+    }
+    if !report.arrived.is_empty() {
+        notify::new_mail(app, engine, account_id, &report.arrived);
+        crate::automation::wake(app);
     }
 }
 
