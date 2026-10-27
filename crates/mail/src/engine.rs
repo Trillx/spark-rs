@@ -4247,8 +4247,9 @@ mod tests {
     /// by UID.
     type Held = HashMap<String, (u32, Vec<(u32, Vec<u8>)>)>;
 
-    /// The mailboxes the stand-in lists but won't select, with its NO.
-    type Refused = HashMap<String, String>;
+    /// The mailboxes the stand-in won't select, with its NO, and whether it
+    /// lists them.
+    type Refused = HashMap<String, (String, bool)>;
 
     /// What the stand-in does once, as it's about to send a whole message.
     #[derive(Default)]
@@ -4322,7 +4323,16 @@ mod tests {
             self.refused
                 .lock()
                 .unwrap()
-                .insert(mailbox.into(), said.into());
+                .insert(mailbox.into(), (said.into(), true));
+        }
+
+        /// `refuse`, but with `mailbox` not listed either, as a shared
+        /// folder the user may no longer look in can be (RFC 4314).
+        fn refuse_unlisted(&self, mailbox: &str, said: &str) {
+            self.refused
+                .lock()
+                .unwrap()
+                .insert(mailbox.into(), (said.into(), false));
         }
 
         /// Runs `then` as the next whole message is about to go out.
@@ -4423,7 +4433,7 @@ mod tests {
                     .to_owned();
                 let refusal = refused.lock().unwrap().get(&selected).cloned();
                 match (refusal, held.lock().unwrap().get(&selected)) {
-                    (Some(said), _) => status = said,
+                    (Some((said, _)), _) => status = said,
                     (None, Some((validity, mail))) => reply.extend(
                         format!(
                             "* {} EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n",
@@ -4437,7 +4447,7 @@ mod tests {
                 // One mailbox, by its quoted name.
                 let name = command.rsplit('"').nth(1).unwrap_or_default();
                 let there = held.lock().unwrap().contains_key(name)
-                    || refused.lock().unwrap().contains_key(name);
+                    || refused.lock().unwrap().get(name).is_some_and(|r| r.1);
                 if there {
                     reply.extend(format!("* LIST () \"/\" \"{name}\"\r\n").into_bytes());
                 }
@@ -5153,11 +5163,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_draft_waits_while_the_folder_of_its_forwarded_file_cant_be_opened() {
-        // A forward's original is in a shared folder the user may no
-        // longer read, and nowhere else.
+        // Listed still, or not once the user may no longer look in it.
+        a_draft_waits_for_a_file_in_a_shared_folder(true).await;
+        a_draft_waits_for_a_file_in_a_shared_folder(false).await;
+    }
+
+    /// A forward's original is in a shared folder the user may no longer
+    /// read, the folder listed or not, and nowhere else.
+    async fn a_draft_waits_for_a_file_in_a_shared_folder(folder_listed: bool) {
         let raw = big_message("shared@example.com", 1, 1024);
         let imap = ImapStandIn::start(7, Vec::new()).await;
-        imap.refuse("Shared", "NO [NOPERM] Permission denied");
+        if folder_listed {
+            imap.refuse("Shared", "NO [NOPERM] Permission denied");
+        } else {
+            imap.refuse_unlisted("Shared", "NO [NOPERM] Permission denied");
+        }
         let mut store = Store::open_in_memory().unwrap();
         let account = imap_account(&store, &imap.server, 7);
         store
@@ -5200,7 +5220,7 @@ mod tests {
         assert_eq!(pushed.uploaded, 0);
         assert!(
             matches!(&pushed.errors[..], [e] if e.contains("part1.pdf") && e.contains("Permission denied")),
-            "{:?}",
+            "{folder_listed}: {:?}",
             pushed.errors
         );
         let store = store.lock().unwrap();
@@ -5266,15 +5286,46 @@ mod tests {
                 );
             }
         }
+        // Not listed, as a shared folder the user may no longer look in can
+        // be (RFC 4314): only a NO that says it's gone, or says nothing, is.
+        for (said, gone) in [
+            ("NO [NONEXISTENT] No such mailbox", true),
+            ("NO Mailbox does not exist", true),
+            ("NO [NOPERM] Permission denied", false),
+            ("NO [UNAVAILABLE] Try again later", false),
+            ("NO [INUSE] Mailbox in use", false),
+            ("NO [SERVERBUG] Internal error", false),
+            ("NO [LIMIT] Too many open", false),
+            ("NO [EXPUNGEISSUED] Mail was expunged", false),
+        ] {
+            imap.refuse_unlisted("Shared", said);
+            let found = imap::fetch_raw(&mut session, &state, &at).await;
+            if gone {
+                assert!(matches!(found, Ok(None)), "{said}: {found:?}");
+            } else {
+                let text = said.trim_start_matches("NO ");
+                assert!(
+                    matches!(&found, Err(Error::Server(e)) if e.contains(text) && e.contains("Shared")),
+                    "{said}: {found:?}"
+                );
+            }
+        }
 
-        // Opening it says why it can't be had, not that it's gone.
-        imap.refuse("Shared", "NO [NOPERM] Permission denied");
-        let fetched = engine.fetch_body(older).await;
-        assert!(
-            matches!(&fetched, Err(Error::Server(e)) if e.contains("Permission denied")),
-            "{fetched:?}"
-        );
-        assert!(engine.store().content(older).unwrap().unwrap().body_missing);
+        // Opening it says why it can't be had, not that it's gone, listed
+        // or not.
+        for listed in [true, false] {
+            if listed {
+                imap.refuse("Shared", "NO [NOPERM] Permission denied");
+            } else {
+                imap.refuse_unlisted("Shared", "NO [NOPERM] Permission denied");
+            }
+            let fetched = engine.fetch_body(older).await;
+            assert!(
+                matches!(&fetched, Err(Error::Server(e)) if e.contains("Permission denied")),
+                "{listed}: {fetched:?}"
+            );
+            assert!(engine.store().content(older).unwrap().unwrap().body_missing);
+        }
     }
 
     #[tokio::test]

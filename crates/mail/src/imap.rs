@@ -2514,19 +2514,18 @@ pub async fn fetch_raw_checked(
 }
 
 /// Fails if a mailbox the server wouldn't open (`unopened`, with what it
-/// said) is still there: what wasn't found may be in it, so it isn't gone.
-/// RFC 5530 tells which: NONEXISTENT says it isn't there, as TRYCREATE
-/// (RFC 3501's for an APPEND or COPY to a mailbox that isn't) does when a
-/// server gives it for a SELECT; NOPERM, a damaged mailbox or one in use
-/// is still there. A NO without either is checked by listing the mailbox:
-/// it's gone unless it's listed as one that can be opened.
+/// said) may still be there: what wasn't found may be in it, so it isn't
+/// gone. The NO's code tells which (`Refusal`). Only one without a code is
+/// checked by listing the mailbox: it's gone unless it's listed as one
+/// that can be opened.
 async fn none_unreadable(session: &mut Session, unopened: &[(String, String)]) -> Result<()> {
     for (mailbox, said) in unopened {
-        let code = said.to_ascii_uppercase();
-        if code.contains("[NONEXISTENT]") || code.contains("TRYCREATE") {
-            continue;
-        }
-        if selectable(session, mailbox).await? {
+        let there = match Refusal::of(said) {
+            Refusal::Gone => false,
+            Refusal::Unreadable => true,
+            Refusal::Unsaid => selectable(session, mailbox).await?,
+        };
+        if there {
             return Err(Error::Server(format!(
                 "The mail server wouldn't open {}: {}",
                 utf7::decode(mailbox),
@@ -2535,6 +2534,49 @@ async fn none_unreadable(session: &mut Session, unopened: &[(String, String)]) -
         }
     }
     Ok(())
+}
+
+/// What a NO to opening a mailbox says of it, by its response code
+/// (RFC 5530).
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// It isn't there: NONEXISTENT, or TRYCREATE (RFC 3501's for an APPEND
+    /// or COPY to a mailbox that isn't), which some servers give a SELECT.
+    Gone,
+    /// It's there, but can't be read now or by this user: any other code,
+    /// as NOPERM, a damaged mailbox or one in use, the server's trouble or
+    /// a limit reached. So even when it isn't listed, as RFC 4314 lets a
+    /// server hide a shared folder the user may no longer look in.
+    Unreadable,
+    /// It doesn't say: no code, or only one for the user to read (ALERT).
+    Unsaid,
+}
+
+impl Refusal {
+    /// `said` is the NO, as async-imap gives it.
+    fn of(said: &str) -> Self {
+        match no_code(said).as_deref() {
+            Some("NONEXISTENT" | "TRYCREATE") => Self::Gone,
+            None | Some("ALERT") => Self::Unsaid,
+            Some(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// The response code a NO gives, upper-cased: as async-imap read it
+/// (`code: Some(TryCreate)`), or from its text, for one it doesn't know
+/// (`information: Some("[NOPERM] …")`).
+fn no_code(said: &str) -> Option<String> {
+    if let Some((_, rest)) = said.split_once("code: Some(") {
+        let code: String = rest
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        return Some(code.to_ascii_uppercase());
+    }
+    let code = no_text(said).trim_start().strip_prefix('[')?;
+    let end = code.find(|c: char| c == ']' || c.is_ascii_whitespace())?;
+    Some(code[..end].to_ascii_uppercase())
 }
 
 /// Whether the server lists `mailbox` as one that can be selected.
@@ -3173,6 +3215,37 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     use super::*;
+
+    #[test]
+    fn a_no_to_opening_a_mailbox_says_by_its_code_whether_its_there() {
+        // Each as async-imap gives a SELECT's NO.
+        let no = |line: &str| {
+            let response = format!("a1 {line}\r\n");
+            match Response::parse(response.as_bytes()).unwrap().1 {
+                Response::Done { outcome, .. } => format!("outcome: {outcome:?}"),
+                other => panic!("not a tagged answer: {other:?}"),
+            }
+        };
+        for (line, refusal) in [
+            (
+                "NO [NONEXISTENT] Unknown Mailbox: Shared (Failure)",
+                Refusal::Gone,
+            ),
+            ("NO [TRYCREATE] No such mailbox", Refusal::Gone),
+            ("NO [NOPERM] Permission denied", Refusal::Unreadable),
+            ("NO [UNAVAILABLE] Try again later", Refusal::Unreadable),
+            ("NO [INUSE] Mailbox in use", Refusal::Unreadable),
+            ("NO [SERVERBUG] Internal error", Refusal::Unreadable),
+            ("NO [LIMIT] Too many open", Refusal::Unreadable),
+            ("NO [EXPUNGEISSUED] Mail was expunged", Refusal::Unreadable),
+            ("NO [CORRUPTION] Mailbox is damaged", Refusal::Unreadable),
+            ("NO [ALERT] Mailbox does not exist", Refusal::Unsaid),
+            ("NO Mailbox does not exist", Refusal::Unsaid),
+            ("NO", Refusal::Unsaid),
+        ] {
+            assert_eq!(Refusal::of(&no(line)), refusal, "{line}");
+        }
+    }
 
     /// `fetch` as a FETCH response reads, its literals counted out.
     fn read_fetch_response(fetch: &str) -> Fetched {
