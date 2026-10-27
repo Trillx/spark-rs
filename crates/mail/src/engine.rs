@@ -4678,6 +4678,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_draft_waits_while_which_copy_has_its_forwarded_file_cant_be_told() {
+        // A forward's original was at UID 42, which is gone; two copies of
+        // it alike are there instead.
+        let raw = big_message("dup@example.com", 1, 1024);
+        let imap = ImapStandIn::start(7, vec![(50, raw.clone()), (52, raw.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        store
+            .replace_folders(
+                account.id,
+                &[RemoteFolder {
+                    remote_id: "Drafts".into(),
+                    parent: None,
+                    name: "Drafts".into(),
+                    role: Some(FolderRole::Drafts),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let source = store_imap(&mut store, account.id, imap::INBOX, 42, &raw);
+        let draft = Draft {
+            account: account.id,
+            subject: "Fwd: Files".into(),
+            attachments: vec![OutgoingAttachment::Message {
+                message: source,
+                index: 1,
+                name: "part1.pdf".into(),
+                size: 1024,
+            }],
+            ..Default::default()
+        };
+        let saved = drafts::save(&mut store, &account, &draft, &[], 1).unwrap();
+        let listed = store.content(saved).unwrap().unwrap().attachments;
+        let store = Mutex::new(store);
+        let state = imap::SyncState {
+            uid_validity: Some(7),
+            ..Default::default()
+        };
+        let mut session = imap::login(&imap.server, "me@example.com", "pw")
+            .await
+            .unwrap();
+        let pushed = drafts::push_imap(&mut session, &store, &account, &state, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(pushed.uploaded, 0);
+        assert!(
+            matches!(&pushed.errors[..], [e] if e.contains("part1.pdf")),
+            "{:?}",
+            pushed.errors
+        );
+        {
+            // Still queued as it was, its file too.
+            let store = store.lock().unwrap();
+            let uploads = store.draft_uploads(account.id, i64::MAX).unwrap();
+            assert!(matches!(&uploads[..], [u] if u.draft.contains("part1.pdf")));
+            assert_eq!(store.content(saved).unwrap().unwrap().attachments, listed);
+        }
+
+        // Its folder renamed away, an email is still looked for elsewhere.
+        let at = Location {
+            account_id: account.id,
+            remote_id: None,
+            mailbox: Some("Gone".into()),
+            uid: Some(9),
+            message_id: Some("moved@example.com".into()),
+            remote_place: Place::Inbox,
+            from_address: "ana@example.com".into(),
+            subject: "Files".into(),
+            date: 1,
+        };
+        let moved = big_message("moved@example.com", 2, 1024);
+        imap.hold(imap::INBOX, 7, vec![(60, moved.clone())]);
+        let found = imap::fetch_raw(&mut session, &state, &at).await.unwrap();
+        assert_eq!(found, Some(moved));
+    }
+
+    #[tokio::test]
     async fn older_microsoft_mail_is_gone_over_after_start_and_hourly() {
         fn empty(_: &str) -> Option<serde_json::Value> {
             Some(serde_json::json!({ "value": [] }))

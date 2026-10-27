@@ -2402,7 +2402,7 @@ pub async fn empty_folder(session: &mut Session, mailbox: &str) -> Result<u32> {
 
 /// The whole raw message, wherever the server keeps it now: at its known
 /// mailbox and UID, else found by Message-ID in the folder it was last
-/// pushed to, then the inbox. `None` if it's gone.
+/// pushed to, then the inbox. `None` if it's gone, its mailbox too.
 pub async fn fetch_raw(
     session: &mut Session,
     state: &SyncState,
@@ -2437,13 +2437,19 @@ pub async fn fetch_raw_checked(
     };
     let mut renumbered = false;
     if let (Some(mailbox), Some(uid)) = (&at.mailbox, at.uid) {
-        let selected = session.select(mailbox).await?;
-        renumbered = validity.is_some_and(|v| selected.uid_validity != Some(v));
-        if !renumbered && let Some(raw) = fetch_body(session, uid).await? {
-            if is_it(&raw) {
-                return Ok(Some((raw, true)));
+        match session.select(mailbox).await {
+            Ok(selected) => {
+                renumbered = validity.is_some_and(|v| selected.uid_validity != Some(v));
+                if !renumbered && let Some(raw) = fetch_body(session, uid).await? {
+                    if is_it(&raw) {
+                        return Ok(Some((raw, true)));
+                    }
+                    renumbered = true;
+                }
             }
-            renumbered = true;
+            // Renamed or deleted: it's looked for where else it may be.
+            Err(async_imap::error::Error::No(_)) => {}
+            Err(e) => return Err(e.into()),
         }
     }
     let Some(message_id) = &at.message_id else {

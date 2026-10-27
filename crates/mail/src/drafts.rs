@@ -462,11 +462,12 @@ pub async fn push_imap(
         let from = from_mailbox(account)?;
         for upload in uploads {
             match upload_imap(session, store, state, &from, &mailbox, &upload).await? {
-                None => report.uploaded += 1,
-                Some(refused) => {
+                Upload::Done => report.uploaded += 1,
+                Upload::Refused(refused) => {
                     lock(store).drop_draft_upload(upload.message_id)?;
                     report.errors.push(refused);
                 }
+                Upload::Held(held) => report.errors.push(held),
             }
         }
     }
@@ -530,8 +531,19 @@ async fn drafts_mailbox(
     Ok((mailbox, true))
 }
 
-/// Appends one draft as `\Draft \Seen` and records where it is. `Some`
-/// with the reason if the server or the draft itself is refused.
+/// How uploading one draft went, short of failing the round
+/// (`upload_imap`).
+enum Upload {
+    Done,
+    /// The server or the draft itself is refused, with why: it stays on
+    /// this computer.
+    Refused(String),
+    /// A file it attaches from another email can't be read now, with why:
+    /// it stays queued, and its server copy as it was, for a later round.
+    Held(String),
+}
+
+/// Appends one draft as `\Draft \Seen` and records where it is.
 async fn upload_imap(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -539,9 +551,9 @@ async fn upload_imap(
     from: &Mailbox,
     mailbox: &str,
     upload: &DraftUpload,
-) -> Result<Option<String>> {
+) -> Result<Upload> {
     let Ok(draft) = serde_json::from_str::<Draft>(&upload.draft) else {
-        return Ok(Some("A saved draft is unreadable.".into()));
+        return Ok(Upload::Refused("A saved draft is unreadable.".into()));
     };
     let mut files = Vec::with_capacity(draft.attachments.len());
     let mut saved = lock(store).draft_files(upload.message_id)?.into_iter();
@@ -562,10 +574,13 @@ async fn upload_imap(
                     continue;
                 };
                 // A source that's gone (or a mailbox renamed away) loses its file, not the draft.
+                // One that can't be read now (of several copies, which it is can't be told) holds
+                // the draft back: uploaded without it, the file would be gone from it for good.
                 match imap::fetch_raw(session, state, &at).await {
                     Ok(Some(raw)) => files.extend(attachment::extract(&raw, index, name)),
-                    Ok(None) | Err(Error::Server(_)) => {}
-                    Err(e) => return Err(e),
+                    Ok(None) => {}
+                    Err(e @ (Error::Network { .. } | Error::Auth(_))) => return Err(e),
+                    Err(e) => return Ok(Upload::Held(format!("Couldn't attach {name}: {e}"))),
                 }
             }
         }
@@ -580,7 +595,7 @@ async fn upload_imap(
         &files,
     ) {
         Ok(raw) => raw,
-        Err(e) => return Ok(Some(e.to_string())),
+        Err(e) => return Ok(Upload::Refused(e.to_string())),
     };
     match session
         .append(mailbox, Some("(\\Draft \\Seen)"), None, &raw)
@@ -588,7 +603,9 @@ async fn upload_imap(
     {
         Ok(()) => {}
         Err(async_imap::error::Error::No(text) | async_imap::error::Error::Bad(text)) => {
-            return Ok(Some(format!("The mail server refused a draft: {text}")));
+            return Ok(Upload::Refused(format!(
+                "The mail server refused a draft: {text}"
+            )));
         }
         Err(e) => return Err(e.into()),
     }
@@ -612,7 +629,7 @@ async fn upload_imap(
         .zip(validity)
         .map(|(uid, validity)| imap_version(mailbox, validity, uid));
     store.auto_draft_uploaded(upload.message_id, at.as_deref())?;
-    Ok(None)
+    Ok(Upload::Done)
 }
 
 /// An IMAP draft copy's version as `Store::auto_draft_uploaded` keeps it:
