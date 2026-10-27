@@ -10,6 +10,7 @@ import {
   type InboxAutomation,
   type InboxAutomationChange,
 } from "../automation";
+import { onSettingsChanged } from "../api";
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { AUTO_LABELS, AUTO_LABEL_ORDER } from "../lib/autoLabels";
 import type { AccountId, AutoLabel } from "../types";
@@ -71,6 +72,21 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
     );
   }, []);
 
+  // Another window saved: what it changed shows here, read after this page's own saves, unless the user
+  // changes something meanwhile (that save's answer shows then).
+  useEffect(
+    () =>
+      onSettingsChanged(() => {
+        const mine = saves.current;
+        saving.current = saving.current
+          .then(() => getInboxAutomation())
+          .then((v) => {
+            if (mine === saves.current) show(v);
+          }, () => {});
+      }),
+    [],
+  );
+
   // The worker finds out it can't work (no AI key, say) after a save returns.
   useEffect(
     () =>
@@ -85,21 +101,13 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
     return status.kind === "error" ? <StatusLine status={status} /> : <LoaderCircle size={18} className="animate-spin text-text-2" />;
   }
 
-  /** Saves `change`, worked out from what the user asked for last. */
-  function save(change: (asked: InboxAutomation) => Partial<InboxAutomationChange>) {
+  /** Saves `change`, worked out from what the user asked for last; the rest stays as saved. */
+  function save(change: (asked: InboxAutomation) => InboxAutomationChange) {
     const asked = latest.current;
     if (!asked) return;
-    const next: InboxAutomationChange = {
-      labelAccounts: asked.labelAccounts,
-      labelsOff: asked.labelsOff,
-      draftAccounts: asked.draftAccounts,
-      cleanupDays: asked.cleanupDays,
-      gatekeeperDrafts: asked.gatekeeperDrafts,
-      model: asked.model,
-      ...change(asked),
-    };
+    const next = change(asked);
     // Shown at once; the last save's answer replaces it.
-    show({ ...asked, ...next });
+    show({ ...asked, ...next, model: next.model === undefined ? asked.model : (next.model ?? undefined) });
     const mine = ++saves.current;
     saving.current = saving.current
       .then(() => saveInboxAutomation(next))
@@ -378,7 +386,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
               className="flex items-center gap-1.5"
               onSubmit={(e) => {
                 e.preventDefault();
-                save(() => ({ model: model.trim() || undefined }));
+                save(() => ({ model: model.trim() || null }));
               }}
             >
               <input

@@ -34,9 +34,14 @@ export interface InboxAutomation {
   problem?: string;
 }
 
-export type InboxAutomationChange = Pick<
-  InboxAutomation,
-  "labelAccounts" | "labelsOff" | "draftAccounts" | "cleanupDays" | "gatekeeperDrafts" | "model"
+/**
+ * What a save changes. What it leaves out stays as saved, so a page open in another window can't put
+ * back what this one changed. `model: null` goes back to Settings → AI's.
+ */
+export type InboxAutomationChange = Partial<
+  Pick<InboxAutomation, "labelAccounts" | "labelsOff" | "draftAccounts" | "cleanupDays" | "gatekeeperDrafts"> & {
+    model: string | null;
+  }
 >;
 
 /** One of the replies an auto-draft offers. */

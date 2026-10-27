@@ -674,16 +674,55 @@ pub struct AutomationView {
     problem: Option<String>,
 }
 
-/// What the settings page saves; accounts just turned on start from now.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// What the settings page saves: what it leaves out stays as saved, so a
+/// page open in another window can't put back what this one changed.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct AutomationChange {
-    label_accounts: Vec<i64>,
-    labels_off: Vec<AutoLabel>,
-    draft_accounts: Vec<i64>,
-    cleanup_days: Option<u32>,
-    gatekeeper_drafts: bool,
-    model: Option<String>,
+    label_accounts: Option<Vec<i64>>,
+    labels_off: Option<Vec<AutoLabel>>,
+    draft_accounts: Option<Vec<i64>>,
+    /// `Some(None)`: no cleanup.
+    #[serde(deserialize_with = "present")]
+    cleanup_days: Option<Option<u32>>,
+    gatekeeper_drafts: Option<bool>,
+    /// `Some(None)`: Settings → AI's model.
+    #[serde(deserialize_with = "present")]
+    model: Option<Option<String>>,
+}
+
+/// A field that's there, `null` too, as `Some`; one left out stays `None`.
+fn present<'de, D, T>(field: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(field).map(Some)
+}
+
+/// The settings `before`, with `change` made at `now`: accounts just turned
+/// on start from then.
+fn merged(before: &AutomationSettings, change: AutomationChange, now: i64) -> AutomationSettings {
+    let since = |on: &std::collections::BTreeMap<i64, i64>, ids: Option<Vec<i64>>| match ids {
+        Some(ids) => ids
+            .into_iter()
+            .map(|id| (id, on.get(&id).copied().unwrap_or(now)))
+            .collect(),
+        None => on.clone(),
+    };
+    AutomationSettings {
+        label_accounts: since(&before.label_accounts, change.label_accounts),
+        labels_off: change
+            .labels_off
+            .unwrap_or_else(|| before.labels_off.clone()),
+        draft_accounts: since(&before.draft_accounts, change.draft_accounts),
+        cleanup_days: change.cleanup_days.unwrap_or(before.cleanup_days),
+        gatekeeper_drafts: change.gatekeeper_drafts.unwrap_or(before.gatekeeper_drafts),
+        model: match change.model {
+            Some(model) => model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()),
+            None => before.model.clone(),
+        },
+    }
 }
 
 fn view(store: &Store, automation: &Automation) -> Result<AutomationView, String> {
@@ -729,29 +768,17 @@ pub fn save_inbox_automation(
     change: AutomationChange,
 ) -> Result<AutomationView, String> {
     live(&mailbox)?;
-    if change.cleanup_days.is_some_and(|d| !(1..=365).contains(&d)) {
+    if change
+        .cleanup_days
+        .flatten()
+        .is_some_and(|d| !(1..=365).contains(&d))
+    {
         return Err("Choose between 1 and 365 days.".into());
     }
     let view = {
         let mut store = mailbox.live.engine.store();
         let before = store.automation_settings().map_err(text)?;
-        let now = now_ms();
-        let since = |on: &std::collections::BTreeMap<i64, i64>, ids: &[i64]| {
-            ids.iter()
-                .map(|id| (*id, on.get(id).copied().unwrap_or(now)))
-                .collect()
-        };
-        let settings = AutomationSettings {
-            label_accounts: since(&before.label_accounts, &change.label_accounts),
-            labels_off: change.labels_off,
-            draft_accounts: since(&before.draft_accounts, &change.draft_accounts),
-            cleanup_days: change.cleanup_days,
-            gatekeeper_drafts: change.gatekeeper_drafts,
-            model: change
-                .model
-                .map(|m| m.trim().to_owned())
-                .filter(|m| !m.is_empty()),
-        };
+        let settings = merged(&before, change, now_ms());
         store.set_automation_settings(&settings).map_err(text)?;
         // Nothing on, nothing wrong: a worker holding off after a failure
         // would otherwise leave its problem up until it looks again.
@@ -1265,6 +1292,37 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_save_changes_only_what_it_says() {
+        let before = AutomationSettings {
+            label_accounts: [(1, 100), (2, 200)].into(),
+            draft_accounts: [(1, 100)].into(),
+            cleanup_days: Some(7),
+            model: Some("small".into()),
+            ..Default::default()
+        };
+        let change = |json: &str| serde_json::from_str::<AutomationChange>(json).unwrap();
+        // A label turned off in a page that still shows account 2 off,
+        // after it was turned on in another window: account 2 stays on.
+        let after = merged(&before, change(r#"{"labelsOff":["fyi"]}"#), 900);
+        assert_eq!(after.labels_off, [AutoLabel::Fyi]);
+        assert_eq!(after.label_accounts, before.label_accounts);
+        assert_eq!(after.draft_accounts, before.draft_accounts);
+        assert_eq!(
+            (after.cleanup_days, after.model.as_deref()),
+            (Some(7), Some("small"))
+        );
+        // Accounts said keep when they came on; a new one starts now.
+        let after = merged(&before, change(r#"{"labelAccounts":[2,3]}"#), 900);
+        assert_eq!(after.label_accounts, [(2, 200), (3, 900)].into());
+        // `null` clears what's optional; left out, it stays.
+        let after = merged(&before, change(r#"{"cleanupDays":null,"model":null}"#), 900);
+        assert_eq!((after.cleanup_days, after.model), (None, None));
+        let after = merged(&before, change(r#"{"model":"  big "}"#), 900);
+        assert_eq!(after.model.as_deref(), Some("big"));
+        assert_eq!(after.cleanup_days, Some(7));
     }
 
     #[test]
