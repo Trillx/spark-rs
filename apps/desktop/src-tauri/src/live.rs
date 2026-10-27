@@ -480,7 +480,16 @@ async fn work(
                         certificate: None,
                         queued: false,
                     },
-                    Ok(false) => return,
+                    // Queued again: the Scheduled list shows it.
+                    Ok(false) => SendEvent {
+                        id: outcome.id,
+                        account: account_id,
+                        draft_id: None,
+                        status: "retrying",
+                        message: None,
+                        certificate: None,
+                        queued: false,
+                    },
                     Err(e) => SendEvent {
                         id: outcome.id,
                         account: account_id,

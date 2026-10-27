@@ -1,4 +1,4 @@
-import { AlarmClock, CalendarClock, Pencil, Send, Trash2, type LucideIcon } from "lucide-react";
+import { AlarmClock, CalendarClock, Pencil, RefreshCw, Send, Trash2, type LucideIcon } from "lucide-react";
 import type { ReminderView, ScheduledView } from "../types";
 import { useAccounts } from "../lib/accounts";
 import { formatLater } from "../lib/format";
@@ -25,7 +25,8 @@ export interface ReminderActions {
 
 /**
  * The Scheduled and Reminders lists, which hold what's planned rather than
- * mail: Send Later's queue, soonest first, and the reminders on sent mail.
+ * mail: Send Later's queue, soonest first, with mail that couldn't be sent
+ * yet and is tried again, and the reminders on sent mail.
  */
 export default function PlannedList(
   props:
@@ -49,8 +50,15 @@ export default function PlannedList(
               to={s.to}
               subject={s.subject}
               snippet={s.snippet}
-              when={`Sends ${formatLater(s.sendAt)}`}
-              Icon={CalendarClock}
+              when={
+                s.failed === undefined
+                  ? `Sends ${formatLater(s.sendAt)}`
+                  : s.sending
+                    ? "Trying again…"
+                    : "Couldn't send yet"
+              }
+              Icon={s.failed === undefined ? CalendarClock : RefreshCw}
+              problem={s.failed && `${s.failed.replace(/\.$/, "")}. It'll keep trying.`}
               onOpen={() => props.actions.edit(s)}
               buttons={[
                 { tip: "Send now", Icon: Send, run: () => props.actions.sendNow(s) },
@@ -90,6 +98,7 @@ function Row({
   snippet,
   when,
   Icon,
+  problem,
   onOpen,
   buttons,
 }: {
@@ -99,6 +108,8 @@ function Row({
   snippet: string;
   when: string;
   Icon: LucideIcon;
+  /** What went wrong, shown in place of the snippet. */
+  problem?: string;
   onOpen: () => void;
   buttons: { tip: Tip; Icon: LucideIcon; run: () => void }[];
 }) {
@@ -116,7 +127,9 @@ function Row({
           <span className="truncate text-sm font-medium leading-5">
             {to.trim() ? `To: ${to}` : <i className="font-normal">No recipients</i>}
           </span>
-          <span className="ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 text-priority group-hover:hidden">
+          <span
+            className={`ml-auto flex shrink-0 items-center gap-1 pl-2 text-[11px] leading-5 group-hover:hidden ${problem ? "text-error" : "text-priority"}`}
+          >
             <Icon size={12} />
             {when}
           </span>
@@ -140,7 +153,13 @@ function Row({
         <div className="truncate text-[13px] font-medium leading-5">
           {subject.trim() || <i className="font-normal">No subject</i>}
         </div>
-        <div className="truncate text-[13px] leading-5 text-text-2">{snippet || "No content"}</div>
+        {problem ? (
+          <div className="truncate text-[13px] leading-5 text-error" title={problem}>
+            {problem}
+          </div>
+        ) : (
+          <div className="truncate text-[13px] leading-5 text-text-2">{snippet || "No content"}</div>
+        )}
       </div>
     </div>
   );
@@ -149,7 +168,11 @@ function Row({
 function Empty({ kind }: { kind: "scheduled" | "reminders" }) {
   const [Icon, title, text] =
     kind === "scheduled"
-      ? [CalendarClock, "Nothing scheduled", "Mail you send later waits here until it goes out."]
+      ? [
+          CalendarClock,
+          "Nothing scheduled",
+          "Mail you send later waits here until it goes out, as does mail that couldn't be sent yet.",
+        ]
       : [AlarmClock, "No reminders", "Choose Remind me when you send, and the email comes back if nobody replies."];
   return (
     <div className="flex flex-col items-center px-6 pt-20 text-center">

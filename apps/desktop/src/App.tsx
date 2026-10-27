@@ -194,6 +194,7 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
+import { stuckNotice } from "./lib/outbox";
 import {
   activate as activateHome,
   clearAll as clearHomeFeed,
@@ -1411,6 +1412,8 @@ export default function App() {
 
   function sendStatus(e: SendStatusEvent) {
     reloadPlanned();
+    // Queued again: the Scheduled list shows it, and it may be told of later.
+    if (e.status === "retrying") return;
     const sent = outbox.current.get(e.id);
     outbox.current.delete(e.id);
     // A saved draft it came from is gone now, or back in Drafts if it
@@ -1418,15 +1421,15 @@ export default function App() {
     void reloadMessages();
     if (e.status !== "failed") return;
     if (e.queued) {
-      // Long after "Message sent": which one, if this window sent it.
-      const subject = sent ? ` “${sent.subject.trim() || "(no subject)"}”` : "";
-      const why = (e.message ?? "the server can't be reached").replace(/\.$/, "");
-      showToast(
-        `Couldn't send${subject} yet: ${why}. It'll keep trying.`,
-        () => void editQueued(e.id),
-        ICONS.error,
-        { actionLabel: "Edit", duration: ERROR_TOAST_MS },
-      );
+      // Long after "Message sent", and maybe with others: the Scheduled list has each that couldn't go yet.
+      void listScheduled()
+        .catch(() => [])
+        .then((items) =>
+          showToast(stuckNotice(items, e), () => selectList("scheduled"), ICONS.error, {
+            actionLabel: "Show",
+            duration: ERROR_TOAST_MS,
+          }),
+        );
       return;
     }
     const recovered = e.draftId;

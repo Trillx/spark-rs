@@ -3829,23 +3829,32 @@ fn scheduled_sends_can_move_or_come_back_out() {
     let now =
         r#"{"account":1,"to":"a@x.com","subject":"Now","body":"","sendAt":10,"attachments":[]}"#;
     let scheduled = store.queue_send(account, later, 9_000, &[]).unwrap();
-    store.queue_send(account, now, 10, &[]).unwrap();
-    let listed = store.scheduled_sends().unwrap();
-    assert_eq!(listed.iter().map(|s| s.0).collect::<Vec<_>>(), [scheduled]);
+    let sent_now = store.queue_send(account, now, 10, &[]).unwrap();
+    let listed = store.outbox_sends().unwrap();
+    assert_eq!(
+        listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [sent_now, scheduled],
+        "soonest first"
+    );
 
     assert!(store.reschedule_send(scheduled, Some(20_000), 0).unwrap());
-    let (_, _, draft, send_at) = store.scheduled_sends().unwrap().remove(0);
-    assert_eq!(send_at, 20_000);
-    let draft: serde_json::Value = serde_json::from_str(&draft).unwrap();
+    let moved = store.outbox_sends().unwrap().remove(1);
+    assert_eq!(moved.send_at, 20_000);
+    let draft: serde_json::Value = serde_json::from_str(&moved.draft).unwrap();
     assert_eq!(draft["sendLater"]["at"], 20_000);
     assert_eq!(draft["sendAt"], 20_000);
 
     // Sent now: no longer scheduled, and due.
     assert!(store.reschedule_send(scheduled, None, 30).unwrap());
-    assert!(store.scheduled_sends().unwrap().is_empty());
+    let moved = store.outbox_sends().unwrap().remove(1);
+    assert!(
+        moved.send_at == 30 && !moved.draft.contains("sendLater"),
+        "{moved:?}"
+    );
     assert_eq!(store.claim_due_sends(account, 30).unwrap().len(), 2);
     // Once it's sending it's no longer queued.
     assert_eq!(store.queued_send(scheduled).unwrap(), None);
+    assert!(store.outbox_sends().unwrap().iter().all(|s| s.sending));
     let again = store.queue_send(account, later, 9_000, &[]).unwrap();
     let (owner, draft) = store.queued_send(again).unwrap().unwrap();
     assert_eq!(owner, account);

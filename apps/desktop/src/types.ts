@@ -160,14 +160,19 @@ export interface MessageChanges {
   mark?: MessageMark;
 }
 
-/** Mail scheduled with Send Later; `id` is its outbox id. */
+/** Mail scheduled with Send Later, or that couldn't be sent yet; `id` is its outbox id. */
 export interface ScheduledView {
   id: number;
   account: AccountId;
   to: string;
   subject: string;
   snippet: string;
+  /** When it's sent, or tried again if it `failed`. */
   sendAt: number;
+  /** Why its last try failed on the network: it's still queued, and tried again. */
+  failed?: string;
+  /** A try of it is under way. */
+  sending?: boolean;
 }
 
 /** A "Remind me" on mail you sent: still to come, or `due` and back in the Inbox as `message`. */
@@ -595,7 +600,8 @@ export interface SendStatusEvent {
   account: AccountId;
   /** The exact failed email recovered in Drafts, also for agent sends. */
   draftId?: number;
-  status: "sent" | "failed";
+  /** "retrying": it failed on the network and is queued again, which the Scheduled list shows. */
+  status: "sent" | "failed" | "retrying";
   message?: string;
   /** It failed on the SMTP server's certificate, which the user may trust. */
   certificate?: Untrusted;

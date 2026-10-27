@@ -29,7 +29,7 @@ Last full check: 2026-10-26.
 | Unified Inbox | ✅ | Every account in one inbox, with a row per account to see one alone |
 | Smart Search | 🟡 | Full-text search on your computer and on each mail server, in every account or just the one you're in, with `from:`, `has:attachment`, `is:unread` and `date:today`, search by sender and recent searches; no plain-language searches such as "PDFs from Anna last week" |
 | Smart Notifications | ✅ | Only mail from people notifies, unless you change it to all mail or only Priority mail |
-| Scheduled Sends | ✅ | Send Later with Spark's presets or a day and time you pick; the Scheduled list sends now, moves, edits or cancels what's waiting |
+| Scheduled Sends | ✅ | Send Later with Spark's presets or a day and time you pick; the Scheduled list sends now, moves, edits or cancels what's waiting, and lists mail that couldn't be sent yet, with why, while it's tried again |
 | Snooze | 🟡 | Spark's presets, a custom date and time, and Discard Snooze; Snoozed lists mail by when it comes back, and it returns to the top of the Inbox with a notification. No Someday |
 | Set Aside | ✅ | |
 | Reminders | 🟡 | Remind me when you send, if nobody replies or either way: the email comes back to the top of the Inbox with a notification, and the Reminders list moves or removes them. Not yet on mail you receive |

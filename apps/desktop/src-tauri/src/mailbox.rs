@@ -122,7 +122,8 @@ pub struct MessageChanges {
     pub mark: Option<Mark>,
 }
 
-/// Mail scheduled with Send Later, for the Scheduled list.
+/// Mail scheduled with Send Later, or failing to send on the network, for
+/// the Scheduled list.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduledView {
@@ -133,6 +134,13 @@ pub struct ScheduledView {
     pub subject: String,
     pub snippet: String,
     pub send_at: i64,
+    /// Why its last try failed: it couldn't be sent yet, and is tried again
+    /// at `send_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
+    /// A try of it is under way.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sending: bool,
 }
 
 /// A reminder, for the Reminders list.
@@ -689,30 +697,25 @@ pub async fn delete_folder(
     Ok(())
 }
 
-/// Mail scheduled with Send Later, soonest first.
+/// Mail scheduled with Send Later, and mail that couldn't be sent yet as
+/// it fails on the network, soonest first (`Engine::waiting_sends`).
 #[tauri::command]
 pub fn list_scheduled(mailbox: State<'_, Mailbox>) -> Result<Vec<ScheduledView>, String> {
     if !mailbox.live() {
         return Ok(Vec::new());
     }
-    let scheduled = mailbox
-        .live
-        .engine
-        .store()
-        .scheduled_sends()
-        .map_err(text)?;
-    Ok(scheduled
+    let waiting = mailbox.live.engine.waiting_sends().map_err(text)?;
+    Ok(waiting
         .into_iter()
-        .filter_map(|(id, account, json, send_at)| {
-            let draft: Draft = serde_json::from_str(&json).ok()?;
-            Some(ScheduledView {
-                id,
-                account,
-                to: draft.to,
-                subject: draft.subject,
-                snippet: spark_mail::parse::snippet(&draft.body),
-                send_at,
-            })
+        .map(|w| ScheduledView {
+            id: w.id,
+            account: w.account_id,
+            snippet: spark_mail::parse::snippet(&w.draft.body),
+            to: w.draft.to,
+            subject: w.draft.subject,
+            send_at: w.send_at,
+            failed: w.failed,
+            sending: w.sending,
         })
         .collect())
 }

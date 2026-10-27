@@ -240,6 +240,19 @@ pub struct OutboxFile {
     pub data: Vec<u8>,
 }
 
+/// A send in the queue (`Store::outbox_sends`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedSend {
+    /// Its outbox id.
+    pub id: i64,
+    pub account_id: i64,
+    /// The draft, as JSON.
+    pub draft: String,
+    pub send_at: i64,
+    /// A try of it is under way (`Store::claim_send`).
+    pub sending: bool,
+}
+
 /// Where the server keeps a stored message, for fetching it again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
@@ -2012,16 +2025,22 @@ impl Store {
         .collect()
     }
 
-    /// Mail scheduled with Send Later and still queued, soonest first: its
-    /// outbox id, account, draft (JSON) and send time.
-    pub fn scheduled_sends(&self) -> Result<Vec<(i64, i64, String, i64)>> {
+    /// Every send in the queue, soonest first.
+    pub fn outbox_sends(&self) -> Result<Vec<QueuedSend>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, account_id, draft, send_at FROM outbox
-             WHERE status = 'queued' AND json_extract(draft, '$.sendLater') IS NOT NULL
-             ORDER BY send_at",
+            "SELECT id, account_id, draft, send_at, status = 'sending' FROM outbox
+             ORDER BY send_at, id",
         )?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect()
+        stmt.query_map([], |r| {
+            Ok(QueuedSend {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                draft: r.get(2)?,
+                send_at: r.get(3)?,
+                sending: r.get(4)?,
+            })
+        })?
+        .collect()
     }
 
     /// Sends a scheduled message at `at` instead, or with `None` now (it's
