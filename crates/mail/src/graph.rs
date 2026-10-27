@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use reqwest::header::RETRY_AFTER;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,6 +54,14 @@ const MAX_PAGE: usize = 1000;
 const FETCH_ONE_BY_ONE: usize = 10;
 /// Most messages of a folder's listing stored in one transaction.
 const STORE_BATCH: usize = 50;
+/// Most requests a piece of work has out at once (`in_turns`): Exchange
+/// throttles an app with more than four at a time on one mailbox.
+const IN_FLIGHT: usize = 4;
+/// The longest pause Graph may ask for that's waited out; a request asked
+/// to wait longer fails as busy, for a later round.
+const LONGEST_PAUSE: Duration = Duration::from_secs(30);
+/// How often a throttled request is tried again.
+const THROTTLED_RETRIES: u32 = 3;
 /// Well-known folders: their role, or `None` for ones left out of the list.
 /// Folders inside the inbox are listed at the top.
 const WELL_KNOWN: [(&str, Option<FolderRole>); 8] = [
@@ -255,6 +265,8 @@ enum Delta {
 pub struct Graph {
     token: String,
     base: String,
+    /// Until when Graph asked to be left alone (`send_patiently`).
+    paused_until: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Graph {
@@ -267,6 +279,7 @@ impl Graph {
         Self {
             token: access_token.to_owned(),
             base: base.trim_end_matches('/').to_owned(),
+            paused_until: Mutex::new(None),
         }
     }
 
@@ -284,38 +297,75 @@ impl Graph {
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response> {
         let response = request.send().await.map_err(|e| Error::network(HOST, e))?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        let detail = response
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| status.to_string());
-        Err(match status {
-            StatusCode::UNAUTHORIZED => Error::Auth("Microsoft needs you to sign in again.".into()),
-            StatusCode::FORBIDDEN => Error::Auth(format!(
-                "Microsoft refused access ({detail}). Your organization may need to approve the app."
-            )),
-            StatusCode::NOT_FOUND | StatusCode::GONE => Error::Gone,
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-                Error::network(HOST, "Microsoft is busy; trying again shortly")
-            }
-            _ => Error::Server(format!("Microsoft Graph: {detail}")),
-        })
+        checked(response).await
     }
 
     pub(crate) async fn json<T: for<'de> Deserialize<'de>>(
         &self,
         request: RequestBuilder,
     ) -> Result<T> {
-        self.send(request)
-            .await?
-            .json()
-            .await
-            .map_err(|e| Error::Server(format!("Microsoft Graph sent an unexpected reply: {e}")))
+        json_of(self.send(request).await?).await
+    }
+
+    /// `send` for requests that go a few at a time (`in_turns`). When Graph
+    /// throttles one, all of them pause for as long as it asks, and that
+    /// one is tried again. `request` makes it anew for each try.
+    async fn send_patiently(
+        &self,
+        request: impl Fn() -> RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let mut retries = 0;
+        loop {
+            self.paused().await;
+            let response = request()
+                .send()
+                .await
+                .map_err(|e| Error::network(HOST, e))?;
+            if retries < THROTTLED_RETRIES
+                && let Some(pause) = throttled(&response, retries)
+            {
+                self.pause(pause);
+                retries += 1;
+                continue;
+            }
+            return checked(response).await;
+        }
+    }
+
+    async fn json_patiently<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: impl Fn() -> RequestBuilder,
+    ) -> Result<T> {
+        json_of(self.send_patiently(request).await?).await
+    }
+
+    /// Waits out the pause Graph asked for, if any.
+    async fn paused(&self) {
+        loop {
+            let until = *self
+                .paused_until
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match until {
+                Some(until) if until > tokio::time::Instant::now() => {
+                    tokio::time::sleep_until(until).await;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Holds back requests sent patiently for `pause` from now, unless
+    /// they're held back longer already.
+    fn pause(&self, pause: Duration) {
+        let until = tokio::time::Instant::now() + pause;
+        let mut paused = self
+            .paused_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if paused.is_none_or(|paused| paused < until) {
+            *paused = Some(until);
+        }
     }
 
     pub async fn me(&self) -> Result<Me> {
@@ -398,23 +448,30 @@ impl Graph {
                 known
             };
             let mut changes = Vec::with_capacity(page.value.len());
-            for m in page.value {
+            for m in &page.value {
                 missing.remove(&m.id);
-                if m.removed.is_some() {
-                    changes.push(Delta::Gone(m.id));
-                    continue;
-                }
-                let mut incoming = to_incoming(account_id, &m);
-                // A header-only delta must not overwrite the stored flags.
-                let flags = m.is_read.is_some();
-                if flags && !known.contains(&m.id) {
-                    self.complete(&m, &mut incoming).await;
-                }
-                changes.push(Delta::Changed {
-                    incoming: Box::new(incoming),
-                    flags,
+                changes.push(match m.removed {
+                    Some(_) => Delta::Gone(m.id.clone()),
+                    None => Delta::Changed {
+                        incoming: Box::new(to_incoming(account_id, m)),
+                        // A header-only delta must not overwrite the stored flags.
+                        flags: m.is_read.is_some(),
+                    },
                 });
             }
+            let new = page
+                .value
+                .iter()
+                .zip(&mut changes)
+                .filter_map(|(m, change)| match change {
+                    Delta::Changed {
+                        incoming,
+                        flags: true,
+                    } if !known.contains(&m.id) => Some((m, &mut **incoming)),
+                    _ => None,
+                })
+                .collect();
+            self.complete_all(new).await;
             lock(store).batch(|b| {
                 for change in &changes {
                     match change {
@@ -576,7 +633,9 @@ impl Graph {
         let mut changed = 0;
         let mut members = Vec::new();
         for chunk in listing.chunks(STORE_BATCH) {
-            let mut incomings = Vec::with_capacity(chunk.len());
+            // Each with the message in full when it's new.
+            let mut incomings: Vec<(Incoming, Option<&GraphMessage>)> =
+                Vec::with_capacity(chunk.len());
             for listed in chunk {
                 let unread = !listed.is_read.unwrap_or(false);
                 let flagged = listed
@@ -584,7 +643,7 @@ impl Graph {
                     .as_ref()
                     .is_some_and(|f| f.flag_status == "flagged");
                 incomings.push(if known.contains(&listed.id) {
-                    Incoming {
+                    let incoming = Incoming {
                         account_id,
                         remote_id: Some(listed.id.clone()),
                         reply_to: listed
@@ -594,17 +653,21 @@ impl Graph {
                         unread,
                         flagged,
                         ..Default::default()
-                    }
+                    };
+                    (incoming, None)
                 } else if let Some(m) = full.get(&listed.id) {
-                    let mut incoming = to_incoming(account_id, m);
-                    self.complete(m, &mut incoming).await;
-                    incoming
+                    (to_incoming(account_id, m), Some(m))
                 } else {
                     continue;
                 });
             }
+            let new = incomings
+                .iter_mut()
+                .filter_map(|(incoming, m)| Some(((*m)?, incoming)))
+                .collect();
+            self.complete_all(new).await;
             lock(store).batch(|b| {
-                for incoming in &incomings {
+                for (incoming, _) in &incomings {
                     changed += usize::from(b.observe_reply_to(incoming)?);
                     let id = match b.add_folder_message(folder.id, incoming)? {
                         Added::New(id) | Added::Known(id) => id,
@@ -660,26 +723,45 @@ impl Graph {
                 }
             }
         } else {
-            for m in listed.iter().filter(|m| unknown(m)) {
-                if let Some(m) = self.message_in_full(&m.id).await? {
-                    full.insert(m.id.clone(), m);
-                }
-            }
+            let ids: Vec<&str> = listed
+                .iter()
+                .filter(|m| unknown(m))
+                .map(|m| m.id.as_str())
+                .collect();
+            full = self.messages_in_full(&ids).await?;
         }
         Ok(full)
+    }
+
+    /// The messages with `ids`, with their bodies, a few at a time. Ones
+    /// moved or deleted since they were listed are left out.
+    async fn messages_in_full(&self, ids: &[&str]) -> Result<HashMap<String, GraphMessage>> {
+        let mut full = HashMap::new();
+        let mut failed = None;
+        let fetches = ids.iter().map(|id| self.message_in_full(id)).collect();
+        in_turns(fetches, |_, fetched| match fetched {
+            Ok(m) => {
+                full.extend(m.map(|m| (m.id.clone(), m)));
+                true
+            }
+            Err(e) => {
+                failed.get_or_insert(e);
+                false
+            }
+        })
+        .await;
+        failed.map_or(Ok(full), Err)
     }
 
     /// A message with its body; `None` if it was moved or deleted since it
     /// was listed.
     async fn message_in_full(&self, id: &str) -> Result<Option<GraphMessage>> {
+        let url = format!("/me/messages/{}?$select={SELECT}", path(id));
         match self
-            .json(
-                self.request(
-                    Method::GET,
-                    &format!("/me/messages/{}?$select={SELECT}", path(id)),
-                )
-                .header("Prefer", "outlook.body-content-type=\"html\""),
-            )
+            .json_patiently(|| {
+                self.request(Method::GET, &url)
+                    .header("Prefer", "outlook.body-content-type=\"html\"")
+            })
             .await
         {
             Ok(m) => Ok(Some(m)),
@@ -735,15 +817,15 @@ impl Graph {
             let full = self
                 .unknown_in_full(&messages, offset, &page.value, &known)
                 .await?;
-            let mut incomings = Vec::new();
-            for listed in &page.value {
-                let Some(m) = full.get(&listed.id) else {
-                    continue;
-                };
-                let mut incoming = to_incoming(account_id, m);
-                self.complete(m, &mut incoming).await;
-                incomings.push(incoming);
-            }
+            let new: Vec<&GraphMessage> = page
+                .value
+                .iter()
+                .filter_map(|listed| full.get(&listed.id))
+                .collect();
+            let mut incomings: Vec<Incoming> =
+                new.iter().map(|m| to_incoming(account_id, m)).collect();
+            self.complete_all(new.into_iter().zip(&mut incomings).collect())
+                .await;
             stored += lock(store).batch(|b| {
                 let mut new = 0;
                 for incoming in &incomings {
@@ -856,21 +938,20 @@ impl Graph {
                 .await?;
             full.extend(page.value.into_iter().map(|m| (m.id.clone(), m)));
         } else {
-            for (m, _) in &wanted {
-                if let Some(m) = self.message_in_full(&m.id).await? {
-                    full.insert(m.id.clone(), m);
-                }
-            }
+            let ids: Vec<&str> = wanted.iter().map(|(m, _)| m.id.as_str()).collect();
+            full = self.messages_in_full(&ids).await?;
         }
+        let mut new = Vec::new();
         let mut found = Vec::new();
         for (listed, folder) in wanted {
-            let Some(m) = full.get(&listed.id) else {
-                continue;
-            };
-            let mut incoming = to_incoming(account_id, m);
-            self.complete(m, &mut incoming).await;
-            found.push((incoming, folder));
+            if let Some(m) = full.get(&listed.id) {
+                new.push(m);
+                found.push((to_incoming(account_id, m), folder));
+            }
         }
+        let incomings = found.iter_mut().map(|(incoming, _)| incoming);
+        self.complete_all(new.into_iter().zip(incomings).collect())
+            .await;
         Ok(lock(store).batch(|b| {
             let mut stored = 0;
             for (incoming, folder) in &found {
@@ -966,6 +1047,16 @@ impl Graph {
         }
     }
 
+    /// Completes new messages, each given with its message as listed
+    /// (`complete`), a few at a time.
+    async fn complete_all(&self, new: Vec<(&GraphMessage, &mut Incoming)>) {
+        let completing = new
+            .into_iter()
+            .map(|(m, incoming)| self.complete(m, incoming))
+            .collect();
+        in_turns(completing, |_, ()| true).await;
+    }
+
     /// What a listing leaves out of a new message: its attachments, and
     /// the invite a meeting message carries.
     async fn complete(&self, m: &GraphMessage, incoming: &mut Incoming) {
@@ -995,8 +1086,9 @@ impl Graph {
     /// The invite in a meeting message. Exchange keeps meeting messages as
     /// items of their own and writes the calendar part out only in their MIME.
     async fn invite(&self, id: &str) -> Option<Invite> {
+        let url = format!("/me/messages/{}/$value", path(id));
         let response = self
-            .send(self.request(Method::GET, &format!("/me/messages/{}/$value", path(id))))
+            .send_patiently(|| self.request(Method::GET, &url))
             .await
             .ok()?;
         Invite::from_raw(&response.bytes().await.ok()?)
@@ -1029,14 +1121,12 @@ impl Graph {
             size: Option<u64>,
             is_inline: Option<bool>,
         }
+        let url = format!(
+            "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
+            path(id)
+        );
         let page: Page = self
-            .json(self.request(
-                Method::GET,
-                &format!(
-                    "/me/messages/{}/attachments?$select=id,name,contentType,size,isInline",
-                    path(id)
-                ),
-            ))
+            .json_patiently(|| self.request(Method::GET, &url))
             .await?;
         Ok(page
             .value
@@ -1204,48 +1294,61 @@ impl Graph {
         } else {
             None
         };
-        let mut pushed = 0;
-        for p in pending {
-            let Some(id) = p.remote_id.clone() else {
-                lock(store).drop_pending(p.id)?;
-                continue;
-            };
-            let result = async {
-                if p.unread != p.remote_unread || p.pinned != p.remote_pinned {
-                    let flag = if p.pinned { "flagged" } else { "notFlagged" };
-                    let body = json!({ "isRead": !p.unread, "flag": { "flagStatus": flag } });
-                    self.send(
-                        self.request(Method::PATCH, &format!("/me/messages/{}", path(&id)))
-                            .json(&body),
-                    )
-                    .await?;
-                }
-                if let Some(destination) = move_destination(&p, blocked.as_deref()) {
-                    self.send(
-                        self.request(Method::POST, &format!("/me/messages/{}/move", path(&id)))
-                            .json(&json!({ "destinationId": destination })),
-                    )
-                    .await?;
-                }
-                Ok(())
-            }
-            .await;
-            match result {
-                Ok(()) => {
-                    lock(store).mark_pushed(
-                        &p,
-                        Pushed {
-                            mailbox: None,
-                            uid: None,
-                        },
-                    )?;
-                    pushed += 1;
-                }
-                Err(Error::Gone) => lock(store).drop_pending(p.id)?,
-                Err(e) => return Err(e),
+        let mut sendable = Vec::with_capacity(pending.len());
+        for p in &pending {
+            match &p.remote_id {
+                Some(id) => sendable.push((id.as_str(), p)),
+                None => lock(store).drop_pending(p.id)?,
             }
         }
-        Ok(pushed)
+        // A few messages at a time, each recorded as soon as it's through.
+        // After a failure nothing more starts, and what's under way is
+        // still recorded: the rest stays pending for the next round.
+        let sending = sendable
+            .iter()
+            .map(|&(id, p)| self.push_one(id, p, blocked.as_deref()))
+            .collect();
+        let mut pushed = 0;
+        let mut failed = None;
+        in_turns(sending, |i, sent| {
+            let (_, p) = sendable[i];
+            let recorded = match sent {
+                Ok(()) => {
+                    let at = Pushed {
+                        mailbox: None,
+                        uid: None,
+                    };
+                    lock(store).mark_pushed(p, at).map(|()| pushed += 1)
+                }
+                Err(Error::Gone) => lock(store).drop_pending(p.id),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    return false;
+                }
+            };
+            recorded.map_err(|e| failed.get_or_insert(e.into())).is_ok()
+        })
+        .await;
+        failed.map_or(Ok(pushed), Err)
+    }
+
+    /// Sends message `id`'s local changes `p`: its read and flagged state,
+    /// then its move.
+    async fn push_one(&self, id: &str, p: &Pending, blocked: Option<&str>) -> Result<()> {
+        let message = format!("/me/messages/{}", path(id));
+        if p.unread != p.remote_unread || p.pinned != p.remote_pinned {
+            let flag = if p.pinned { "flagged" } else { "notFlagged" };
+            let body = json!({ "isRead": !p.unread, "flag": { "flagStatus": flag } });
+            self.send_patiently(|| self.request(Method::PATCH, &message).json(&body))
+                .await?;
+        }
+        if let Some(destination) = move_destination(p, blocked) {
+            let body = json!({ "destinationId": destination });
+            let url = format!("{message}/move");
+            self.send_patiently(|| self.request(Method::POST, &url).json(&body))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Sends a new message, or a reply threaded under `reply_to` (a Graph
@@ -1793,6 +1896,82 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
+/// `response` if it succeeded, else what went wrong.
+async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let detail = response
+        .json::<Value>()
+        .await
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| status.to_string());
+    Err(match status {
+        StatusCode::UNAUTHORIZED => Error::Auth("Microsoft needs you to sign in again.".into()),
+        StatusCode::FORBIDDEN => Error::Auth(format!(
+            "Microsoft refused access ({detail}). Your organization may need to approve the app."
+        )),
+        StatusCode::NOT_FOUND | StatusCode::GONE => Error::Gone,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+            Error::network(HOST, "Microsoft is busy; trying again shortly")
+        }
+        _ => Error::Server(format!("Microsoft Graph: {detail}")),
+    })
+}
+
+async fn json_of<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> Result<T> {
+    response
+        .json()
+        .await
+        .map_err(|e| Error::Server(format!("Microsoft Graph sent an unexpected reply: {e}")))
+}
+
+/// How long Graph asks to be left alone when `response` is throttled: its
+/// Retry-After, else a pause that doubles with each of the `retries`.
+/// `None` if it isn't throttled, or asks for longer than `LONGEST_PAUSE`.
+fn throttled(response: &reqwest::Response, retries: u32) -> Option<Duration> {
+    if !matches!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        return None;
+    }
+    let pause = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok()?.trim().parse().ok())
+        .map_or(Duration::from_secs(1 << retries), Duration::from_secs);
+    (pause <= LONGEST_PAUSE).then_some(pause)
+}
+
+/// Runs `work` at most `IN_FLIGHT` at a time, handing each result to
+/// `done` with the work's position as it comes in, in whatever order.
+/// Once `done` returns false no more work starts, but what's under way
+/// finishes and is handed over.
+///
+/// The work comes ready made, as futures do nothing until they're polled:
+/// a lazy iterator's closure held across an await would keep the caller's
+/// future from being `Send`.
+async fn in_turns<F: Future>(work: Vec<F>, mut done: impl FnMut(usize, F::Output) -> bool) {
+    let mut waiting = work.into_iter().enumerate();
+    let mut running = FuturesUnordered::new();
+    let mut starting = true;
+    loop {
+        while starting && running.len() < IN_FLIGHT {
+            match waiting.next() {
+                Some((i, work)) => running.push(async move { (i, work.await) }),
+                None => starting = false,
+            }
+        }
+        match running.next().await {
+            Some((i, output)) => starting &= done(i, output),
+            None => return,
+        }
+    }
+}
+
 fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
     store
         .lock()
@@ -1801,6 +1980,9 @@ fn lock(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
     use super::*;
 
     #[test]
@@ -1982,47 +2164,177 @@ pub(crate) mod tests {
         assert_eq!(to_incoming(3, &m).bcc, ["Boss <boss@contoso.com>"]);
     }
 
-    /// A stand-in for Graph on a local port: answers each GET with
-    /// `reply(path)` as JSON, or 404 for `None`, and records the paths.
     /// A local stand-in for Graph answering GETs and POSTs by path with
     /// `reply` (404 for `None`); returns its base URL and the paths asked for.
     pub(crate) async fn stand_in(
         reply: fn(&str) -> Option<Value>,
-    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let log = paths.clone();
+        let (base, _) = serve(move |asked, _| {
+            log.lock().unwrap().push(asked.path.clone());
+            match reply(&asked.path) {
+                Some(json) => Answer::json(json),
+                None => Answer::status(404),
+            }
+        })
+        .await;
+        (base, paths)
+    }
+
+    /// A request as a stand-in saw it.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Asked {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        /// Its `Prefer` headers.
+        pub(crate) prefer: Vec<String>,
+        pub(crate) at: std::time::Instant,
+    }
+
+    /// A stand-in's answer: its status (0 drops the connection unanswered),
+    /// Retry-After, body, and how long it takes.
+    pub(crate) struct Answer {
+        status: u16,
+        retry_after: Option<u64>,
+        body: String,
+        delay: Duration,
+    }
+
+    impl Answer {
+        fn json(body: Value) -> Self {
+            Self {
+                status: 200,
+                retry_after: None,
+                body: body.to_string(),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                ..Self::json(json!({ "error": { "message": "nope" } }))
+            }
+        }
+
+        fn after(self, delay: Duration) -> Self {
+            Self { delay, ..self }
+        }
+    }
+
+    /// What a stand-in saw: the requests as they came in, and the most it
+    /// was answering at once.
+    #[derive(Default)]
+    pub(crate) struct Seen {
+        pub(crate) asked: Mutex<Vec<Asked>>,
+        /// How often each method and path was asked for, ever.
+        attempts: Mutex<HashMap<String, usize>>,
+        answering: AtomicUsize,
+        pub(crate) most: AtomicUsize,
+    }
+
+    impl Seen {
+        /// The requests so far, forgotten.
+        fn take(&self) -> Vec<Asked> {
+            std::mem::take(&mut *self.asked.lock().unwrap())
+        }
+    }
+
+    /// A local stand-in for Graph that serves connections side by side,
+    /// answering each request with `answer(request, attempt)`; `attempt`
+    /// counts the earlier requests with its method and path.
+    pub(crate) async fn serve(
+        answer: impl Fn(&Asked, usize) -> Answer + Send + Sync + 'static,
+    ) -> (String, Arc<Seen>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Seen::default());
+        let answer = Arc::new(answer);
         let log = seen.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match stream.read(&mut chunk).await {
-                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
-                        _ => break,
+                let (seen, answer) = (log.clone(), answer.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let end = loop {
+                        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        match stream.read(&mut chunk).await {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                    let mut lines = head.lines();
+                    let mut first = lines.next().unwrap_or_default().split_whitespace();
+                    let method = first.next().unwrap_or_default().to_owned();
+                    let path = first.next().unwrap_or("/").to_owned();
+                    let mut prefer = Vec::new();
+                    let mut length = 0;
+                    for (name, value) in lines.filter_map(|l| l.split_once(':')) {
+                        if name.eq_ignore_ascii_case("prefer") {
+                            prefer.push(value.trim().to_owned());
+                        } else if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
                     }
-                }
-                let request = String::from_utf8_lossy(&buf);
-                let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                let (status, body) = match reply(&path) {
-                    Some(json) => ("200 OK", json.to_string()),
-                    None => (
-                        "404 Not Found",
-                        json!({ "error": { "message": "nope" } }).to_string(),
-                    ),
-                };
-                log.lock().unwrap().push(path);
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                    // The whole body, so closing doesn't reset the connection.
+                    while buf.len() < end + length {
+                        match stream.read(&mut chunk).await {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    let asked = Asked {
+                        method,
+                        path,
+                        prefer,
+                        at: std::time::Instant::now(),
+                    };
+                    let attempt = {
+                        let mut attempts = seen.attempts.lock().unwrap();
+                        let count = attempts
+                            .entry(format!("{} {}", asked.method, asked.path))
+                            .or_default();
+                        *count += 1;
+                        *count - 1
+                    };
+                    seen.asked.lock().unwrap().push(asked.clone());
+                    let answering = seen.answering.fetch_add(1, SeqCst) + 1;
+                    seen.most.fetch_max(answering, SeqCst);
+                    let reply = answer(&asked, attempt);
+                    tokio::time::sleep(reply.delay).await;
+                    // Done before the client hears, so the count never runs ahead of it.
+                    seen.answering.fetch_sub(1, SeqCst);
+                    if reply.status != 0 {
+                        let retry_after = reply
+                            .retry_after
+                            .map(|s| format!("Retry-After: {s}\r\n"))
+                            .unwrap_or_default();
+                        let response = format!(
+                            "HTTP/1.1 {} Stand-in\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            reply.status,
+                            reply.body.len(),
+                            reply.body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
             }
         });
         (base, seen)
+    }
+
+    /// Every request asked for immutable ids.
+    fn immutable(asked: &[Asked]) -> bool {
+        asked
+            .iter()
+            .all(|a| a.prefer.iter().any(|p| p == "IdType=\"ImmutableId\""))
     }
 
     fn attachments_of_m1(path: &str) -> Option<Value> {
@@ -2574,14 +2886,15 @@ pub(crate) mod tests {
             ),
             "{paths:?}"
         );
-        let fetched: Vec<&str> = paths
+        let mut fetched: Vec<&str> = paths
             .iter()
             .filter_map(|p| p.strip_prefix("/me/messages/"))
             .map(|p| p.split('?').next().unwrap())
             .collect();
+        fetched.sort_unstable();
         assert_eq!(
             fetched,
-            ["m5", "a8", "i20"],
+            ["a8", "i20", "m5"],
             "one by one, only those stored"
         );
 
@@ -2659,5 +2972,398 @@ pub(crate) mod tests {
             text_to_html("a < b\nc & d"),
             "<div style=\"font-family:Calibri,Arial,sans-serif;font-size:11pt\">a &lt; b<br>c &amp; d</div><br>"
         );
+    }
+
+    /// The store's folder for the stand-in mailbox's `f1`.
+    fn projects(store: &Mutex<Store>, account_id: i64) -> Folder {
+        let mut s = lock(store);
+        let f1 = RemoteFolder {
+            remote_id: "f1".into(),
+            parent: None,
+            name: "Projects".into(),
+            role: None,
+            selectable: true,
+        };
+        s.replace_folders(account_id, &[f1]).unwrap();
+        s.folders().unwrap().remove(0)
+    }
+
+    #[test]
+    fn graph_work_can_move_between_threads() {
+        // The app's runtime moves tasks between threads, so their futures
+        // must be `Send`, whatever they hold across a request.
+        fn send(_: impl Future + Send) {}
+        let graph = Graph::new("token");
+        let (store, account_id) = microsoft_store();
+        let folder = projects(&store, account_id);
+        let mut state = SyncState::default();
+        send(graph.push(&store, Vec::new()));
+        send(graph.sync_inbox(&store, account_id, &mut state));
+        send(graph.older_inbox(&store, account_id, &mut state));
+        send(graph.search_server(&store, account_id, &state, &Query::parse("x")));
+        send(graph.sync_folder(&store, &folder, &mut FolderState::default()));
+    }
+
+    /// The number in a stand-in message id such as `m13`.
+    fn number(id: &str) -> usize {
+        id[1..].parse().unwrap()
+    }
+
+    /// A meeting request's MIME, as Graph gives it.
+    const MEETING: &str = "Content-Type: text/calendar; method=REQUEST\r\n\r\n\
+BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:sync\r\nSUMMARY:Sync\r\n\
+DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    /// The `mailbox` stand-in where each message has an attachment named
+    /// for it (`m7.pdf`) and every 25th is a meeting request. Answers about
+    /// every third message take longer, so they come back out of order.
+    /// m13's attachments are throttled for a second once, m40's are gone
+    /// and m41's fail. Asked for alone, m3 is gone and m5 fails once.
+    fn attached(asked: &Asked, attempt: usize) -> Answer {
+        let route = asked.path.split('?').next().unwrap();
+        let Some(rest) = route.strip_prefix("/me/messages/") else {
+            let Some(mut listed) = mailbox(&asked.path) else {
+                return Answer::status(404);
+            };
+            for m in listed["value"].as_array_mut().unwrap() {
+                m["hasAttachments"] = json!(true);
+                if number(m["id"].as_str().unwrap()).is_multiple_of(25) {
+                    m["@odata.type"] = json!("#microsoft.graph.eventMessageRequest");
+                }
+            }
+            return Answer::json(listed).after(Duration::from_millis(10));
+        };
+        let (id, part) = rest.split_once('/').unwrap_or((rest, ""));
+        let answer = match (part, number(id)) {
+            ("attachments", 13) if attempt == 0 => {
+                return Answer {
+                    retry_after: Some(1),
+                    ..Answer::status(429)
+                };
+            }
+            ("attachments", 40) | ("", 3) => Answer::status(404),
+            ("attachments", 41) => Answer::status(500),
+            ("", 5) if attempt == 0 => Answer::status(500),
+            ("attachments", _) => Answer::json(json!({ "value": [
+                { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
+            ] })),
+            ("$value", _) => Answer {
+                body: MEETING.into(),
+                ..Answer::json(Value::Null)
+            },
+            ("", n) => {
+                let mut m = mailbox(route).unwrap();
+                m["hasAttachments"] = json!(true);
+                if n.is_multiple_of(25) {
+                    m["@odata.type"] = json!("#microsoft.graph.eventMessageRequest");
+                }
+                Answer::json(m)
+            }
+            _ => Answer::status(404),
+        };
+        let slow = number(id).is_multiple_of(3);
+        answer.after(Duration::from_millis(if slow { 25 } else { 10 }))
+    }
+
+    /// The `n` of each of `asked` for attachments or MIME.
+    fn completing(asked: &[Asked], part: &str) -> Vec<usize> {
+        asked
+            .iter()
+            .filter_map(|a| {
+                let rest = a.path.strip_prefix("/me/messages/")?;
+                let (id, rest) = rest.split_once('/')?;
+                rest.starts_with(part).then(|| number(id))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn new_mail_is_completed_a_few_requests_at_a_time() {
+        let (base, seen) = serve(attached).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let folder = projects(&store, account_id);
+
+        let started = std::time::Instant::now();
+        let changed = graph
+            .sync_folder(&store, &folder, &mut FolderState::default())
+            .await;
+        let elapsed = started.elapsed();
+        let asked = seen.take();
+        let most = seen.most.load(SeqCst);
+        eprintln!(
+            "200 new messages with attachments: {} requests, {} for attachments, at most {most} at once, {elapsed:?}",
+            asked.len(),
+            completing(&asked, "attachments").len()
+        );
+        assert_eq!(changed.unwrap(), Some(200));
+        // Two listings, four with bodies, 200 attachment listings (m13's
+        // twice) and eight meetings' MIME.
+        assert_eq!(asked.len(), 2 + 4 + 201 + 8);
+        assert_eq!(most, 4, "never more than four at once");
+        assert!(immutable(&asked));
+        let mut meetings = completing(&asked, "$value");
+        meetings.sort_unstable();
+        assert_eq!(meetings, (0..200).step_by(25).collect::<Vec<_>>());
+        let m13: Vec<&Asked> = asked
+            .iter()
+            .filter(|a| a.path.starts_with("/me/messages/m13/attachments"))
+            .collect();
+        assert!(
+            m13[1].at - m13[0].at >= Duration::from_secs(1),
+            "asked again only after the second Graph asked for"
+        );
+
+        let s = lock(&store);
+        for id in s.folder_member_ids(folder.id).unwrap() {
+            let subject = s.message(id).unwrap().unwrap().subject;
+            let remote = subject.strip_prefix("Message ").unwrap();
+            let content = s.content(id).unwrap().unwrap();
+            let names: Vec<&str> = content
+                .attachments
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect();
+            match number(remote) {
+                // Gone since it was listed, or failing: stored without.
+                40 | 41 => assert!(names.is_empty(), "{remote}"),
+                _ => assert_eq!(names, [format!("{remote}.pdf")], "its own: {remote}"),
+            }
+            let meeting = number(remote).is_multiple_of(25);
+            assert_eq!(content.invite.is_some(), meeting, "{remote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_few_new_messages_come_whole_a_few_at_a_time() {
+        let (base, seen) = serve(attached).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let folder = projects(&store, account_id);
+        let mut state = FolderState {
+            limit: Some(FETCH_ONE_BY_ONE),
+            ..Default::default()
+        };
+
+        // m5 fails: nothing is stored, and the next sync tries again.
+        let failed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert!(matches!(failed, Err(Error::Server(_))), "{failed:?}");
+        let members = lock(&store).folder_member_ids(folder.id).unwrap();
+        assert!(members.is_empty());
+        assert!(seen.most.load(SeqCst) <= 4);
+        seen.take();
+        seen.most.store(0, SeqCst);
+
+        let started = std::time::Instant::now();
+        let changed = graph.sync_folder(&store, &folder, &mut state).await;
+        let elapsed = started.elapsed();
+        let asked = seen.take();
+        let most = seen.most.load(SeqCst);
+        eprintln!(
+            "10 new messages one by one: {} requests, at most {most} at once, {elapsed:?}",
+            asked.len()
+        );
+        assert_eq!(changed.unwrap(), Some(9), "m3 went since it was listed");
+        let whole: Vec<&Asked> = asked
+            .iter()
+            .filter(|a| a.path.starts_with("/me/messages/m") && a.path.contains("?$select=subject"))
+            .collect();
+        assert_eq!(whole.len(), 10);
+        assert!(whole.iter().all(|a| {
+            a.prefer
+                .iter()
+                .any(|p| p == "outlook.body-content-type=\"html\"")
+        }));
+        assert!(immutable(&asked));
+        // The listing, ten messages, nine attachment listings and m0's MIME.
+        assert_eq!(asked.len(), 1 + 10 + 9 + 1);
+        assert!(
+            (2..=4).contains(&most),
+            "side by side, never more than four: {most}"
+        );
+    }
+
+    /// Triage of `p0`… as Graph takes it: a flag change, then a move. p7
+    /// is gone; p13's move is throttled for a second once (answered at
+    /// once), p50's fails once and p90's flag change is cut off once.
+    /// Answers about every third message take longer, so they come back
+    /// out of order.
+    fn triage(asked: &Asked, attempt: usize) -> Answer {
+        let rest = asked.path.strip_prefix("/me/messages/").unwrap();
+        let (id, part) = rest.split_once('/').unwrap_or((rest, ""));
+        let answer = match (asked.method.as_str(), part, number(id)) {
+            ("POST", "move", 13) if attempt == 0 => {
+                return Answer {
+                    retry_after: Some(1),
+                    ..Answer::status(429)
+                };
+            }
+            ("PATCH", "", 7) => Answer::status(404),
+            ("PATCH", "", 90) if attempt == 0 => Answer::status(0),
+            ("POST", "move", 50) if attempt == 0 => Answer::status(500),
+            ("PATCH", "", _) | ("POST", "move", _) => Answer::json(json!({ "id": id })),
+            _ => Answer::status(400),
+        };
+        let slow = number(id).is_multiple_of(3);
+        answer.after(Duration::from_millis(if slow { 15 } else { 5 }))
+    }
+
+    /// `count` messages `p0`… stored unread in the inbox, then read and
+    /// marked Done in turn. Returns their ids.
+    fn triaged(store: &Mutex<Store>, account_id: i64, count: usize) -> Vec<i64> {
+        let mut s = lock(store);
+        (0..count)
+            .map(|n| {
+                let incoming = Incoming {
+                    account_id,
+                    remote_id: Some(format!("p{n}")),
+                    from_address: "ana@contoso.com".into(),
+                    unread: true,
+                    date: 1,
+                    ..Default::default()
+                };
+                let Added::New(id) = s.add_incoming(&incoming, false).unwrap() else {
+                    panic!("p{n} is new");
+                };
+                let done = spark_store::Patch {
+                    state: Some(spark_store::MessageState::Done),
+                    unread: Some(false),
+                    ..Default::default()
+                };
+                s.update(id, &done, n as i64 + 1).unwrap();
+                id
+            })
+            .collect()
+    }
+
+    /// The remote ids of `ids` that the store has in Archive on the server.
+    fn archived(store: &Mutex<Store>, ids: &[i64]) -> HashSet<String> {
+        let s = lock(store);
+        ids.iter()
+            .map(|id| s.location(*id).unwrap().unwrap())
+            .filter(|at| at.remote_place == Place::Archive)
+            .map(|at| at.remote_id.unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn triage_goes_a_few_requests_at_a_time_and_never_twice() {
+        let (base, seen) = serve(triage).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let ids = triaged(&store, account_id, 200);
+        let pending = || lock(&store).pending(account_id, 1_000, 0).unwrap();
+
+        // Pushed until it all goes, each round after a failure.
+        let started = std::time::Instant::now();
+        let mut errors = Vec::new();
+        let mut rounds = Vec::new();
+        loop {
+            let before = archived(&store, &ids);
+            let pushed = graph.push(&store, pending()).await;
+            rounds.push((before, seen.take()));
+            match pushed {
+                Ok(_) => break,
+                Err(e) if errors.len() < 5 => errors.push(e),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let elapsed = started.elapsed();
+        let asked: Vec<&Asked> = rounds.iter().flat_map(|(_, asked)| asked).collect();
+        let most = seen.most.load(SeqCst);
+        eprintln!(
+            "200 messages read and archived: {} requests over {} rounds, at most {most} at once, {elapsed:?}",
+            asked.len(),
+            rounds.len()
+        );
+        assert!(
+            matches!(errors[..], [Error::Server(_), Error::Network { .. }]),
+            "p50's failure, then p90's: {errors:?}"
+        );
+        assert_eq!(most, 4, "never more than four at once");
+        assert!(rounds.iter().all(|(_, asked)| immutable(asked)));
+
+        // Each message's requests in order: its flags before its move, and
+        // nothing again once it's through.
+        for n in 0..200 {
+            let path = format!("/me/messages/p{n}");
+            let methods: Vec<&str> = asked
+                .iter()
+                .filter(|a| a.path == path || a.path == format!("{path}/move"))
+                .map(|a| a.method.as_str())
+                .collect();
+            let expected: &[&str] = match n {
+                7 => &["PATCH"],
+                13 => &["PATCH", "POST", "POST"],
+                50 => &["PATCH", "POST", "PATCH", "POST"],
+                90 => &["PATCH", "PATCH", "POST"],
+                _ => &["PATCH", "POST"],
+            };
+            assert_eq!(methods, expected, "p{n}");
+        }
+        assert_eq!(asked.len(), 200 + 199 + 4);
+        for (before, asked) in &rounds {
+            assert!(
+                !asked.iter().any(|a| {
+                    let id = a.path.strip_prefix("/me/messages/").unwrap();
+                    before.contains(id.split('/').next().unwrap())
+                }),
+                "a round asks nothing of mail pushed before it"
+            );
+        }
+        let p13: Vec<&&Asked> = asked
+            .iter()
+            .filter(|a| a.path == "/me/messages/p13/move")
+            .collect();
+        let throttled = p13[0].at;
+        assert!(p13[1].at - throttled >= Duration::from_secs(1));
+        assert!(
+            !asked.iter().any(|a| {
+                let after = a.at.saturating_duration_since(throttled);
+                after > Duration::from_millis(300) && after < Duration::from_millis(900)
+            }),
+            "nothing new starts while Graph wants a pause"
+        );
+
+        assert!(pending().is_empty());
+        let done = archived(&store, &ids);
+        assert_eq!(done.len(), 199);
+        assert!(!done.contains("p7"), "gone: dropped, not pushed");
+    }
+
+    /// Graph throttling `p0`'s move for an hour.
+    fn throttling(asked: &Asked, _: usize) -> Answer {
+        if asked.path == "/me/messages/p0/move" {
+            Answer {
+                retry_after: Some(3600),
+                ..Answer::status(429)
+            }
+        } else {
+            Answer::json(json!({})).after(Duration::from_millis(20))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_throttle_leaves_the_change_for_a_later_round() {
+        let (base, seen) = serve(throttling).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let ids = triaged(&store, account_id, 3);
+        let pending = lock(&store).pending(account_id, 1_000, 0).unwrap();
+
+        let started = std::time::Instant::now();
+        let pushed = graph.push(&store, pending).await;
+        assert!(matches!(pushed, Err(Error::Network { .. })), "{pushed:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "not waited out"
+        );
+        let pending = lock(&store).pending(account_id, 1_000, 0).unwrap();
+        assert_eq!(
+            pending.iter().map(|p| p.id).collect::<Vec<_>>(),
+            [ids[0]],
+            "p0 stays pending; what went alongside it is through"
+        );
+        assert_eq!(seen.take().len(), 3 + 3);
     }
 }
