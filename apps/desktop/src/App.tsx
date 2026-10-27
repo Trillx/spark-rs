@@ -1417,6 +1417,18 @@ export default function App() {
     // failed; and the people it went to are through the Gatekeeper.
     void reloadMessages();
     if (e.status !== "failed") return;
+    if (e.queued) {
+      // Long after "Message sent": which one, if this window sent it.
+      const subject = sent ? ` “${sent.subject.trim() || "(no subject)"}”` : "";
+      const why = (e.message ?? "the server can't be reached").replace(/\.$/, "");
+      showToast(
+        `Couldn't send${subject} yet: ${why}. It'll keep trying.`,
+        () => void editQueued(e.id),
+        ICONS.error,
+        { actionLabel: "Edit", duration: ERROR_TOAST_MS },
+      );
+      return;
+    }
     const recovered = e.draftId;
     const untrusted = e.certificate;
     if (untrusted) {
@@ -2601,15 +2613,17 @@ export default function App() {
 
   // ---- Scheduled and Reminders ----
 
+  /** Takes a queued send into Drafts exactly as queued, then opens it there: nothing is lost if editing stops. */
+  async function editQueued(outboxId: number) {
+    const id = await unscheduleSend(outboxId, true).catch(() => null);
+    reloadPlanned();
+    if (id === null) return showToast("Already sent", undefined, ICONS.send);
+    await reloadMessages();
+    void editDraft({ id });
+  }
+
   const scheduledActions: ScheduledActions = {
-    edit: async (item) => {
-      // Into Drafts exactly as queued, then open there: nothing is lost if editing stops.
-      const id = await unscheduleSend(item.id, true).catch(() => null);
-      reloadPlanned();
-      if (id === null) return showToast("Already sent", undefined, ICONS.send);
-      await reloadMessages();
-      void editDraft({ id });
-    },
+    edit: (item) => editQueued(item.id),
     sendNow: async (item) => {
       const moved = await rescheduleSend(item.id, null).catch(() => false);
       showToast(moved ? "Sending now" : "Already sent", undefined, ICONS.send);

@@ -599,4 +599,6 @@ export interface SendStatusEvent {
   message?: string;
   /** It failed on the SMTP server's certificate, which the user may trust. */
   certificate?: Untrusted;
+  /** It kept failing on the network, but is still queued and tried; it's not in Drafts. */
+  queued?: boolean;
 }

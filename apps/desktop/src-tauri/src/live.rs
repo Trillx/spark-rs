@@ -149,6 +149,9 @@ struct SendEvent {
     /// The send failed on a server certificate the user may trust.
     #[serde(skip_serializing_if = "Option::is_none")]
     certificate: Option<Untrusted>,
+    /// It failed again and again, but is still queued, and tried.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    queued: bool,
 }
 
 impl Live {
@@ -475,6 +478,7 @@ async fn work(
                             status: "sent",
                             message: None,
                             certificate: None,
+                            queued: false,
                         },
                         Ok(false) => continue,
                         Err(e) => SendEvent {
@@ -484,6 +488,7 @@ async fn work(
                             status: "failed",
                             message: Some(e.to_string()),
                             certificate: certificate_of(&e),
+                            queued: outcome.queued,
                         },
                     };
                     let _ = app.emit("send-status", event);

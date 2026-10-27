@@ -40,6 +40,11 @@ use crate::{Error, OLDER_STEP, Result, Service, parse, search, smtp};
 pub const SETTLE_MS: i64 = 6_000;
 /// A send that failed on the network is retried after this long.
 const SEND_RETRY_MS: i64 = 60_000;
+/// A queued send that keeps failing on the network is told of once it has
+/// failed this many tries in a row, over this long: being offline a moment,
+/// or the network coming back after sleep, isn't.
+const SEND_TELL_TRIES: u32 = 3;
+const SEND_TELL_AFTER_MS: i64 = 10 * 60_000;
 /// How many waiting senders a round asks the Sent folder about, at most.
 const SENT_CHECKS: usize = 20;
 /// A waiting sender the Sent folder didn't have is asked about again after
@@ -198,8 +203,23 @@ pub struct SendOutcome {
     pub draft_id: Option<i64>,
     /// The email it replies to, if it's a reply.
     pub reply_to: Option<i64>,
-    /// `Ok(true)` sent; `Ok(false)` will be retried; `Err` failed for good.
+    /// `Ok(true)` sent; `Ok(false)` will be retried; `Err` failed for good,
+    /// unless `queued`.
     pub result: Result<bool>,
+    /// The `Err` is a network failure it kept failing at, said once: it
+    /// stays queued, and is still tried.
+    pub queued: bool,
+}
+
+/// A queued send failing on the network, try after try (`Engine::send_due`).
+struct FailingSend {
+    /// Its draft's hash: an outbox id is given again once its send is gone.
+    draft: u64,
+    /// When it first failed, and how many tries have since.
+    since: i64,
+    tries: u32,
+    /// The user heard of it.
+    told: bool,
 }
 
 /// Whether an account's calendar can show.
@@ -321,6 +341,9 @@ pub struct Engine {
     /// Per message whose body is downloading (`fetch_body`), taken by each
     /// asker in turn, so it's downloaded once.
     bodies: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
+    /// Queued sends failing on the network, by outbox id, in memory only:
+    /// a restart counts their tries again.
+    failing_sends: Mutex<HashMap<i64, FailingSend>>,
 }
 
 impl Engine {
@@ -337,6 +360,7 @@ impl Engine {
             graph_base: graph::GRAPH.to_owned(),
             paces: Mutex::new(HashMap::new()),
             bodies: Mutex::new(HashMap::new()),
+            failing_sends: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1761,7 +1785,10 @@ impl Engine {
         Ok(OwnDraft::Deleted)
     }
 
-    /// Sends the account's drafts whose time has come.
+    /// Sends the account's drafts whose time has come. One that fails on the
+    /// network stays queued, to be tried again. One that keeps failing so,
+    /// as a forward does whose original the server drops the connection
+    /// over, is told of once (`failed_again`), and still tried.
     pub async fn send_due(&self, account_id: i64) -> Result<Vec<SendOutcome>> {
         self.send_due_each(account_id, |_| {}).await
     }
@@ -1790,6 +1817,10 @@ impl Engine {
                 ))),
             };
             let mut draft_id = None;
+            let mut queued = false;
+            if !matches!(result, Err(Error::Network { .. })) {
+                self.failing_sends_lock().remove(&id);
+            }
             let result = match result {
                 Ok(message_id) => {
                     // The saved draft it came from is done with, here and on the server.
@@ -1822,9 +1853,10 @@ impl Engine {
                     Ok(true)
                 }
                 // Offline or the server is busy: keep it queued.
-                Err(Error::Network { .. }) => {
+                Err(e @ Error::Network { .. }) => {
                     self.store().retry_send(id, now_ms() + SEND_RETRY_MS)?;
-                    Ok(false)
+                    queued = self.failed_again(id, &json, now_ms());
+                    if queued { Err(e) } else { Ok(false) }
                 }
                 Err(e) => {
                     if let Ok(draft) = parsed {
@@ -1850,6 +1882,7 @@ impl Engine {
                 draft_id,
                 reply_to,
                 result,
+                queued,
             };
             each(&outcome);
             outcomes.push(outcome);
@@ -1871,6 +1904,39 @@ impl Engine {
             .into_iter()
             .find_map(|id| store.find_message_id(account_id, id).ok().flatten())
             .filter(|found| Some(*found) != draft.draft_id)
+    }
+
+    /// Counts a try of queued send `id` (`draft`, as queued) that failed on
+    /// the network at `now`. Whether the user is to hear of it now: once,
+    /// when it has failed `SEND_TELL_TRIES` in a row, over
+    /// `SEND_TELL_AFTER_MS`.
+    fn failed_again(&self, id: i64, draft: &str, now: i64) -> bool {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        draft.hash(&mut hasher);
+        let draft = hasher.finish();
+        let mut failing = self.failing_sends_lock();
+        if failing.get(&id).is_some_and(|f| f.draft != draft) {
+            failing.remove(&id);
+        }
+        let failing = failing.entry(id).or_insert(FailingSend {
+            draft,
+            since: now,
+            tries: 0,
+            told: false,
+        });
+        failing.tries += 1;
+        let tell = !failing.told
+            && failing.tries >= SEND_TELL_TRIES
+            && now - failing.since >= SEND_TELL_AFTER_MS;
+        failing.told |= tell;
+        tell
+    }
+
+    fn failing_sends_lock(&self) -> MutexGuard<'_, HashMap<i64, FailingSend>> {
+        self.failing_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Takes a scheduled send out of the queue into Drafts, exactly as it was
@@ -4999,6 +5065,103 @@ mod tests {
         assert!(store.content(original).unwrap().unwrap().body_missing);
         assert!(store.cancel_send(id).unwrap(), "still queued");
         delivery.abort();
+    }
+
+    #[tokio::test]
+    async fn a_send_that_keeps_failing_on_the_network_is_said_to_once_and_stays_queued() {
+        // A forward whose file isn't kept here: the IMAP server hangs up
+        // part way into its original, try after try.
+        let raw = big_message("fwd@example.com", 1, 1024);
+        let imap = ImapStandIn::start(7, vec![(42, raw.clone())]).await;
+        let (smtp, delivery) = smtp_delivery(250).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Test",
+                config: &to_json(&AccountConfig::Imap {
+                    username: "me@example.com".into(),
+                    imap: imap.server.clone(),
+                    smtp,
+                }),
+            })
+            .unwrap();
+        let source = store_imap(&mut store, account.id, imap::INBOX, 42, &raw);
+        let draft = Draft {
+            account: account.id,
+            to: "ana@example.com".into(),
+            subject: "Fwd: Files".into(),
+            body: "Here".into(),
+            attachments: vec![OutgoingAttachment::Message {
+                message: source,
+                index: 1,
+                name: "part1.pdf".into(),
+                size: 1024,
+            }],
+            ..Default::default()
+        };
+        let id = store
+            .queue_send(account.id, &to_json(&draft), 0, &[])
+            .unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let try_again = |hang_up: bool| {
+            if hang_up {
+                imap.hang_up_in_body();
+            }
+            engine.store().retry_send(id, 0).unwrap();
+            engine.send_due(account.id)
+        };
+        let still_queued = |outcomes: &[SendOutcome]| matches!(outcomes, [o] if matches!(o.result, Ok(false)) && !o.queued);
+
+        // Three tries in a row aren't said to before ten minutes are up.
+        for _ in 0..SEND_TELL_TRIES {
+            let outcomes = try_again(true).await.unwrap();
+            assert!(still_queued(&outcomes), "{:?}", outcomes[0].result);
+        }
+        engine.failing_sends_lock().get_mut(&id).unwrap().since -= SEND_TELL_AFTER_MS;
+        let outcomes = try_again(true).await.unwrap();
+        assert!(
+            matches!(&outcomes[..], [o] if matches!(o.result, Err(Error::Network { .. }))
+                && o.queued
+                && o.draft_id.is_none()),
+            "{:?}",
+            outcomes[0].result
+        );
+        assert!(engine.store().queued_send(id).unwrap().is_some());
+        // Once.
+        let outcomes = try_again(true).await.unwrap();
+        assert!(still_queued(&outcomes), "{:?}", outcomes[0].result);
+
+        // It goes once the server gives the file, and is forgotten.
+        let outcomes = try_again(false).await.unwrap();
+        assert!(
+            matches!(outcomes[0].result, Ok(true)),
+            "{:?}",
+            outcomes[0].result
+        );
+        assert!(engine.failing_sends_lock().is_empty());
+        delivery.abort();
+    }
+
+    #[test]
+    fn a_send_failing_a_moment_isnt_said_to() {
+        let engine = Engine::new(
+            Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+            Arc::new(TestSecrets),
+        );
+        let minute = 60_000;
+        // Offline over sleep: a try before and after, an hour apart.
+        assert!(!engine.failed_again(1, "a", 0));
+        assert!(!engine.failed_again(1, "a", 60 * minute));
+        // Ten minutes and the third try in a row.
+        assert!(engine.failed_again(1, "a", 61 * minute));
+        assert!(!engine.failed_again(1, "a", 62 * minute));
+        // An outbox id given again to another send counts afresh.
+        assert!(!engine.failed_again(1, "b", 63 * minute));
+        assert!(!engine.failed_again(1, "b", 73 * minute));
+        assert!(engine.failed_again(1, "b", 74 * minute));
     }
 
     #[test]
