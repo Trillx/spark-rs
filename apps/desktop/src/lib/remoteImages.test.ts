@@ -12,7 +12,7 @@ const { ALLOWED_MAX, allowRemoteImages, loadRemoteImages, remoteImagesAllowed, s
   "./remoteImages.ts"
 );
 
-const email = (id: number, subject = "Hi") => ({ id, address: "ana@x.com", subject });
+const email = (id: number, timestamp = 1_000) => ({ id, timestamp });
 
 test("remote images load unless the setting is off, as Spark ships it", () => {
   assert.equal(loadRemoteImages(), true);
@@ -29,9 +29,9 @@ test("Show images is kept for that email, and not for a later one given its id",
   allowRemoteImages(email(7));
   assert.equal(remoteImagesAllowed(email(7)), true);
   assert.equal(remoteImagesAllowed(email(8)), false);
-  assert.equal(remoteImagesAllowed(email(7, "Another")), false);
-  assert.equal(remoteImagesAllowed({ id: 7, address: "ANA@x.com", subject: "Hi" }), true);
-  assert.equal(JSON.parse(saved.get("spark-rs.remoteImagesAllowed")!).length, 1);
+  // The next daily digest, same sender and subject, stored under the deleted one's id.
+  assert.equal(remoteImagesAllowed(email(7, 87_400_000)), false);
+  assert.deepEqual(JSON.parse(saved.get("spark-rs.remoteImagesAllowed")!), ["7:1000"]);
 });
 
 test("only the latest emails are remembered", () => {
@@ -51,5 +51,5 @@ test("a damaged list counts as empty", () => {
   saved.set("spark-rs.remoteImagesAllowed", "{oops");
   allowRemoteImages(email(3));
   assert.equal(remoteImagesAllowed(email(3)), true);
-  assert.equal(JSON.parse(saved.get("spark-rs.remoteImagesAllowed")!).length, 1);
+  assert.deepEqual(JSON.parse(saved.get("spark-rs.remoteImagesAllowed")!), ["3:1000"]);
 });

@@ -11,21 +11,13 @@ const ALLOWED_KEY = "spark-rs.remoteImagesAllowed";
 /** How many emails' "Show images" are remembered, the latest first to stay. */
 export const ALLOWED_MAX = 1000;
 
-type Email = { id: number; address: string; subject: string };
-
 /**
- * An email, by its id and a hash of its sender and subject: a new email can get the id of the
- * newest one after that's deleted, and the demo's arrival times move with the clock.
+ * An email, by its id and the date it was stored with: a new email can get the id of the newest
+ * one after that's deleted, even from the same sender with the same subject, but not its date.
+ * (The demo's dates move with the clock, so there it's forgotten; no demo email has remote images.)
  */
-function emailKey(m: Email) {
-  // FNV-1a.
-  let hash = 0x811c9dc5;
-  for (const c of `${m.address.toLowerCase()}\n${m.subject}`) {
-    hash ^= c.codePointAt(0)!;
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `${m.id}:${(hash >>> 0).toString(36)}`;
-}
+type Email = { id: number; timestamp: number };
+const emailKey = (m: Email) => `${m.id}:${m.timestamp}`;
 
 let setting: boolean | null = null;
 let allowed: Set<string> | null = null;

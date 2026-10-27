@@ -4277,6 +4277,7 @@ dependencies = [
  "ammonia",
  "async-imap",
  "base64 0.22.1",
+ "dom_query",
  "futures-util",
  "getrandom 0.3.4",
  "lettre",

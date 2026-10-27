@@ -27,6 +27,7 @@ use crate::draft::{Bodies, Draft, recipients};
 use crate::invite::Invite;
 use crate::parse::{automated_sender, bare_id, html_to_text, snippet};
 use crate::search::{self, SERVER_HITS};
+use crate::trackers;
 use crate::{BLOCKED, Error, OLDER_STEP, Result};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -1232,7 +1233,7 @@ impl Graph {
             .unwrap_or_else(|| text_to_html(&draft.body));
         let update = json!({
             "subject": draft.subject.trim(),
-            "body": { "contentType": "HTML", "content": format!("{ours}{quoted}") },
+            "body": { "contentType": "HTML", "content": reply_html(&ours, &quoted) },
             "toRecipients": to, "ccRecipients": cc, "bccRecipients": bcc,
         });
         let draft_path = format!("/me/messages/{}", path(&reply.id));
@@ -1661,6 +1662,12 @@ fn text_to_html(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('\n', "<br>");
     format!("<div style=\"{OUTLOOK_BODY}\">{escaped}</div><br>")
+}
+
+/// A reply's body: ours, above the quote Graph made of the original, without
+/// the original's tracking pixels (each reader of the reply would set them off).
+fn reply_html(ours: &str, quoted: &str) -> String {
+    format!("{ours}{}", trackers::strip(quoted))
 }
 
 /// Graph ids can contain `/`, `+` and `=`; immutable ids are URL-safe base64.
@@ -2471,6 +2478,17 @@ pub(crate) mod tests {
         assert!(state.since.is_none() && state.older_than.is_none() && !state.complete);
         let folder: FolderState = serde_json::from_str("{}").unwrap();
         assert_eq!(folder, FolderState::default());
+    }
+
+    #[test]
+    fn replies_leave_out_the_original_s_tracking_pixels() {
+        let quoted = r#"<html><body><div id="divRplyFwdMsg">From: Ana</div><p>Sale!</p><img src="https://track.example/open.gif" width="1" height="1"></body></html>"#;
+        let html = reply_html("<div>Thanks</div>", quoted);
+        assert!(html.starts_with("<div>Thanks</div>"), "{html}");
+        assert!(
+            html.contains("<p>Sale!</p>") && !html.contains("open.gif"),
+            "{html}"
+        );
     }
 
     #[test]
