@@ -1197,16 +1197,28 @@ impl Engine {
                     let Some(ours) = ours else {
                         return Ok(OwnDraft::Changed);
                     };
-                    let now = self
-                        .syncing_graph(account.id, &client_id, &tenant)
-                        .await?
-                        .change_key(remote)
-                        .await?;
-                    if now.as_deref() != Some(ours.as_str()) {
+                    let graph = self.syncing_graph(account.id, &client_id, &tenant).await?;
+                    if graph.change_key(remote).await?.as_deref() != Some(ours.as_str()) {
                         return Ok(OwnDraft::Changed);
                     }
+                    {
+                        let store = self.store();
+                        if !may(&store) {
+                            return Ok(OwnDraft::Kept);
+                        }
+                        // Gone from here now, with nothing queued: a later
+                        // round couldn't tell an edit made in Outlook since.
+                        store.remove_messages(&[id])?;
+                    }
+                    // Left on the server, it comes back as a draft of the user's.
+                    if let Err(e) = graph.delete_draft(remote).await {
+                        eprintln!(
+                            "spark-rs: couldn't delete an auto-draft's copy on the server: {e}"
+                        );
+                    }
+                    return Ok(OwnDraft::Deleted);
                 }
-                // Its copy goes by its Graph id with the next round.
+                // Not on the server yet: only here.
                 let mut store = self.store();
                 if !may(&store) {
                     return Ok(OwnDraft::Kept);
@@ -1228,17 +1240,17 @@ impl Engine {
                     store.discard_draft(id)?;
                     return Ok(OwnDraft::Deleted);
                 };
-                let uid = ours
+                let place = ours
                     .as_deref()
-                    .and_then(|version| drafts::imap_uid(version, &mailbox));
-                let (Some(uid), Some(message_id)) = (uid, at.message_id.clone()) else {
+                    .and_then(|version| drafts::imap_place(version, &mailbox));
+                let (Some(place), Some(message_id)) = (place, at.message_id.clone()) else {
                     // Uploaded, but where to wasn't learned: can't tell.
                     return Ok(OwnDraft::Changed);
                 };
                 let password = self.password(account.id)?;
                 let mut session = imap::login(&server, &username, &password).await?;
                 let deleted = self
-                    .delete_own_imap_copy(&mut session, id, &mailbox, uid, &message_id, may)
+                    .delete_own_imap_copy(&mut session, id, &mailbox, place, &message_id, may)
                     .await;
                 let _ = session.logout().await;
                 deleted
@@ -1246,13 +1258,14 @@ impl Engine {
         }
     }
 
-    /// `delete_own_draft` on IMAP: draft `id`'s copy at `uid` of `mailbox`.
+    /// `delete_own_draft` on IMAP: draft `id`'s copy in `mailbox`, at the
+    /// UIDVALIDITY and UID `place` it went up as.
     async fn delete_own_imap_copy(
         &self,
         session: &mut imap::Session,
         id: i64,
         mailbox: &str,
-        uid: u32,
+        (validity, uid): (u32, u32),
         message_id: &str,
         may: impl FnOnce(&Store) -> bool,
     ) -> Result<OwnDraft> {
@@ -1261,6 +1274,11 @@ impl Engine {
             return Ok(OwnDraft::Kept);
         }
         match session.select(mailbox).await {
+            // Renumbered since (the mailbox restored or made again): its UID
+            // could be another message's now.
+            Ok(selected) if selected.uid_validity != Some(validity) => {
+                return Ok(OwnDraft::Changed);
+            }
             Ok(_) => {}
             Err(async_imap::error::Error::No(_)) => return Ok(OwnDraft::Changed),
             Err(e) => return Err(e.into()),
@@ -3449,10 +3467,11 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_microsoft_draft_still_as_this_app_put_it_is_deleted() {
-        let (base, _) = crate::graph::tests::serve(|asked, _| match asked.path.as_str() {
+        let (base, seen) = crate::graph::tests::serve(|asked, _| match asked.path.as_str() {
             "/me/messages/edited?$select=changeKey" => {
                 Answer::json(serde_json::json!({ "changeKey": "v2" }))
             }
+            "/me/messages/untouched/permanentDelete" => Answer::status(204),
             "/me/messages/untouched?$select=changeKey"
             | "/me/messages/unrecorded?$select=changeKey" => {
                 Answer::json(serde_json::json!({ "changeKey": "v1" }))
@@ -3481,11 +3500,23 @@ mod tests {
             OwnDraft::Kept
         );
         assert!(engine.store().message(ids[0]).unwrap().is_some());
+        let deletes = |seen: &crate::graph::tests::Seen| -> Vec<String> {
+            seen.take()
+                .into_iter()
+                .filter(|a| a.path.ends_with("/permanentDelete"))
+                .map(|a| a.path)
+                .collect()
+        };
+        assert!(deletes(&seen).is_empty());
+        // Its copy goes now, right after its changeKey was checked: queued
+        // for a later round, an edit made in Outlook meanwhile would go too.
         assert_eq!(
             engine.delete_own_draft(ids[0], |_| true).await.unwrap(),
             OwnDraft::Deleted
         );
+        assert_eq!(deletes(&seen), ["/me/messages/untouched/permanentDelete"]);
         assert!(engine.store().message(ids[0]).unwrap().is_none());
+        assert!(engine.store().draft_removals(account).unwrap().is_empty());
         // Outlook changed it since it went up, or its version wasn't kept.
         for id in [ids[1], ids[2]] {
             assert_eq!(
@@ -3494,6 +3525,7 @@ mod tests {
             );
             assert!(engine.store().message(id).unwrap().is_some());
         }
+        assert!(deletes(&seen).is_empty());
         assert!(matches!(
             engine.delete_own_draft(ids[3], |_| true).await,
             Err(Error::Gone)
@@ -3575,15 +3607,21 @@ mod tests {
             message_id: Some("own@example.com".into()),
             ..Default::default()
         };
-        let version = drafts::imap_version("Drafts", 5);
-        for (server_has, expected) in [(5, OwnDraft::Deleted), (20, OwnDraft::Changed)] {
+        // Drafts is at UIDVALIDITY 1 on the server. Another app replaced UID
+        // 5 with an edited UID 20, keeping the Message-ID, before a sync saw
+        // it; or Drafts was made again since UID 5 went up at UIDVALIDITY 2,
+        // and its UID 5 now is some other copy: it stays, there and here.
+        for (validity, server_has, expected) in [
+            (1, 5, OwnDraft::Deleted),
+            (1, 20, OwnDraft::Changed),
+            (2, 5, OwnDraft::Changed),
+        ] {
+            let version = drafts::imap_version("Drafts", validity, 5);
             let (server, commands) = scripted_imap(drafts_holding(server_has)).await;
             let mut store = Store::open_in_memory().unwrap();
             let account = imap_account(&store, &server, 1);
             let id = own_draft(&mut store, account.id, Some(copy(Some(5))), Some(&version));
             let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
-            // Another app replaced UID 5 with an edited UID 20, keeping the
-            // Message-ID, before a sync saw it: it stays, there and here.
             assert_eq!(
                 engine.delete_own_draft(id, |_| true).await.unwrap(),
                 expected

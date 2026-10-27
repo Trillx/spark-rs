@@ -593,7 +593,7 @@ async fn upload_imap(
         Err(e) => return Err(e.into()),
     }
     // APPEND doesn't say the new UID without UIDPLUS; the new Message-ID finds it.
-    session.select(mailbox).await?;
+    let validity = session.select(mailbox).await?.uid_validity;
     let uid = session
         .uid_search(format!("HEADER Message-ID {}", imap::quoted(&message_id)))
         .await?
@@ -608,21 +608,28 @@ async fn upload_imap(
     let store = &mut lock(store);
     store.draft_uploaded(upload, &copy, &described(&files))?;
     // An auto-draft's own copy: another app replacing it moves it to a new UID.
-    let at = uid.map(|uid| imap_version(mailbox, uid));
+    let at = uid
+        .zip(validity)
+        .map(|(uid, validity)| imap_version(mailbox, validity, uid));
     store.auto_draft_uploaded(upload.message_id, at.as_deref())?;
     Ok(None)
 }
 
 /// An IMAP draft copy's version as `Store::auto_draft_uploaded` keeps it:
-/// where it is. IMAP messages don't change; an edit is a new message.
-pub(crate) fn imap_version(mailbox: &str, uid: u32) -> String {
-    format!("{uid} {mailbox}")
+/// where it is, as UID `uid` of `mailbox` while its UIDVALIDITY is
+/// `validity`. IMAP messages don't change; an edit is a new message.
+pub(crate) fn imap_version(mailbox: &str, validity: u32, uid: u32) -> String {
+    format!("{uid} {validity} {mailbox}")
 }
 
-/// The UID in an `imap_version` of a copy in `mailbox`.
-pub(crate) fn imap_uid(version: &str, mailbox: &str) -> Option<u32> {
-    let (uid, at) = version.split_once(' ')?;
-    (at == mailbox).then(|| uid.parse().ok()).flatten()
+/// The UIDVALIDITY and UID in an `imap_version` of a copy in `mailbox`.
+pub(crate) fn imap_place(version: &str, mailbox: &str) -> Option<(u32, u32)> {
+    let (uid, rest) = version.split_once(' ')?;
+    let (validity, at) = rest.split_once(' ')?;
+    if at != mailbox {
+        return None;
+    }
+    Some((validity.parse().ok()?, uid.parse().ok()?))
 }
 
 /// Deletes a draft's server copy by its verified Message-ID. A UID without
