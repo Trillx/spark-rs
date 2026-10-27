@@ -26,7 +26,7 @@ pub fn email_text(m: &Message) -> String {
 }
 
 /// `2026-09-21 14:13 UTC` from Unix milliseconds, without a date library.
-fn utc_date(ms: i64) -> String {
+pub(crate) fn utc_date(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     let minutes = secs.rem_euclid(86_400) / 60;
@@ -89,6 +89,8 @@ pub mod tests {
             muted: false,
             reminder: None,
             invite_kind: None,
+            auto_label: None,
+            auto_draft: None,
         }
     }
 

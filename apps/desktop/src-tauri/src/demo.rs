@@ -13,9 +13,9 @@ use spark_mail::draft::{Draft, OutgoingAttachment};
 use spark_mail::invite::{Answer, Card, Kind, Person};
 use spark_mail::{drafts, parse};
 use spark_store::{
-    AccountKind, Category, Change, Contact, Decision, FolderRole, GatekeeperMode, Incoming,
-    MessageState, NewAccount, Patch, PriorityUndo, Screen, SenderStatus, Store, domain_of,
-    is_public_domain, now_ms,
+    AccountKind, AutoLabel, Category, Change, Contact, Decision, DraftOption, FolderRole,
+    GatekeeperMode, Incoming, MessageState, NewAccount, Patch, PriorityUndo, Screen, SenderStatus,
+    Store, domain_of, is_public_domain, now_ms,
 };
 
 use crate::mailbox::{AccountView, FolderView, Message, SyncView};
@@ -129,6 +129,15 @@ struct DemoEntry {
     html: Option<String>,
     #[serde(default)]
     invite: Option<DemoInvite>,
+    /// The Auto-Label it shows, as if inbox automation had given it one.
+    #[serde(default)]
+    auto_label: Option<AutoLabel>,
+    /// The draft replying to it, as if inbox automation had written one.
+    #[serde(default)]
+    auto_draft: Option<i64>,
+    /// For such a draft, the replies it offers.
+    #[serde(default)]
+    auto_draft_options: Vec<DraftOption>,
 }
 
 /// The demo accounts and their mail in a store of their own, for recipient
@@ -461,6 +470,17 @@ impl DemoMailbox {
         before
     }
 
+    /// Shows `label` on a message instead of its own; `None` takes it off.
+    pub fn set_auto_label(&self, id: i64, label: Option<AutoLabel>) -> Result<(), String> {
+        let mut messages = self.0.lock().unwrap();
+        let message = messages
+            .iter_mut()
+            .find(|m| m.id == id)
+            .ok_or_else(|| format!("no message with id {id}"))?;
+        message.auto_label = label;
+        Ok(())
+    }
+
     /// Mutes or unmutes a conversation.
     pub fn set_muted(&self, conversation: i64, muted: bool) {
         let mut messages = self.0.lock().unwrap();
@@ -550,6 +570,8 @@ impl DemoMailbox {
             muted: false,
             reminder: None,
             invite_kind: None,
+            auto_label: None,
+            auto_draft: None,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -729,6 +751,8 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             muted: false,
             reminder: None,
             invite_kind: e.invite.map(|i| kind_name(i.kind)),
+            auto_label: e.auto_label,
+            auto_draft: e.auto_draft,
         })
         .collect()
 }
@@ -739,6 +763,20 @@ fn kind_name(kind: Kind) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default()
+}
+
+/// The demo auto-draft `id`: the email it replies to and the replies it
+/// offers.
+pub fn auto_draft(id: i64) -> Option<(i64, Vec<DraftOption>)> {
+    let entries: Vec<DemoEntry> = serde_json::from_str(include_str!("../../demo/mailbox.json"))
+        .expect("demo/mailbox.json is valid");
+    let options = entries
+        .iter()
+        .find(|e| e.id == id)?
+        .auto_draft_options
+        .clone();
+    let replies_to = entries.iter().find(|e| e.auto_draft == Some(id))?.id;
+    Some((replies_to, options))
 }
 
 /// The HTML of demo message `id`, if it has one.

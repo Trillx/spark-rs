@@ -554,6 +554,7 @@ async fn work(
                     }
                     if !report.arrived.is_empty() {
                         notify::new_mail(&app, &engine, account_id, &report.arrived);
+                        crate::automation::wake(&app);
                     }
                 }
                 Err(e) => {

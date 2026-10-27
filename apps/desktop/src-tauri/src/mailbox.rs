@@ -17,9 +17,9 @@ use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_mail::{signature, trackers};
 use spark_store::{
-    Account, AccountKind, Category, Change, Contact, DraftFile, DraftSend, DueReminder, Folder,
-    FolderRole, GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo, QueuedDraft,
-    SavedFile, SenderStatus, Store, now_ms,
+    Account, AccountKind, AutoLabel, Category, Change, Contact, DraftFile, DraftSend, DueReminder,
+    Folder, FolderRole, GatekeeperMode, Mark, MessageState, OutboxFile, Patch, PriorityUndo,
+    QueuedDraft, SavedFile, SenderStatus, Store, now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -88,6 +88,12 @@ pub struct Message {
     /// The calendar invite it carries, by kind ("invitation", "reply", …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_kind: Option<String>,
+    /// The Auto-Label inbox automation gave it, or the user chose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_label: Option<AutoLabel>,
+    /// The draft inbox automation wrote in reply to it, by id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_draft: Option<i64>,
 }
 
 /// The message list's changes since the UI's `mark`: every message (`full`)
@@ -364,6 +370,8 @@ fn from_store(m: spark_store::Message) -> Message {
         muted: m.muted,
         reminder: m.reminder,
         invite_kind: m.invite_kind,
+        auto_label: m.auto_label,
+        auto_draft: m.auto_draft,
     }
 }
 
@@ -1535,7 +1543,11 @@ pub fn sync_now(mailbox: State<'_, Mailbox>) {
 
 /// Queues a draft to go out at `draft.sendAt`; returns its outbox id.
 #[tauri::command]
-pub async fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
+pub async fn send_message(
+    app: AppHandle,
+    mailbox: State<'_, Mailbox>,
+    draft: Draft,
+) -> Result<i64, String> {
     if !mailbox.live() {
         // The demo pretends.
         let id = mailbox.demo.send(&draft);
@@ -1553,6 +1565,9 @@ pub async fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i
         .await
         .map_err(text)??;
     signed(&mailbox, &draft)?;
+    if let Some(original) = draft.reply_to {
+        crate::automation::replied(&app, original);
+    }
     if draft.send_at <= now_ms() {
         mailbox.live.nudge(draft.account);
     }
@@ -2824,6 +2839,8 @@ mod tests {
             muted: true,
             reminder: None,
             invite_kind: None,
+            auto_label: None,
+            auto_draft: None,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["muted"], true);

@@ -635,6 +635,8 @@ mod tests {
             muted: false,
             reminder: None,
             invite_kind: None,
+            auto_label: None,
+            auto_draft: None,
         }
     }
 

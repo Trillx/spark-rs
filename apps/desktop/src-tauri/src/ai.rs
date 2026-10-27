@@ -3,8 +3,8 @@
 //! included). The key stays on this side; the UI only learns whether one is
 //! stored.
 
-mod compose;
-mod email;
+pub(crate) mod compose;
+pub(crate) mod email;
 pub(crate) mod keys;
 mod settings;
 mod stream;
@@ -127,6 +127,27 @@ impl AiState {
         }
         let client = AiClient::new(settings.config, key.clone())
             .map_err(|e| Unready::Failed(describe(&e)))?;
+        Ok((client, key))
+    }
+
+    /// A client for work done in the background (inbox automation): the
+    /// saved provider, with `model` in place of its own when given. An
+    /// error says, in words for the UI, what's missing.
+    pub(crate) fn background_client(
+        &self,
+        model: Option<&str>,
+    ) -> Result<(AiClient, Option<String>), String> {
+        let Some(mut settings) = AiSettings::load(&self.config_dir)? else {
+            return Err("Choose a provider and add your API key in Settings → AI.".into());
+        };
+        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+            settings.config.model = model.to_owned();
+        }
+        let key = self.keys.get(settings.preset)?;
+        if let Some(missing) = settings.missing(key.is_some(), true) {
+            return Err(missing);
+        }
+        let client = AiClient::new(settings.config, key.clone()).map_err(|e| describe(&e))?;
         Ok((client, key))
     }
 
@@ -291,7 +312,7 @@ pub fn cancel_compose(state: State<'_, AiState>, composer: u64) {
 }
 
 /// AI errors in words for the UI.
-fn describe(error: &AiError) -> String {
+pub(crate) fn describe(error: &AiError) -> String {
     match error {
         AiError::Http {
             status: status @ (401 | 403),
@@ -334,7 +355,7 @@ fn capitalize(text: &str) -> String {
 }
 
 /// Some providers echo the key in auth errors; it must not reach the UI.
-fn redact(message: String, key: Option<&str>) -> String {
+pub(crate) fn redact(message: String, key: Option<&str>) -> String {
     match key {
         Some(key) if key.len() >= 8 && message.contains(key) => message.replace(key, "[API key]"),
         _ => message,

@@ -4,6 +4,7 @@
 mod agents;
 mod ai;
 mod alerts;
+mod automation;
 mod background;
 mod calendar;
 mod chime;
@@ -60,6 +61,7 @@ fn main() {
             app.manage(meetings::Meetings::default());
             app.manage(alerts::Alerts::default());
             app.manage(ai::AiState::new(config_dir.clone(), ai::Keys::platform()));
+            app.manage(automation::Automation::new());
             notify::register(app.handle());
             let live = live::Live::open(&app.path().app_local_data_dir()?)?;
             live.start_all(app.handle());
@@ -67,6 +69,7 @@ fn main() {
                 demo: demo::DemoMailbox::load(),
                 live,
             });
+            automation::start(app.handle());
             if let Err(e) = agents::start(app.handle()) {
                 eprintln!("spark-rs: agents can't connect: {e}");
             }
@@ -176,6 +179,15 @@ fn main() {
             ai::cancel_summary,
             ai::compose_with_ai,
             ai::cancel_compose,
+            automation::get_inbox_automation,
+            automation::save_inbox_automation,
+            automation::set_auto_label,
+            automation::auto_draft_reply,
+            automation::get_auto_draft,
+            automation::choose_auto_draft_option,
+            automation::set_auto_draft_excluded,
+            automation::add_draft_instruction,
+            automation::remove_draft_instruction,
             prefs::get_prefs,
             prefs::save_prefs,
             notify::test_notification,
