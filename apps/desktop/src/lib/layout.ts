@@ -477,8 +477,9 @@ export function listItems(
   const label = autoLabelOf(key);
   if (label) {
     const conversations = conversationsIn(messages, ctx.folders);
+    const own = new Set(ctx.accounts.map((a) => a.email.toLowerCase()));
     return live
-      .filter((m) => !waiting(m, ctx.gatekeeper) && inLabelList(label, m, conversationOf(conversations, m)))
+      .filter((m) => !waiting(m, ctx.gatekeeper) && inLabelList(label, m, conversationOf(conversations, m), own))
       .sort(newestFirst);
   }
   return live.filter(inFolders(listFolderIds(key, ctx.folders))).sort(newestFirst);

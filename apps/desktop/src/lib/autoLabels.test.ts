@@ -29,14 +29,18 @@ test("a conversation shows its newest email's label", () => {
 });
 
 test("a thread is in the list of the label its row shows", () => {
+  const own = new Set(["me@example.com"]);
+  const mine = (id: number): Message => ({ ...mail(id), address: "Me@example.com" });
   // A request, then "never mind, handled it", then the user's own reply.
-  const thread = [mail(1, "toRespond"), mail(2, "actioned"), mail(3)];
-  const listed = (label: AutoLabel) => thread.filter((m) => inLabelList(label, m, thread)).map((m) => m.id);
-  assert.deepEqual(listed("toRespond"), []);
-  assert.deepEqual(listed("actioned"), [1, 2]);
-  const alone = mail(4, "fyi");
-  assert.ok(inLabelList("fyi", alone, [alone]));
-  assert.ok(!inLabelList("fyi", mail(5), [mail(5)]));
+  const thread = [mail(1, "toRespond"), mail(2, "actioned"), mine(3)];
+  const listed = (label: AutoLabel, emails: Message[]) =>
+    emails.filter((m) => inLabelList(label, m, emails, own)).map((m) => m.id);
+  assert.deepEqual(listed("toRespond", thread), []);
+  assert.deepEqual(listed("actioned", thread), [1, 2]);
+  // A reply without a label of its own (labels turned off since) is listed with it, so its row is the
+  // newest email's; the user's own isn't.
+  assert.deepEqual(listed("fyi", [mail(4, "fyi"), mail(5), mine(6)]), [4, 5]);
+  assert.deepEqual(listed("fyi", [mail(7)]), []);
 });
 
 test("every label has a name and a color, in Spark's order", () => {

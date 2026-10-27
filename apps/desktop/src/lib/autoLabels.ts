@@ -27,10 +27,17 @@ export function conversationLabel(conversation: readonly Message[]): AutoLabel |
 }
 
 /**
- * Whether email `m` of `conversation` is in `label`'s list. Lists go by the
- * label rows show, the conversation's, so a thread that moved on (a request,
- * then "never mind") is in one list, not both.
+ * Whether email `m` of `conversation` is in `label`'s list: mail to the user
+ * (not from `own`, their addresses in lowercase) in a conversation showing
+ * `label`. Lists go by the label rows show, the conversation's, so a thread
+ * that moved on (a request, then "never mind") is in one list, not both, and
+ * a reply without a label of its own is listed, and its row, with it.
  */
-export function inLabelList(label: AutoLabel, m: Message, conversation: readonly Message[]): boolean {
-  return m.autoLabel !== undefined && conversationLabel(conversation) === label;
+export function inLabelList(
+  label: AutoLabel,
+  m: Message,
+  conversation: readonly Message[],
+  own: ReadonlySet<string>,
+): boolean {
+  return (m.autoLabel !== undefined || !own.has(m.address.toLowerCase())) && conversationLabel(conversation) === label;
 }

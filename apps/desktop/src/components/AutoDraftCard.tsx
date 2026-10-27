@@ -1,5 +1,5 @@
 import { LoaderCircle, Sparkles } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { openDraft } from "../api";
 import { getAutoDraft, type AutoDraftView } from "../automation";
 import { recipientNames } from "../lib/recipients";
@@ -24,21 +24,36 @@ export default function AutoDraftCard({ draft: d, actions }: { draft: Message; a
   const [auto, setAuto] = useState<AutoDraftView | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [choosing, setChoosing] = useState<number | null>(null);
-  // A save changes the row: then the draft is read again.
-  const version = `${d.id} ${d.timestamp} ${d.snippet}`;
-  useEffect(() => {
-    let current = true;
-    Promise.all([openDraft(d.id), getAutoDraft(d.id)]).then(
+  const reads = useRef(0);
+  const reading = useRef<Promise<void>>(Promise.resolve());
+  /** Reads the draft and its replies again; only the last read started shows. */
+  function load() {
+    const mine = ++reads.current;
+    reading.current = Promise.all([openDraft(d.id), getAutoDraft(d.id)]).then(
       ([draft, view]) => {
-        if (!current) return;
+        if (mine !== reads.current) return;
         setSaved(draft);
         setAuto(view);
         setFailed(null);
       },
-      (error) => current && setFailed(String(error)),
+      (error) => {
+        if (mine === reads.current) setFailed(String(error));
+      },
     );
+  }
+  /** Once the last read started has shown: a save can start another (the row changed). */
+  async function loaded() {
+    for (let read = reading.current; ; read = reading.current) {
+      await read;
+      if (read === reading.current) return;
+    }
+  }
+  // A save changes the row: then the draft is read again.
+  const version = `${d.id} ${d.timestamp} ${d.snippet}`;
+  useEffect(() => {
+    load();
     return () => {
-      current = false;
+      reads.current++;
     };
   }, [version]);
 
@@ -53,6 +68,9 @@ export default function AutoDraftCard({ draft: d, actions }: { draft: Message; a
     setChoosing(index);
     try {
       await actions.choose(d, index);
+      // The reply put in shows before Send can go again: Send sends what's saved.
+      load();
+      await loaded();
     } finally {
       setChoosing(null);
     }

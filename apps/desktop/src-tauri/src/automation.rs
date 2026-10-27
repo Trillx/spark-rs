@@ -67,6 +67,15 @@ impl Automation {
             *now = problem;
         }
     }
+
+    /// The provider failed: `problem`, unless inbox automation was turned
+    /// off while it was asked. With `store` held, as a save holds it to
+    /// clear the problem, the two come in the order they happened.
+    fn failed(&self, app: &AppHandle, store: &Store, problem: String) {
+        if store.automation_settings().is_ok_and(|s| s.is_on()) {
+            self.problem(app, Some(problem));
+        }
+    }
 }
 
 /// Starts the worker, and the cleanup of untouched auto-drafts beside it:
@@ -130,7 +139,7 @@ async fn round(app: &AppHandle) -> Duration {
         {
             Ok(ready) => ready,
             Err(message) => {
-                automation.problem(app, Some(message));
+                automation.failed(app, &engine.store(), message);
                 return LOOK_EVERY;
             }
         };
@@ -161,7 +170,8 @@ async fn round(app: &AppHandle) -> Duration {
                 Err(e) => {
                     // The provider can't be reached or refuses the key: nothing
                     // is held against the emails, which wait for it.
-                    automation.problem(app, Some(redact(describe(&e), key.as_deref())));
+                    let problem = redact(describe(&e), key.as_deref());
+                    automation.failed(app, &engine.store(), problem);
                     return AFTER_FAILING;
                 }
             };
@@ -225,7 +235,7 @@ async fn round(app: &AppHandle) -> Duration {
                     store.draft_failed(id, now_ms())
                 }
                 Err(Failed::Provider(message)) => {
-                    automation.problem(app, Some(message));
+                    automation.failed(app, &store, message);
                     return AFTER_FAILING;
                 }
             };
