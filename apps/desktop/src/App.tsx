@@ -1471,15 +1471,18 @@ export default function App() {
       if (finishing.length) await updateAll(finishing.map((f) => ({ id: f.id, patch: f.previous })));
       await decideSenders(undo);
     };
-    void decideSenders(changes)
-      .then(async (undo) => {
-        if (finishing.length) await updateAll(finishing);
-        return undo;
-      })
-      .then((undo) => {
-        void reloadMessages();
-        showToast(text, () => void undoAll(undo)().then(reloadMessages, failed).finally(putBack), icon);
-      }, failed);
+    // Tracked: a conversation's own window waits for it, and then for its Undo.
+    void track(
+      decideSenders(changes)
+        .then(async (undo) => {
+          if (finishing.length) await updateAll(finishing);
+          return undo;
+        })
+        .then((undo) => {
+          void reloadMessages();
+          showToast(text, () => void undoAll(undo)().then(reloadMessages, failed).finally(putBack), icon);
+        }, failed),
+    );
   }
 
   /** Everyone at `m`'s domain, unless anyone can have an address there. */

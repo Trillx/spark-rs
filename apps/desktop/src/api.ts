@@ -1007,12 +1007,17 @@ export function testNotification(): Promise<void> {
   return Promise.reject("Run the desktop app to see notifications.");
 }
 
-/** Whether the meeting pop-up has focus: it's spark-rs too, so the user hasn't left it. */
+/**
+ * Whether another of spark-rs's windows has focus (the meeting pop-up, a conversation's own
+ * window): it's spark-rs too, so the user hasn't left it.
+ */
 export async function otherWindowFocused(): Promise<boolean> {
   if (!isTauri()) return false;
   try {
-    const popup = await Window.getByLabel("meeting-popup");
-    return popup ? await popup.isFocused() : false;
+    const here = getCurrentWindow().label;
+    const others = (await Window.getAll()).filter((w) => w.label !== here);
+    const focused = await Promise.all(others.map((w) => w.isFocused().catch(() => false)));
+    return focused.some(Boolean);
   } catch {
     return false;
   }
