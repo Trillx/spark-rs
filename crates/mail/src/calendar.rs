@@ -474,9 +474,10 @@ pub fn changed_event_body(
 /// What the series `master` (as Graph has it, `MASTER_SELECT`) says, as a
 /// new series from occurrence `before` on, with what the user changed in
 /// `draft`: "All future", split off. The people invited are the series'
-/// with the user's additions and removals; the note is the editor's, so a
-/// Teams meeting gets joining details of its own. It repeats by
-/// `recurrence`.
+/// with the user's additions and removals. A Teams meeting gets joining
+/// details of its own, so its description is the editor's note; any other
+/// keeps the series' description, with the note as the user changed it, so
+/// a Zoom call's joining details stay. It repeats by `recurrence`.
 pub fn series_from(
     master: &serde_json::Value,
     draft: &EventDraft,
@@ -522,10 +523,19 @@ pub fn series_from(
             body.insert(key.clone(), value.clone());
         }
     }
-    body.insert(
-        "body".into(),
-        json!({ "contentType": "text", "content": draft.notes.trim() }),
-    );
+    let html = master["body"]["content"].as_str().unwrap_or_default();
+    let note = json!({ "contentType": "text", "content": draft.notes.trim() });
+    let description = if master["isOnlineMeeting"] == true || html.trim().is_empty() {
+        note
+    } else if draft.notes.trim() != before.notes.trim() {
+        with_notes(html, draft.notes.trim()).map_or(
+            note,
+            |html| json!({ "contentType": "html", "content": html }),
+        )
+    } else {
+        json!({ "contentType": "html", "content": html })
+    };
+    body.insert("body".into(), description);
     body.insert("start".into(), zone.time(draft.start, draft.all_day));
     body.insert("end".into(), zone.time(draft.end, draft.all_day));
     body.insert("isAllDay".into(), json!(draft.all_day));
@@ -534,7 +544,7 @@ pub fn series_from(
 }
 
 /// What `series_from` reads of a series.
-pub const MASTER_SELECT: &str = "subject,start,end,isAllDay,location,attendees,hideAttendees,\
+pub const MASTER_SELECT: &str = "subject,body,start,end,isAllDay,location,attendees,hideAttendees,\
      isReminderOn,reminderMinutesBeforeStart,showAs,sensitivity,isOnlineMeeting,\
      onlineMeetingProvider,recurrence,originalStartTimeZone";
 
@@ -1717,6 +1727,42 @@ mod tests {
             body["attendees"][0].get("status").is_none(),
             "answers aren't copied"
         );
+    }
+
+    #[test]
+    fn all_future_keeps_a_zoom_calls_joining_details() {
+        let start = parse_iso_date("2026-11-03T16:30:00Z").unwrap();
+        let zoom = format!(
+            "<html><body><div>Agenda</div><div>{}</div><div>Join Zoom: https://us02web.zoom.us/j/123</div></body></html>",
+            "_".repeat(40)
+        );
+        let master =
+            json!({ "subject": "Vendor", "isOnlineMeeting": false, "body": { "content": zoom } });
+        let before = EventDraft {
+            title: "Vendor".into(),
+            start,
+            end: start + 1_800_000,
+            notes: "Agenda".into(),
+            ..Default::default()
+        };
+        let renamed = EventDraft {
+            title: "Vendor sync".into(),
+            ..before.clone()
+        };
+        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        assert_eq!(
+            body["body"],
+            json!({ "contentType": "html", "content": zoom })
+        );
+        let new_note = EventDraft {
+            notes: "New agenda".into(),
+            ..before.clone()
+        };
+        let body = series_from(&master, &new_note, &before, PACIFIC, json!(null));
+        let html = body["body"]["content"].as_str().unwrap();
+        assert!(html.contains("<div>New agenda</div>"), "{html}");
+        assert!(html.contains("https://us02web.zoom.us/j/123"), "{html}");
+        assert!(!html.contains(">Agenda<"), "{html}");
     }
 
     #[test]

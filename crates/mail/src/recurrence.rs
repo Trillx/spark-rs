@@ -334,16 +334,19 @@ pub fn changed(
         let p = &mut out["pattern"];
         match p["type"].as_str() {
             Some("weekly") => {
+                let shift = |d: &str| {
+                    let i = WEEKDAYS.iter().position(|w| *w == d)?;
+                    Some(WEEKDAYS[(i as i64 + days).rem_euclid(7) as usize])
+                };
                 if let Some(list) = p["daysOfWeek"].as_array() {
-                    let moved: Vec<Value> = list
-                        .iter()
-                        .filter_map(|d| {
-                            let i = WEEKDAYS.iter().position(|w| Some(*w) == d.as_str())?;
-                            Some(json!(WEEKDAYS[(i as i64 + days).rem_euclid(7) as usize]))
-                        })
-                        .collect();
+                    let moved: Vec<&str> = list.iter().filter_map(|d| shift(d.as_str()?)).collect();
                     p["daysOfWeek"] = json!(moved);
                 }
+                // The week starts as many days later too, so days that were
+                // in one week (Friday and Saturday, every other week) still
+                // are (Saturday and Sunday).
+                let first_day = p["firstDayOfWeek"].as_str().unwrap_or("sunday");
+                p["firstDayOfWeek"] = json!(shift(first_day).unwrap_or("sunday"));
             }
             Some("absoluteMonthly") => p["dayOfMonth"] = json!(day_of(&first)),
             Some("relativeMonthly") => {
@@ -498,6 +501,15 @@ mod tests {
         );
         assert_eq!(out["pattern"]["daysOfWeek"], json!(["wednesday"]));
         assert_eq!(out["range"]["startDate"], "2026-11-11");
+        // Friday and Saturday every other week, a day later: Saturday and
+        // Sunday, still in one week, as the week starts a day later too.
+        let weekend = json!({
+            "pattern": { "type": "weekly", "interval": 2, "daysOfWeek": ["friday", "saturday"], "firstDayOfWeek": "sunday" },
+            "range": { "type": "noEnd", "startDate": "2026-10-30", "recurrenceTimeZone": "UTC" }
+        });
+        let out = changed(&weekend, None, 1, Some(("2026-10-31", "UTC")));
+        assert_eq!(out["pattern"]["daysOfWeek"], json!(["saturday", "sunday"]));
+        assert_eq!(out["pattern"]["firstDayOfWeek"], "monday");
         let monthly = json!({
             "pattern": { "type": "relativeMonthly", "interval": 1, "daysOfWeek": ["tuesday"], "index": "second" },
             "range": { "type": "noEnd", "startDate": "2026-10-13", "recurrenceTimeZone": "UTC" }

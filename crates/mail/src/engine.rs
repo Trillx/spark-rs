@@ -1642,9 +1642,8 @@ impl Engine {
     /// zone. A series' first occurrence changes the whole series instead.
     /// The new series' days move as the occurrence did
     /// (`recurrence::changed`). One ending after so many times ends on the
-    /// day the old one would have, unless its end changed. If the old
-    /// series can't be ended, the new one is taken back, so the
-    /// occurrences aren't there twice.
+    /// day the old one would have, unless its end changed. The old series
+    /// ends first, and goes on as it was if the new one can't be made.
     async fn split_series(
         &self,
         event_id: i64,
@@ -1675,10 +1674,14 @@ impl Engine {
                 .await;
         }
         let from = calendar::date_in(zone, draft.start, draft.all_day);
-        let days = recurrence::days_between(
+        // How far the user moved it, and the series' days as the user's
+        // clock has them: a Wednesday 00:30 in Tokyo is a Tuesday in
+        // California, where the new series is written.
+        let moved = recurrence::days_between(
             &calendar::date_in(zone, before.start, before.all_day),
             &from,
         );
+        let days = recurrence::days_between(&split, &from);
         let rule = if draft.repeat != before.repeat {
             draft.repeat.as_ref()
         } else {
@@ -1702,7 +1705,7 @@ impl Engine {
                 .last_occurrence(&series, from_ms, from_ms + span, zone.name)
                 .await?
             {
-                new = recurrence::ending_on(&new, &recurrence::add_days(&last, days));
+                new = recurrence::ending_on(&new, &recurrence::add_days(&last, moved));
             }
         }
         let calendar = self
@@ -1712,10 +1715,15 @@ impl Engine {
             .find(|c| c.id == stored.calendar_id)
             .ok_or_else(|| Error::Config("That calendar is no longer here.".into()))?;
         let body = calendar::series_from(&master, draft, before, zone, new);
-        let created = graph.create_event(&calendar.remote_id, &body).await?;
+        // The old series ends first, so a room it booked is free for the new
+        // one's invitation; if the new one can't be made, the old one goes
+        // on as it was.
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(&old, &split) });
-        if let Err(e) = graph.update_event(&series, &ended).await {
-            let _ = graph.delete_event(&created).await;
+        graph.update_event(&series, &ended).await?;
+        if let Err(e) = graph.create_event(&calendar.remote_id, &body).await {
+            let _ = graph
+                .update_event(&series, &serde_json::json!({ "recurrence": old }))
+                .await;
             return Err(e);
         }
         Ok(())
