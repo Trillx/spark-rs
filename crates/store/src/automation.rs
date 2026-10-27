@@ -1085,8 +1085,10 @@ fn settings(conn: &Connection) -> Result<AutomationSettings> {
 }
 
 /// Whether the user wrote in email `id`'s conversation after it. Mail of
-/// theirs kept for a folder must be in one: a draft out of Drafts here
-/// (deleted in another app, or past the newest a listing holds) wasn't sent.
+/// theirs in Trash doesn't count (a draft deleted in another app lands
+/// there), and mail kept for a folder must be in one other than Trash or
+/// Spam: a draft out of Drafts here (or past the newest a listing holds)
+/// wasn't sent.
 fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
     conn.query_row(
         &format!(
@@ -1095,8 +1097,12 @@ fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
                  SELECT 1 FROM members JOIN messages m ON m.id = members.id, o
                  JOIN accounts a ON a.email = m.from_address COLLATE NOCASE
                  WHERE m.id != ?1 AND m.date > o.date AND {NOT_DRAFT}
+                   AND m.state NOT IN ('deleted', 'blocked')
                    AND (m.state != 'filed'
-                        OR EXISTS (SELECT 1 FROM folder_members fm WHERE fm.message_id = m.id)))"
+                        OR EXISTS (SELECT 1 FROM folder_members fm
+                                   JOIN folders f ON f.id = fm.folder_id
+                                   WHERE fm.message_id = m.id
+                                     AND f.role IS NOT 'trash' AND f.role IS NOT 'spam')))"
         ),
         [id],
         |r| r.get(0),

@@ -690,6 +690,74 @@ fn a_draft_deleted_in_another_app_wasnt_a_reply() {
 }
 
 #[test]
+fn a_draft_in_trash_wasnt_a_reply_but_one_in_sent_was() {
+    let (mut store, account) = store();
+    let folder = |name: &str, role| RemoteFolder {
+        remote_id: name.into(),
+        parent: None,
+        name: name.into(),
+        role: Some(role),
+        selectable: true,
+    };
+    store
+        .replace_folders(
+            account,
+            &[
+                folder("Drafts", FolderRole::Drafts),
+                folder("Trash", FolderRole::Trash),
+                folder("Sent", FolderRole::Sent),
+            ],
+        )
+        .unwrap();
+    let role = |store: &Store, role| {
+        store
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.role == Some(role))
+            .unwrap()
+            .id
+    };
+    let (trash, sent) = (
+        role(&store, FolderRole::Trash),
+        role(&store, FolderRole::Sent),
+    );
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
+    let draft = save_reply(&mut store, account, "1@example.com", "Sure.");
+    // Out of Drafts and into Trash: Deleted Items (Microsoft) leaves it
+    // deleted; an IMAP Trash, filed there.
+    let moved = |store: &Store, sql: &str| {
+        store
+            .conn
+            .execute_batch(&format!(
+                "DELETE FROM draft_uploads WHERE message_id = {draft};
+                 DELETE FROM folder_members WHERE message_id = {draft};
+                 {sql}"
+            ))
+            .unwrap();
+    };
+    moved(
+        &store,
+        &format!("UPDATE messages SET state = 'deleted' WHERE id = {draft};"),
+    );
+    assert!(!store.answered_after(id).unwrap());
+    moved(
+        &store,
+        &format!(
+            "UPDATE messages SET state = 'filed' WHERE id = {draft};
+             INSERT INTO folder_members (folder_id, message_id) VALUES ({trash}, {draft});"
+        ),
+    );
+    assert!(!store.answered_after(id).unwrap());
+    // Sent, as a listing of Sent finds it: a reply.
+    moved(
+        &store,
+        &format!("INSERT INTO folder_members (folder_id, message_id) VALUES ({sent}, {draft});"),
+    );
+    assert!(store.answered_after(id).unwrap());
+}
+
+#[test]
 fn a_users_own_reply_draft_counts_too() {
     let (mut store, account) = store();
     with_drafts_folder(&mut store, account);
