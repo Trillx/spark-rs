@@ -161,7 +161,8 @@ import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { joinAddresses, parseEntry, replyRecipients, splitAddresses } from "./lib/addresses";
 import { badgeIcon } from "./lib/badge";
-import { clearContent, loadContent, remoteImagesAllowed } from "./lib/content";
+import { clearContent, loadContent } from "./lib/content";
+import { remoteImagesAllowed } from "./lib/remoteImages";
 import {
   asThread,
   conversationOf,
@@ -3653,6 +3654,7 @@ export default function App() {
     deleteSummary,
     summaryCopied: () => showToast("Summary Copied", undefined, ICONS.copy),
     openAiSettings: () => openSettings("ai"),
+    openImageSettings: () => openSettings("appearance"),
     reply: (m) => reply(m),
     quickReply,
     replyAll: (m) => void replyAll(m),
@@ -3697,7 +3699,7 @@ export default function App() {
                 header,
                 html: content.html,
                 text: content.text,
-                remoteImages: remoteImagesAllowed(x.id),
+                remoteImages: remoteImagesAllowed(x),
                 inlineImages:
                   content.html && /["'=(]cid:/i.test(content.html) ? await getInlineImages(x.id).catch(() => null) : null,
               })),

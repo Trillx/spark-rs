@@ -14,6 +14,7 @@ use spark_store::{DefaultSignature, Signature, Store};
 
 use crate::attachment::{self, InlineImage};
 use crate::parse::html_to_text;
+use crate::trackers;
 
 pub const BODY_SECTION: &str = "messageBodySection";
 pub const SIGNATURE_SECTION: &str = "messageSignatureSection";
@@ -289,10 +290,11 @@ fn rgb_from_lab([l, a, b]: [f64; 3]) -> [u8; 3] {
     })
 }
 
-/// An original's HTML as a reply quotes it: cleaned, and without the
-/// images it carries as parts of its own (`cid:`), which don't go along.
+/// An original's HTML as a reply quotes it: cleaned, without its tracking
+/// pixels, and without the images it carries as parts of its own (`cid:`),
+/// which don't go along.
 pub fn sanitize_quoted(html: &str) -> String {
-    let clean = sanitize(html);
+    let clean = sanitize(&trackers::strip(html));
     let lower = clean.to_ascii_lowercase();
     let mut out = String::with_capacity(clean.len());
     let mut last = 0;
@@ -988,6 +990,17 @@ mod tests {
                 r#"<div>Hi<IMG SRC="CID:a@b" alt="logo"></div><img src="https://x/y.png"><script>x</script>"#
             ),
             r#"<div>Hi</div><img src="https://x/y.png">"#
+        );
+    }
+
+    #[test]
+    fn quoted_html_leaves_out_tracking_pixels() {
+        // Forwarded, it would tell the sender each time the next reader opened it.
+        assert_eq!(
+            sanitize_quoted(
+                r#"<p>Sale</p><img src="https://x.list-manage.com/track/open.php?u=1" height="1" width="1"><img src="https://x/y.png">"#
+            ),
+            r#"<p>Sale</p><img src="https://x/y.png">"#
         );
     }
 

@@ -10,9 +10,9 @@ use spark_mail::draft::{self, Draft, OutgoingAttachment};
 use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
-use spark_mail::signature;
 use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
+use spark_mail::{signature, trackers};
 use spark_store::{
     Account, AccountKind, Category, Change, Contact, DueReminder, Folder, FolderRole,
     GatekeeperMode, MessageState, OutboxFile, Patch, PriorityUndo, SenderStatus, now_ms,
@@ -881,7 +881,7 @@ pub fn get_message_content(mailbox: State<'_, Mailbox>, id: i64) -> Result<Messa
     };
     Ok(MessageContent {
         text: paragraphs(&content.text),
-        html: content.html,
+        html: content.html.map(|html| trackers::strip(&html).into_owned()),
         to: content.to,
         cc: content.cc,
         reply_to: content.reply_to,

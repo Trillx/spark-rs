@@ -50,7 +50,8 @@ const CATEGORIES: { key: Category; label: string }[] = [
 import { isFromYou, useAccount } from "../lib/accounts";
 import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
-import { allowRemoteImages, remoteImagesAllowed, useInlineImages, useMessageContent } from "../lib/content";
+import { useInlineImages, useMessageContent } from "../lib/content";
+import { allowRemoteImages, useRemoteImagesAllowed } from "../lib/remoteImages";
 import {
   laterPresets,
   formatFullDate,
@@ -115,6 +116,8 @@ export interface ThreadActions {
   deleteSummary: (m: Message) => void;
   summaryCopied: () => void;
   openAiSettings: () => void;
+  /** Opens the settings page with Load remote images. */
+  openImageSettings: () => void;
   reply: (m: Message) => void;
   /** Opens a reply that AI writes for the chip. */
   quickReply: (m: Message, chip: QuickReply) => void;
@@ -1033,9 +1036,14 @@ function MessageCard({
       )}
       {content &&
         (content.invite ? (
-          <InviteBody id={m.id} content={content} account={account} />
+          <InviteBody message={m} content={content} account={account} onImageSettings={actions.openImageSettings} />
         ) : (
-          <Body id={m.id} content={content} quotes={!isForward(m.subject)} />
+          <Body
+            message={m}
+            content={content}
+            quotes={!isForward(m.subject)}
+            onImageSettings={actions.openImageSettings}
+          />
         ))}
       {content && content.attachments.length > 0 && (
         <AttachmentList
@@ -1071,26 +1079,30 @@ function MessageCard({
 
 /**
  * The email's HTML in the sandboxed frame (embedded images fetched, remote
- * ones on request), else its text. A reply's quote folds away unless `quotes`
- * is off, as it is for a forward, whose quote is the point.
+ * ones as Load remote images says, or once the user shows them), else its
+ * text. A reply's quote folds away unless `quotes` is off, as it is for a
+ * forward, whose quote is the point.
  */
-function Body({ id, content, quotes }: { id: number; content: MessageContent; quotes: boolean }) {
-  const [images, setImages] = useState(() => remoteImagesAllowed(id));
+function Body({
+  message: m,
+  content,
+  quotes,
+  onImageSettings,
+}: {
+  message: Message;
+  content: MessageContent;
+  quotes: boolean;
+  onImageSettings: () => void;
+}) {
+  const images = useRemoteImagesAllowed(m);
   const html = content.html;
   const blocked = useMemo(() => html !== null && hasRemoteImages(html), [html]);
   const embeds = useMemo(() => html !== null && hasInlineImages(html), [html]);
-  const inlineImages = useInlineImages(id, embeds);
+  const inlineImages = useInlineImages(m.id, embeds);
   if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} />;
   return (
     <>
-      {blocked && !images && (
-        <BlockedImagesBar
-          onLoad={() => {
-            allowRemoteImages(id);
-            setImages(true);
-          }}
-        />
-      )}
+      {blocked && !images && <BlockedImagesBar onShow={() => allowRemoteImages(m)} onSettings={onImageSettings} />}
       <HtmlBody html={html} remoteImages={images} inlineImages={inlineImages} quotes={quotes} />
     </>
   );
@@ -1100,16 +1112,26 @@ function Body({ id, content, quotes }: { id: number; content: MessageContent; qu
  * An invite email: the event's card in place of the body, which mostly
  * repeats it, so the email itself folds away behind "⋯" as the related message.
  */
-function InviteBody({ id, content, account }: { id: number; content: MessageContent; account?: AccountView }) {
+function InviteBody({
+  message: m,
+  content,
+  account,
+  onImageSettings,
+}: {
+  message: Message;
+  content: MessageContent;
+  account?: AccountView;
+  onImageSettings: () => void;
+}) {
   const [related, setRelated] = useState(false);
   const hasBody = content.html !== null || content.text.some((p) => p.trim() !== "");
   return (
     <>
-      <InviteCard id={id} invite={content.invite!} account={account} />
+      <InviteCard id={m.id} invite={content.invite!} account={account} />
       {hasBody &&
         (related ? (
           <>
-            <Body id={id} content={content} quotes />
+            <Body message={m} content={content} quotes onImageSettings={onImageSettings} />
             <button className="mx-5 mb-4 text-xs font-medium text-primary hover:underline" onClick={() => setRelated(false)}>
               Hide related message
             </button>

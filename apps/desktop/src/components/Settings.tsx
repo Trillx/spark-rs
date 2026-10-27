@@ -99,6 +99,7 @@ import {
   type FocusTime,
   type HomeSettings,
 } from "../lib/homeScreen";
+import { saveLoadRemoteImages, useLoadRemoteImages } from "../lib/remoteImages";
 import type { ThemePref } from "../lib/theme";
 import { signatureLabel } from "../lib/signatures";
 import type {
@@ -1933,6 +1934,7 @@ function AppearancePage({
   // Priority's size is Settings → Priority's; People always shows.
   const sized = (key: CardKey) => key !== "priority";
   const { prefs, change } = usePrefs();
+  const remoteImages = useLoadRemoteImages();
   return (
     <>
       <section className="mb-7">
@@ -1965,6 +1967,13 @@ function AppearancePage({
           htmlFor="minimize-old"
         >
           <Switch id="minimize-old" on={minimize} onToggle={() => onMinimize(!minimize)} />
+        </Row>
+        <Row
+          label="Load remote images"
+          description="Senders may use remote images to track if you've opened their email. Tracking pixels stay blocked either way."
+          htmlFor="remote-images"
+        >
+          <Switch id="remote-images" on={remoteImages} onToggle={() => saveLoadRemoteImages(!remoteImages)} />
         </Row>
         {prefs && (
           <Row

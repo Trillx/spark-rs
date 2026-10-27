@@ -8,7 +8,7 @@ export interface PrintEmail {
   /** Untrusted HTML, or null for a text email (`text`). */
   html: string | null;
   text: string[];
-  /** The user loaded its remote pictures. */
+  /** Its remote pictures may load: Load remote images is on, or the user showed them. */
   remoteImages: boolean;
   inlineImages: InlineImages | null;
 }

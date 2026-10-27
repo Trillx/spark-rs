@@ -7,9 +7,10 @@ import type { InlineImages } from "../types";
 
 // Email HTML is untrusted. It renders in an iframe sandboxed without
 // `allow-scripts` (so nothing in it runs, submits or opens windows) under its
-// own CSP that blocks every fetch except inline images until the user asks for
-// remote ones. `allow-same-origin` only lets this side size the frame and
-// catch link clicks; with scripts off, the email itself can't use it.
+// own CSP that blocks every fetch except inline images, and remote ones when
+// they're allowed (`remoteImages.ts`); tracking pixels are gone by then.
+// `allow-same-origin` only lets this side size the frame and catch link
+// clicks; with scripts off, the email itself can't use it.
 //
 // In the dark theme an email is shown the way Spark shows it (see
 // `emailScheme`): in its own dark design if it has one, on a white sheet if
@@ -19,7 +20,11 @@ import type { InlineImages } from "../types";
 /** A runaway layout (e.g. `100vh` content) stops growing here. */
 const MAX_FRAME_HEIGHT = 50_000;
 
-/** Whether the HTML loads anything from the network: img src/srcset, background="", CSS url(). */
+/**
+ * Whether the HTML loads anything from the network: img src/srcset, background="", CSS url().
+ * Tracking pixels don't count: the backend has taken them out, so a newsletter with only a
+ * tracker gets no bar, as in Spark.
+ */
 export function hasRemoteImages(html: string) {
   return /(?:\bsrc(?:set)?|\bbackground)\s*=\s*["']?\s*(?:https?:)?\/\/|url\(\s*["']?\s*(?:https?:)?\/\//i.test(html);
 }
@@ -29,14 +34,20 @@ export function hasInlineImages(html: string) {
   return /["'=(]cid:/i.test(html);
 }
 
-/** The bar above a body whose remote images are blocked. */
-export function BlockedImagesBar({ onLoad }: { onLoad: () => void }) {
+/** Spark's bar above a body whose remote images are off: Show images for this email, or Settings to turn them on. */
+export function BlockedImagesBar({ onShow, onSettings }: { onShow: () => void; onSettings: () => void }) {
   return (
     <div className="mx-5 mb-1 mt-2 flex items-center gap-2 rounded-lg bg-base-200 px-3 py-1.5 text-xs leading-5 text-text-2">
       <ImageOff size={14} className="shrink-0" />
-      <span className="min-w-0 flex-1">Images are blocked to protect your privacy.</span>
-      <button className="shrink-0 font-medium text-primary hover:underline" onClick={onLoad}>
-        Load images
+      <span className="min-w-0 flex-1">
+        Images aren't shown, to protect your privacy. To always show them, turn on Load remote images in{" "}
+        <button className="font-medium text-primary hover:underline" onClick={onSettings}>
+          Settings
+        </button>
+        .
+      </span>
+      <button className="btn btn-primary btn-xs shrink-0 rounded-md px-2.5" onClick={onShow}>
+        Show images
       </button>
     </div>
   );
@@ -130,7 +141,7 @@ export function HtmlBody({
   quotes?: boolean;
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  /** Kept across the reloads that "Load images" and arriving embedded images cause, so the card doesn't jump. */
+  /** Kept across the reloads that "Show images" and arriving embedded images cause, so the card doesn't jump. */
   const [height, setHeight] = useState(0);
   const [quoteShown, setQuoteShown] = useState(false);
   const dark = useDarkTheme();

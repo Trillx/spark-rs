@@ -13,8 +13,6 @@ const inlineCache = new Map<number, InlineImages>();
 const inlinePending = new Map<number, Promise<InlineImages>>();
 const INLINE_CACHE_MAX = 100;
 const NO_IMAGES: InlineImages = Object.freeze({});
-/** Messages whose remote images the user chose to load. */
-const imagesAllowed = new Set<number>();
 /** Bumped by `clearContent`, so a load that started before it isn't cached. */
 let generation = 0;
 
@@ -56,7 +54,6 @@ export function clearContent() {
   pending.clear();
   inlineCache.clear();
   inlinePending.clear();
-  imagesAllowed.clear();
 }
 
 /** Cached embedded images, marked as just used. */
@@ -123,14 +120,6 @@ export function useInlineImages(id: number, wanted: boolean): InlineImages | nul
   }, [id, wanted]);
 
   return images;
-}
-
-export function remoteImagesAllowed(id: number) {
-  return imagesAllowed.has(id);
-}
-
-export function allowRemoteImages(id: number) {
-  imagesAllowed.add(id);
 }
 
 export type ContentState =
