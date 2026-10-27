@@ -2493,23 +2493,24 @@ export default function App() {
 
   /** Your sent email, as a new one to send again: its To and Cc, subject, text and files. */
   async function sendAgain(m: Message) {
-    const content = await loadContent(m.id).catch(() => null);
+    const content = await contentToAnswer(m, "send it again", () => void sendAgain(m));
+    if (!content) return;
     const people = (list?: string[]) => (list ?? []).filter((r) => r !== "You").join(", ");
-    const cc = people(content?.cc);
+    const cc = people(content.cc);
     // Its formatting and pictures go again too.
-    const html = content?.html;
+    const html = content.html;
     const images = html && /["'=(]cid:/i.test(html) ? await getInlineImages(m.id).catch(() => ({})) : {};
     const bodyHtml = html ? resendHtml(html, images) : undefined;
     compose({
       title: "Send again",
-      to: people(content?.to ?? m.to),
+      to: people(content.to),
       cc,
       showCc: cc !== "",
       subject: m.subject,
-      body: bodyHtml !== undefined ? htmlText(bodyHtml) : (content?.text ?? m.body ?? [m.snippet]).join("\n\n"),
+      body: bodyHtml !== undefined ? htmlText(bodyHtml) : content.text.join("\n\n"),
       bodyHtml,
       from: m.account,
-      attachments: (content?.attachments ?? []).map((a, index) => ({
+      attachments: content.attachments.map((a, index) => ({
         kind: "message" as const,
         message: m.id,
         index,
@@ -3156,13 +3157,9 @@ export default function App() {
   }
 
   /**
-   * The sender plus everyone else on To and Cc, minus this account's own
-   * address. On an email you sent, its own To and Cc.
-   */
-  /**
-   * The content of an email being answered or forwarded, or `null` once the user is told why it can't be had, with
-   * Try again (`retry`). Older mail downloads its body first: offline, a forward would quote only its preview and go
-   * without its files, and Reply All would leave out its Cc.
+   * The content of an email being answered, forwarded or sent again, or `null` once the user is told why it can't be
+   * had, with Try again (`retry`). Older mail downloads its body first: offline, a forward would quote only its
+   * preview and go without its files, Reply All would leave out its Cc, and Send Again would send only the preview.
    */
   async function contentToAnswer(m: Message, what: string, retry: () => void) {
     try {
@@ -3176,6 +3173,10 @@ export default function App() {
     }
   }
 
+  /**
+   * The sender plus everyone else on To and Cc, minus this account's own
+   * address. On an email you sent, its own To and Cc.
+   */
   async function replyAll(m: Message) {
     const content = await contentToAnswer(m, "reply to all", () => void replyAll(m));
     if (!content) return;
