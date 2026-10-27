@@ -3202,3 +3202,31 @@ fn undoing_an_accept_puts_a_new_senders_snoozed_mail_back_in_the_gatekeeper() {
     let woke = store.message(snoozed).unwrap().unwrap();
     assert_eq!((woke.state, woke.screening), (MessageState::Inbox, true));
 }
+
+#[test]
+fn only_the_address_mail_went_to_counts_not_one_in_its_name() {
+    let (mut store, account) = store_with_account();
+    store
+        .replace_folders(
+            account,
+            &[RemoteFolder {
+                remote_id: "[Gmail]/Sent Mail".into(),
+                parent: None,
+                name: "Sent Mail".into(),
+                role: Some(FolderRole::Sent),
+                selectable: true,
+            }],
+        )
+        .unwrap();
+    // As stored for `"Ann <ann@old-vendor.org>" <ann@new-vendor.org>`.
+    let sent = Incoming {
+        from_address: "me@gmail.com".into(),
+        to: vec!["Ann <ann@old-vendor.org> <ann@new-vendor.org>".into()],
+        ..in_folder(account, "[Gmail]/Sent Mail", 7, 7)
+    };
+    store
+        .add_folder_message(folder_id(&store, "[Gmail]/Sent Mail"), &sent)
+        .unwrap();
+    assert!(arrive(&mut store, account, 8, "ann@old-vendor.org").screening);
+    assert!(!arrive(&mut store, account, 9, "ann@new-vendor.org").screening);
+}

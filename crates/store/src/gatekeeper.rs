@@ -449,6 +449,8 @@ fn welcome(conn: &Connection, address: &str) -> Result<bool> {
 /// Whether the user has written to `address`: it's on mail of theirs in a
 /// Sent folder, or on mail sent from here. Other mail claiming to be from
 /// them proves nothing (anyone can write that From), and drafts weren't sent.
+/// A recipient is stored as `Name <address>` or the bare address; only that
+/// address counts, not one written in the name.
 fn wrote_to(conn: &Connection, address: &str) -> Result<bool> {
     let address = address.trim().to_lowercase();
     conn.prepare_cached(
@@ -461,13 +463,13 @@ fn wrote_to(conn: &Connection, address: &str) -> Result<bool> {
                    AND m.from_address IN (SELECT email FROM accounts)
                    AND EXISTS (
                        SELECT 1 FROM json_each(m.to_list) j
-                       WHERE lower(j.value) = ?1 OR instr(lower(j.value), '<' || ?1 || '>') > 0
+                       WHERE lower(j.value) = ?1 OR substr(lower(j.value), -length(?1) - 2) = '<' || ?1 || '>'
                        UNION ALL
                        SELECT 1 FROM json_each(m.cc_list) j
-                       WHERE lower(j.value) = ?1 OR instr(lower(j.value), '<' || ?1 || '>') > 0
+                       WHERE lower(j.value) = ?1 OR substr(lower(j.value), -length(?1) - 2) = '<' || ?1 || '>'
                        UNION ALL
                        SELECT 1 FROM json_each(m.bcc_list) j
-                       WHERE lower(j.value) = ?1 OR instr(lower(j.value), '<' || ?1 || '>') > 0))",
+                       WHERE lower(j.value) = ?1 OR substr(lower(j.value), -length(?1) - 2) = '<' || ?1 || '>'))",
     )?
     .query_row([address], |r| r.get(0))
 }

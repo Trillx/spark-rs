@@ -1025,8 +1025,9 @@ export default function App() {
     reloadPlanned();
     const sent = outbox.current.get(e.id);
     outbox.current.delete(e.id);
-    // A saved draft it came from is gone now, or back in Drafts if it failed.
-    if (sent?.draftId !== undefined || e.draftId !== undefined) void reloadMessages();
+    // A saved draft it came from is gone now, or back in Drafts if it
+    // failed; and the people it went to are through the Gatekeeper.
+    void reloadMessages();
     if (e.status !== "failed") return;
     const recovered = e.draftId;
     const untrusted = e.certificate;
