@@ -738,12 +738,14 @@ impl Engine {
     }
 
     /// Watches an IMAP account's inbox with IDLE, on a connection of its
-    /// own, calling `changed` whenever the server reports a change there.
-    /// Sets `watching` as the IDLE starts; the caller clears it once this
-    /// returns. Returns `Unwatched` at once
-    /// for Microsoft accounts and servers without IDLE, `Restart` once
-    /// `restart` is notified, and otherwise runs until the connection fails.
-    /// It only reads, so it doesn't take the account's turn.
+    /// own, calling `changed` whenever the server reports a change there,
+    /// and once as it connects: mail that came while nothing watched is
+    /// below what IDLE reports. Sets `watching` as the IDLE starts; the
+    /// caller clears it once this returns. Returns `Unwatched` at once for
+    /// Microsoft accounts and servers without IDLE, `Restart` once
+    /// `restart` is notified (connecting too), and otherwise runs until the
+    /// connection fails. It only reads, so it doesn't take the account's
+    /// turn.
     pub async fn watch_inbox(
         &self,
         account_id: i64,
@@ -761,15 +763,26 @@ impl Engine {
             return Ok(Watch::Unwatched);
         };
         let password = self.password(account_id)?;
-        let mut session = imap::login(&server, &username, &password).await?;
-        if !imap::can_idle(&mut session).await? {
-            let _ = session.logout().await;
-            return Ok(Watch::Unwatched);
-        }
-        imap::examine_inbox(&mut session).await?;
+        let connect = async {
+            let mut session = imap::login(&server, &username, &password).await?;
+            if !imap::can_idle(&mut session).await? {
+                let _ = session.logout().await;
+                return Ok(None);
+            }
+            imap::examine_inbox(&mut session).await?;
+            Ok::<_, Error>(Some(session))
+        };
+        let mut session = tokio::select! {
+            session = connect => match session? {
+                Some(session) => session,
+                None => return Ok(Watch::Unwatched),
+            },
+            () = restart.notified() => return Ok(Watch::Restart),
+        };
+        changed();
         watching.store(true, Ordering::Relaxed);
         loop {
-            session = match imap::idle(session, restart.notified()).await? {
+            session = match imap::idle(session, restart.notified(), imap::IDLE_RENEW).await? {
                 imap::Idle::Changed(session) => {
                     changed();
                     session

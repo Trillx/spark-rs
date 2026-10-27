@@ -1061,7 +1061,7 @@ pub const IDLE_RENEW: Duration = Duration::from_secs(28 * 60);
 pub enum Idle {
     /// The server reported a change: new mail, an expunge or a flag.
     Changed(Session),
-    /// `IDLE_RENEW` passed quietly.
+    /// Its time to be renewed came quietly.
     Quiet(Session),
     /// `stop` resolved; the connection was dropped.
     Stopped,
@@ -1069,7 +1069,10 @@ pub enum Idle {
 
 /// Whether the server takes IDLE.
 pub async fn can_idle(session: &mut Session) -> Result<bool> {
-    Ok(session.capabilities().await?.has_str("IDLE"))
+    let capabilities = timeout(NETWORK_TIMEOUT, session.capabilities())
+        .await
+        .map_err(|_| Error::Server("The mail server stopped answering.".into()))??;
+    Ok(capabilities.has_str("IDLE"))
 }
 
 /// Opens the inbox read-only for `idle`.
@@ -1083,9 +1086,13 @@ pub async fn examine_inbox(session: &mut Session) -> Result<()> {
 }
 
 /// Waits in IDLE on the selected mailbox until the server reports a
-/// change, `IDLE_RENEW` passes or `stop` resolves, then ends the IDLE. A
-/// connection the server closes is an error.
-pub async fn idle(session: Session, stop: impl Future<Output = ()>) -> Result<Idle> {
+/// change, `renew` passes (`IDLE_RENEW`) or `stop` resolves, then ends the
+/// IDLE. A connection the server closes is an error.
+pub async fn idle(
+    session: Session,
+    stop: impl Future<Output = ()>,
+    renew: Duration,
+) -> Result<Idle> {
     let quiet = || Error::Server("The mail server stopped answering.".into());
     // Changes reported while the last IDLE ended or this one began (mail
     // that came in between) arrive here, not in the wait.
@@ -1100,10 +1107,13 @@ pub async fn idle(session: Session, stop: impl Future<Output = ()>) -> Result<Id
     }
     let changed = changed_between || {
         // Held through the wait: dropping it would interrupt it.
-        let (wait, _interrupt) = handle.wait_with_timeout(IDLE_RENEW);
+        let (wait, _interrupt) = handle.wait_with_timeout(renew);
         let response = tokio::select! {
             response = wait => response?,
             () = stop => return Ok(Idle::Stopped),
+            // The wait's own timeout starts over with each keepalive
+            // ("* OK Still here"), which some servers send every few minutes.
+            () = tokio::time::sleep(renew) => IdleResponse::Timeout,
         };
         match response {
             IdleResponse::NewData(_) => true,

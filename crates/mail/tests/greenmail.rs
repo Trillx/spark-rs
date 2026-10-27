@@ -9,7 +9,7 @@
 //!     tools/cross/run.sh cargo test -p spark-mail --test greenmail
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1817,7 +1817,10 @@ async fn imap_idle_reports_new_mail() {
 
     // Mail that arrives during the IDLE.
     let (idled, ()) = tokio::join!(
-        tokio::time::timeout(IDLE_WAIT, imap::idle(session, std::future::pending())),
+        tokio::time::timeout(
+            IDLE_WAIT,
+            imap::idle(session, std::future::pending(), imap::IDLE_RENEW)
+        ),
         async {
             tokio::time::sleep(Duration::from_millis(500)).await;
             deliver(&smtp, "Bob <bob@y.org>", &me, "Second", false).await;
@@ -1831,12 +1834,17 @@ async fn imap_idle_reports_new_mail() {
 
     // Mail that arrives between two IDLEs.
     deliver(&smtp, "Bob <bob@y.org>", &me, "Third", false).await;
-    let idled = tokio::time::timeout(IDLE_WAIT, imap::idle(session, std::future::pending())).await;
+    let idled = tokio::time::timeout(
+        IDLE_WAIT,
+        imap::idle(session, std::future::pending(), imap::IDLE_RENEW),
+    )
+    .await;
     let Ok(Ok(imap::Idle::Changed(session))) = idled else {
         panic!("IDLE missed mail that came before it began");
     };
 
-    let stopped = tokio::time::timeout(IDLE_WAIT, imap::idle(session, async {})).await;
+    let stopped =
+        tokio::time::timeout(IDLE_WAIT, imap::idle(session, async {}, imap::IDLE_RENEW)).await;
     assert!(matches!(stopped, Ok(Ok(imap::Idle::Stopped))));
 }
 
@@ -1859,16 +1867,24 @@ async fn imap_engine_watches_the_inbox() {
 
     let restart = tokio::sync::Notify::new();
     let watching = AtomicBool::new(false);
+    let changes = AtomicUsize::new(0);
     let seen = tokio::sync::Notify::new();
-    let watch = engine.watch_inbox(account.id, &restart, &watching, || seen.notify_one());
+    let watch = engine.watch_inbox(account.id, &restart, &watching, || {
+        changes.fetch_add(1, Ordering::Relaxed);
+        seen.notify_one();
+    });
     let (watched, ()) = tokio::join!(tokio::time::timeout(2 * IDLE_WAIT, watch), async {
         while !watching.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Mail from before the watch began is fetched as it connects.
+        assert_eq!(changes.load(Ordering::Relaxed), 1);
+        seen.notified().await;
         deliver(&smtp, "Bob <bob@y.org>", &me, "Second", false).await;
         tokio::time::timeout(IDLE_WAIT, seen.notified())
             .await
             .expect("the watch didn't see the new mail");
+        assert_eq!(changes.load(Ordering::Relaxed), 2);
         restart.notify_one();
     });
     assert_eq!(

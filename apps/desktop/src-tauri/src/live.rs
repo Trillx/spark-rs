@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use futures_util::future::join_all;
 use serde::Serialize;
 use spark_mail::engine::{folder_has_older, inbox_has_older};
@@ -433,11 +434,8 @@ async fn work(
             },
         );
     };
-    let mut last_fetch: Option<Instant> = None;
-    let mut last_sweep: Option<Instant> = None;
+    let mut schedule = Schedule::default();
     let mut last_sync: Option<i64> = None;
-    let mut retry_at: Option<Instant> = None;
-    let mut slept = false;
     loop {
         if !matches!(engine.store().account(account_id), Ok(Some(_))) {
             break;
@@ -480,26 +478,19 @@ async fn work(
         let mut folders: HashSet<i64> = std::mem::take(&mut *asks.folders.lock().unwrap());
         let older_inbox = asks.older_inbox.swap(false, Ordering::Relaxed);
         let older_folders = std::mem::take(&mut *asks.older_folders.lock().unwrap());
-        let due = due(
-            last_fetch.map(|at| at.elapsed()),
-            last_sweep.map(|at| at.elapsed()),
-            watcher.watching.load(Ordering::Relaxed),
+        let wanted = Wanted {
+            sweep: requested,
+            inbox: inbox_asked,
             focused,
-        );
-        let woke = std::mem::take(&mut slept);
-        let sweep = requested || woke || due.sweep;
-        let fetch = sweep || inbox_asked || due.inbox;
-        let asked = requested
-            || woke
-            || inbox_asked
-            || (focused && due.inbox)
-            || list_asked
-            || !folders.is_empty()
-            || older_inbox
-            || !older_folders.is_empty()
-            || !waiters.is_empty();
-        let waiting = retry_at.is_some_and(|at| Instant::now() < at);
-        if asked || !waiting {
+            other: list_asked
+                || !folders.is_empty()
+                || older_inbox
+                || !older_folders.is_empty()
+                || !waiters.is_empty(),
+        };
+        let watching = watcher.watching.load(Ordering::Relaxed);
+        if let Some(plan) = schedule.plan(Instant::now(), watching, &wanted) {
+            let Plan { fetch, sweep } = plan;
             let list_folders = list_asked || sweep;
             if sweep {
                 folders.extend(watched.lock().unwrap().iter());
@@ -525,14 +516,11 @@ async fn work(
             let had_older = (fetch || older_inbox).then(|| has_older(&engine, account_id));
             let folders_were = (!round.folders.is_empty() || !round.older_folders.is_empty())
                 .then(|| folder_reach(&engine, account_id));
-            match engine.run_round(account_id, &round).await {
+            let result = engine.run_round(account_id, &round).await;
+            schedule.finished(Instant::now(), &plan, result.is_ok());
+            match result {
                 Ok(report) => {
-                    retry_at = None;
-                    if sweep {
-                        last_sweep = Some(Instant::now());
-                    }
                     if fetch {
-                        last_fetch = Some(Instant::now());
                         last_sync = Some(now_ms());
                         set_status(SyncView {
                             status: SyncStatus::Idle,
@@ -554,8 +542,6 @@ async fn work(
                     }
                 }
                 Err(e) => {
-                    retry_at = Some(Instant::now() + RETRY_AFTER);
-                    last_fetch = Some(Instant::now());
                     // IDLE's connection may be the one too many.
                     if e.is_connection_limit() && watcher.watching.load(Ordering::Relaxed) {
                         watcher.give_way.store(true, Ordering::Relaxed);
@@ -590,34 +576,80 @@ async fn work(
         }
         // Waking from sleep: IDLE's connection is gone, and mail came in.
         if now_ms() - waited_from > (TICK + SLEPT).as_millis() as i64 {
-            slept = true;
+            schedule.slept = true;
             watcher.restart.notify_one();
         }
     }
 }
 
-/// What a worker's schedule has due.
-#[derive(Debug, PartialEq, Eq)]
-struct Due {
+/// A worker's timetable: when it last fetched the inbox and swept, and
+/// what a failed round left to do.
+#[derive(Default)]
+struct Schedule {
+    last_fetch: Option<Instant>,
+    last_sweep: Option<Instant>,
+    /// After a failed round, rounds nothing asked for wait until then.
+    retry_at: Option<Instant>,
+    /// A failed round's inbox fetch, which the next round makes up.
+    owed: bool,
+    /// The computer slept since the last round.
+    slept: bool,
+}
+
+/// What a round was asked for, besides the schedule.
+#[derive(Default)]
+struct Wanted {
+    /// The user asked for a sweep.
+    sweep: bool,
+    /// IDLE saw the inbox change.
     inbox: bool,
+    /// The window came to the front.
+    focused: bool,
+    /// Folders, the folder list, older mail.
+    other: bool,
+}
+
+/// What a round does besides pushing local changes.
+#[derive(Debug, PartialEq, Eq)]
+struct Plan {
+    fetch: bool,
     sweep: bool,
 }
 
-/// From how long ago the inbox was last fetched and the last sweep ran
-/// (`None`: not yet), whether IDLE watches the inbox, and whether the window
-/// just came to the front.
-fn due(
-    since_inbox: Option<Duration>,
-    since_sweep: Option<Duration>,
-    watching: bool,
-    focused: bool,
-) -> Due {
-    let past = |since: Option<Duration>, every| since.is_none_or(|since| since >= every);
-    let sweep = past(since_sweep, SWEEP_EVERY);
-    // IDLE tells when the inbox changes, so then only the sweep checks it.
-    let every = if watching { SWEEP_EVERY } else { INBOX_EVERY };
-    let inbox = sweep || past(since_inbox, every) || (focused && past(since_inbox, INBOX_EVERY));
-    Due { inbox, sweep }
+impl Schedule {
+    /// The next round, or `None` while it waits after a failure. `watching`:
+    /// IDLE is on the inbox.
+    fn plan(&mut self, now: Instant, watching: bool, wanted: &Wanted) -> Option<Plan> {
+        let past = |at: Option<Instant>, every| at.is_none_or(|at| now - at >= every);
+        let woke = std::mem::take(&mut self.slept);
+        let sweep = wanted.sweep || woke || past(self.last_sweep, SWEEP_EVERY);
+        // IDLE tells when the inbox changes, so then only the sweep checks it.
+        let every = if watching { SWEEP_EVERY } else { INBOX_EVERY };
+        let focus = wanted.focused && past(self.last_fetch, INBOX_EVERY);
+        let fetch = sweep || wanted.inbox || focus || self.owed || past(self.last_fetch, every);
+        let asked = wanted.sweep || woke || wanted.inbox || focus || wanted.other;
+        let waiting = self.retry_at.is_some_and(|at| now < at);
+        (asked || !waiting).then_some(Plan { fetch, sweep })
+    }
+
+    fn finished(&mut self, now: Instant, plan: &Plan, ok: bool) {
+        if ok {
+            self.retry_at = None;
+            if plan.sweep {
+                self.last_sweep = Some(now);
+            }
+            if plan.fetch {
+                self.owed = false;
+            }
+        } else {
+            self.retry_at = Some(now + RETRY_AFTER);
+            self.owed |= plan.fetch;
+        }
+        // A failed fetch waits as long as one that worked.
+        if plan.fetch || !ok {
+            self.last_fetch = Some(now);
+        }
+    }
 }
 
 /// Keeps IDLE on the account's inbox, so the worker fetches new mail as it
@@ -643,23 +675,48 @@ async fn watch(engine: Arc<Engine>, account_id: i64, shared: Arc<Shared>) {
         if started.elapsed() >= SWEEP_EVERY {
             retry = IDLE_RETRY;
         }
-        let wait = match watched {
-            Ok(Watch::Unwatched) => return,
-            Ok(Watch::Restart) if watcher.give_way.swap(false, Ordering::Relaxed) => IDLE_RETRY_MAX,
-            Ok(Watch::Restart) => continue,
-            Err(e) if e.is_connection_limit() => IDLE_RETRY_MAX,
-            Err(e) => {
-                eprintln!("spark-rs: watching the inbox of account {account_id}: {e}");
-                let wait = retry;
-                retry = (retry * 2).min(IDLE_RETRY_MAX);
-                wait
-            }
+        // However the watch ended, a round out of connections asked IDLE to
+        // give its one up, and the restart that asked doesn't end the wait.
+        let give_way = watcher.give_way.swap(false, Ordering::Relaxed);
+        if give_way {
+            let _ = watcher.restart.notified().now_or_never();
+        }
+        if let Err(e) = &watched
+            && !e.is_connection_limit()
+        {
+            eprintln!("spark-rs: watching the inbox of account {account_id}: {e}");
+        }
+        let wait = match next_watch(&watched, give_way, &mut retry) {
+            None => return,
+            Some(Duration::ZERO) => continue,
+            Some(wait) => wait,
         };
         tokio::select! {
             () = tokio::time::sleep(wait) => {}
             () = watcher.restart.notified() => {}
         }
     }
+}
+
+/// How long after a watch ended the next one starts: `None` for an account
+/// it can't watch, zero for one told to start over. `retry` is the wait
+/// after a failure, which doubles.
+fn next_watch(
+    watched: &Result<Watch, Error>,
+    give_way: bool,
+    retry: &mut Duration,
+) -> Option<Duration> {
+    Some(match watched {
+        Ok(Watch::Unwatched) => return None,
+        _ if give_way => IDLE_RETRY_MAX,
+        Ok(Watch::Restart) => Duration::ZERO,
+        Err(e) if e.is_connection_limit() => IDLE_RETRY_MAX,
+        Err(_) => {
+            let wait = *retry;
+            *retry = (*retry * 2).min(IDLE_RETRY_MAX);
+            wait
+        }
+    })
 }
 
 fn has_older(engine: &Engine, account_id: i64) -> bool {
@@ -689,78 +746,126 @@ fn describe(e: &Error) -> String {
 mod tests {
     use super::*;
 
-    fn secs(n: u64) -> Option<Duration> {
-        Some(Duration::from_secs(n))
+    /// A schedule that swept at `start`, and the time `n` seconds later.
+    fn swept() -> (Schedule, impl Fn(u64) -> Instant) {
+        let start = Instant::now();
+        let at = move |n| start + Duration::from_secs(n);
+        let mut schedule = Schedule::default();
+        let plan = schedule.plan(at(0), false, &Wanted::default()).unwrap();
+        assert_eq!(
+            plan,
+            Plan {
+                fetch: true,
+                sweep: true
+            },
+            "the first round sweeps"
+        );
+        schedule.finished(at(0), &plan, true);
+        (schedule, at)
     }
 
-    #[test]
-    fn the_first_round_sweeps() {
-        let due = due(None, None, false, false);
-        assert!(due.inbox && due.sweep);
-    }
+    const QUIET: Plan = Plan {
+        fetch: false,
+        sweep: false,
+    };
+    const INBOX: Plan = Plan {
+        fetch: true,
+        sweep: false,
+    };
+    const SWEEP: Plan = Plan {
+        fetch: true,
+        sweep: true,
+    };
 
     #[test]
     fn an_unwatched_inbox_is_checked_every_30_seconds() {
-        assert_eq!(
-            due(secs(29), secs(29), false, false),
-            Due {
-                inbox: false,
-                sweep: false
-            }
-        );
-        assert_eq!(
-            due(secs(30), secs(30), false, false),
-            Due {
-                inbox: true,
-                sweep: false
-            }
-        );
+        let (mut schedule, at) = swept();
+        let nothing = Wanted::default();
+        assert_eq!(schedule.plan(at(29), false, &nothing), Some(QUIET));
+        assert_eq!(schedule.plan(at(30), false, &nothing), Some(INBOX));
     }
 
     #[test]
-    fn a_watched_inbox_waits_for_the_sweep() {
-        assert_eq!(
-            due(secs(299), secs(299), true, false),
-            Due {
-                inbox: false,
-                sweep: false
-            }
-        );
-        assert_eq!(
-            due(secs(300), secs(300), true, false),
-            Due {
-                inbox: true,
-                sweep: true
-            }
-        );
-    }
-
-    #[test]
-    fn the_sweep_runs_every_five_minutes() {
-        assert_eq!(
-            due(secs(10), secs(300), false, false),
-            Due {
-                inbox: true,
-                sweep: true
-            }
-        );
+    fn a_watched_inbox_waits_for_the_sweep_every_five_minutes() {
+        let (mut schedule, at) = swept();
+        let nothing = Wanted::default();
+        assert_eq!(schedule.plan(at(299), true, &nothing), Some(QUIET));
+        assert_eq!(schedule.plan(at(300), true, &nothing), Some(SWEEP));
     }
 
     #[test]
     fn coming_to_the_front_checks_an_inbox_not_checked_just_now() {
+        let (mut schedule, at) = swept();
+        let focused = Wanted {
+            focused: true,
+            ..Default::default()
+        };
+        assert_eq!(schedule.plan(at(29), true, &focused), Some(QUIET));
+        assert_eq!(schedule.plan(at(30), true, &focused), Some(INBOX));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_made_up_after_the_wait() {
+        let (mut schedule, at) = swept();
+        let changed = Wanted {
+            inbox: true,
+            ..Default::default()
+        };
+        let plan = schedule.plan(at(10), true, &changed).unwrap();
+        assert_eq!(plan, INBOX);
+        schedule.finished(at(10), &plan, false);
+        assert_eq!(schedule.plan(at(20), true, &Wanted::default()), None);
+        let plan = schedule.plan(at(40), true, &Wanted::default()).unwrap();
+        assert_eq!(plan, INBOX);
+        schedule.finished(at(40), &plan, true);
+        assert_eq!(schedule.plan(at(45), true, &Wanted::default()), Some(QUIET));
+    }
+
+    #[test]
+    fn waking_from_sleep_sweeps_even_while_waiting() {
+        let (mut schedule, at) = swept();
+        let plan = schedule.plan(at(10), false, &Wanted::default()).unwrap();
+        schedule.finished(at(10), &plan, false);
+        schedule.slept = true;
         assert_eq!(
-            due(secs(29), secs(29), true, true),
-            Due {
-                inbox: false,
-                sweep: false
-            }
+            schedule.plan(at(11), false, &Wanted::default()),
+            Some(SWEEP)
         );
+    }
+
+    #[test]
+    fn idle_gives_way_however_the_watch_ended() {
+        let mut retry = IDLE_RETRY;
+        let failed: Result<Watch, Error> = Err(Error::Server(
+            "The mail server closed the connection.".into(),
+        ));
+        assert_eq!(next_watch(&failed, true, &mut retry), Some(IDLE_RETRY_MAX));
         assert_eq!(
-            due(secs(30), secs(30), true, true),
-            Due {
-                inbox: true,
-                sweep: false
-            }
+            next_watch(&Ok(Watch::Restart), true, &mut retry),
+            Some(IDLE_RETRY_MAX)
         );
+        assert_eq!(retry, IDLE_RETRY);
+    }
+
+    #[test]
+    fn a_failed_watch_waits_longer_each_time() {
+        let mut retry = IDLE_RETRY;
+        let failed: Result<Watch, Error> = Err(Error::Server(
+            "The mail server closed the connection.".into(),
+        ));
+        let waits: Vec<_> = (0..6)
+            .map(|_| next_watch(&failed, false, &mut retry).unwrap())
+            .collect();
+        let secs: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [30, 60, 120, 240, 300, 300]);
+        let full: Result<Watch, Error> = Err(Error::Auth(
+            "[LIMIT] Too many simultaneous connections".into(),
+        ));
+        assert_eq!(next_watch(&full, false, &mut retry), Some(IDLE_RETRY_MAX));
+        assert_eq!(
+            next_watch(&Ok(Watch::Restart), false, &mut retry),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(next_watch(&Ok(Watch::Unwatched), false, &mut retry), None);
     }
 }
