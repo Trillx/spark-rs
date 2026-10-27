@@ -1242,19 +1242,21 @@ impl Graph {
             .min()
             .map(whole_second);
         let full = page.next_link.is_some() || page.value.len() >= MAX_PAGE;
-        // The stretch the page covers, from `from` to `pass.before`, and
-        // where the next page starts.
-        let (from, next) = match oldest {
-            _ if !full => (pass.until, None),
-            Some(oldest) if oldest + 1000 < pass.before => (oldest + 1000, Some(oldest + 1000)),
+        // The stretch the page covers, from `from` to `pass.before`, where
+        // the next page starts, and the link it goes on from within a
+        // second. Where the next page starts and its link are kept together,
+        // once the page is stored: a link kept with the start before it
+        // would judge that whole stretch by the link's pages alone.
+        let (from, next, next_link) = match oldest {
+            _ if !full => (pass.until, None, None),
+            Some(oldest) if oldest + 1000 < pass.before => {
+                (oldest + 1000, Some(oldest + 1000), None)
+            }
             // A whole page of one second: the next goes on from its link,
             // as listing from before that second gives it again. Nothing
             // of that second can be taken for gone: it's listed in parts.
-            Some(oldest) => {
-                state.reconcile_next.clone_from(&page.next_link);
-                (pass.before, Some(oldest))
-            }
-            None => (pass.before, None),
+            Some(oldest) => (pass.before, Some(oldest), page.next_link.clone()),
+            None => (pass.before, None, None),
         };
 
         let mut unknown = Vec::new();
@@ -1301,6 +1303,7 @@ impl Graph {
             Ok(changed)
         })?;
         state.reconcile = next.map(|before| Reconcile { before, ..pass });
+        state.reconcile_next = next_link;
         Ok(Reconciled {
             changed,
             done: state.reconcile.is_none(),
@@ -4962,6 +4965,55 @@ pub(crate) mod tests {
         let asked = seen.take();
         assert!(asked[2].path.ends_with("&$skip=2"), "{}", asked[2].path);
         assert!(state.reconcile_next.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_step_that_fails_in_a_second_with_more_than_a_page_keeps_its_place() {
+        // i18, j18 and k18 came the same second, more than a page of two;
+        // j18 was just moved into the inbox elsewhere, and the first ask
+        // for it fails.
+        let (store, account_id) = microsoft_store();
+        let ids = store_older(&store, account_id, &["i18", "k18", "i19"]);
+        let inbox: Vec<InInbox> = ["i18", "j18", "k18", "i19"]
+            .iter()
+            .map(|id| (*id, false, false))
+            .collect();
+        let answer = reconciling(Arc::new(Mutex::new(inbox)), 2);
+        let (base, _) = serve(move |asked, attempt| {
+            if asked.path.starts_with("/me/messages/j18") && attempt == 0 {
+                return Answer::status(500);
+            }
+            answer(asked, attempt)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        // The pass is down to i18's second.
+        let pass = Reconcile {
+            before: received(18) + 1000,
+            until: received(19),
+        };
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(17)),
+            older_than: Some(received(19)),
+            reconcile: Some(pass),
+            ..Default::default()
+        };
+        // i18 and j18, a whole page of that second: asking for j18 fails.
+        let failed = graph.reconcile_inbox(&store, account_id, &mut state).await;
+        assert!(failed.is_err());
+        assert_eq!(
+            (state.reconcile, state.reconcile_next.as_deref()),
+            (Some(pass), None)
+        );
+        // Then i18 and j18 again, and k18 and i19 from that link.
+        assert_eq!(whole_pass(&graph, &store, account_id, &mut state).await, 2);
+        use spark_store::MessageState::Inbox;
+        for id in ["i18", "k18", "i19"] {
+            let m = lock(&store).message(ids[id]).unwrap().unwrap();
+            assert_eq!(m.state, Inbox, "{id} is still in the inbox");
+        }
+        assert_eq!(titled(&store, "Message j18").unwrap().state, Inbox);
     }
 
     #[tokio::test]
