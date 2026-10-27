@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { getInlineImages, getMessageContent } from "../api";
 import type { InlineImages, InviteAnswer, MessageContent } from "../types";
 import { loadCache } from "./cache";
@@ -7,7 +7,9 @@ import { loadCache } from "./cache";
 // the app runs, so reopening a thread (or forwarding it) is instant. Failed
 // loads aren't cached. Embedded images come from the server the same way, kept
 // to a budget of their own: being data URLs, they're big. Sizes are estimated
-// as two bytes a character (see `estimateBytes`).
+// as two bytes a character (see `estimateBytes`). A message whose stored
+// content changes is forgotten, and readers showing it load it again
+// (`forgetContent`).
 
 const MiB = 1024 * 1024;
 /** A few hundred ordinary bodies (their HTML and text, ~100–300 KiB as estimated): modest on an 8 GB ARM laptop. */
@@ -22,6 +24,9 @@ const INLINE_ENTRY_MAX = INLINE_BUDGET / 4;
 const contents = loadCache({ fetch: getMessageContent, budget: CONTENT_BUDGET, entryMax: CONTENT_ENTRY_MAX });
 const inline = loadCache({ fetch: getInlineImages, budget: INLINE_BUDGET, entryMax: INLINE_ENTRY_MAX });
 const NO_IMAGES: InlineImages = Object.freeze({});
+/** How often `forgetContent` forgot each message, for readers showing it to load it again. */
+const versions = new Map<number, number>();
+const versionWatchers = new Set<() => void>();
 
 export function loadContent(id: number): Promise<MessageContent> {
   return contents.load(id);
@@ -36,6 +41,28 @@ export function cacheInviteAnswer(id: number, answer: InviteAnswer) {
 export function clearContent() {
   contents.clear();
   inline.clear();
+}
+
+/**
+ * Forgets what's kept of messages whose stored content changed since it was read, loads under way included: a
+ * sync filled in the attachments or invite it stored them without (`staleContent`). Readers showing them load
+ * them again, and show what they have till then. Their embedded images didn't change, so readers keep those.
+ */
+export function forgetContent(ids: readonly number[]) {
+  if (!ids.length) return;
+  for (const id of ids) {
+    contents.forget(id);
+    inline.forget(id);
+    versions.set(id, (versions.get(id) ?? 0) + 1);
+  }
+  for (const watcher of versionWatchers) watcher();
+}
+
+function watchVersions(watcher: () => void) {
+  versionWatchers.add(watcher);
+  return () => {
+    versionWatchers.delete(watcher);
+  };
 }
 
 /** Cached embedded images, marked as just used. */
@@ -89,27 +116,37 @@ export type ContentState =
 
 export function useMessageContent(id: number): [ContentState, () => void] {
   const [attempt, setAttempt] = useState(0);
+  const version = useSyncExternalStore(watchVersions, () => versions.get(id) ?? 0);
   const [state, setState] = useState<ContentState>(() => {
     const cached = contents.get(id);
     return cached ? { status: "ready", content: cached } : { status: "loading" };
   });
+  /** The message and version last loaded. */
+  const loaded = useRef({ id, version });
 
   useEffect(() => {
+    // Loading it again as `forgetContent` forgot it, what shows stays till the new content comes.
+    const again = loaded.current.id === id && loaded.current.version !== version;
+    loaded.current = { id, version };
     let live = true;
     const cached = contents.get(id);
     if (cached) {
       setState({ status: "ready", content: cached });
       return;
     }
-    setState({ status: "loading" });
+    if (!again) setState({ status: "loading" });
     loadContent(id).then(
       (content) => live && setState({ status: "ready", content }),
-      (error) => live && setState({ status: "error", message: String(error) }),
+      (error) => {
+        if (!live) return;
+        const failed: ContentState = { status: "error", message: String(error) };
+        setState((was) => (again && was.status === "ready" ? was : failed));
+      },
     );
     return () => {
       live = false;
     };
-  }, [id, attempt]);
+  }, [id, attempt, version]);
 
   return [state, () => setAttempt((n) => n + 1)];
 }

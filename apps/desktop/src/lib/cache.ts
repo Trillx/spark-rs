@@ -27,6 +27,8 @@ export interface LoadCache<V> {
   load(id: number): Promise<V>;
   /** Replaces a kept value with `change`'s version of it; one that isn't kept stays that way. */
   update(id: number, change: (value: V) => V): void;
+  /** Forgets one value, and a load of it under way: that still answers, but isn't kept. The next ask fetches it. */
+  forget(id: number): void;
   /** Forgets everything, including loads under way: they still answer, but aren't kept. */
   clear(): void;
   /** The estimated bytes kept. */
@@ -52,12 +54,11 @@ export function loadCache<V>({
 }): LoadCache<V> {
   /** In use order, the most recent last. */
   const kept = new Map<number, { value: V; bytes: number }>();
+  /** The load under way for each id, standing for its generation: one `forget` or `clear` let go isn't kept. */
   const pending = new Map<number, Promise<V>>();
   let total = 0;
-  /** Bumped by `clear`, so a load that started before it isn't kept. */
-  let generation = 0;
 
-  function forget(id: number) {
+  function discard(id: number) {
     const entry = kept.get(id);
     if (!entry) return;
     kept.delete(id);
@@ -65,7 +66,7 @@ export function loadCache<V>({
   }
 
   function keep(id: number, value: V) {
-    forget(id);
+    discard(id);
     const bytes = weigh(value);
     if (bytes > entryMax) return;
     kept.set(id, { value, bytes });
@@ -92,18 +93,18 @@ export function loadCache<V>({
       if (cached !== undefined) return Promise.resolve(cached);
       let request = pending.get(id);
       if (!request) {
-        const started = generation;
-        const settle = () => {
-          if (started === generation) pending.delete(id);
-        };
+        /** Whether this is still the load under way for `id`, so what it brings is kept. */
+        const current = () => pending.get(id) === request;
         request = fetch(id).then(
           (value) => {
-            settle();
-            if (started === generation) keep(id, value);
+            if (current()) {
+              pending.delete(id);
+              keep(id, value);
+            }
             return value;
           },
           (error: unknown) => {
-            settle();
+            if (current()) pending.delete(id);
             throw error;
           },
         );
@@ -115,8 +116,11 @@ export function loadCache<V>({
       const entry = kept.get(id);
       if (entry) keep(id, change(entry.value));
     },
+    forget(id) {
+      discard(id);
+      pending.delete(id);
+    },
     clear() {
-      generation++;
       kept.clear();
       pending.clear();
       total = 0;

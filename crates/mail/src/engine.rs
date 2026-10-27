@@ -3370,6 +3370,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mail_killed_as_it_was_listed_for_repair_comes_whole_after_a_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "spark-graph-killed-{}.sqlite",
+            drafts::new_message_id("test")
+        ));
+        // Graph fails to list n2's file while `down`.
+        let down = Arc::new(AtomicBool::new(true));
+        let failing = down.clone();
+        let n2 = move |id: &str| (id == "n2" && failing.load(SeqCst)).then(|| Answer::status(500));
+        let (base, _) = graph::tests::serve(inbox(n2)).await;
+        let account_id = {
+            let (engine, account_id) =
+                microsoft_engine_in(Store::open(&path).unwrap(), base.clone());
+            engine
+                .store()
+                .set_sync_state(account_id, AT_DELTA1)
+                .unwrap();
+            // The app is killed as n2 is listed: none of its page is
+            // stored, and the delta query hasn't moved.
+            graph::tests::LISTING_FAILS.set(true);
+            assert!(engine.run(account_id, true).await.is_err());
+            assert!(files(&engine).is_empty());
+            assert!(repair_list(&engine, account_id).is_empty());
+            assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta1"));
+            account_id
+        };
+
+        // Opened again, the page comes again: stored, with n2 listed.
+        let engine = signed_in(Store::open(&path).unwrap(), base, account_id);
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!((report.new, report.repaired), (4, 0));
+        assert_eq!(files(&engine), whole(1..=4, &[2]));
+        let listed = repair_list(&engine, account_id);
+        assert_eq!((listed.len(), listed[0].id.as_str()), (1, "n2"));
+
+        // And once Graph gives it, n2's file comes.
+        down.store(false, SeqCst);
+        let report = engine.run(account_id, true).await.unwrap();
+        assert_eq!((report.new, report.repaired), (1, 1));
+        assert_eq!(files(&engine), whole(1..=5, &[]));
+        assert!(repair_list(&engine, account_id).is_empty());
+        drop(engine);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    #[tokio::test]
     async fn repaired_mail_reaches_the_message_list() {
         let down = Arc::new(AtomicBool::new(true));
         let failing = down.clone();

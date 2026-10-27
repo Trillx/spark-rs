@@ -161,7 +161,7 @@ import { CaptionButtons, DragStrip } from "./components/WindowChrome";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { joinAddresses, parseEntry, replyRecipients, splitAddresses } from "./lib/addresses";
 import { badgeIcon } from "./lib/badge";
-import { clearContent, loadContent } from "./lib/content";
+import { clearContent, forgetContent, loadContent } from "./lib/content";
 import { remoteImagesAllowed } from "./lib/remoteImages";
 import {
   asThread,
@@ -195,7 +195,7 @@ import {
   type PreviewFilter,
 } from "./lib/homeScreen";
 import { decidableDomain, domain, forSenders, predict } from "./lib/gatekeeper";
-import { coalesce, mailboxCopy } from "./lib/mailboxCopy";
+import { coalesce, mailboxCopy, staleContent } from "./lib/mailboxCopy";
 import { loadPriorityLines, savePriorityLines } from "./lib/priority";
 import {
   formatFullDate,
@@ -490,7 +490,10 @@ export default function App() {
   /** One read at a time; asked meanwhile, it reads once more after. Resolves to the list as shown. */
   const [refreshMessages] = useState(() =>
     coalesce(async () => {
-      const next = mailbox.apply(await messageChanges(mailbox.mark), shownMessages.current);
+      const changes = await messageChanges(mailbox.mark);
+      // Bodies read before a sync filled in their attachments or invite are read again.
+      forgetContent(staleContent(changes, mailbox));
+      const next = mailbox.apply(changes, shownMessages.current);
       setMessages(next);
       setOpenId((id) => (id !== null && mailbox.get(id) ? id : null));
       setSelectedId((id) => (id !== null && mailbox.get(id) ? id : null));

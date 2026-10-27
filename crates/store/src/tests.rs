@@ -3681,6 +3681,34 @@ fn a_thousand_message_import_commits_once_a_chunk() {
 }
 
 #[test]
+fn a_batchs_sync_state_commits_with_its_mail_or_not_at_all() {
+    let (mut store, account) = store_with_account();
+    store
+        .batch(|b| {
+            b.add_incoming(&incoming(account, 1, "a@x.com"), false)?;
+            assert_eq!(b.sync_state(account)?.as_deref(), Some("{}"));
+            b.set_sync_state(account, r#"{"n":1}"#)?;
+            assert_eq!(b.sync_state(account)?.as_deref(), Some(r#"{"n":1}"#));
+            assert_eq!(b.sync_state(account + 1)?, None, "no such account");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.messages().unwrap().len(), 1);
+    let state = |store: &Store| store.account(account).unwrap().unwrap().sync_state;
+    assert_eq!(state(&store), r#"{"n":1}"#);
+
+    // One that fails after writing both keeps neither.
+    let failed = store.batch(|b| {
+        b.add_incoming(&incoming(account, 2, "a@x.com"), false)?;
+        b.set_sync_state(account, r#"{"n":2}"#)?;
+        Err::<(), _>(Error::InvalidQuery)
+    });
+    assert!(failed.is_err());
+    assert_eq!(store.messages().unwrap().len(), 1);
+    assert_eq!(state(&store), r#"{"n":1}"#);
+}
+
+#[test]
 fn flags_the_server_reported_before_write_nothing() {
     use std::sync::atomic::Ordering::SeqCst;
 

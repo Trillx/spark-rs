@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Message, MessageChanges, MessageMark } from "../types.ts";
-import { coalesce, mailboxCopy, sameMessage } from "./mailboxCopy.ts";
+import { loadCache } from "./cache.ts";
+import { coalesce, mailboxCopy, sameMessage, staleContent } from "./mailboxCopy.ts";
 
 const mail = (id: number, timestamp = 1_000 + id): Message => ({
   id,
@@ -161,6 +162,57 @@ test("messages read the same field by field", () => {
   assert.ok(!sameMessage(m, { ...m, reminder: undefined }));
   assert.ok(sameMessage({ ...mail(1), muted: undefined }, mail(1)));
   assert.ok(!sameMessage({ ...mail(1), muted: true }, mail(1)));
+});
+
+test("a body goes stale as a sync fills in its message's files or invite, not as it's read or pinned", () => {
+  const copy = mailboxCopy();
+  const shown = copy.apply(full(ordered([mail(1), mail(2), mail(3), mail(4)])), []);
+  const changes = changed(2, [
+    { ...mail(1), unread: false },
+    { ...mail(2), pinned: true, state: "done" },
+    { ...mail(3), attachment: "plan.pdf" },
+    { ...mail(4), inviteKind: "invitation" },
+    { ...mail(5), attachment: "new.pdf" },
+  ]);
+  assert.deepEqual(staleContent(changes, copy), [3, 4], "5 is new: nothing of it was read");
+  const next = copy.apply(changes, shown);
+  assert.deepEqual(staleContent(changes, copy), [], "taken in");
+  // A full read, after a restart, finds them too.
+  const repaired = next.map((m) => (m.id === 1 ? { ...m, attachment: "late.pdf" } : m));
+  assert.deepEqual(staleContent(full(repaired, 3), copy), [1]);
+  assert.deepEqual(staleContent(full(next, 3), copy), []);
+});
+
+test("a reader's body loaded before its files were filled in is read again, and the old load isn't kept", async () => {
+  // The store's n2: stored without its file, which a later round fills in.
+  let stored = { attachments: [] as string[] };
+  const answers: (() => void)[] = [];
+  const bodies = loadCache({
+    fetch: () => {
+      const read = stored;
+      return new Promise<typeof stored>((resolve) => answers.push(() => resolve(read)));
+    },
+    budget: 1_000_000,
+    entryMax: 100_000,
+  });
+  const copy = mailboxCopy();
+  const shown = copy.apply(full([mail(2)]), []);
+  // The reader opens n2 as the round runs.
+  const opening = bodies.load(2);
+  stored = { attachments: ["n2.pdf"] };
+  const changes = changed(2, [{ ...mail(2), attachment: "n2.pdf" }]);
+  for (const id of staleContent(changes, copy)) bodies.forget(id);
+  copy.apply(changes, shown);
+  // Loaded again, as the reader does: the new body is kept, and the old
+  // one, answering last, doesn't take its place.
+  const again = bodies.load(2);
+  assert.notEqual(again, opening);
+  answers[1]();
+  assert.deepEqual((await again).attachments, ["n2.pdf"]);
+  answers[0]();
+  assert.deepEqual((await opening).attachments, []);
+  assert.deepEqual(bodies.get(2)?.attachments, ["n2.pdf"]);
+  assert.equal(answers.length, 2);
 });
 
 /** A read that answers when told, counting how many started. */

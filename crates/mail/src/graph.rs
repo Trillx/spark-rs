@@ -18,8 +18,8 @@ use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spark_store::{
-    Added, Attachment, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed, Query,
-    RemoteFolder, Store,
+    Added, Attachment, Batch, Category, Folder, FolderRole, Incoming, Pending, Place, Pushed,
+    Query, RemoteFolder, Store,
 };
 
 use crate::attachment::{
@@ -65,7 +65,14 @@ const THROTTLED_RETRIES: u32 = 3;
 /// Most messages a round fetches what's missing of (`Graph::repair`).
 const REPAIR_BATCH: usize = 20;
 /// The longest a round spends fetching what's missing (`Graph::repair`).
+/// What's under way then is cut off, and goes to the end of the list.
 const REPAIR_TIME: Duration = Duration::from_secs(60);
+/// The longest each of those requests may take once it's sent, its answer
+/// included; waiting out the account's pause before doesn't count. A
+/// message asks for its attachments and then its invite, so both fit in
+/// `REPAIR_TIME`: one too slow fails as a try of its own, rather than being
+/// cut off with the round every time.
+const REPAIR_REQUEST_TIME: Duration = Duration::from_secs(25);
 /// A message still missing its attachments or invite this long after it
 /// was stored, and after `REPAIR_TRIES` failed tries of its own, is given
 /// up on (`Graph::repair`).
@@ -429,6 +436,10 @@ pub struct Graph {
     token: String,
     base: String,
     standing: Arc<Standing>,
+    /// `REPAIR_TIME`, shorter in tests.
+    repair_time: Duration,
+    /// `REPAIR_REQUEST_TIME`, shorter in tests.
+    repair_request_time: Duration,
 }
 
 /// Why a request got no answer from Graph (`send_once`).
@@ -459,6 +470,8 @@ impl Graph {
             token: access_token.to_owned(),
             base: base.trim_end_matches('/').to_owned(),
             standing: Arc::default(),
+            repair_time: REPAIR_TIME,
+            repair_request_time: REPAIR_REQUEST_TIME,
         }
     }
 
@@ -614,7 +627,7 @@ impl Graph {
             };
             // New mail is completed (attachments, invites) before the page
             // is stored, in one transaction. What Graph can't give yet is
-            // listed once it's stored, for a later round to fetch.
+            // listed in it too, for a later round to fetch.
             let known: HashSet<String> = {
                 let store = lock(store);
                 let mut known = HashSet::new();
@@ -653,28 +666,22 @@ impl Graph {
                 })
                 .collect();
             let repairs = self.complete_all(new).await;
-            {
-                let mut s = lock(store);
-                s.batch(|b| {
-                    for change in &changes {
-                        match change {
-                            Delta::Gone(remote_id) => {
-                                report.gone += b.observe_gone_remote(account_id, remote_id)?;
-                            }
-                            Delta::Changed { incoming, flags } => {
-                                report.headers += usize::from(b.observe_reply_to(incoming)?);
-                                if *flags
-                                    && let Added::New(id) = b.add_incoming(incoming, !first)?
-                                {
-                                    report.new.push(id);
-                                }
+            lock(store).batch(|b| {
+                for change in &changes {
+                    match change {
+                        Delta::Gone(remote_id) => {
+                            report.gone += b.observe_gone_remote(account_id, remote_id)?;
+                        }
+                        Delta::Changed { incoming, flags } => {
+                            report.headers += usize::from(b.observe_reply_to(incoming)?);
+                            if *flags && let Added::New(id) = b.add_incoming(incoming, !first)? {
+                                report.new.push(id);
                             }
                         }
                     }
-                    Ok(())
-                })?;
-                listed_for_repair(&s, account_id, repairs)?;
-            }
+                }
+                listed_for_repair(b, account_id, repairs)
+            })?;
             match (page.next_link, page.delta_link) {
                 (Some(next), _) => url = next,
                 (None, Some(delta)) => {
@@ -852,10 +859,9 @@ impl Graph {
                 .iter_mut()
                 .filter_map(|(incoming, m)| Some(((*m)?, incoming)))
                 .collect();
-            // What Graph can't give yet is listed once the chunk is stored.
+            // What Graph can't give yet is listed as the chunk is stored.
             let repairs = self.complete_all(new).await;
-            let mut s = lock(store);
-            s.batch(|b| {
+            lock(store).batch(|b| {
                 for (incoming, _) in &incomings {
                     changed += usize::from(b.observe_reply_to(incoming)?);
                     let id = match b.add_folder_message(folder.id, incoming)? {
@@ -866,9 +872,8 @@ impl Graph {
                     }
                     members.push((id, None));
                 }
-                Ok(())
+                listed_for_repair(b, account_id, repairs)
             })?;
-            listed_for_repair(&s, account_id, repairs)?;
         }
         changed += lock(store).set_folder_members(folder.id, &members)?;
         state.complete = complete;
@@ -1015,23 +1020,20 @@ impl Graph {
                 .collect();
             let mut incomings: Vec<Incoming> =
                 new.iter().map(|m| to_incoming(account_id, m)).collect();
-            // What Graph can't give yet is listed once the page is stored.
+            // What Graph can't give yet is listed as the page is stored.
             let repairs = self
                 .complete_all(new.into_iter().zip(&mut incomings).collect())
                 .await;
-            {
-                let mut s = lock(store);
-                stored += s.batch(|b| {
-                    let mut new = 0;
-                    for incoming in &incomings {
-                        if let Added::New(_) = b.add_incoming(incoming, false)? {
-                            new += 1;
-                        }
+            stored += lock(store).batch(|b| {
+                let mut new = 0;
+                for incoming in &incomings {
+                    if let Added::New(_) = b.add_incoming(incoming, false)? {
+                        new += 1;
                     }
-                    Ok(new)
-                })?;
-                listed_for_repair(&s, account_id, repairs)?;
-            }
+                }
+                listed_for_repair(b, account_id, repairs)?;
+                Ok(new)
+            })?;
             offset += page.value.len();
             if let Some(oldest) = page
                 .value
@@ -1147,14 +1149,13 @@ impl Graph {
                 found.push((to_incoming(account_id, m), folder));
             }
         }
-        // What Graph can't give yet is listed once it's stored, for the
+        // What Graph can't give yet is listed as it's stored, for the
         // account's rounds to fetch.
         let incomings = found.iter_mut().map(|(incoming, _)| incoming);
         let repairs = self
             .complete_all(new.into_iter().zip(incomings).collect())
             .await;
-        let mut s = lock(store);
-        let stored = s.batch(|b| {
+        Ok(lock(store).batch(|b| {
             let mut stored = 0;
             for (incoming, folder) in &found {
                 let added = match folder {
@@ -1165,10 +1166,9 @@ impl Graph {
                     stored += 1;
                 }
             }
+            listed_for_repair(b, account_id, repairs)?;
             Ok(stored)
-        })?;
-        listed_for_repair(&s, account_id, repairs)?;
-        Ok(stored)
+        })?)
     }
 
     /// Creates a folder, in `parent` (a folder id) or at the top; returns its id.
@@ -1254,7 +1254,7 @@ impl Graph {
     /// Completes new messages, each given with its message as listed, a
     /// few at a time (`parts`); one listed twice is completed once. What
     /// Graph can't give yet is left out, and returned for the caller to
-    /// list once they're stored (`listed_for_repair`). Once Graph holds off
+    /// list as they're stored (`listed_for_repair`). Once Graph holds off
     /// the whole account no more start, and the rest are returned missing
     /// all of it.
     async fn complete_all(&self, new: Vec<(&GraphMessage, &mut Incoming)>) -> Vec<Repair> {
@@ -1265,7 +1265,7 @@ impl Graph {
             .collect();
         let fetching = new
             .iter()
-            .map(|(m, _)| self.parts(&m.id, Missing::of(m)))
+            .map(|(m, _)| self.parts(&m.id, Missing::of(m), None))
             .collect();
         let mut fetched: Vec<Option<Parts>> = new.iter().map(|_| None).collect();
         in_turns(fetching, |i, parts| {
@@ -1300,11 +1300,11 @@ impl Graph {
     /// Graph won't give is left out, such as an attachment deleted since
     /// the message was listed or a listing it can't read. What it may give
     /// later is `missing`; once it holds off the whole account, the rest
-    /// isn't asked for.
-    async fn parts(&self, id: &str, wanted: Missing) -> Parts {
+    /// isn't asked for. Each request may take `limit` (`part`).
+    async fn parts(&self, id: &str, wanted: Missing, limit: Option<Duration>) -> Parts {
         let mut parts = Parts::default();
         if wanted.attachments {
-            match self.part(&attachment_listing(id)).await {
+            match self.part(&attachment_listing(id), limit).await {
                 Part::Settled(listing) => {
                     parts.attachments = listing
                         .and_then(|l| serde_json::from_slice::<Attachments>(&l).ok())
@@ -1322,7 +1322,7 @@ impl Graph {
             // Exchange keeps meeting messages as items of their own and
             // writes the calendar part out only in their MIME.
             let mime = format!("/me/messages/{}/$value", path(id));
-            match self.part(&mime).await {
+            match self.part(&mime, limit).await {
                 Part::Settled(raw) => {
                     parts.invite = raw
                         .and_then(|raw| Invite::from_raw(&raw))
@@ -1339,12 +1339,18 @@ impl Graph {
 
     /// The body of Graph's answer to `url`, for `parts`: `None` if Graph
     /// won't give it. `Later` if it may when asked again (`everyone`,
-    /// `later`), or the answer was cut off.
-    async fn part(&self, url: &str) -> Part {
-        let response = match self
-            .answered_patiently(|| self.request(Method::GET, url))
-            .await
-        {
+    /// `later`), or the answer was cut off. Each try may take `limit` from
+    /// when it's sent until its answer is in, else the client's limit: one
+    /// that takes longer is cut off too.
+    async fn part(&self, url: &str, limit: Option<Duration>) -> Part {
+        let request = || {
+            let request = self.request(Method::GET, url);
+            match limit {
+                Some(limit) => request.timeout(limit),
+                None => request,
+            }
+        };
+        let response = match self.answered_patiently(request).await {
             Ok(response) => response,
             Err(Unanswered::Held) => return Part::Later { everyone: true },
             Err(Unanswered::Failed(_)) => return Part::Later { everyone: false },
@@ -1364,17 +1370,18 @@ impl Graph {
     /// Fetches what new mail was stored without, as Graph couldn't give it
     /// then (`SyncState::repair`): for the first `REPAIR_BATCH` messages
     /// listed, a few at a time, for `REPAIR_TIME` at most, keeping to the
-    /// account's pause. What comes is written into the stored message and
-    /// taken off the list (`repaired`), as is what Graph won't give, and a
-    /// message no longer stored. What may come later goes to the end of the
-    /// list, for a later round.
+    /// account's pause. Each request may take `REPAIR_REQUEST_TIME`. What
+    /// comes is written into the stored message and taken off the list
+    /// (`repaired`), as is what Graph won't give, and a message no longer
+    /// stored. What may come later goes to the end of the list, for a later
+    /// round, as does what's cut off when the time is up.
     ///
     /// Never fails, so a round can't for it. Returns how many stored
     /// messages changed. `now` is Unix ms.
     pub async fn repair(&self, store: &Mutex<Store>, account_id: i64, now: i64) -> usize {
         let mut due = Vec::new();
         {
-            let s = lock(store);
+            let mut s = lock(store);
             let Ok(Some(state)) = stored_state(&s, account_id) else {
                 return 0;
             };
@@ -1390,20 +1397,37 @@ impl Graph {
             }
             if !gone.is_empty() {
                 // Tried again next round if this fails.
-                let _ = change_repairs(&s, account_id, |list| {
-                    list.retain(|r| !gone.contains(&r.id));
+                let _ = s.batch(|b| {
+                    change_repairs(b, account_id, |list| {
+                        list.retain(|r| !gone.contains(&r.id));
+                    })
                 });
             }
         }
         let mut changed = 0;
-        let fetching = due.iter().map(|r| self.parts(&r.id, r.missing)).collect();
-        let fetched = in_turns(fetching, |i, parts| {
-            let more = !parts.everyone;
-            changed += usize::from(repaired(&lock(store), account_id, &due[i], parts, now));
+        let end = tokio::time::Instant::now() + self.repair_time;
+        let fetching = due
+            .iter()
+            .map(|r| async move {
+                let limit = Some(self.repair_request_time);
+                let fetched = tokio::time::timeout_at(end, self.parts(&r.id, r.missing, limit));
+                // Cut off, it goes to the end of the list as when Graph holds
+                // off the account, without counting as a try of its own: it
+                // may have been waiting out the account's pause.
+                fetched.await.unwrap_or_else(|_| Parts {
+                    missing: r.missing,
+                    everyone: true,
+                    ..Default::default()
+                })
+            })
+            .collect();
+        in_turns(fetching, |i, parts| {
+            let more = !parts.everyone && tokio::time::Instant::now() < end;
+            let mut s = lock(store);
+            changed += usize::from(repaired(&mut s, account_id, &due[i], parts, now));
             more
-        });
-        // What's under way then is left on the list, as it was.
-        let _ = tokio::time::timeout(REPAIR_TIME, fetched).await;
+        })
+        .await;
         changed
     }
 
@@ -2215,31 +2239,40 @@ fn state_json(state: &SyncState) -> String {
 }
 
 /// Changes the account's repair list (`SyncState::repair`) where it's
-/// stored, in one go.
+/// stored, in one go: read and written in batch `b`, under the store's
+/// lock, so what another round or search changed meanwhile stays.
 fn change_repairs(
-    store: &Store,
+    b: &Batch,
     account_id: i64,
     change: impl FnOnce(&mut Vec<Repair>),
-) -> Result<()> {
-    let Some(mut state) = stored_state(store, account_id)? else {
+) -> spark_store::Result<()> {
+    let stored = b.sync_state(account_id)?;
+    let Some(mut state) = stored.and_then(|json| serde_json::from_str::<SyncState>(&json).ok())
+    else {
         return Ok(());
     };
     let before = state.repair.clone();
     change(&mut state.repair);
     if state.repair != before {
-        store.set_sync_state(account_id, &state_json(&state))?;
+        b.set_sync_state(account_id, &state_json(&state))?;
     }
     Ok(())
 }
 
 /// Lists `repairs` (`Graph::complete_all`) for the account's rounds to
-/// fetch, once the batch storing their messages is in. A message listed
-/// already is missing what it was, and these too.
-fn listed_for_repair(store: &Store, account_id: i64, repairs: Vec<Repair>) -> Result<()> {
+/// fetch, in the batch that stores their messages: a message is never
+/// stored without what it's missing being listed, even if the app is
+/// killed then. A message listed already is missing what it was, and
+/// these too.
+fn listed_for_repair(b: &Batch, account_id: i64, repairs: Vec<Repair>) -> spark_store::Result<()> {
     if repairs.is_empty() {
         return Ok(());
     }
-    change_repairs(store, account_id, |list| {
+    #[cfg(test)]
+    if tests::LISTING_FAILS.take() {
+        return Err(spark_store::Error::InvalidQuery);
+    }
+    change_repairs(b, account_id, |list| {
         for new in repairs {
             match list.iter_mut().find(|r| r.id == new.id) {
                 Some(listed) => {
@@ -2259,7 +2292,7 @@ fn listed_for_repair(store: &Store, account_id: i64, repairs: Vec<Repair>) -> Re
 /// of its own for the `REPAIR_TRIES`th time, `REPAIR_FOR_MS` or more after
 /// it was stored (`now`), it's given up on. Returns whether the stored
 /// message changed.
-fn repaired(store: &Store, account_id: i64, asked: &Repair, parts: Parts, now: i64) -> bool {
+fn repaired(store: &mut Store, account_id: i64, asked: &Repair, parts: Parts, now: i64) -> bool {
     let came = !parts.attachments.is_empty() || parts.invite.is_some();
     let stored = if came {
         match store.fill_in_remote(
@@ -2276,8 +2309,7 @@ fn repaired(store: &Store, account_id: i64, asked: &Repair, parts: Parts, now: i
         true
     };
     let settled = asked.missing.without(parts.missing);
-    // Left as it was if this fails: what came is fetched again.
-    let _ = change_repairs(store, account_id, |list| {
+    let change = |list: &mut Vec<Repair>| {
         let Some(at) = list.iter().position(|r| r.id == asked.id) else {
             return;
         };
@@ -2302,7 +2334,9 @@ fn repaired(store: &Store, account_id: i64, asked: &Repair, parts: Parts, now: i
             }
         }
         list.push(r);
-    });
+    };
+    // Left as it was if this fails: what came is fetched again.
+    let _ = store.batch(|b| change_repairs(b, account_id, change));
     came && stored
 }
 
@@ -2465,10 +2499,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::cell::Cell;
+    use std::ops::Range;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 
     use super::*;
+
+    thread_local! {
+        /// Fails the next listing for repair (`listed_for_repair`), as
+        /// though the app were killed as it wrote it.
+        pub(crate) static LISTING_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
 
     #[test]
     fn dates_round_trip() {
@@ -4030,6 +4072,12 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         state.unwrap().repair
     }
 
+    /// Lists `repairs` on the account's repair list, as a sync would.
+    fn list_for_repair(store: &Mutex<Store>, account_id: i64, repairs: Vec<Repair>) {
+        let listed = lock(store).batch(|b| listed_for_repair(b, account_id, repairs));
+        listed.unwrap();
+    }
+
     /// The Graph ids on the account's repair list, in its order.
     fn listed(store: &Mutex<Store>, account_id: i64) -> Vec<String> {
         let list = repair_list(store, account_id);
@@ -4301,10 +4349,13 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         assert!(titled(&store, "Message n2").unwrap().attachment.is_none());
         let since = repair_list(&store, account_id)[0].since;
         // As though it had failed often enough of its own already.
-        change_repairs(&lock(&store), account_id, |list| {
-            list[0].tries = REPAIR_TRIES;
-        })
-        .unwrap();
+        lock(&store)
+            .batch(|b| {
+                change_repairs(b, account_id, |list| {
+                    list[0].tries = REPAIR_TRIES;
+                })
+            })
+            .unwrap();
 
         // They hold up the account, not n2: they aren't its tries, and
         // however long they last it isn't given up on.
@@ -4359,17 +4410,13 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
 
         // A week since it was stored isn't enough without the tries: a
         // computer that was off meanwhile tries again first.
-        listed_for_repair(
-            &lock(&store),
-            account_id,
-            vec![Repair {
-                id: "n2".into(),
-                missing: FILES,
-                since,
-                tries: 0,
-            }],
-        )
-        .unwrap();
+        let n2 = Repair {
+            id: "n2".into(),
+            missing: FILES,
+            since,
+            tries: 0,
+        };
+        list_for_repair(&store, account_id, vec![n2]);
         for tries in 1..REPAIR_TRIES {
             graph.repair(&store, account_id, week).await;
             assert_eq!(repair_list(&store, account_id)[0].tries, tries);
@@ -4546,24 +4593,241 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         }
     }
 
+    #[tokio::test]
+    async fn a_chunk_is_stored_with_its_repair_listing_or_not_at_all() {
+        // Graph fails to list m7's attachments while `down`.
+        let down = Arc::new(AtomicBool::new(true));
+        let failing = down.clone();
+        let (base, _) = serve(move |asked, attempt| {
+            if asked.path.starts_with("/me/messages/m7/attachments") && failing.load(SeqCst) {
+                return Answer::status(500);
+            }
+            attached(asked, attempt)
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let folder = projects(&store, account_id);
+        let mut state = FolderState {
+            limit: Some(STORE_BATCH),
+            ..Default::default()
+        };
+        let unsynced = state.clone();
+
+        // The app is killed as it lists m7: none of the chunk is stored.
+        LISTING_FAILS.set(true);
+        let killed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert!(killed.is_err());
+        assert!(lock(&store).messages().unwrap().is_empty());
+        assert!(listed(&store, account_id).is_empty());
+        assert_eq!(state, unsynced);
+
+        // Started again, the folder's next sync stores it all, and lists
+        // m7, whose file comes once Graph gives it.
+        let synced = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(synced.unwrap(), Some(50));
+        assert_eq!(listed(&store, account_id), ["m7"]);
+        down.store(false, SeqCst);
+        let now = spark_store::now_ms();
+        assert_eq!(graph.repair(&store, account_id, now).await, 1);
+        let m7 = titled(&store, "Message m7").unwrap();
+        assert_eq!(m7.attachment.as_deref(), Some("m7.pdf"));
+    }
+
+    #[tokio::test]
+    async fn reaching_back_stores_a_page_with_its_repair_listing_or_not_at_all() {
+        let (base, _) = serve(invite_fails_once).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(250) + 1_800_000),
+            ..Default::default()
+        };
+        let unsynced = state.clone();
+
+        // Killed as it lists i300's invite: none of the page is stored, and
+        // reaching back hasn't moved.
+        LISTING_FAILS.set(true);
+        let killed = graph.older_inbox(&store, account_id, &mut state).await;
+        assert!(killed.is_err());
+        assert!(lock(&store).messages().unwrap().is_empty());
+        assert!(listed(&store, account_id).is_empty());
+        assert_eq!(state, unsynced);
+
+        // The next try gets the page again, i300 with its invite this time.
+        let stored = graph.older_inbox(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 100);
+        let i300 = titled(&store, "Message i300").unwrap();
+        let content = lock(&store).content(i300.id).unwrap().unwrap();
+        assert!(content.invite.is_some());
+        assert!(listed(&store, account_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_search_stores_what_it_finds_with_its_repair_listing_or_not_at_all() {
+        let down = Arc::new(AtomicBool::new(true));
+        let (base, _) = serve(searchable_with_files(down.clone())).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = searched_store();
+        let state = searchable_state(&base);
+        let query = Query::parse("invoice");
+
+        // Killed as it lists what it found: none of it is stored.
+        LISTING_FAILS.set(true);
+        let killed = graph.search_server(&store, account_id, &state, &query);
+        assert!(killed.await.is_err());
+        assert_eq!(
+            lock(&store).messages().unwrap().len(),
+            1,
+            "k4, stored before"
+        );
+        assert!(listed(&store, account_id).is_empty());
+
+        // Searched again, it's stored and listed, and the files come.
+        let found = graph.search_server(&store, account_id, &state, &query);
+        assert_eq!(found.await.unwrap(), 3);
+        let mut missing = listed(&store, account_id);
+        missing.sort_unstable();
+        assert_eq!(missing, ["a8", "i20", "m5"]);
+        down.store(false, SeqCst);
+        let now = spark_store::now_ms();
+        assert_eq!(graph.repair(&store, account_id, now).await, 3);
+    }
+
+    /// Stores m`n` for each of `numbers` without its file, and lists it
+    /// for repair, in that order.
+    fn stored_without_files(store: &Mutex<Store>, account_id: i64, numbers: Range<usize>) {
+        let mut repairs = Vec::new();
+        for n in numbers {
+            let m = Incoming {
+                account_id,
+                remote_id: Some(format!("m{n}")),
+                subject: format!("Message m{n}"),
+                date: received(n),
+                ..Default::default()
+            };
+            lock(store).add_incoming(&m, false).unwrap();
+            repairs.push(Repair {
+                id: format!("m{n}"),
+                missing: FILES,
+                since: 0,
+                tries: 0,
+            });
+        }
+        list_for_repair(store, account_id, repairs);
+    }
+
+    /// A stand-in for Graph listing a message's file, named for it
+    /// (`m7.pdf`): at once, but m0's to m3's take far longer than a round.
+    fn slow_m0_to_m3(asked: &Asked, _: usize) -> Answer {
+        let rest = asked.path.strip_prefix("/me/messages/");
+        let Some((id, _)) = rest.and_then(|rest| rest.split_once("/attachments")) else {
+            return Answer::status(404);
+        };
+        let answer = Answer::json(json!({ "value": [
+            { "id": "a1", "name": format!("{id}.pdf"), "contentType": "application/pdf", "size": 10 }
+        ] }));
+        match number(id) {
+            0..4 => answer.after(Duration::from_secs(600)),
+            _ => answer,
+        }
+    }
+
+    /// The ids and tries on the account's repair list, sorted.
+    fn tries(store: &Mutex<Store>, account_id: i64) -> Vec<(String, u32)> {
+        let list = repair_list(store, account_id);
+        let mut tries: Vec<_> = list.into_iter().map(|r| (r.id, r.tries)).collect();
+        tries.sort_unstable();
+        tries
+    }
+
+    /// The files stored for m`n` for each of `numbers`.
+    fn files_of(store: &Mutex<Store>, numbers: Range<usize>) -> Vec<Option<String>> {
+        numbers
+            .map(|n| titled(store, &format!("Message m{n}")).unwrap().attachment)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_repair_too_slow_fails_a_try_of_its_own_and_lets_the_rest_through() {
+        let (base, seen) = serve(slow_m0_to_m3).await;
+        let graph = Graph {
+            repair_request_time: Duration::from_millis(300),
+            ..Graph::with_base(&base, "token")
+        };
+        let (store, account_id) = microsoft_store();
+        stored_without_files(&store, account_id, 0..8);
+
+        // The round waits out the account's pause, longer than a request
+        // may take, which doesn't count against them. Then m0 to m3 take
+        // too long: each fails a try of its own and goes to the end of the
+        // list, and m4 to m7 come after them.
+        let paused = tokio::time::Instant::now() + Duration::from_millis(600);
+        pause_until(&graph.standing, Some(paused));
+        let now = spark_store::now_ms();
+        assert_eq!(graph.repair(&store, account_id, now).await, 4);
+        assert!(seen.take().iter().all(|a| a.at >= paused.into_std()));
+        let failed: Vec<_> = (0..4).map(|n| (format!("m{n}"), 1)).collect();
+        assert_eq!(tries(&store, account_id), failed);
+        let came: Vec<_> = (4..8).map(|n| Some(format!("m{n}.pdf"))).collect();
+        assert_eq!(files_of(&store, 4..8), came);
+        assert!(files_of(&store, 0..4).iter().all(Option::is_none));
+
+        // Each round counts another.
+        assert_eq!(graph.repair(&store, account_id, now).await, 0);
+        let failed: Vec<_> = (0..4).map(|n| (format!("m{n}"), 2)).collect();
+        assert_eq!(tries(&store, account_id), failed);
+    }
+
+    #[tokio::test]
+    async fn what_a_repair_round_has_no_time_left_for_goes_to_the_end() {
+        let (base, _) = serve(slow_m0_to_m3).await;
+        // The round runs out before a request would.
+        let graph = Graph {
+            repair_time: Duration::from_millis(500),
+            ..Graph::with_base(&base, "token")
+        };
+        let (store, account_id) = microsoft_store();
+        stored_without_files(&store, account_id, 0..8);
+
+        // m0 to m3 are cut off and go to the end of the list, not counting
+        // it as a try: they may have been waiting out the account's pause.
+        // m4 to m7 never started, and keep their places.
+        let now = spark_store::now_ms();
+        assert_eq!(graph.repair(&store, account_id, now).await, 0);
+        let list = listed(&store, account_id);
+        assert_eq!(list[..4], ["m4", "m5", "m6", "m7"]);
+        let mut cut = list[4..].to_vec();
+        cut.sort_unstable();
+        assert_eq!(cut, ["m0", "m1", "m2", "m3"]);
+        assert!(repair_list(&store, account_id).iter().all(|r| r.tries == 0));
+
+        // So the next round comes to m4 to m7.
+        assert_eq!(graph.repair(&store, account_id, now).await, 4);
+        let came: Vec<_> = (4..8).map(|n| Some(format!("m{n}.pdf"))).collect();
+        assert_eq!(files_of(&store, 4..8), came);
+        let cut: Vec<_> = (0..4).map(|n| (format!("m{n}"), 0)).collect();
+        assert_eq!(tries(&store, account_id), cut);
+    }
+
     #[test]
     fn repair_lists_survive_saving_the_rest_of_the_state() {
         let (store, account_id) = microsoft_store();
-        let s = lock(&store);
         let n2 = Repair {
             id: "n2".into(),
             missing: FILES,
             since: 5,
             tries: 0,
         };
-        listed_for_repair(&s, account_id, vec![n2.clone()]).unwrap();
+        list_for_repair(&store, account_id, vec![n2.clone()]);
         // A round's copy, read before n2 was listed, moves the delta link.
         let round = SyncState {
             delta_link: Some("/delta2".into()),
             ..Default::default()
         };
-        save_state(&s, account_id, &round).unwrap();
-        let stored = stored_state(&s, account_id).unwrap().unwrap();
+        save_state(&lock(&store), account_id, &round).unwrap();
+        let stored = stored_state(&lock(&store), account_id).unwrap().unwrap();
         assert_eq!(stored.delta_link.as_deref(), Some("/delta2"));
         assert_eq!(stored.repair, std::slice::from_ref(&n2));
 
@@ -4576,7 +4840,7 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
             since: 9,
             ..n2.clone()
         };
-        listed_for_repair(&s, account_id, vec![invite]).unwrap();
+        list_for_repair(&store, account_id, vec![invite]);
         let both = Repair {
             missing: Missing {
                 attachments: true,
@@ -4584,11 +4848,12 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
             },
             ..n2
         };
-        assert_eq!(
-            stored_state(&s, account_id).unwrap().unwrap().repair,
-            [both]
-        );
-        let json = s.account(account_id).unwrap().unwrap().sync_state;
+        assert_eq!(repair_list(&store, account_id), [both]);
+        let json = lock(&store)
+            .account(account_id)
+            .unwrap()
+            .unwrap()
+            .sync_state;
         assert!(
             json.contains(
                 r#""repair":[{"id":"n2","attachments":true,"invite":true,"since":5,"tries":0}]"#

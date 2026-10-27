@@ -160,6 +160,38 @@ test("a load under way when the cache clears answers its asker but isn't kept", 
   assert.equal(cache.weight(), 0);
 });
 
+test("forgetting a value lets its load under way go: that answers its asker, but only a new one is kept", async () => {
+  const s = server((id: number) => body(id, 100));
+  const cache = loadCache({ fetch: s.fetch, budget: 1_000_000, entryMax: 100_000 });
+  const first = cache.load(2);
+  await s.answer();
+  await first;
+  cache.forget(2);
+  assert.equal(cache.get(2), undefined);
+  assert.equal(cache.weight(), 0);
+
+  const old = cache.load(1);
+  cache.forget(1);
+  const fresh = cache.load(1);
+  assert.notEqual(fresh, old);
+  await s.answer(1);
+  assert.ok(await old);
+  assert.equal(cache.get(1), undefined);
+  // The old load settling mustn't drop the new one, or this ask would fetch again.
+  assert.equal(cache.load(1), fresh);
+  await s.answer();
+  await fresh;
+  assert.ok(cache.get(1));
+  assert.deepEqual(s.asked, [2, 1, 1]);
+  // Another id's value and load are left be.
+  const other = cache.load(3);
+  cache.forget(1);
+  await s.answer();
+  await other;
+  assert.ok(cache.get(3));
+  assert.equal(cache.get(1), undefined);
+});
+
 test("update replaces a kept value and weighs it again, but keeps nothing new", async () => {
   const cache = loadCache({ fetch: async (id: number) => body(id, 100), budget: 1_000_000, entryMax: 100_000 });
   cache.update(1, (content) => ({ ...content, html: "changed" }));

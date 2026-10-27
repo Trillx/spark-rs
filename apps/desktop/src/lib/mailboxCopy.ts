@@ -98,6 +98,27 @@ export function mailboxCopy(): MailboxCopy {
 }
 
 /**
+ * Whether a message's stored content changed between two reads of it, so a body kept from before is stale: a sync
+ * filled in the attachments or invite it was stored without, as the server couldn't give them then. Its being read,
+ * pinned or moved doesn't change it.
+ */
+const contentChanged = (was: Message, now: Message) =>
+  was.attachment !== now.attachment || was.inviteKind !== now.inviteKind;
+
+/**
+ * The ids of messages in `changes` whose stored content changed since `copy` read them (`contentChanged`), for their
+ * kept bodies to be forgotten. Ask before `copy.apply` takes the changes in.
+ */
+export function staleContent(changes: MessageChanges, copy: MailboxCopy): number[] {
+  const stale: number[] = [];
+  for (const m of changes.messages) {
+    const was = copy.get(m.id);
+    if (was !== undefined && contentChanged(was, m)) stale.push(m.id);
+  }
+  return stale;
+}
+
+/**
  * `run`, once at a time: asked while it runs, it runs once more when it's done, for everyone who asked meanwhile.
  * Each caller gets the outcome of a run that started after they asked.
  */

@@ -927,11 +927,7 @@ impl Store {
     }
 
     pub fn set_sync_state(&self, id: i64, sync_state: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET sync_state = ?2 WHERE id = ?1",
-            params![id, sync_state],
-        )?;
-        Ok(())
+        set_sync_state_in(&self.conn, id, sync_state)
     }
 
     // ---- incoming mail ----
@@ -1859,6 +1855,28 @@ impl Batch<'_> {
     pub fn observe_gone_remote(&self, account_id: i64, remote_id: &str) -> Result<usize> {
         observe_gone_remote_in(self.conn, account_id, remote_id)
     }
+
+    /// The account's sync state (`Account::sync_state`) as the batch sees
+    /// it; `None` if the account is gone.
+    pub fn sync_state(&self, account_id: i64) -> Result<Option<String>> {
+        self.conn
+            .prepare_cached("SELECT sync_state FROM accounts WHERE id = ?1")?
+            .query_row([account_id], |r| r.get(0))
+            .optional()
+    }
+
+    /// `Store::set_sync_state`, in the batch: it commits with what the
+    /// batch stores, or not at all.
+    pub fn set_sync_state(&self, account_id: i64, sync_state: &str) -> Result<()> {
+        set_sync_state_in(self.conn, account_id, sync_state)
+    }
+}
+
+/// `Store::set_sync_state`, in the caller's transaction.
+fn set_sync_state_in(conn: &Connection, id: i64, sync_state: &str) -> Result<()> {
+    conn.prepare_cached("UPDATE accounts SET sync_state = ?2 WHERE id = ?1")?
+        .execute(params![id, sync_state])?;
+    Ok(())
 }
 
 /// `Store::add_incoming`, in the caller's transaction.
