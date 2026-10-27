@@ -226,8 +226,6 @@ pub struct SendOutcome {
 
 /// A queued send failing on the network, try after try (`Engine::send_due`).
 struct FailingSend {
-    /// Its draft's hash: an outbox id is given again once its send is gone.
-    draft: u64,
     /// When it first failed, and how many tries have since.
     since: i64,
     tries: u32,
@@ -270,15 +268,6 @@ impl Drop for Trying<'_> {
         }
         self.engine.send_tried.notify_waiters();
     }
-}
-
-/// A queued draft's hash, which tells it from another send given its
-/// outbox id later (`FailingSend::draft`).
-fn draft_hash(draft: &str) -> u64 {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    draft.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Whether an account's calendar can show.
@@ -400,8 +389,8 @@ pub struct Engine {
     /// Per message whose body is downloading (`fetch_body`), taken by each
     /// asker in turn, so it's downloaded once.
     bodies: Mutex<HashMap<i64, Arc<AsyncMutex<()>>>>,
-    /// Queued sends failing on the network, by outbox id, in memory only:
-    /// a restart counts their tries again.
+    /// Queued sends failing on the network, by outbox id (never another
+    /// send's), in memory only: a restart counts their tries again.
     failing_sends: Mutex<HashMap<i64, FailingSend>>,
     /// A try of a queued send ended (`Trying`).
     send_tried: Notify,
@@ -1877,7 +1866,7 @@ impl Engine {
         let due = self.store().due_sends(account_id, now_ms())?;
         for id in due {
             // Taken back or put off meanwhile.
-            let Some(json) = self.store().claim_send(id, now_ms())? else {
+            let Some(json) = self.store().claim_send(id, account_id, now_ms())? else {
                 continue;
             };
             let mut trying = Trying {
@@ -1956,7 +1945,7 @@ impl Engine {
             // Offline or the server is busy: keep it queued.
             Err(e @ Error::Network { .. }) => {
                 self.store().retry_send(id, now_ms() + SEND_RETRY_MS)?;
-                queued = self.failed_again(id, json, &e, now_ms());
+                queued = self.failed_again(id, &e, now_ms());
                 if queued { Err(e) } else { Ok(false) }
             }
             Err(e) => {
@@ -2003,18 +1992,13 @@ impl Engine {
             .filter(|found| Some(*found) != draft.draft_id)
     }
 
-    /// Counts a try of queued send `id` (`draft`, as queued) that failed on
-    /// the network at `now`, with `error`. Whether the user is to hear of it
-    /// now: once, when it has failed `SEND_TELL_TRIES` in a row, over
+    /// Counts a try of queued send `id` that failed on the network at
+    /// `now`, with `error`. Whether the user is to hear of it now: once,
+    /// when it has failed `SEND_TELL_TRIES` in a row, over
     /// `SEND_TELL_AFTER_MS`.
-    fn failed_again(&self, id: i64, draft: &str, error: &Error, now: i64) -> bool {
-        let draft = draft_hash(draft);
+    fn failed_again(&self, id: i64, error: &Error, now: i64) -> bool {
         let mut failing = self.failing_sends_lock();
-        if failing.get(&id).is_some_and(|f| f.draft != draft) {
-            failing.remove(&id);
-        }
         let failing = failing.entry(id).or_insert(FailingSend {
-            draft,
             since: now,
             tries: 0,
             error: String::new(),
@@ -2039,19 +2023,16 @@ impl Engine {
     /// with Send Later, and those failing on the network (`send_due_each`),
     /// so one that can't go yet can be found, changed or taken back.
     pub fn waiting_sends(&self) -> Result<Vec<WaitingSend>> {
-        let failing: HashMap<i64, (u64, String)> = self
+        let failing: HashMap<i64, String> = self
             .failing_sends_lock()
             .iter()
-            .map(|(id, f)| (*id, (f.draft, f.error.clone())))
+            .map(|(id, f)| (*id, f.error.clone()))
             .collect();
         let sends = self.store().outbox_sends()?;
         Ok(sends
             .into_iter()
             .filter_map(|send| {
-                let failed = failing
-                    .get(&send.id)
-                    .filter(|(draft, _)| *draft == draft_hash(&send.draft))
-                    .map(|(_, error)| error.clone());
+                let failed = failing.get(&send.id).cloned();
                 let draft: Draft = serde_json::from_str(&send.draft).ok()?;
                 (failed.is_some() || draft.send_later.is_some()).then_some(WaitingSend {
                     id: send.id,
@@ -2104,10 +2085,15 @@ impl Engine {
 
     /// Sends a queued send at `at` instead, or with `None` now (it's no
     /// longer scheduled), once a try of it under way is over
-    /// (`between_tries`). False once it's gone.
+    /// (`between_tries`). False once it's gone. Moved, it counts its
+    /// failures afresh.
     pub async fn reschedule(&self, outbox_id: i64, at: Option<i64>) -> Result<bool> {
         self.between_tries(outbox_id, |store| {
-            Ok(store.reschedule_send(outbox_id, at, now_ms())?)
+            let moved = store.reschedule_send(outbox_id, at, now_ms())?;
+            if moved {
+                self.failing_sends_lock().remove(&outbox_id);
+            }
+            Ok(moved)
         })
         .await
     }
@@ -5334,17 +5320,13 @@ mod tests {
         );
         let minute = 60_000;
         let offline = Error::network("smtp.example.com", "offline");
-        let failed_again = |draft, at| engine.failed_again(1, draft, &offline, at);
+        let failed_again = |at| engine.failed_again(1, &offline, at);
         // Offline over sleep: a try before and after, an hour apart.
-        assert!(!failed_again("a", 0));
-        assert!(!failed_again("a", 60 * minute));
+        assert!(!failed_again(0));
+        assert!(!failed_again(60 * minute));
         // Ten minutes and the third try in a row.
-        assert!(failed_again("a", 61 * minute));
-        assert!(!failed_again("a", 62 * minute));
-        // An outbox id given again to another send counts afresh.
-        assert!(!failed_again("b", 63 * minute));
-        assert!(!failed_again("b", 73 * minute));
-        assert!(failed_again("b", 74 * minute));
+        assert!(failed_again(61 * minute));
+        assert!(!failed_again(62 * minute));
     }
 
     /// An SMTP server that holds each connection until `release` is told
@@ -5494,14 +5476,14 @@ mod tests {
     async fn each_send_is_told_of_as_soon_as_its_try_is_over() {
         let mut store = Store::open_in_memory().unwrap();
         let account = test_account(&mut store, smtp_offline().await).id;
-        let (first, queued) = queue_to_ana(&mut store, account, "First", 0);
+        let (first, _) = queue_to_ana(&mut store, account, "First", 0);
         let (second, _) = queue_to_ana(&mut store, account, "Second", 1);
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
         // The first has failed twice over ten minutes: this try is told of.
         let offline = Error::network("127.0.0.1", "offline");
         let then = now_ms() - SEND_TELL_AFTER_MS;
         for _ in 1..SEND_TELL_TRIES {
-            assert!(!engine.failed_again(first, &queued, &offline, then));
+            assert!(!engine.failed_again(first, &offline, then));
         }
 
         // As each is told of, the next hasn't been tried yet, and the one
@@ -5579,25 +5561,37 @@ mod tests {
         assert!(
             engine
                 .store()
-                .claim_send(failing, i64::MAX)
+                .claim_send(failing, account, i64::MAX)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(listed(&engine)[0], (failing, true, true));
         engine.store().release_send(failing).unwrap();
 
-        // Taken back, it's gone; and its outbox id, given to a send in its
-        // undo window, isn't taken for the failing one.
+        // Taken back, it's gone; a send queued after it is another.
         assert!(engine.store().cancel_send(stuck).unwrap());
         let (again, _) = {
             let mut store = engine.store();
             queue_to_ana(&mut store, account, "Again", now_ms() + 5_000)
         };
-        assert_eq!(again, stuck, "the same outbox id");
+        assert!(again > stuck, "a new outbox id");
         assert_eq!(
             listed(&engine),
             [(failing, true, false), (later, false, false)]
         );
+
+        // Moved, it's listed by its new time, and counts its tries afresh.
+        assert!(
+            engine
+                .reschedule(failing, Some(i64::MAX / 4))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            listed(&engine),
+            [(failing, false, false), (later, false, false)]
+        );
+        assert!(!engine.failing_sends_lock().contains_key(&failing));
         assert!(engine.unschedule(failing, true).await.unwrap().is_some());
         assert_eq!(listed(&engine), [(later, false, false)]);
     }

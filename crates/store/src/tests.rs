@@ -1318,15 +1318,27 @@ fn due_sends_are_claimed_one_at_a_time() {
 
     // The one being tried can no longer be cancelled; the next one can.
     assert_eq!(
-        store.claim_send(b, 5_000).unwrap().as_deref(),
+        store.claim_send(b, account, 5_000).unwrap().as_deref(),
         Some("{\"b\":1}")
     );
     assert!(store.is_sending(b).unwrap() && !store.is_sending(a).unwrap());
     assert!(!store.cancel_send(b).unwrap());
-    assert_eq!(store.claim_send(b, 5_000).unwrap(), None, "claimed once");
+    assert_eq!(
+        store.claim_send(b, account, 5_000).unwrap(),
+        None,
+        "claimed once"
+    );
     assert!(store.cancel_send(a).unwrap());
-    assert_eq!(store.claim_send(a, 5_000).unwrap(), None, "cancelled");
-    assert_eq!(store.claim_send(later, 5_000).unwrap(), None, "not due");
+    assert_eq!(
+        store.claim_send(a, account, 5_000).unwrap(),
+        None,
+        "cancelled"
+    );
+    assert_eq!(
+        store.claim_send(later, account, 5_000).unwrap(),
+        None,
+        "not due"
+    );
     assert_eq!(store.due_sends(account, 9_000).unwrap(), [later]);
 
     store.retry_send(b, 6_000).unwrap();
@@ -1335,11 +1347,144 @@ fn due_sends_are_claimed_one_at_a_time() {
     assert!(store.due_sends(account, 5_999).unwrap().is_empty());
 
     // A try cut off goes back in the queue as it was.
-    assert!(store.claim_send(b, 6_000).unwrap().is_some());
+    assert!(store.claim_send(b, account, 6_000).unwrap().is_some());
     assert!(store.release_send(b).unwrap());
     assert_eq!(store.due_sends(account, 6_000).unwrap(), [b]);
     store.finish_send(b).unwrap();
     assert!(!store.is_sending(b).unwrap() && !store.release_send(b).unwrap());
+}
+
+#[test]
+fn a_gone_sends_outbox_id_is_never_another_sends() {
+    let (mut store, personal) = store_with_account();
+    let work = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Imap,
+            email: "me@work.example",
+            name: "Me",
+            label: "Work",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let first = store.queue_send(personal, "{\"a\":1}", 0, &[]).unwrap();
+    let second = store.queue_send(personal, "{\"a\":2}", 0, &[]).unwrap();
+    // Personal's worker lists both, and tries the first a while.
+    assert_eq!(store.due_sends(personal, 0).unwrap(), [first, second]);
+    assert!(store.claim_send(first, personal, 0).unwrap().is_some());
+
+    // Meanwhile the second is taken back, and an email queued from Work.
+    assert!(store.cancel_send(second).unwrap());
+    let other = store.queue_send(work, "{\"b\":1}", 0, &[]).unwrap();
+    assert!(other > second, "a new id: {other}");
+    // Personal's worker comes to the second: gone, not Work's email.
+    assert_eq!(store.claim_send(second, personal, 0).unwrap(), None);
+    // A send is claimed only for its own account.
+    assert_eq!(store.claim_send(other, personal, 0).unwrap(), None);
+    assert_eq!(
+        store.claim_send(other, work, 0).unwrap().as_deref(),
+        Some("{\"b\":1}")
+    );
+    store.finish_send(other).unwrap();
+    assert!(store.queue_send(work, "{}", 0, &[]).unwrap() > other);
+}
+
+#[test]
+fn version_27_databases_keep_their_queue_and_give_no_outbox_id_twice() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v27-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v27.sqlite");
+    let _ = std::fs::remove_file(&path);
+    let file = OutboxFile {
+        name: "plan.pdf".into(),
+        mime: "application/pdf".into(),
+        data: b"%PDF".to_vec(),
+    };
+    let (account, kept, sending) = {
+        let mut store = Store::open(&path).unwrap();
+        // The queue as version 27 kept it: an id given again once the
+        // newest send is gone.
+        store
+            .conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE outbox;
+                 CREATE TABLE outbox (
+                     id INTEGER PRIMARY KEY,
+                     account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                     draft TEXT NOT NULL,
+                     send_at INTEGER NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'queued',
+                     draft_message INTEGER REFERENCES messages(id) ON DELETE SET NULL
+                 );
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA user_version = 27;",
+            )
+            .unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "a@b.c",
+                name: "A",
+                label: "A",
+                config: "{}",
+            })
+            .unwrap()
+            .id;
+        let kept = store
+            .queue_send(account, "{\"a\":1}", 5, std::slice::from_ref(&file))
+            .unwrap();
+        let sending = store.queue_send(account, "{\"a\":2}", 6, &[]).unwrap();
+        assert!(store.claim_send(sending, account, 9).unwrap().is_some());
+        (account, kept, sending)
+    };
+    let mut store = Store::open(&path).unwrap();
+    let version: i64 = store
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 28);
+    let queued: Vec<_> = store
+        .outbox_sends()
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.id, s.draft, s.send_at, s.sending))
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            (kept, "{\"a\":1}".to_owned(), 5, false),
+            (sending, "{\"a\":2}".to_owned(), 6, true)
+        ]
+    );
+    assert_eq!(
+        store.outbox_files(kept).unwrap(),
+        std::slice::from_ref(&file)
+    );
+
+    // The newest gone, its id isn't given again.
+    store.finish_send(sending).unwrap();
+    let next = store
+        .queue_send(account, "{}", 0, std::slice::from_ref(&file))
+        .unwrap();
+    assert!(next > sending, "{next}");
+    // Its files still go with it, and foreign keys are back on.
+    assert!(store.cancel_send(next).unwrap());
+    let files: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM outbox_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(files, 1);
+    let checked: bool = store
+        .conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap();
+    assert!(checked);
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert!(store.queue_send(account, "{}", 0, &[]).unwrap() > next);
+    drop(store);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

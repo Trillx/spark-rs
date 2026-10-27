@@ -647,6 +647,24 @@ ALTER TABLE messages ADD COLUMN invite TEXT;
 ALTER TABLE messages ADD COLUMN rsvp TEXT;
 ";
 
+/// Version 28: a send's outbox id is never given to another (AUTOINCREMENT),
+/// so what holds on to it (a try's failures, an Edit waiting out a try)
+/// can't come to mean another send, maybe another account's.
+const SCHEMA_28: &str = "
+CREATE TABLE outbox_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    draft TEXT NOT NULL,
+    send_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    draft_message INTEGER REFERENCES messages(id) ON DELETE SET NULL
+);
+INSERT INTO outbox_new (id, account_id, draft, send_at, status, draft_message)
+    SELECT id, account_id, draft, send_at, status, draft_message FROM outbox;
+DROP TABLE outbox;
+ALTER TABLE outbox_new RENAME TO outbox;
+";
+
 /// A message with no change waiting to be pushed, not snoozed and not set
 /// aside: nothing about it is the user's alone but its priority.
 const SETTLED: &str = "changed_at = 0 AND state NOT IN ('snoozed', 'aside')";
@@ -927,6 +945,17 @@ impl Store {
             )?;
             tx.pragma_update(None, "user_version", 27)?;
             tx.commit()?;
+        }
+        if version < 28 {
+            // SQLite's way to change a table: build it anew and copy it
+            // over, with foreign keys off so dropping the old one leaves
+            // the queued files that refer to it be.
+            conn.pragma_update(None, "foreign_keys", false)?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_28)?;
+            tx.pragma_update(None, "user_version", 28)?;
+            tx.commit()?;
+            conn.pragma_update(None, "foreign_keys", true)?;
         }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
         conn.execute_batch(&changes::WATCH_MESSAGES)?;
@@ -2123,15 +2152,16 @@ impl Store {
             .collect()
     }
 
-    /// Takes send `id` to try now, if it's still queued and due by `now`,
-    /// marking it as sending so it can no longer be cancelled. Returns its
-    /// draft (JSON).
-    pub fn claim_send(&self, id: i64, now: i64) -> Result<Option<String>> {
+    /// Takes send `id` to try now from `account_id`, if it's still queued
+    /// from there and due by `now`, marking it as sending so it can no
+    /// longer be cancelled. Returns its draft (JSON).
+    pub fn claim_send(&self, id: i64, account_id: i64, now: i64) -> Result<Option<String>> {
         self.conn
             .query_row(
                 "UPDATE outbox SET status = 'sending'
-                 WHERE id = ?1 AND status = 'queued' AND send_at <= ?2 RETURNING draft",
-                params![id, now],
+                 WHERE id = ?1 AND account_id = ?2 AND status = 'queued' AND send_at <= ?3
+                 RETURNING draft",
+                params![id, account_id, now],
                 |r| r.get(0),
             )
             .optional()
