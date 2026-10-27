@@ -1078,6 +1078,174 @@ async fn imap_inbox_reaches_back() {
     let _ = other.logout().await;
 }
 
+/// Changes a flag of the message with `message_id` in `mailbox`, as another
+/// client does.
+async fn store_flag(session: &mut imap::Session, mailbox: &str, message_id: &str, change: &str) {
+    session.select(mailbox).await.unwrap();
+    let uids = session
+        .uid_search(format!("HEADER Message-ID \"{message_id}\""))
+        .await
+        .unwrap();
+    let uid = uids.into_iter().next().unwrap();
+    let _: Vec<_> = session
+        .uid_store(uid.to_string(), change)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+}
+
+/// Deletes the message with `message_id` in `mailbox` for good, as another
+/// client does.
+async fn expunge(session: &mut imap::Session, mailbox: &str, message_id: &str) {
+    store_flag(session, mailbox, message_id, "+FLAGS.SILENT (\\Deleted)").await;
+    let _: Vec<_> = session
+        .expunge()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn imap_follows_changes_made_elsewhere() {
+    let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {
+        eprintln!("skipped: set SPARK_TEST_GREENMAIL to a GreenMail host");
+        return;
+    };
+    let imap = plain(&host, 3143);
+    let smtp = plain(&host, 3025);
+    let me = format!("elsewhere{}@example.com", now_ms());
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    append_many(&mut other, "INBOX", 5).await;
+    other.create("Projects").await.unwrap();
+    for n in 0..3 {
+        let (id, subject) = (format!("project{n}@x.com"), format!("Project {n}"));
+        other
+            .append("Projects", None, None, raw(&id, &subject))
+            .await
+            .unwrap();
+    }
+
+    let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+    let engine = Engine::new(store, Arc::new(MemorySecrets::default()));
+    let account = engine
+        .add_password_account(AccountKind::Imap, &me, "pw", "", imap.clone(), smtp.clone())
+        .await
+        .unwrap();
+    let first = Round {
+        fetch: true,
+        list_folders: true,
+        ..Default::default()
+    };
+    assert_eq!(engine.run_round(account.id, &first).await.unwrap().new, 5);
+    let projects = folder_id(&engine, "Projects");
+    let both = Round {
+        fetch: true,
+        folders: vec![projects],
+        ..Default::default()
+    };
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert_eq!(report.folder_changes, 3, "{report:?}");
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert!(!report.changed(), "a quiet round: {report:?}");
+    eprintln!("modseq: {:?}", account_state(&engine, account.id).modseq);
+    let in_projects = |subject: &str| find(&engine, subject).folders.contains(&projects);
+
+    // Read and flagged elsewhere, in the inbox and the folder.
+    store_flag(&mut other, "INBOX", "old1@x.com", "+FLAGS.SILENT (\\Seen)").await;
+    store_flag(
+        &mut other,
+        "INBOX",
+        "old2@x.com",
+        "+FLAGS.SILENT (\\Flagged)",
+    )
+    .await;
+    store_flag(
+        &mut other,
+        "Projects",
+        "project1@x.com",
+        "+FLAGS.SILENT (\\Seen \\Flagged)",
+    )
+    .await;
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert_eq!((report.new, report.gone), (0, 0), "{report:?}");
+    assert!(!find(&engine, "Old 1").unread);
+    assert!(find(&engine, "Old 2").pinned && find(&engine, "Old 2").unread);
+    let project = find(&engine, "Project 1");
+    assert!(project.pinned && !project.unread);
+
+    // Marked unread again.
+    store_flag(&mut other, "INBOX", "old1@x.com", "-FLAGS.SILENT (\\Seen)").await;
+    engine.run_round(account.id, &both).await.unwrap();
+    assert!(find(&engine, "Old 1").unread);
+
+    // Deleted for good elsewhere: gone from the inbox and from the folder.
+    expunge(&mut other, "INBOX", "old3@x.com").await;
+    expunge(&mut other, "Projects", "project0@x.com").await;
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert_eq!(report.gone, 1, "{report:?}");
+    assert_eq!(report.folder_changes, 1, "{report:?}");
+    assert_eq!(find(&engine, "Old 3").state, MessageState::Done);
+    assert!(!in_projects("Project 0") && in_projects("Project 2"));
+
+    // New mail still comes in.
+    other
+        .append("INBOX", None, None, raw("arrived@x.com", "Arrived"))
+        .await
+        .unwrap();
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert_eq!(report.new, 1, "{report:?}");
+    assert!(find(&engine, "Arrived").unread);
+
+    // A cache from before incremental syncs: its first round fetches the
+    // stored headers once and follows changes as before.
+    let strip = |state: &str, keys: &[&str]| {
+        let mut json: serde_json::Value = serde_json::from_str(state).unwrap();
+        for key in keys {
+            assert!(
+                json.as_object_mut().unwrap().remove(*key).is_some(),
+                "{key}"
+            );
+        }
+        json.to_string()
+    };
+    let account_json = engine
+        .store()
+        .account(account.id)
+        .unwrap()
+        .unwrap()
+        .sync_state;
+    let old = strip(&account_json, &["replyToFetched", "modseq"]);
+    engine.store().set_sync_state(account.id, &old).unwrap();
+    let folder = engine.store().folder(projects).unwrap().unwrap();
+    let old = strip(&folder.sync_state, &["replyToFetched"]);
+    engine
+        .store()
+        .set_folder_synced(projects, &old, now_ms())
+        .unwrap();
+    store_flag(&mut other, "INBOX", "old4@x.com", "+FLAGS.SILENT (\\Seen)").await;
+    store_flag(
+        &mut other,
+        "Projects",
+        "project2@x.com",
+        "+FLAGS.SILENT (\\Flagged)",
+    )
+    .await;
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert!(!report.changed(), "{report:?}");
+    assert!(!find(&engine, "Old 4").unread);
+    assert!(find(&engine, "Project 2").pinned);
+    let state = account_state(&engine, account.id);
+    assert!(state.reply_to_fetched && state.floor.is_some());
+    let report = engine.run_round(account.id, &both).await.unwrap();
+    assert!(!report.changed(), "{report:?}");
+
+    let _ = other.logout().await;
+}
+
 #[tokio::test]
 async fn imap_folders_reach_back() {
     let Ok(host) = std::env::var("SPARK_TEST_GREENMAIL") else {

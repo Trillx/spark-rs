@@ -221,7 +221,9 @@ async fn cached_imap_mail_gains_reply_to_without_downloading_the_body() {
                 String::new()
             } else if command.starts_with("SELECT ") {
                 "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n* OK [UIDNEXT 2] next\r\n".into()
-            } else if command == "UID SEARCH ALL" {
+            } else if command == "FETCH 1 (UID)" {
+                "* 1 FETCH (UID 1)\r\n".into()
+            } else if command == "UID SEARCH UID 1:*" {
                 "* SEARCH 1\r\n".into()
             } else if command.starts_with("UID FETCH ") {
                 if command.contains("REPLY-TO") {
@@ -240,7 +242,8 @@ async fn cached_imap_mail_gains_reply_to_without_downloading_the_body() {
                 .write_all(format!("{data}{tag} OK done\r\n").as_bytes())
                 .await
                 .unwrap();
-            if command.starts_with("UID FETCH ") {
+            // The flags come last, after the headers.
+            if command.starts_with("UID FETCH ") && !command.contains("REPLY-TO") {
                 return commands;
             }
         }

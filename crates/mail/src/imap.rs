@@ -9,6 +9,10 @@
 //! scrolls to it: reaching back fetches the next messages below the floor
 //! and lowers it. Other folders are synced only when the user wants them,
 //! and only their newest messages, a window that reaching back widens.
+//!
+//! Of mail already stored only flags are asked for again (Message-ID and
+//! Reply-To never change), and with CONDSTORE only the flags that changed
+//! since the last sync.
 
 use std::collections::HashSet;
 use std::io;
@@ -48,6 +52,11 @@ const FETCH_BATCH: usize = 25;
 const OBSERVE_BATCH: usize = 500;
 /// Most mail one fetch of bodies asks for, by the server's sizes.
 const FETCH_BYTES: u64 = 16 * 1024 * 1024;
+/// How many UIDs below the floor reaching back first searches; each search
+/// after that is twice as wide.
+const OLDER_SPAN: u32 = 2 * OLDER_STEP as u32;
+/// Message-ID and Reply-To, the headers stored mail is checked against.
+const REPLY_TO_HEADERS: &str = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)]";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +118,15 @@ pub struct SyncState {
     /// some has to.
     #[serde(default)]
     pub blocked: Option<String>,
+    /// The Reply-To of the inbox mail stored has been fetched. Caches from
+    /// before Reply-To was kept fetch it once; mail fetched since has it.
+    #[serde(default)]
+    pub reply_to_fetched: bool,
+    /// On servers with CONDSTORE, the inbox's HIGHESTMODSEQ when the flags
+    /// of all the mail tracked were last brought in: the next sync asks
+    /// only for flags changed since.
+    #[serde(default)]
+    pub modseq: Option<u64>,
 }
 
 /// Where a folder's sync stands, kept as JSON with the folder.
@@ -123,6 +141,9 @@ pub struct FolderState {
     /// The folder has no messages beyond the limit.
     #[serde(default)]
     pub complete: bool,
+    /// The Reply-To of the mail it lists has been fetched (as for the inbox).
+    #[serde(default)]
+    pub reply_to_fetched: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -506,90 +527,52 @@ pub async fn sync_folder(
         state.uid_validity = mailbox.uid_validity;
     }
 
-    // The newest messages by sequence number, with their flags.
+    // The newest messages by sequence number. Of the mail it lists
+    // already, the flags are stored as they come.
     let limit = state.limit.unwrap_or(FOLDER_LIMIT);
     state.complete = mailbox.exists <= limit;
-    let mut window: Vec<(u32, bool, bool)> = Vec::new();
-    let mut header_changes = 0;
+    let known = lock(store).folder_uids(folder.id)?;
+    let mut window: Vec<u32> = Vec::new();
     if mailbox.exists > 0 {
         let first = mailbox.exists.saturating_sub(limit) + 1;
-        let fetched: Vec<Fetch> = session
-            .fetch(
-                format!("{first}:*"),
-                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)])",
-            )
-            .await?
-            .try_collect()
-            .await?;
-        for chunk in fetched.chunks(OBSERVE_BATCH) {
-            let mut headers = Vec::new();
-            for f in chunk {
-                if let Some(uid) = f.uid {
-                    let (unread, flagged) = read_flags(f);
-                    window.push((uid, unread, flagged));
-                    if let Some(fields) = f.header() {
-                        headers.push(Incoming {
-                            account_id: folder.account_id,
-                            mailbox: Some(folder.remote_id.clone()),
-                            uid: Some(uid),
-                            message_id: parse::message_id(fields),
-                            reply_to: parse::reply_to(fields),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            header_changes += lock(store).batch(|b| {
-                let mut changed = 0;
-                for m in &headers {
-                    changed += usize::from(b.observe_reply_to(m)?);
-                }
-                Ok(changed)
-            })?;
-        }
+        let fetched = session.fetch(format!("{first}:*"), "(UID FLAGS)").await?;
+        flags_in_chunks(fetched, |chunk| {
+            window.extend(chunk.iter().map(|(uid, ..)| *uid));
+            store_flags(store, folder.account_id, &folder.remote_id, chunk, |uid| {
+                known.contains_key(&uid)
+            })
+        })
+        .await?;
     }
 
-    let known = lock(store).folder_uids(folder.id)?;
-    let mut report = FolderReport {
-        changed: header_changes,
-        ..Default::default()
-    };
-    // Flags of the mail it lists already.
-    let listed: Vec<(u32, bool, bool)> = window
+    let listed: Vec<u32> = window
         .iter()
         .copied()
-        .filter(|(uid, ..)| known.contains_key(uid))
+        .filter(|uid| known.contains_key(uid))
         .collect();
-    for chunk in listed.chunks(OBSERVE_BATCH) {
-        lock(store).batch(|b| {
-            for (uid, unread, flagged) in chunk {
-                b.observe_flags(
-                    folder.account_id,
-                    &folder.remote_id,
-                    *uid,
-                    *unread,
-                    *flagged,
-                )?;
-            }
-            Ok(())
-        })?;
+    let mut report = FolderReport::default();
+    if !state.reply_to_fetched {
+        report.changed += fetch_reply_to(
+            session,
+            store,
+            folder.account_id,
+            &folder.remote_id,
+            &listed,
+        )
+        .await?;
+        state.reply_to_fetched = true;
     }
-    let mut members: Vec<(i64, Option<u32>)> = listed
-        .iter()
-        .map(|(uid, ..)| (known[uid], Some(*uid)))
-        .collect();
+    let mut members: Vec<(i64, Option<u32>)> =
+        listed.iter().map(|uid| (known[uid], Some(*uid))).collect();
 
     let new: Vec<u32> = window
         .iter()
-        .map(|(uid, ..)| *uid)
+        .copied()
         .filter(|uid| !known.contains_key(uid))
         .collect();
     for batch in new.chunks(FETCH_BATCH * 4) {
         let heads: Vec<Fetch> = session
-            .uid_fetch(
-                uid_set(batch),
-                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)])",
-            )
+            .uid_fetch(uid_set(batch), format!("(UID FLAGS {REPLY_TO_HEADERS})"))
             .await?
             .try_collect()
             .await?;
@@ -815,24 +798,53 @@ pub async fn sync_inbox(
         }
         state.uid_validity = mailbox.uid_validity;
         state.floor = None;
+        state.modseq = None;
     }
 
-    let present = session.uid_search("ALL").await?;
     let first = state.floor.is_none();
-    let floor = match state.floor {
-        Some(floor) => floor,
+    let (floor, present, complete) = match state.floor {
+        Some(floor) => {
+            // Mail only ever comes in above the floor (UIDs only grow), so
+            // once nothing is below it, nothing ever is.
+            let complete = state.complete
+                || lowest_uid(session, mailbox.exists)
+                    .await?
+                    .is_none_or(|lowest| lowest >= floor);
+            // "floor:*" also matches the newest message if that's below it.
+            let present: HashSet<u32> = session
+                .uid_search(format!("UID {floor}:*"))
+                .await?
+                .into_iter()
+                .filter(|uid| *uid >= floor)
+                .collect();
+            (floor, present, complete)
+        }
+        // The newest messages, by sequence number.
         None => {
-            let mut newest: Vec<u32> = present.iter().copied().collect();
-            newest.sort_unstable_by(|a, b| b.cmp(a));
-            newest.truncate(FIRST_SYNC_LIMIT);
-            newest
-                .last()
+            let limit = FIRST_SYNC_LIMIT as u32;
+            let mut present = HashSet::new();
+            if mailbox.exists > 0 {
+                let first = mailbox.exists.saturating_sub(limit) + 1;
+                let fetched: Vec<Fetch> = session
+                    .fetch(format!("{first}:*"), "(UID)")
+                    .await?
+                    .try_collect()
+                    .await?;
+                present.extend(
+                    fetched
+                        .iter()
+                        .filter(|f| f.message >= first)
+                        .filter_map(|f| f.uid),
+                );
+            }
+            let floor = present
+                .iter()
+                .min()
                 .copied()
-                .unwrap_or_else(|| mailbox.uid_next.unwrap_or(1))
+                .unwrap_or_else(|| mailbox.uid_next.unwrap_or(1));
+            (floor, present, mailbox.exists <= limit)
         }
     };
-    let complete = present.iter().all(|uid| *uid >= floor);
-    let present: HashSet<u32> = present.into_iter().filter(|uid| *uid >= floor).collect();
     let known = lock(store).uids(account_id, INBOX)?;
 
     let mut new: Vec<u32> = present.difference(&known).copied().collect();
@@ -847,45 +859,37 @@ pub async fn sync_inbox(
             .extend(fetch_new(session, store, account_id, batch, !first).await?);
     }
 
-    // Flags of everything else we track in the inbox.
-    if !known.is_empty() {
-        let flags: Vec<Fetch> = session
-            .uid_fetch(
-                format!("{floor}:*"),
-                "(UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REPLY-TO)])",
-            )
-            .await?
-            .try_collect()
-            .await?;
-        for chunk in flags.chunks(OBSERVE_BATCH) {
-            let seen: Vec<(u32, bool, bool, Option<Incoming>)> = chunk
-                .iter()
-                .filter_map(|fetch| {
-                    let uid = fetch.uid.filter(|uid| known.contains(uid))?;
-                    let (unread, flagged) = read_flags(fetch);
-                    let headers = fetch.header().map(|headers| Incoming {
-                        account_id,
-                        mailbox: Some(INBOX.into()),
-                        uid: Some(uid),
-                        message_id: parse::message_id(headers),
-                        reply_to: parse::reply_to(headers),
-                        ..Default::default()
-                    });
-                    Some((uid, unread, flagged, headers))
-                })
-                .collect();
-            report.headers += lock(store).batch(|b| {
-                let mut changed = 0;
-                for (uid, unread, flagged, headers) in &seen {
-                    b.observe_flags(account_id, INBOX, *uid, *unread, *flagged)?;
-                    if let Some(headers) = headers {
-                        changed += usize::from(b.observe_reply_to(headers)?);
-                    }
-                }
-                Ok(changed)
-            })?;
-        }
+    if !state.reply_to_fetched {
+        let mut stored: Vec<u32> = known.iter().copied().collect();
+        stored.sort_unstable();
+        report.headers += fetch_reply_to(session, store, account_id, INBOX, &stored).await?;
+        state.reply_to_fetched = true;
     }
+
+    // Flags of everything else we track in the inbox: with CONDSTORE, of
+    // what changed since the last sync.
+    let tracked = |uid: u32| uid >= floor && known.contains(&uid);
+    if known.iter().any(|uid| tracked(*uid)) {
+        let query = match (state.modseq, mailbox.highest_modseq) {
+            // Lower than before (a server that rebuilt its index): all of them.
+            (Some(since), Some(now)) if now >= since => {
+                format!("(UID FLAGS) (CHANGEDSINCE {since})")
+            }
+            _ => "(UID FLAGS)".into(),
+        };
+        let fetched = session.uid_fetch(format!("{floor}:*"), query).await?;
+        flags_in_chunks(fetched, |chunk| {
+            store_flags(store, account_id, INBOX, chunk, tracked)
+        })
+        .await?;
+    }
+    state.modseq = match (state.modseq, mailbox.highest_modseq) {
+        (Some(_), now) => now,
+        // HIGHESTMODSEQ is CONDSTORE's, but a server that sends it without
+        // CHANGEDSINCE would fail every sync.
+        (None, Some(now)) if session.capabilities().await?.has_str("CONDSTORE") => Some(now),
+        (None, _) => None,
+    };
 
     // Mail a search brought in from below the floor isn't tracked until
     // reaching back gets to it.
@@ -921,22 +925,39 @@ pub async fn older_inbox(
     if mailbox.uid_validity != state.uid_validity {
         return Ok(0);
     }
-    let present = session.uid_search("ALL").await?;
+    let lowest = lowest_uid(session, mailbox.exists).await?;
     let known = lock(store).uids(account_id, INBOX)?;
-    let mut below: Vec<u32> = present.iter().copied().filter(|uid| *uid < floor).collect();
-    below.sort_unstable_by(|a, b| b.cmp(a));
-    // Down to the `OLDER_STEP`th one not stored yet: mail a search stored
-    // is passed, not fetched again.
+    // Down to the `OLDER_STEP`th one not stored yet, and on past any stored
+    // below it: mail a search stored is passed, not fetched again. The UIDs
+    // below the floor are searched a range at a time, each range twice as
+    // wide as the last, until one more not stored turns up (`more`) or the
+    // lowest is reached.
     let mut older = Vec::new();
     let mut unknown = 0;
-    for uid in below {
-        if !known.contains(&uid) {
-            if unknown == OLDER_STEP {
-                break;
+    let mut more = false;
+    let mut top = floor;
+    let mut span = OLDER_SPAN;
+    while let Some(lowest) = lowest.filter(|lowest| !more && *lowest < top) {
+        let bottom = top.saturating_sub(span).max(lowest);
+        let mut page: Vec<u32> = session
+            .uid_search(format!("UID {bottom}:{}", top - 1))
+            .await?
+            .into_iter()
+            .filter(|uid| (bottom..top).contains(uid))
+            .collect();
+        page.sort_unstable_by(|a, b| b.cmp(a));
+        for uid in page {
+            if !known.contains(&uid) {
+                if unknown == OLDER_STEP {
+                    more = true;
+                    break;
+                }
+                unknown += 1;
             }
-            unknown += 1;
+            older.push(uid);
         }
-        older.push(uid);
+        top = bottom;
+        span = span.saturating_mul(2);
     }
 
     let mut stored = 0;
@@ -949,13 +970,117 @@ pub async fn older_inbox(
         stored += fetch_new(session, store, account_id, &new, false)
             .await?
             .len();
+        // Mail a search stored brings its flags from then: the next sync
+        // asks for every flag, not just the changes.
+        if new.len() < batch.len() {
+            state.modseq = None;
+        }
         // Lowered batch by batch (they're newest first), so mail stored
         // before a failure is above the floor, where syncs track it.
         state.floor = batch.last().copied();
     }
-    let floor = state.floor.unwrap_or(floor);
-    state.complete = present.iter().all(|uid| *uid >= floor);
+    state.complete = !more;
     Ok(stored)
+}
+
+/// The lowest UID in the selected mailbox, `exists` messages long: its
+/// first message's. `None` if it's empty.
+async fn lowest_uid(session: &mut Session, exists: u32) -> Result<Option<u32>> {
+    if exists == 0 {
+        return Ok(None);
+    }
+    let first: Vec<Fetch> = session.fetch("1", "(UID)").await?.try_collect().await?;
+    Ok(first.iter().filter_map(|f| f.uid).min())
+}
+
+/// Reads a fetch's UIDs and flags (unread, flagged) `OBSERVE_BATCH`
+/// messages at a time, handing each chunk to `each` as it arrives, so the
+/// responses held stay bounded however many come back. If `each` fails,
+/// the rest is read (to leave the session ready for its next command)
+/// and the failure returned.
+async fn flags_in_chunks(
+    fetched: impl futures_util::Stream<Item = async_imap::error::Result<Fetch>>,
+    mut each: impl FnMut(&[(u32, bool, bool)]) -> Result<()>,
+) -> Result<()> {
+    let mut fetched = std::pin::pin!(fetched);
+    let mut chunk = Vec::with_capacity(OBSERVE_BATCH);
+    let mut handed = Ok(());
+    while let Some(fetch) = fetched.try_next().await? {
+        let Some(uid) = fetch.uid.filter(|_| handed.is_ok()) else {
+            continue;
+        };
+        let (unread, flagged) = read_flags(&fetch);
+        chunk.push((uid, unread, flagged));
+        if chunk.len() == OBSERVE_BATCH {
+            handed = each(&chunk);
+            chunk.clear();
+        }
+    }
+    handed?;
+    if !chunk.is_empty() {
+        each(&chunk)?;
+    }
+    Ok(())
+}
+
+/// Stores the server's flags for the UIDs in `mailbox` that `wanted` keeps,
+/// in one transaction.
+fn store_flags(
+    store: &Mutex<Store>,
+    account_id: i64,
+    mailbox: &str,
+    flags: &[(u32, bool, bool)],
+    wanted: impl Fn(u32) -> bool,
+) -> Result<()> {
+    Ok(lock(store).batch(|b| {
+        for &(uid, unread, flagged) in flags.iter().filter(|(uid, ..)| wanted(*uid)) {
+            b.observe_flags(account_id, mailbox, uid, unread, flagged)?;
+        }
+        Ok(())
+    })?)
+}
+
+/// Fetches the Message-ID and Reply-To of stored mail at `uids` in the
+/// selected `mailbox`, `OBSERVE_BATCH` at a time, and brings the stored
+/// Reply-To up to date. Caches from before Reply-To was kept do this once.
+/// Returns how many changed.
+async fn fetch_reply_to(
+    session: &mut Session,
+    store: &Mutex<Store>,
+    account_id: i64,
+    mailbox: &str,
+    uids: &[u32],
+) -> Result<usize> {
+    let mut changed = 0;
+    for chunk in uids.chunks(OBSERVE_BATCH) {
+        let fetched: Vec<Fetch> = session
+            .uid_fetch(uid_set(chunk), format!("(UID {REPLY_TO_HEADERS})"))
+            .await?
+            .try_collect()
+            .await?;
+        let headers: Vec<Incoming> = fetched
+            .iter()
+            .filter_map(|f| {
+                let fields = f.header()?;
+                Some(Incoming {
+                    account_id,
+                    mailbox: Some(mailbox.into()),
+                    uid: Some(f.uid?),
+                    message_id: parse::message_id(fields),
+                    reply_to: parse::reply_to(fields),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        changed += lock(store).batch(|b| {
+            let mut changed = 0;
+            for m in &headers {
+                changed += usize::from(b.observe_reply_to(m)?);
+            }
+            Ok(changed)
+        })?;
+    }
+    Ok(changed)
 }
 
 /// Puts a search to the server: the inbox below the floor (mail above it is
@@ -1762,6 +1887,9 @@ fn lock(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+#[cfg(test)]
+mod sync_tests;
 
 #[cfg(test)]
 mod tests {
