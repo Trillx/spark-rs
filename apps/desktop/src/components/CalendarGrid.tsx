@@ -88,12 +88,15 @@ function follow<T>(
   const x0 = ev.clientX;
   const y0 = ev.clientY;
   let last: T | null = null;
+  // The calendar leaves Esc to the drag meanwhile.
+  document.documentElement.setAttribute("data-calendar-drag", "");
   const onMove = (e: PointerEvent) => {
     if (last === null && Math.hypot(e.clientX - x0, e.clientY - y0) < DRAG_PX) return;
     last = at(e.clientX, e.clientY);
     move(last);
   };
   const stop = () => {
+    document.documentElement.removeAttribute("data-calendar-drag");
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
     window.removeEventListener("keydown", onKey, true);

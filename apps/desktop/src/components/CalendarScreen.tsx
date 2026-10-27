@@ -116,6 +116,9 @@ async function newEventDefaults(): Promise<NewEventDefaults> {
     : { minutes: 60, alert: 10, allDayAlert: 720 };
 }
 
+/** What a move being saved is for: the event, or every occurrence of its series. */
+const savingKey = (e: CalendarEvent) => e.series ?? String(e.id);
+
 /** A question the screen asks, and what to do with its answer. */
 interface Question {
   title: string;
@@ -167,6 +170,9 @@ export default function CalendarScreen({
   const noticeTimer = useRef(0);
   /** The editor or a question is up, as of the last render: a drag that ends meanwhile does nothing. */
   const busyNow = useRef(false);
+  /** Events (or series) whose move is being saved; `savingNow` as of now, for a drag ending meanwhile. */
+  const [saving, setSaving] = useState<ReadonlySet<string>>(new Set());
+  const savingNow = useRef<ReadonlySet<string>>(saving);
   const [question, setQuestion] = useState<Question | null>(null);
   /** What went wrong deleting an event, until the next try. */
   const [failed, setFailed] = useState<string | null>(null);
@@ -296,6 +302,8 @@ export default function CalendarScreen({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || editor || question || menu) return;
+      // A drag on the grid takes Esc for itself.
+      if (document.documentElement.hasAttribute("data-calendar-drag")) return;
       if (isTypingTarget(e.target) || isInsideOverlay(e.target) || document.querySelector("[data-composer]")) return;
       const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       const handled = () => {
@@ -358,6 +366,8 @@ export default function CalendarScreen({
 
   /** The user's own event, in their own calendar: they can change and delete it. */
   const editable = (e: CalendarEvent) => calendars.get(e.calendar)?.own === true && e.response === "organizer";
+  /** Whether it's not still saving a move: one at a time, so a second drag can't race the first. */
+  const draggable = (e: CalendarEvent) => editable(e) && !saving.has(savingKey(e));
 
   const ask = (q: Omit<Question, "answer">) =>
     new Promise<string | null>((answer) => setQuestion({ ...q, answer }));
@@ -409,7 +419,23 @@ export default function CalendarScreen({
    * which occurrences first); back where it was if that's cancelled or fails.
    */
   const moveEvent = async (e: CalendarEvent, to: DragOutcome) => {
-    if (busyNow.current) return;
+    const key = savingKey(e);
+    if (busyNow.current || savingNow.current.has(key)) return;
+    const mark = (on: boolean) => {
+      const next = new Set(savingNow.current);
+      if (on) next.add(key);
+      else next.delete(key);
+      savingNow.current = next;
+      setSaving(next);
+    };
+    mark(true);
+    try {
+      await saveMove(e, to);
+    } finally {
+      mark(false);
+    }
+  };
+  const saveMove = async (e: CalendarEvent, to: DragOutcome) => {
     const defaults = await newEventDefaults();
     const end = to.end ?? to.start + defaults.minutes * MINUTE;
     const draft: EventDraft = {
@@ -708,7 +734,7 @@ export default function CalendarScreen({
               selected={open?.id}
               onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
               onPickDay={pickDay}
-              canEdit={editable}
+              canEdit={draggable}
               onCreate={(start, end, allDay, anchor) => void createAt(start, end, allDay, anchor)}
               onChange={(e, to) => void moveEvent(e, to)}
               onMenu={(target, x, y) => setMenu({ target, x, y })}
@@ -723,7 +749,7 @@ export default function CalendarScreen({
               selected={open?.id}
               onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
               onPickDay={pickDay}
-              canEdit={editable}
+              canEdit={draggable}
               onCreate={(start, end, allDay, anchor) => void createAt(start, end, allDay, anchor)}
               onChange={(e, to) => void moveEvent(e, to)}
               onMenu={(target, x, y) => setMenu({ target, x, y })}

@@ -257,7 +257,7 @@ export type GridGesture =
   | { kind: "create"; from: GridPoint }
   /**
    * A timed event, `grab` minutes after its start where it was picked up; its start goes no earlier
-   * than `floor` minutes into a day (below 0 for one that began the day before).
+   * than `floor` minutes into a day (no limit for one that began the day before).
    */
   | { kind: "move"; event: CalendarEvent; grab: number; floor: number }
   /** A timed event's top or bottom edge. */
@@ -273,7 +273,9 @@ export type GridGesture =
 export function moveGesture(e: CalendarEvent, p: GridPoint, days: number[]): GridGesture {
   const startsDaysBefore = Math.round((days[p.col] - dayOf(e.start)) / DAY);
   const start = minutesOf(e.start) - startsDaysBefore * 24 * 60;
-  return { kind: "move", event: e, grab: p.minutes - start, floor: Math.min(0, start) };
+  // Moved up past the top of the grid, an event stays in its day; one already from the day before
+  // can go on earlier.
+  return { kind: "move", event: e, grab: p.minutes - start, floor: start < 0 ? -Infinity : 0 };
 }
 
 /** The times a drag ends with; `end` null for the default length. */

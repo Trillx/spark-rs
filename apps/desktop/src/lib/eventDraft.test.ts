@@ -262,7 +262,7 @@ test("moves keep clock times across a DST change and past midnight", async () =>
     // Monday 23:00 to Tuesday 1:00, picked up by Tuesday's part: a day later, Tuesday 23:00.
     const late = event(atMinutes(days[1], 23 * 60), atMinutes(days[2], 60));
     const night = moveGesture(late, { col: 2, minutes: 30, allDay: false }, days);
-    assert.equal(night.kind === "move" && night.floor, -60);
+    assert.equal(night.kind === "move" && night.floor, -Infinity);
     assert.equal(gestureOutcome(night, { col: 2, minutes: 30, allDay: false }, days), null, "where it was");
     const week = [days[1], days[2], midnight(2026, 10, 4)];
     const tuesday = moveGesture(late, { col: 1, minutes: 30, allDay: false }, week);
@@ -270,6 +270,14 @@ test("moves keep clock times across a DST change and past midnight", async () =>
     assert.equal(new Date(shifted.start).getDate(), 3);
     assert.equal(clock(shifted.start), "23:00");
     assert.equal(clock(shifted.end!), "1:00");
+    // Picked up at 0:45 and let go at 0:30 the next day: a quarter hour earlier, 22:45.
+    const earlier = gestureOutcome(
+      moveGesture(late, { col: 1, minutes: 45, allDay: false }, week),
+      { col: 2, minutes: 30, allDay: false },
+      week,
+    )!;
+    assert.equal(clock(earlier.start), "22:45");
+    assert.equal(new Date(earlier.start).getDate(), 3);
   } finally {
     if (zone === undefined) delete process.env.TZ;
     else process.env.TZ = zone;
