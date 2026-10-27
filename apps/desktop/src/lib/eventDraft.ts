@@ -19,10 +19,13 @@ export function dayOf(t: number) {
   return d.getTime();
 }
 
-/** `minutes` after the local midnight `day`, on the clock (a DST change in between doesn't shift it). */
+/**
+ * `minutes` after the local midnight `day`, on the clock (a DST change in between doesn't shift
+ * it); negative or past a day, into the day before or after.
+ */
 export function atMinutes(day: number, minutes: number) {
   const d = new Date(day);
-  d.setHours(Math.floor(minutes / 60), minutes % 60, 0, 0);
+  d.setHours(0, minutes, 0, 0);
   return d.getTime();
 }
 
@@ -246,12 +249,26 @@ export interface GridPoint {
 export type GridGesture =
   /** Across empty time: a new event, in the column it started in. */
   | { kind: "create"; from: GridPoint }
-  /** A timed event, `grab` minutes after its start where it was picked up. */
-  | { kind: "move"; event: CalendarEvent; grab: number }
+  /**
+   * A timed event, `grab` minutes after its start where it was picked up; its start goes no earlier
+   * than `floor` minutes into a day (below 0 for one that began the day before).
+   */
+  | { kind: "move"; event: CalendarEvent; grab: number; floor: number }
   /** A timed event's top or bottom edge. */
   | { kind: "resize"; event: CalendarEvent; edge: "start" | "end" }
   /** An event in the all-day row, picked up in `from`'s column. */
   | { kind: "row"; event: CalendarEvent; from: GridPoint };
+
+/**
+ * Picking up timed event `e` at `p` (`days`: each column's local midnight): where its start is, on
+ * the clock, from that column's day, which is before 0 for the part of an overnight event after
+ * midnight.
+ */
+export function moveGesture(e: CalendarEvent, p: GridPoint, days: number[]): GridGesture {
+  const startsDaysBefore = Math.round((days[p.col] - dayOf(e.start)) / DAY);
+  const start = minutesOf(e.start) - startsDaysBefore * 24 * 60;
+  return { kind: "move", event: e, grab: p.minutes - start, floor: Math.min(0, start) };
+}
 
 /** The times a drag ends with; `end` null for the default length. */
 export interface DragOutcome {
@@ -304,7 +321,8 @@ export function gestureOutcome(g: GridGesture, p: GridPoint, days: number[]): Dr
         const start = toUtcDate(day(p.col));
         return { start, end: start + DAY, allDay: true };
       }
-      const start = atMinutes(day(p.col), clampDay(roundQuarter(p.minutes - g.grab)));
+      const minutes = Math.max(g.floor, Math.min(24 * 60 - QUARTER, roundQuarter(p.minutes - g.grab)));
+      const start = atMinutes(day(p.col), minutes);
       return start === e.start ? null : { start, end: start + (e.end - e.start), allDay: false };
     }
     case "resize": {

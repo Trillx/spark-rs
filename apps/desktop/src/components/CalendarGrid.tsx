@@ -24,6 +24,7 @@ import {
   dayOf,
   gestureOutcome,
   minutesOf,
+  moveGesture,
   shiftDays,
   type DragOutcome,
   type GridGesture,
@@ -182,7 +183,7 @@ export function WeekGrid({
       // Opens on the hours around now, three of them before it.
       if (!scrolled.current) {
         scrolled.current = true;
-        const minutes = (Date.now() - startOfDay(Date.now())) / 60_000;
+        const minutes = minutesOf(Date.now());
         el.scrollTop = Math.max(0, (minutes / 60 - 3) * height);
       }
     };
@@ -194,7 +195,7 @@ export function WeekGrid({
 
   const n = days.length;
   const today = startOfDay(now);
-  const nowMinutes = (now - today) / 60_000;
+  const nowMinutes = minutesOf(now);
   // Events come with a day either side of the view: keep only those on the days shown.
   const allDay = events
     .filter((e) => {
@@ -252,7 +253,7 @@ export function WeekGrid({
         ? { kind: "resize", event: e, edge }
         : inAllDayRow(e)
           ? { kind: "row", event: e, from: p }
-          : { kind: "move", event: e, grab: p.minutes - (e.start - days[p.col]) / MINUTE },
+          : moveGesture(e, p, days),
     );
   };
   const open = (ev: MouseEvent<HTMLElement>, e: CalendarEvent) => {
@@ -494,12 +495,13 @@ function DayColumn({
   const placed = layoutDay(
     events.map((e) => ({
       item: e,
-      start: Math.max(0, (e.start - day) / 60_000),
-      end: Math.min(MINUTES_PER_DAY, (Math.min(e.end, next) - day) / 60_000),
+      // On the clock, as the hours are labelled, a day of a DST change too.
+      start: e.start <= day ? 0 : minutesOf(e.start),
+      end: e.end >= next ? MINUTES_PER_DAY : minutesOf(e.end),
     })),
     (15 / hour) * 60,
   );
-  const nowMinutes = (now - startOfDay(now)) / 60_000;
+  const nowMinutes = minutesOf(now);
   return (
     <div
       className={`relative min-w-0 flex-1 border-l border-hairline ${
@@ -513,7 +515,9 @@ function DayColumn({
       {placed.map(({ item: e, top, bottom, column, span, columns }) => {
         const color = colorOf(calendars, e);
         const height = Math.max(15, ((bottom - top) / 60) * hour - 2);
-        const edges = canEdit(e) && height >= 20;
+        const editable = canEdit(e);
+        // A short card keeps its bottom edge; its top is for moving it.
+        const tall = height >= 24;
         return (
           <button
             key={e.id}
@@ -536,19 +540,19 @@ function DayColumn({
               onMenu(ev, e);
             }}
           >
-            {edges && (
-              <>
-                <span
-                  aria-hidden
-                  className="absolute inset-x-0 top-0 z-10 h-[5px] cursor-ns-resize"
-                  onPointerDown={(ev) => onPress(ev, e, "start")}
-                />
-                <span
-                  aria-hidden
-                  className="absolute inset-x-0 bottom-0 z-10 h-[5px] cursor-ns-resize"
-                  onPointerDown={(ev) => onPress(ev, e, "end")}
-                />
-              </>
+            {editable && tall && (
+              <span
+                aria-hidden
+                className="absolute inset-x-0 top-0 z-10 h-[5px] cursor-ns-resize"
+                onPointerDown={(ev) => onPress(ev, e, "start")}
+              />
+            )}
+            {editable && (
+              <span
+                aria-hidden
+                className={`absolute inset-x-0 bottom-0 z-10 cursor-ns-resize ${tall ? "h-[5px]" : "h-1"}`}
+                onPointerDown={(ev) => onPress(ev, e, "end")}
+              />
             )}
             {height >= 38 ? (
               <span className="block px-1.5 py-0.5">

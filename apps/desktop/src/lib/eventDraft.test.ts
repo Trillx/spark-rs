@@ -179,17 +179,17 @@ test("drags on the grid end where Spark's do", async () => {
 
   // Moved: the length kept, to the quarter hour; onto the all-day row, all day.
   const standup = event(atMinutes(days[0], 9 * 60 + 30), atMinutes(days[0], 9 * 60 + 45));
-  const moved = gestureOutcome({ kind: "move", event: standup, grab: 5 }, at(2, 14 * 60 + 12), days)!;
+  const moved = gestureOutcome({ kind: "move", event: standup, grab: 5, floor: 0 }, at(2, 14 * 60 + 12), days)!;
   assert.equal(moved.start, atMinutes(days[2], 14 * 60));
   assert.equal(moved.end! - moved.start, 15 * MINUTE);
-  assert.equal(gestureOutcome({ kind: "move", event: standup, grab: 0 }, at(0, 9 * 60 + 31), days), null, "no change");
-  assert.deepEqual(gestureOutcome({ kind: "move", event: standup, grab: 0 }, at(1, 0, true), days), {
+  assert.equal(gestureOutcome({ kind: "move", event: standup, grab: 0, floor: 0 }, at(0, 9 * 60 + 31), days), null, "no change");
+  assert.deepEqual(gestureOutcome({ kind: "move", event: standup, grab: 0, floor: 0 }, at(1, 0, true), days), {
     start: toUtcDate(days[1]),
     end: toUtcDate(days[1]) + DAY,
     allDay: true,
   });
   assert.equal(
-    gestureOutcome({ kind: "move", event: { ...standup, repeats: true }, grab: 0 }, at(1, 0, true), days),
+    gestureOutcome({ kind: "move", event: { ...standup, repeats: true }, grab: 0, floor: 0 }, at(1, 0, true), days),
     null,
     "a repeating event keeps its all day",
   );
@@ -226,3 +226,52 @@ function minutesOfTest(t: number) {
   const d = new Date(t);
   return d.getHours() * 60 + d.getMinutes();
 }
+
+test("moves keep clock times across a DST change and past midnight", async () => {
+  const { gestureOutcome, moveGesture } = await import("./eventDraft.ts");
+  const zone = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const midnight = (y: number, m: number, d: number) => new Date(y, m, d).getTime();
+    const event = (start: number, end: number): CalendarEvent => ({
+      id: 1,
+      calendar: 1,
+      account: 1,
+      title: "x",
+      start,
+      end,
+      allDay: false,
+      attendees: [],
+      response: "organizer",
+      canceled: false,
+      repeats: false,
+      showAs: "busy",
+      private: false,
+      onlineMeeting: false,
+    });
+    const clock = (t: number) => `${new Date(t).getHours()}:${String(new Date(t).getMinutes()).padStart(2, "0")}`;
+
+    // November 1, 2026 has 25 hours; 9:00 there to Monday is 9:00 still.
+    const days = [midnight(2026, 10, 1), midnight(2026, 10, 2), midnight(2026, 10, 3)];
+    const nine = event(atMinutes(days[0], 9 * 60), atMinutes(days[0], 10 * 60));
+    const g = moveGesture(nine, { col: 0, minutes: 9 * 60 + 10, allDay: false }, days);
+    const moved = gestureOutcome(g, { col: 1, minutes: 9 * 60 + 10, allDay: false }, days)!;
+    assert.equal(clock(moved.start), "9:00");
+    assert.equal(new Date(moved.start).getDate(), 2);
+
+    // Monday 23:00 to Tuesday 1:00, picked up by Tuesday's part: a day later, Tuesday 23:00.
+    const late = event(atMinutes(days[1], 23 * 60), atMinutes(days[2], 60));
+    const night = moveGesture(late, { col: 2, minutes: 30, allDay: false }, days);
+    assert.equal(night.kind === "move" && night.floor, -60);
+    assert.equal(gestureOutcome(night, { col: 2, minutes: 30, allDay: false }, days), null, "where it was");
+    const week = [days[1], days[2], midnight(2026, 10, 4)];
+    const tuesday = moveGesture(late, { col: 1, minutes: 30, allDay: false }, week);
+    const shifted = gestureOutcome(tuesday, { col: 2, minutes: 30, allDay: false }, week)!;
+    assert.equal(new Date(shifted.start).getDate(), 3);
+    assert.equal(clock(shifted.start), "23:00");
+    assert.equal(clock(shifted.end!), "1:00");
+  } finally {
+    if (zone === undefined) delete process.env.TZ;
+    else process.env.TZ = zone;
+  }
+});
