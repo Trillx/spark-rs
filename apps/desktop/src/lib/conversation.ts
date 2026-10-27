@@ -1,4 +1,5 @@
 import type { FolderView, Message } from "../types";
+import { conversationLabel } from "./autoLabels";
 import { isDraft } from "./drafts";
 
 // A conversation is the messages that share `conversation`: the Rust side
@@ -46,16 +47,25 @@ export function movesWith(conversation: Message[], m: Message): Message[] {
 /**
  * `m` as its list row and the thread toolbar show it: unread, pinned or
  * priority if any email of its conversation is, with an attachment if any
- * has one. The same object when nothing differs, so memoized rows keep it.
+ * has one, and the conversation's Auto-Label and newest auto-draft. The same
+ * object when nothing differs, so memoized rows keep it.
  */
 export function asThread(m: Message, conversation: readonly Message[]): Message {
   const unread = conversation.some((x) => x.unread);
   const pinned = conversation.some((x) => x.pinned);
   const priority = conversation.some((x) => x.priority);
   const attachment = m.attachment ?? conversation.find((x) => x.attachment)?.attachment;
-  return unread === m.unread && pinned === m.pinned && priority === m.priority && attachment === m.attachment
+  const autoLabel = conversationLabel(conversation) ?? m.autoLabel;
+  let autoDraft = m.autoDraft;
+  for (let i = conversation.length - 1; autoDraft === undefined && i >= 0; i--) autoDraft = conversation[i].autoDraft;
+  return unread === m.unread &&
+    pinned === m.pinned &&
+    priority === m.priority &&
+    attachment === m.attachment &&
+    autoLabel === m.autoLabel &&
+    autoDraft === m.autoDraft
     ? m
-    : { ...m, unread, pinned, priority, attachment };
+    : { ...m, unread, pinned, priority, attachment, autoLabel, autoDraft };
 }
 
 /**

@@ -24,6 +24,7 @@ use tokio::sync::Notify;
 
 use crate::ai::{AiState, describe, redact};
 use crate::mailbox::{Mailbox, text};
+use crate::thread_window::Editing;
 use prompts::{Email, User, Writing};
 
 /// Emails sorted with one request.
@@ -73,10 +74,15 @@ pub fn start(app: &AppHandle) {
                 cleanup(&app);
                 cleaned = Some(std::time::Instant::now());
             }
+            // After the provider failed, new mail doesn't cut the wait short.
+            let held = wait == AFTER_FAILING;
+            let until = tokio::time::Instant::now() + wait;
             let automation = app.state::<Automation>();
-            tokio::select! {
-                _ = automation.wake.notified() => {}
-                _ = tokio::time::sleep(wait) => {}
+            loop {
+                tokio::select! {
+                    _ = automation.wake.notified() => if !held { break },
+                    _ = tokio::time::sleep_until(until) => break,
+                }
             }
         }
     });
@@ -87,8 +93,8 @@ pub fn wake(app: &AppHandle) {
     app.state::<Automation>().wake.notify_one();
 }
 
-/// Looks at the mail waiting for it, until there's none. Returns how long
-/// to wait before looking again.
+/// Looks at the mail waiting for it, and writes the replies due, until
+/// there's nothing left. Returns how long to wait before looking again.
 async fn round(app: &AppHandle) -> Duration {
     let mailbox = app.state::<Mailbox>();
     if !mailbox.live() {
@@ -97,15 +103,13 @@ async fn round(app: &AppHandle) -> Duration {
     let engine = mailbox.live.engine.clone();
     let automation = app.state::<Automation>();
     // What the last batch was: one that comes back the same wasn't recorded,
-    // and isn't sent to AI again until the next round.
+    // and isn't sent to AI again until the next round. Replies tried this
+    // round aren't tried again in it either.
     let mut last: Vec<i64> = Vec::new();
+    let mut tried: HashSet<i64> = HashSet::new();
     loop {
-        let settings = match engine.store().automation_settings() {
-            Ok(settings) => settings,
-            Err(e) => {
-                eprintln!("spark-rs: inbox automation: {e}");
-                return LOOK_EVERY;
-            }
+        let Some(settings) = saved_settings(&engine) else {
+            return LOOK_EVERY;
         };
         if !settings.is_on() {
             automation.problem(None);
@@ -121,87 +125,118 @@ async fn round(app: &AppHandle) -> Duration {
                 return LOOK_EVERY;
             }
         };
+        let mut worked = false;
+
         let batch = match next_batch(&engine.store(), &settings, &automation) {
-            Ok(batch) => batch,
+            Ok(batch) => batch.filter(|b| !b.ids.is_empty() && b.ids != last),
             Err(e) => {
                 eprintln!("spark-rs: inbox automation: {e}");
                 return LOOK_EVERY;
             }
         };
-        let Some(batch) = batch.filter(|b| !b.ids.is_empty()) else {
-            automation.problem(None);
-            return LOOK_EVERY;
-        };
-        if batch.ids == last {
-            return LOOK_EVERY;
-        }
-        last = batch.ids.clone();
-        let answer = complete(&client, &batch.request).await;
-        let now = now_ms();
-        let verdicts = match answer {
-            Ok(Some(text)) => prompts::read_verdicts(&text, batch.ids.len()).unwrap_or_else(|e| {
-                eprintln!("spark-rs: inbox automation: {e}");
-                vec![None; batch.ids.len()]
-            }),
-            // Declined: these emails are tried again later, the rest go on.
-            Ok(None) => vec![None; batch.ids.len()],
-            Err(e) => {
-                // The provider can't be reached or refuses the key: nothing
-                // is held against the emails, which wait for it.
-                automation.problem(Some(redact(describe(&e), key.as_deref())));
-                return AFTER_FAILING;
-            }
-        };
-        let push = push_labels(&engine, batch.account);
-        let mut changed = false;
-        let mut needing = Vec::new();
-        {
-            let mut store = engine.store();
-            for (&id, verdict) in batch.ids.iter().zip(verdicts) {
-                let recorded = match verdict {
-                    Some(verdict) => {
-                        if verdict.needs_reply {
-                            needing.push(id);
-                        }
-                        store
+        if let Some(batch) = batch {
+            worked = true;
+            last = batch.ids.clone();
+            let answer = complete(&client, &batch.request).await;
+            let now = now_ms();
+            let verdicts = match answer {
+                Ok(Some(text)) => {
+                    prompts::read_verdicts(&text, batch.ids.len()).unwrap_or_else(|e| {
+                        eprintln!("spark-rs: inbox automation: {e}");
+                        vec![None; batch.ids.len()]
+                    })
+                }
+                // Declined: these emails are tried again later, the rest go on.
+                Ok(None) => vec![None; batch.ids.len()],
+                Err(e) => {
+                    // The provider can't be reached or refuses the key: nothing
+                    // is held against the emails, which wait for it.
+                    automation.problem(Some(redact(describe(&e), key.as_deref())));
+                    return AFTER_FAILING;
+                }
+            };
+            // What the user wants now, not when the request went out.
+            let Some(settings) = saved_settings(&engine) else {
+                return LOOK_EVERY;
+            };
+            let push = push_labels(&engine, batch.account);
+            let mut changed = false;
+            {
+                let mut store = engine.store();
+                for (&id, verdict) in batch.ids.iter().zip(verdicts) {
+                    let recorded = match verdict {
+                        Some(verdict) => store
                             .record_verdict(id, verdict, &settings, push, now)
-                            .map(|c| changed |= c)
+                            .map(|c| changed |= c),
+                        None => store.record_check_failed(id, now),
+                    };
+                    if let Err(e) = recorded {
+                        eprintln!("spark-rs: inbox automation: {e}");
                     }
-                    None => store.record_check_failed(id, now),
-                };
-                if let Err(e) = recorded {
-                    eprintln!("spark-rs: inbox automation: {e}");
                 }
             }
-        }
-        if changed {
-            let _ = app.emit("mailbox-changed", ());
-            mailbox.live.nudge(batch.account);
-        }
-        let mut written = 0;
-        for id in needing {
-            if written == DRAFTS_PER_ROUND {
-                break;
+            if changed {
+                let _ = app.emit("mailbox-changed", ());
+                mailbox.live.nudge(batch.account);
             }
-            let wanted = should_draft(&engine.store(), &settings, id).unwrap_or(false);
-            if !wanted || !automation.writing.lock().unwrap().insert(id) {
+        }
+
+        let due = engine
+            .store()
+            .draft_candidates(&settings, now_ms(), DRAFTS_PER_ROUND)
+            .unwrap_or_default();
+        for id in due {
+            if !tried.insert(id) {
                 continue;
             }
-            let result = write_draft(app, &engine, &client, key.as_deref(), id).await;
+            worked = true;
+            // Asked again before each request: the user may have turned
+            // Auto-Drafts off, or answered, meanwhile.
+            let Some(settings) = saved_settings(&engine) else {
+                return LOOK_EVERY;
+            };
+            if !should_draft(&engine.store(), &settings, id).unwrap_or(false) {
+                let _ = engine.store().draft_settled(id);
+                continue;
+            }
+            // Being written on request already.
+            if !automation.writing.lock().unwrap().insert(id) {
+                continue;
+            }
+            let result =
+                write_draft(app, &engine, &client, key.as_deref(), id, Asked::Worker).await;
             automation.writing.lock().unwrap().remove(&id);
-            match result {
-                Ok(_) => written += 1,
+            let store = engine.store();
+            let settled = match result {
+                Ok(_) | Err(Failed::Nothing | Failed::Unwanted) => store.draft_settled(id),
+                Err(Failed::Email(message)) => {
+                    eprintln!("spark-rs: inbox automation: no draft for email {id}: {message}");
+                    store.draft_failed(id, now_ms())
+                }
                 Err(Failed::Provider(message)) => {
                     automation.problem(Some(message));
                     return AFTER_FAILING;
                 }
-                Err(Failed::Email(message)) => {
-                    eprintln!("spark-rs: inbox automation: no draft for email {id}: {message}")
-                }
+            };
+            if let Err(e) = settled {
+                eprintln!("spark-rs: inbox automation: {e}");
             }
         }
-        automation.problem(None);
+
+        if !worked {
+            automation.problem(None);
+            return LOOK_EVERY;
+        }
     }
+}
+
+/// The settings as saved now; `None` (and a log line) if they can't be read.
+fn saved_settings(engine: &Engine) -> Option<AutomationSettings> {
+    engine
+        .store()
+        .automation_settings()
+        .inspect_err(|e| eprintln!("spark-rs: inbox automation: {e}"))
+        .ok()
 }
 
 /// The next emails to sort, all of one account, and the request for them.
@@ -262,12 +297,27 @@ fn should_draft(
         && !store.answered_after(id)?)
 }
 
+/// Who wants a reply written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// The worker, for mail that needs one: only while it's still wanted.
+    Worker,
+    /// The user, with "Auto-Draft a reply": whatever the settings say.
+    User,
+}
+
 /// Why a draft wasn't written.
+#[derive(Debug)]
 enum Failed {
     /// The provider can't be used now: nothing else can be written either.
     Provider(String),
-    /// Something about this email.
+    /// Something about this email; it may work another time.
     Email(String),
+    /// AI found nothing in the email to reply to.
+    Nothing,
+    /// By the time it was written, it wasn't wanted: the user answered or
+    /// drafted a reply, or turned Auto-Drafts off.
+    Unwanted,
 }
 
 /// Writes the user's reply to email `id`, saves it in Drafts and keeps its
@@ -278,6 +328,7 @@ async fn write_draft(
     client: &AiClient,
     key: Option<&str>,
     id: i64,
+    asked: Asked,
 ) -> Result<i64, Failed> {
     let email_failed = |e: spark_store::Error| Failed::Email(e.to_string());
     let (request, account_id) = {
@@ -327,9 +378,9 @@ async fn write_draft(
         .ok_or_else(|| Failed::Email("The AI provider declined to write it.".into()))?;
     let options = prompts::read_options(&answer).map_err(Failed::Email)?;
     if options.is_empty() {
-        return Err(Failed::Email(NOTHING_TO_DRAFT.into()));
+        return Err(Failed::Nothing);
     }
-    let draft_id = save_draft(engine, id, &options).map_err(Failed::Email)?;
+    let draft_id = save_draft(engine, id, &options, asked)?;
     let _ = app.emit("mailbox-changed", ());
     app.state::<Mailbox>().live.nudge(account_id);
     Ok(draft_id)
@@ -337,17 +388,30 @@ async fn write_draft(
 
 /// Saves `options`' first as a reply to email `id`, the way the composer
 /// starts one: to Reply-To or the sender, with the signature a reply gets.
-fn save_draft(engine: &Engine, id: i64, options: &[DraftOption]) -> Result<i64, String> {
+/// For the worker, only if it's still wanted, checked as it's saved.
+fn save_draft(
+    engine: &Engine,
+    id: i64,
+    options: &[DraftOption],
+    asked: Asked,
+) -> Result<i64, Failed> {
+    let failed = |e: spark_store::Error| Failed::Email(e.to_string());
     let mut store = engine.store();
+    if asked == Asked::Worker {
+        let settings = store.automation_settings().map_err(failed)?;
+        if !should_draft(&store, &settings, id).map_err(failed)? {
+            return Err(Failed::Unwanted);
+        }
+    }
     let message = store
         .message(id)
-        .map_err(text)?
-        .ok_or("That email is gone.")?;
+        .map_err(failed)?
+        .ok_or_else(|| Failed::Email("That email is gone.".into()))?;
     let account = store
         .account(message.account_id)
-        .map_err(text)?
-        .ok_or("Its account is gone.")?;
-    let signature = signature::for_reply(&store, &account.email, id).map_err(text)?;
+        .map_err(failed)?
+        .ok_or_else(|| Failed::Email("Its account is gone.".into()))?;
+    let signature = signature::for_reply(&store, &account.email, id).map_err(failed)?;
     let subject = message.subject.trim();
     let draft = Draft {
         account: account.id,
@@ -368,11 +432,11 @@ fn save_draft(engine: &Engine, id: i64, options: &[DraftOption]) -> Result<i64, 
         ..Default::default()
     };
     let now = now_ms();
-    let draft_id =
-        spark_mail::drafts::save(&mut store, &account, &draft, &[], now).map_err(text)?;
+    let draft_id = spark_mail::drafts::save(&mut store, &account, &draft, &[], now)
+        .map_err(|e| Failed::Email(e.to_string()))?;
     store
         .add_auto_draft(draft_id, id, options, 0, now)
-        .map_err(text)?;
+        .map_err(failed)?;
     Ok(draft_id)
 }
 
@@ -661,12 +725,18 @@ pub async fn auto_draft_reply(
         return Err("A reply to this email is being written already.".into());
     }
     let _ = app.emit("auto-draft-writing", WritingEvent { id, writing: true });
-    let result = write_draft(&app, &engine, &client, key.as_deref(), id).await;
+    let result = write_draft(&app, &engine, &client, key.as_deref(), id, Asked::User).await;
     automation.writing.lock().unwrap().remove(&id);
     let _ = app.emit("auto-draft-writing", WritingEvent { id, writing: false });
-    result.map_err(|f| match f {
-        Failed::Provider(message) | Failed::Email(message) => message,
-    })
+    match result {
+        Ok(draft) => {
+            // Written: the worker has none left to write for it.
+            let _ = engine.store().draft_settled(id);
+            Ok(draft)
+        }
+        Err(Failed::Provider(message) | Failed::Email(message)) => Err(message),
+        Err(Failed::Nothing | Failed::Unwanted) => Err(NOTHING_TO_DRAFT.into()),
+    }
 }
 
 /// `auto-draft-writing`: a reply to email `id` is being written, or done.
@@ -712,16 +782,22 @@ pub fn get_auto_draft(
         }))
 }
 
-/// The auto-draft says option `index` now.
+/// The auto-draft says option `index` now. Refused once the draft was
+/// edited, or while a composer has it open, as that would lose what the
+/// user wrote; its files stay as they were.
 #[tauri::command]
-pub fn choose_auto_draft_option(
+pub async fn choose_auto_draft_option(
     app: AppHandle,
     mailbox: State<'_, Mailbox>,
+    editing: State<'_, Editing>,
     id: i64,
     index: usize,
 ) -> Result<(), String> {
     live(&mailbox)?;
-    let engine = &mailbox.live.engine;
+    if editing.holds(id) {
+        return Err("This draft is open in the composer: pick a reply there.".into());
+    }
+    let engine = mailbox.live.engine.clone();
     let auto = engine
         .store()
         .auto_draft(id)
@@ -731,27 +807,31 @@ pub fn choose_auto_draft_option(
         .options
         .get(index)
         .ok_or("That draft has no such option.")?;
-    let mut draft = engine
-        .open_draft(id)
-        .map_err(text)?
-        .ok_or("That draft is gone.")?;
+    let mut draft = crate::mailbox::open_live(&engine, id).await?;
     draft.body = option.body.clone();
     draft.body_html = None;
     draft.draft_id = Some(id);
-    {
-        let mut store = engine.store();
-        if store.draft_reserved(id).map_err(text)? {
-            return Err("This draft is being sent.".into());
-        }
-        let account = store
-            .account(draft.account)
-            .map_err(text)?
-            .ok_or("Its account is gone.")?;
-        spark_mail::drafts::save(&mut store, &account, &draft, &[], now_ms()).map_err(text)?;
-        store.auto_draft_chosen(id, index).map_err(text)?;
-    }
+    let account = draft.account;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::mailbox::save_saved_draft_if(
+            &engine,
+            &draft,
+            |store| {
+                if store.draft_reserved(id).map_err(text)? {
+                    Err("This draft is being sent.".into())
+                } else if !store.auto_draft_untouched(id).map_err(text)? {
+                    Err("This draft was edited, so its other replies are gone.".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |store, _| store.auto_draft_chosen(id, index).map(|_| ()).map_err(text),
+        )
+    })
+    .await
+    .map_err(text)??;
     let _ = app.emit("mailbox-changed", ());
-    mailbox.live.nudge(draft.account);
+    mailbox.live.nudge(account);
     Ok(())
 }
 
@@ -839,10 +919,11 @@ mod tests {
         assert_eq!(view.problem, None);
     }
 
-    #[test]
-    fn a_reply_draft_is_saved_with_its_options() {
+    /// An engine whose Gmail account has a Drafts folder and one inbox
+    /// email from Dana, which it returns too.
+    fn one_email() -> (Engine, i64, i64) {
         use spark_store::{Added, FolderRole, Incoming, NewAccount, RemoteFolder};
-        let store = Store::open_in_memory().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
         let account = store
             .add_account(&NewAccount {
                 kind: AccountKind::Gmail,
@@ -852,7 +933,6 @@ mod tests {
                 config: "{}",
             })
             .unwrap();
-        let mut store = store;
         store
             .replace_folders(
                 account.id,
@@ -885,7 +965,11 @@ mod tests {
             panic!("new");
         };
         let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(NoSecrets));
-        let options = vec![
+        (engine, account.id, id)
+    }
+
+    fn options() -> Vec<DraftOption> {
+        vec![
             DraftOption {
                 title: "Accept".into(),
                 body: "Tuesday works.".into(),
@@ -894,8 +978,15 @@ mod tests {
                 title: "Decline".into(),
                 body: "I can't make it.".into(),
             },
-        ];
-        let draft_id = save_draft(&engine, id, &options).unwrap();
+        ]
+    }
+
+    #[test]
+    fn a_reply_draft_is_saved_with_its_options() {
+        let (engine, _, id) = one_email();
+        let Ok(draft_id) = save_draft(&engine, id, &options(), Asked::User) else {
+            panic!("saved");
+        };
         let draft = engine.open_draft(draft_id).unwrap().unwrap();
         assert_eq!(draft.to, "\"Whitfield, Dana\" <dana@x.com>");
         assert_eq!(draft.subject, "Re: Lunch");
@@ -907,8 +998,43 @@ mod tests {
         );
         assert_eq!(
             store.auto_draft(draft_id).unwrap().unwrap().options,
-            options
+            options()
         );
         assert!(store.conversation_has_draft(id).unwrap());
+    }
+
+    #[test]
+    fn the_worker_saves_a_reply_only_while_its_still_wanted() {
+        let (engine, account, id) = one_email();
+        // Auto-Drafts turned off while AI was writing: dropped.
+        assert!(matches!(
+            save_draft(&engine, id, &options(), Asked::Worker),
+            Err(Failed::Unwanted)
+        ));
+        let settings = AutomationSettings {
+            draft_accounts: [(account, now_ms() - 60_000)].into(),
+            ..Default::default()
+        };
+        engine.store().set_automation_settings(&settings).unwrap();
+        // The user wrote a reply of their own meanwhile.
+        let own = Draft {
+            account,
+            to: "dana@x.com".into(),
+            subject: "Re: Lunch".into(),
+            body: "Let me check.".into(),
+            reply_to: Some(id),
+            ..Default::default()
+        };
+        {
+            let mut store = engine.store();
+            let account = store.account(account).unwrap().unwrap();
+            spark_mail::drafts::save(&mut store, &account, &own, &[], now_ms()).unwrap();
+        }
+        assert!(matches!(
+            save_draft(&engine, id, &options(), Asked::Worker),
+            Err(Failed::Unwanted)
+        ));
+        // Asked for by the user, it's written all the same.
+        assert!(save_draft(&engine, id, &options(), Asked::User).is_ok());
     }
 }

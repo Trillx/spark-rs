@@ -18,7 +18,7 @@ export const AUTO_LABELS: Record<AutoLabel, { name: string; color: string }> = {
 export const AUTO_LABEL_ORDER = Object.keys(AUTO_LABELS) as AutoLabel[];
 
 /** The label a conversation shows: its newest email's that has one. */
-export function conversationLabel(conversation: Message[]): AutoLabel | undefined {
+export function conversationLabel(conversation: readonly Message[]): AutoLabel | undefined {
   for (let i = conversation.length - 1; i >= 0; i--) {
     const label = conversation[i].autoLabel;
     if (label) return label;

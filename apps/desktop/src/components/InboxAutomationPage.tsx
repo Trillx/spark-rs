@@ -1,5 +1,5 @@
 import { LoaderCircle, Plus, Tag, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   addDraftInstruction,
   getInboxAutomation,
@@ -37,6 +37,17 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
   const accounts = useAccounts();
   const demo = isDemoMode(accounts);
   const [view, setView] = useState<InboxAutomation | null>(null);
+  /**
+   * What the user has asked for so far. Saves go one at a time, each with all of it, and only the
+   * last one's answer shows: one answered late can't undo a later choice.
+   */
+  const latest = useRef<InboxAutomation | null>(null);
+  const saving = useRef<Promise<unknown>>(Promise.resolve());
+  const saves = useRef(0);
+  const show = (v: InboxAutomation) => {
+    latest.current = v;
+    setView(v);
+  };
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [instruction, setInstruction] = useState("");
   const [instructionAccount, setInstructionAccount] = useState<AccountId | "all">("all");
@@ -46,7 +57,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
   useEffect(() => {
     void getInboxAutomation().then(
       (v) => {
-        setView(v);
+        show(v);
         setModel(v.model ?? "");
       },
       (error) => setStatus({ kind: "error", text: String(error) }),
@@ -57,26 +68,36 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
     return status.kind === "error" ? <StatusLine status={status} /> : <LoaderCircle size={18} className="animate-spin text-text-2" />;
   }
 
-  async function save(change: Partial<InboxAutomationChange>) {
-    if (!view) return;
+  /** Saves `change`, worked out from what the user asked for last. */
+  function save(change: (asked: InboxAutomation) => Partial<InboxAutomationChange>) {
+    const asked = latest.current;
+    if (!asked) return;
     const next: InboxAutomationChange = {
-      labelAccounts: view.labelAccounts,
-      labelsOff: view.labelsOff,
-      draftAccounts: view.draftAccounts,
-      cleanupDays: view.cleanupDays,
-      gatekeeperDrafts: view.gatekeeperDrafts,
-      model: view.model,
-      ...change,
+      labelAccounts: asked.labelAccounts,
+      labelsOff: asked.labelsOff,
+      draftAccounts: asked.draftAccounts,
+      cleanupDays: asked.cleanupDays,
+      gatekeeperDrafts: asked.gatekeeperDrafts,
+      model: asked.model,
+      ...change(asked),
     };
-    // Shown at once; the answer replaces it.
-    setView({ ...view, ...next });
-    try {
-      setView(await saveInboxAutomation(next));
-      setStatus((s) => (s.kind === "error" ? { kind: "idle" } : s));
-    } catch (error) {
-      setView(view);
-      setStatus({ kind: "error", text: String(error) });
-    }
+    // Shown at once; the last save's answer replaces it.
+    show({ ...asked, ...next });
+    const mine = ++saves.current;
+    saving.current = saving.current
+      .then(() => saveInboxAutomation(next))
+      .then(
+        (saved) => {
+          if (mine !== saves.current) return;
+          show(saved);
+          setStatus((s) => (s.kind === "error" ? { kind: "idle" } : s));
+        },
+        (error) => {
+          setStatus({ kind: "error", text: String(error) });
+          // Back to what's saved, unless another save is on its way.
+          if (mine === saves.current) void getInboxAutomation().then(show, () => {});
+        },
+      );
   }
 
   async function run<T>(work: Promise<T>, done: (result: T) => void) {
@@ -130,7 +151,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
               id={`labels-${a.id}`}
               on={view.labelAccounts.includes(a.id)}
               disabled={demo}
-              onToggle={() => void save({ labelAccounts: toggled(view.labelAccounts, a.id) })}
+              onToggle={() => save((v) => ({ labelAccounts: toggled(v.labelAccounts, a.id) }))}
             />
           </Row>
         ))}
@@ -150,11 +171,11 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
                 id={`label-${label}`}
                 on={!view.labelsOff.includes(label)}
                 onToggle={() =>
-                  void save({
-                    labelsOff: view.labelsOff.includes(label)
-                      ? view.labelsOff.filter((l) => l !== label)
-                      : [...view.labelsOff, label],
-                  })
+                  save((v) => ({
+                    labelsOff: v.labelsOff.includes(label)
+                      ? v.labelsOff.filter((l) => l !== label)
+                      : [...v.labelsOff, label],
+                  }))
                 }
               />
             </Row>
@@ -173,7 +194,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
               id={`drafts-${a.id}`}
               on={view.draftAccounts.includes(a.id)}
               disabled={demo}
-              onToggle={() => void save({ draftAccounts: toggled(view.draftAccounts, a.id) })}
+              onToggle={() => save((v) => ({ draftAccounts: toggled(v.draftAccounts, a.id) }))}
             />
           </Row>
         ))}
@@ -193,7 +214,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
                 value={view.cleanupDays ?? CLEANUP_DEFAULT}
                 onChange={(e) => {
                   const days = Math.round(Number(e.target.value));
-                  if (days >= 1 && days <= 365) void save({ cleanupDays: days });
+                  if (days >= 1 && days <= 365) save(() => ({ cleanupDays: days }));
                 }}
                 className={`${INPUT} w-16`}
               />
@@ -201,7 +222,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
               <Switch
                 id="drafts-cleanup"
                 on={view.cleanupDays !== null}
-                onToggle={() => void save({ cleanupDays: view.cleanupDays === null ? CLEANUP_DEFAULT : null })}
+                onToggle={() => save((v) => ({ cleanupDays: v.cleanupDays === null ? CLEANUP_DEFAULT : null }))}
               />
             </Row>
             <Row
@@ -212,7 +233,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
               <Switch
                 id="drafts-gatekeeper"
                 on={view.gatekeeperDrafts}
-                onToggle={() => void save({ gatekeeperDrafts: !view.gatekeeperDrafts })}
+                onToggle={() => save((v) => ({ gatekeeperDrafts: !v.gatekeeperDrafts }))}
               />
             </Row>
           </>
@@ -235,7 +256,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
                   aria-label="Delete instruction"
                   data-tip="Delete"
                   className="grid size-7 place-items-center rounded-md text-text-2 hover:bg-base-content/10 hover:text-error"
-                  onClick={() => void run(removeDraftInstruction(i.id), (list) => setView({ ...view, instructions: list }))}
+                  onClick={() => void run(removeDraftInstruction(i.id), (list) => latest.current && show({ ...latest.current, instructions: list }))}
                 >
                   <Trash2 size={15} />
                 </button>
@@ -249,7 +270,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
                 if (!text) return;
                 const account = instructionAccount === "all" ? undefined : instructionAccount;
                 void run(addDraftInstruction(text, account), (list) => {
-                  setView({ ...view, instructions: list });
+                  if (latest.current) show({ ...latest.current, instructions: list });
                   setInstruction("");
                 });
               }}
@@ -296,7 +317,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
                   aria-label={`Remove ${address}`}
                   data-tip="Remove"
                   className="grid size-7 place-items-center rounded-md text-text-2 hover:bg-base-content/10 hover:text-error"
-                  onClick={() => void run(setAutoDraftExcluded(address, false), (list) => setView({ ...view, excluded: list }))}
+                  onClick={() => void run(setAutoDraftExcluded(address, false), (list) => latest.current && show({ ...latest.current, excluded: list }))}
                 >
                   <Trash2 size={15} />
                 </button>
@@ -309,7 +330,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
                 const address = excluding.trim();
                 if (!address) return;
                 void run(setAutoDraftExcluded(address, true), (list) => {
-                  setView({ ...view, excluded: list });
+                  if (latest.current) show({ ...latest.current, excluded: list });
                   setExcluding("");
                 });
               }}
@@ -340,7 +361,7 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
               className="flex items-center gap-1.5"
               onSubmit={(e) => {
                 e.preventDefault();
-                void save({ model: model.trim() || undefined });
+                save(() => ({ model: model.trim() || undefined }));
               }}
             >
               <input

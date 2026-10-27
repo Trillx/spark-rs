@@ -1977,6 +1977,36 @@ fn save_live(
     draft: &Draft,
     read_file: impl Fn(&str, &str) -> io::Result<LocalCopy>,
 ) -> Result<i64, String> {
+    save_live_if(
+        engine,
+        snapshots,
+        draft,
+        read_file,
+        |_| Ok(()),
+        |_, _| Ok(()),
+    )
+}
+
+/// Saves a real account's draft again with its files, as the composer
+/// does, but only if `check` passes; `then` runs right after the save. Both
+/// run while the store is held, so nothing saves in between.
+pub(crate) fn save_saved_draft_if(
+    engine: &spark_mail::Engine,
+    draft: &Draft,
+    check: impl Fn(&Store) -> Result<(), String>,
+    then: impl Fn(&Store, i64) -> Result<(), String>,
+) -> Result<i64, String> {
+    save_live_if(engine, &SAVED_FILES, draft, read_local, check, then)
+}
+
+fn save_live_if(
+    engine: &spark_mail::Engine,
+    snapshots: &SavedFiles,
+    draft: &Draft,
+    read_file: impl Fn(&str, &str) -> io::Result<LocalCopy>,
+    check: impl Fn(&Store) -> Result<(), String>,
+    then: impl Fn(&Store, i64) -> Result<(), String>,
+) -> Result<i64, String> {
     let local = attached(draft);
     let found: Vec<Option<Source>> = local.iter().map(|f| Source::now(f.path)).collect();
     let mut read: Vec<Option<io::Result<LocalCopy>>> = local.iter().map(|_| None).collect();
@@ -2003,8 +2033,10 @@ fn save_live(
                     .account(draft.account)
                     .map_err(text)?
                     .ok_or_else(|| "That account was removed.".to_owned())?;
+                check(&store)?;
                 let id = spark_mail::drafts::save(&mut store, &account, draft, &files, now_ms())
                     .map_err(text)?;
+                then(&store, id)?;
                 let sources = picks
                     .into_iter()
                     .map(|p| match p {
@@ -2044,16 +2076,21 @@ pub async fn save_draft(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64
 /// A draft from Drafts, for the composer.
 #[tauri::command]
 pub async fn open_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<Draft, String> {
-    let gone = || "That draft is gone.".to_owned();
     if !mailbox.live() {
-        return mailbox.demo.open_draft(id).ok_or_else(gone);
+        return mailbox
+            .demo
+            .open_draft(id)
+            .ok_or_else(|| "That draft is gone.".to_owned());
     }
-    let mut draft = mailbox
-        .live
-        .engine
+    open_live(&mailbox.live.engine, id).await
+}
+
+/// A real account's saved draft, as the composer gets it.
+pub(crate) async fn open_live(engine: &spark_mail::Engine, id: i64) -> Result<Draft, String> {
+    let mut draft = engine
         .open_draft(id)
         .map_err(text)?
-        .ok_or_else(gone)?;
+        .ok_or_else(|| "That draft is gone.".to_owned())?;
     // A copy from the server shows its pictures by cid: they come back as
     // data, for the editor to show and a send to carry again.
     let shown = [draft.body_html.as_deref(), draft.signature.as_deref()]
@@ -2061,7 +2098,7 @@ pub async fn open_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<Draft, S
         .flatten()
         .any(|html| !cid_refs(html).is_empty());
     if shown {
-        match mailbox.live.engine.inline_images(id).await {
+        match engine.inline_images(id).await {
             Ok(images) => {
                 for html in [&mut draft.body_html, &mut draft.signature]
                     .into_iter()
@@ -2255,6 +2292,58 @@ mod tests {
         assert_eq!(engine.store().draft_files(id).unwrap(), files);
         let retry = queue_live(&engine, &recovered).unwrap();
         assert_eq!(engine.store().outbox_files(retry).unwrap(), files);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_checked_save_keeps_the_files_and_saves_only_when_allowed() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("checked-save");
+        let file = dir.join("plan.txt");
+        std::fs::write(&file, b"plan").unwrap();
+        let draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            body: "Tuesday works.".into(),
+            attachments: vec![file_attachment(&file, 4)],
+            ..Default::default()
+        };
+        let id = save_live(&engine, &SavedFiles::default(), &draft, read_local).unwrap();
+        // Gone from disk: the copy saved with the draft is what it keeps.
+        std::fs::remove_file(&file).unwrap();
+        let mut opened = spark_mail::drafts::open(&engine.store(), id)
+            .unwrap()
+            .unwrap();
+        opened.body = "I can't make it.".into();
+        opened.draft_id = Some(id);
+        let text = |engine: &spark_mail::Engine| engine.store().content(id).unwrap().unwrap().text;
+        let refused = save_live_if(
+            &engine,
+            &SavedFiles::default(),
+            &opened,
+            read_local,
+            |_| Err("edited".into()),
+            |_, _| panic!("not saved"),
+        );
+        assert_eq!(refused, Err("edited".into()));
+        assert!(text(&engine).contains("Tuesday works."));
+        let then = std::cell::Cell::new(None);
+        let saved = save_live_if(
+            &engine,
+            &SavedFiles::default(),
+            &opened,
+            read_local,
+            |_| Ok(()),
+            |store, saved| {
+                // Still holding the store: the save is there already.
+                then.set(Some(store.content(saved).unwrap().unwrap().text));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(saved, id);
+        assert!(then.take().unwrap().contains("I can't make it."));
+        assert_eq!(bytes(&engine.store().draft_files(id).unwrap()), [b"plan"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

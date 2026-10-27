@@ -101,6 +101,28 @@ CREATE TABLE IF NOT EXISTS auto_draft_instructions (
 );
 ";
 
+/// Version 24: the replies still to be written. `draft_due` is when to
+/// write one (NULL: none to write), `draft_failures` how often it failed.
+/// Adds only what's missing, so it's safe to run again over itself.
+pub(crate) fn add_draft_queue(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('automation_checked')
+                        WHERE name = 'draft_due')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(
+            "ALTER TABLE automation_checked ADD COLUMN draft_due INTEGER;
+             ALTER TABLE automation_checked ADD COLUMN draft_failures INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS automation_draft_due ON automation_checked(draft_due)
+             WHERE draft_due IS NOT NULL;",
+    )
+}
+
 /// Spark's Auto-Labels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,23 +394,28 @@ impl Store {
         now: i64,
     ) -> Result<bool> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO automation_checked (message_id, checked_at, label, needs_reply)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (message_id) DO UPDATE SET checked_at = excluded.checked_at,
-                 label = excluded.label, needs_reply = excluded.needs_reply, retry_at = NULL",
-            params![
-                id,
-                now,
-                verdict.label.map(AutoLabel::as_str),
-                verdict.needs_reply
-            ],
-        )?;
         let account: Option<i64> = tx
             .query_row("SELECT account_id FROM messages WHERE id = ?1", [id], |r| {
                 r.get(0)
             })
             .optional()?;
+        // A reply is due for one that needs it, in an account with Auto-Drafts on.
+        let draft_due =
+            (verdict.needs_reply && account.is_some_and(|a| settings.drafts(a))).then_some(now);
+        tx.execute(
+            "INSERT INTO automation_checked (message_id, checked_at, label, needs_reply, draft_due)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (message_id) DO UPDATE SET checked_at = excluded.checked_at,
+                 label = excluded.label, needs_reply = excluded.needs_reply, retry_at = NULL,
+                 draft_due = excluded.draft_due, draft_failures = 0",
+            params![
+                id,
+                now,
+                verdict.label.map(AutoLabel::as_str),
+                verdict.needs_reply,
+                draft_due
+            ],
+        )?;
         let mut changed = false;
         if let (Some(account), Some(label)) = (account, verdict.label)
             && settings.applies(account, label)
@@ -399,6 +426,86 @@ impl Store {
         }
         tx.commit()?;
         Ok(changed)
+    }
+
+    /// Up to `limit` emails a reply is due for (`record_verdict`), newest
+    /// first, in accounts with Auto-Drafts on and since it was turned on.
+    /// Whether one is still wanted is for the caller to check again.
+    pub fn draft_candidates(
+        &self,
+        settings: &AutomationSettings,
+        now: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut found: Vec<(i64, i64)> = Vec::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT c.message_id, m.date FROM automation_checked c
+             CROSS JOIN messages m ON m.id = c.message_id
+             WHERE c.draft_due IS NOT NULL AND c.draft_due <= ?3
+               AND m.account_id = ?1 AND m.date >= ?2
+             ORDER BY m.date DESC LIMIT ?4",
+        )?;
+        for (&account, &on) in &settings.draft_accounts {
+            let rows = stmt.query_map(
+                params![account, on - DRAFT_GRACE_MS, now, limit as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            for row in rows {
+                found.push(row?);
+            }
+        }
+        found.sort_by_key(|&(id, date)| (std::cmp::Reverse(date), id));
+        found.truncate(limit);
+        Ok(found.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// No reply is due for email `id` any more: one was written, or isn't
+    /// wanted after all.
+    pub fn draft_settled(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE automation_checked SET draft_due = NULL WHERE message_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Writing a reply to email `id` failed: it's tried again later, a few
+    /// times, as a look is.
+    pub fn draft_failed(&self, id: i64, now: i64) -> Result<()> {
+        let failures: i64 = self
+            .conn
+            .query_row(
+                "SELECT draft_failures FROM automation_checked WHERE message_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            + 1;
+        let due = (failures < MAX_FAILURES).then(|| now + RETRY_MS * (1 << (failures - 1)));
+        self.conn.execute(
+            "UPDATE automation_checked SET draft_due = ?2, draft_failures = ?3
+             WHERE message_id = ?1",
+            params![id, due, failures],
+        )?;
+        Ok(())
+    }
+
+    /// Whether auto-draft `draft_id` still says exactly what it was written
+    /// with: then picking another option can't lose the user's edits.
+    pub fn auto_draft_untouched(&self, draft_id: i64) -> Result<bool> {
+        let written: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT written FROM auto_drafts WHERE draft_id = ?1",
+                [draft_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(written) = written else {
+            return Ok(false);
+        };
+        Ok(written == saved_text(&self.conn, draft_id)?)
     }
 
     /// A look at an email that failed: it's tried again later, a few times.

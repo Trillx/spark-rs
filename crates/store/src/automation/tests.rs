@@ -650,6 +650,185 @@ fn the_label_queue_is_read_from_the_queue_not_the_mailbox() {
 }
 
 #[test]
+fn replies_due_wait_until_written_or_given_up() {
+    let (mut store, account) = store();
+    let settings = on(account);
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    let mut due = Vec::new();
+    for uid in 1..=5 {
+        let id = add(
+            &mut store,
+            &incoming(account, uid, "a@x.com", NOW + uid as i64),
+        );
+        store
+            .record_verdict(id, respond, &settings, true, NOW)
+            .unwrap();
+        due.push(id);
+    }
+    let fyi = add(&mut store, &incoming(account, 9, "b@x.com", NOW));
+    let no_reply = Verdict {
+        label: Some(AutoLabel::Fyi),
+        needs_reply: false,
+    };
+    store
+        .record_verdict(fyi, no_reply, &settings, true, NOW)
+        .unwrap();
+    // All five wait, newest first, however many a round takes.
+    assert_eq!(
+        store.draft_candidates(&settings, NOW, 3).unwrap(),
+        [due[4], due[3], due[2]]
+    );
+    assert_eq!(store.draft_candidates(&settings, NOW, 10).unwrap().len(), 5);
+
+    store.draft_settled(due[4]).unwrap();
+    assert!(
+        !store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .contains(&due[4])
+    );
+    // A failure waits, then is tried again, a few times at most.
+    store.draft_failed(due[3], NOW).unwrap();
+    assert!(
+        !store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .contains(&due[3])
+    );
+    assert!(
+        store
+            .draft_candidates(&settings, NOW + 6 * 60_000, 10)
+            .unwrap()
+            .contains(&due[3])
+    );
+    store.draft_failed(due[3], NOW).unwrap();
+    store.draft_failed(due[3], NOW).unwrap();
+    assert!(
+        !store
+            .draft_candidates(&settings, NOW + 10 * DAY, 10)
+            .unwrap()
+            .contains(&due[3])
+    );
+
+    // Auto-Drafts off: nothing is due, and none is queued for new verdicts.
+    let labels_only = AutomationSettings {
+        label_accounts: [(account, NOW)].into(),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .draft_candidates(&labels_only, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let later = add(&mut store, &incoming(account, 20, "c@x.com", NOW + 100));
+    store
+        .record_verdict(later, respond, &labels_only, true, NOW)
+        .unwrap();
+    assert!(
+        !store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .contains(&later)
+    );
+}
+
+#[test]
+fn an_option_can_be_picked_only_while_the_draft_is_untouched() {
+    let (mut store, account) = store();
+    with_drafts_folder(&mut store, account);
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let options = vec![
+        DraftOption {
+            title: "Yes".into(),
+            body: "Yes.".into(),
+        },
+        DraftOption {
+            title: "No".into(),
+            body: "No.".into(),
+        },
+    ];
+    let draft = save_reply(&mut store, account, "1@example.com", "Yes.");
+    assert!(
+        !store.auto_draft_untouched(draft).unwrap(),
+        "not an auto-draft yet"
+    );
+    store.add_auto_draft(draft, id, &options, 0, NOW).unwrap();
+    assert!(store.auto_draft_untouched(draft).unwrap());
+    resave(&mut store, account, draft, "Yes, see you there.");
+    assert!(!store.auto_draft_untouched(draft).unwrap());
+}
+
+#[test]
+fn version_23_databases_gain_the_reply_queue() {
+    let dir = std::env::temp_dir().join(format!("spark-store-v23-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("v23.sqlite");
+    let _ = std::fs::remove_file(&path);
+    let (account, id) = {
+        let mut store = Store::open(&path).unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Me",
+                config: "{}",
+            })
+            .unwrap()
+            .id;
+        let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX automation_draft_due;
+                 ALTER TABLE automation_checked DROP COLUMN draft_failures;
+                 ALTER TABLE automation_checked DROP COLUMN draft_due;
+                 PRAGMA user_version = 23;",
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO automation_checked (message_id, checked_at, needs_reply) VALUES (?1, ?2, 1)",
+                params![id, NOW],
+            )
+            .unwrap();
+        (account, id)
+    };
+    let mut store = Store::open(&path).unwrap();
+    let settings = on(account);
+    // Checked before: no reply due, as before the queue.
+    assert!(
+        store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let respond = Verdict {
+        label: None,
+        needs_reply: true,
+    };
+    store
+        .record_verdict(id, respond, &settings, false, NOW)
+        .unwrap();
+    assert_eq!(store.draft_candidates(&settings, NOW, 10).unwrap(), [id]);
+    drop(store);
+    // Opening it again changes nothing.
+    assert_eq!(
+        Store::open(&path)
+            .unwrap()
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap(),
+        [id]
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn labels_have_ids_and_names() {
     for label in AutoLabel::ALL {
         assert_eq!(AutoLabel::parse(label.as_str()), Some(label));

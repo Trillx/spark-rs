@@ -101,6 +101,13 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
 #[derive(Default)]
 pub struct Editing(Mutex<HashMap<String, i64>>);
 
+impl Editing {
+    /// Whether any window's composer has saved draft `id` open.
+    pub fn holds(&self, id: i64) -> bool {
+        self.0.lock().unwrap().values().any(|open| *open == id)
+    }
+}
+
 /// This window's composer now has saved draft `id` open (none: no saved
 /// draft, or no composer).
 #[tauri::command]
