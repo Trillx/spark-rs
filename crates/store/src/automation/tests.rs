@@ -362,6 +362,63 @@ fn a_reply_sent_answers_the_conversation_before_it_syncs() {
 }
 
 #[test]
+fn failures_coming_back_after_a_reply_dont_undo_it() {
+    let (mut store, account) = store();
+    let settings = on(account);
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    // AI was sorting one, and writing a reply to another, when the user's
+    // replies went out; both then failed.
+    let sorting = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
+    let writing = add(&mut store, &incoming(account, 2, "b@x.com", NOW - 60_000));
+    store
+        .record_verdict(writing, respond, &settings, true, NOW)
+        .unwrap();
+    store.user_replied(sorting, &settings, true, NOW).unwrap();
+    store.user_replied(writing, &settings, true, NOW).unwrap();
+    store.record_check_failed(sorting, NOW).unwrap();
+    store.draft_failed(writing, NOW).unwrap();
+    let later = NOW + DAY;
+    assert!(
+        store
+            .automation_candidates(&settings, later, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .draft_candidates(&settings, later, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn turning_drafts_on_leaves_mail_already_answered() {
+    let (mut store, account) = store();
+    let labels_only = AutomationSettings {
+        label_accounts: [(account, NOW)].into(),
+        ..Default::default()
+    };
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
+    store.set_automation_settings(&labels_only).unwrap();
+    store
+        .record_verdict(id, respond, &labels_only, true, NOW)
+        .unwrap();
+    // Answered before Sent synced, then Auto-Drafts turned on within the hour.
+    store.user_replied(id, &labels_only, true, NOW).unwrap();
+    let both = on(account);
+    store.set_automation_settings(&both).unwrap();
+    assert!(store.draft_candidates(&both, NOW, 10).unwrap().is_empty());
+}
+
+#[test]
 fn a_reply_sent_with_actioned_off_leaves_no_label() {
     let (mut store, account) = store();
     let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));

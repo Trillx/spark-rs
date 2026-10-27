@@ -540,9 +540,10 @@ impl Store {
             .unwrap_or(0)
             + 1;
         let due = (failures < MAX_FAILURES).then(|| now + RETRY_MS * (1 << (failures - 1)));
+        // Not if it stopped being due meanwhile (the user replied).
         self.conn.execute(
             "UPDATE automation_checked SET draft_due = ?2, draft_failures = ?3
-             WHERE message_id = ?1",
+             WHERE message_id = ?1 AND draft_due IS NOT NULL",
             params![id, due, failures],
         )?;
         Ok(())
@@ -618,11 +619,13 @@ impl Store {
         } else {
             (None, Some(now + RETRY_MS * (1 << (failures - 1))))
         };
+        // One looked at meanwhile (answered by the user) stays so.
         self.conn.execute(
             "INSERT INTO automation_checked (message_id, checked_at, failures, retry_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (message_id) DO UPDATE SET checked_at = excluded.checked_at,
-                 failures = excluded.failures, retry_at = excluded.retry_at",
+                 failures = excluded.failures, retry_at = excluded.retry_at
+             WHERE automation_checked.checked_at IS NULL",
             params![id, checked_at, failures, retry_at],
         )?;
         Ok(())
@@ -686,8 +689,8 @@ impl Store {
     /// answered before a sync brings the reply here for `answered_after` to
     /// find. To respond becomes Actioned (no label, if that's off); its mail
     /// from before then that AI hasn't looked at yet won't be, and is
-    /// Actioned too; and no reply is due for any of it. Returns the emails
-    /// whose label changed.
+    /// Actioned too; and none of it needs a reply any more, nor gets one
+    /// when Auto-Drafts comes on. Returns the emails whose label changed.
     pub fn user_replied(
         &mut self,
         id: i64,
@@ -755,8 +758,8 @@ impl Store {
         tx.execute(
             &format!(
                 "WITH {MEMBERS}
-                 UPDATE automation_checked SET draft_due = NULL
-                 WHERE draft_due IS NOT NULL AND message_id IN
+                 UPDATE automation_checked SET draft_due = NULL, needs_reply = 0
+                 WHERE (draft_due IS NOT NULL OR needs_reply = 1) AND message_id IN
                      (SELECT m.id FROM members JOIN messages m ON m.id = members.id
                       WHERE m.date <= ?2)"
             ),
