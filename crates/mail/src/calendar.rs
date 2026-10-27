@@ -360,19 +360,28 @@ pub fn changed_event_body(
     if draft.title.trim() != before.title.trim() {
         body.insert("subject".into(), json!(draft.title.trim()));
     }
+    // How many days this occurrence moved, on the clock the change is told on.
+    let days = recurrence::days_between(
+        &date_in(zone, before.start, before.all_day),
+        &date_in(zone, draft.start, draft.all_day),
+    );
+    // A monthly or yearly series moved to another date goes by the date it
+    // went to (the 1st, the second Tuesday), so its own first day stays.
+    let by_date = shift && days != 0 && recurrence::by_date(&details.recurrence);
     if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
         // The series' own first time moves by as much as this occurrence's
         // did on the clock (days and hours), so its own length stays and a
         // DST change between them doesn't move it an hour.
+        let stay = if by_date { days * DAY_MS } else { 0 };
         let moved = |series: i64, was: i64, now: i64| {
             if !shift {
                 zone.time(now, draft.all_day)
             } else if draft.all_day {
-                zone.time(series + (now - was), true)
+                zone.time(series + (now - was) - stay, true)
             } else {
                 // Clock times, counted as if they were UTC's.
                 let clock = |t: i64| parse_iso_date(&format!("{}Z", zone.wall_at(t))).unwrap_or(t);
-                let at = clock(series) + (clock(now) - clock(was));
+                let at = clock(series) + (clock(now) - clock(was)) - stay;
                 json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
             }
         };
@@ -455,10 +464,6 @@ pub fn changed_event_body(
     let old = &details.recurrence;
     if shift && !old.is_null() {
         // A series: its rule as changed, and its days moved with the event's.
-        let days = recurrence::days_between(
-            &date_in(zone, before.start, before.all_day),
-            &date_in(zone, draft.start, draft.all_day),
-        );
         if ruled && draft.repeat.is_none() {
             body.insert("recurrence".into(), serde_json::Value::Null);
         } else if ruled || days != 0 {
@@ -471,7 +476,13 @@ pub fn changed_event_body(
             let start = first.as_deref().map(|first| (first, zone.name));
             body.insert(
                 "recurrence".into(),
-                recurrence::changed(old, rule, days, start),
+                recurrence::changed(
+                    old,
+                    rule,
+                    days,
+                    start,
+                    &date_in(zone, draft.start, draft.all_day),
+                ),
             );
         }
     } else if ruled {
@@ -856,21 +867,21 @@ impl Graph {
     }
 
     /// Event `id`'s start as wall-clock time ("2026-10-27T09:30:00") in the
-    /// Windows time zone `zone`.
-    pub async fn start_in(&self, id: &str, zone: &str) -> Result<String> {
+    /// Windows time zone `zone`, and for an occurrence of a series, when it
+    /// was to start before it was moved on its own (Unix ms).
+    pub async fn start_in(&self, id: &str, zone: &str) -> Result<(String, Option<i64>)> {
         let event: serde_json::Value = self
             .json(
                 self.request(
                     Method::GET,
-                    &format!("/me/events/{}?$select=start", path(id)),
+                    &format!("/me/events/{}?$select=start,originalStart", path(id)),
                 )
                 .header("Prefer", format!("outlook.timezone=\"{zone}\"")),
             )
             .await?;
-        Ok(event["start"]["dateTime"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned())
+        let start = event["start"]["dateTime"].as_str().unwrap_or_default();
+        let original = event["originalStart"].as_str().and_then(parse_iso_date);
+        Ok((start.to_owned(), original))
     }
 
     /// The day ("2026-10-27") of series `id`'s last occurrence from
@@ -1793,6 +1804,41 @@ mod tests {
     }
 
     #[test]
+    fn a_monthly_series_goes_by_the_date_an_occurrence_moved_to() {
+        // On the 15th from January 15; February's moved to March 1, for all.
+        let series_start = parse_iso_date("2027-01-15T17:00:00Z").unwrap();
+        let details = EventDetails {
+            start: series_start,
+            end: series_start + 3_600_000,
+            recurrence: json!({
+                "pattern": { "type": "absoluteMonthly", "interval": 1, "dayOfMonth": 15 },
+                "range": { "type": "noEnd", "startDate": "2027-01-15", "recurrenceTimeZone": "Pacific Standard Time" }
+            }),
+            ..Default::default()
+        };
+        let occurrence = parse_iso_date("2027-02-15T17:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Rent".into(),
+            start: occurrence,
+            end: occurrence + 3_600_000,
+            ..Default::default()
+        };
+        let march = parse_iso_date("2027-03-01T17:00:00Z").unwrap();
+        let draft = EventDraft {
+            start: march,
+            end: march + 3_600_000,
+            ..before.clone()
+        };
+        let body = changed_event_body(&draft, &before, &details, PACIFIC, true);
+        assert_eq!(
+            body["start"]["dateTime"], "2027-01-15T10:00:00",
+            "its own first day stays"
+        );
+        assert_eq!(body["recurrence"]["pattern"]["dayOfMonth"], 1);
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2027-01-15");
+    }
+
+    #[test]
     fn all_future_keeps_a_zoom_calls_joining_details() {
         let start = parse_iso_date("2026-11-03T16:30:00Z").unwrap();
         let zoom = format!(
@@ -1977,7 +2023,7 @@ mod tests {
                 "/me/events/ser1/instances?page=2" => {
                     json!({ "value": [{ "start": { "dateTime": "2026-10-20T09:30:00.0000000" } }] })
                 }
-                "/me/events/occ1?$select=start" => {
+                "/me/events/occ1?$select=start,originalStart" => {
                     json!({ "start": { "dateTime": "2026-10-28T00:30:00.0000000", "timeZone": "Tokyo Standard Time" } })
                 }
                 _ => return None,
@@ -1997,7 +2043,7 @@ mod tests {
         assert_eq!(last.as_deref(), Some("2026-10-27"));
         assert_eq!(
             graph.start_in("occ1", "Tokyo Standard Time").await.unwrap(),
-            "2026-10-28T00:30:00.0000000"
+            ("2026-10-28T00:30:00.0000000".to_owned(), None)
         );
     }
 

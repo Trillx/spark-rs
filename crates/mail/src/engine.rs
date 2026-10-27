@@ -1715,13 +1715,13 @@ impl Engine {
             &calendar::date_in(zone, before.start, before.all_day),
             &from,
         );
-        let days = recurrence::days_between(&split, &from);
+        let days = recurrence::days_between(&clock.current, &from);
         let rule = if draft.repeat != before.repeat {
             draft.repeat.as_ref()
         } else {
             None
         };
-        let mut new = recurrence::changed(&old, rule, days, Some((&from, zone.name)));
+        let mut new = recurrence::changed(&old, rule, days, Some((&from, zone.name)), &from);
         let was = Repeat::from_graph(&old);
         let ends_kept = rule.is_none_or(|r| was.as_ref().is_some_and(|w| w.ends == r.ends));
         if let Some(was) = was.as_ref().filter(|_| ends_kept)
@@ -2477,6 +2477,9 @@ struct SeriesClock {
     /// read from.
     shift: i64,
     /// The day ("2026-10-27") that occurrence is on there.
+    current: String,
+    /// The day its place in the series is: where it was before it was moved
+    /// on its own ("Only This Event"), else `current`.
     day: String,
 }
 
@@ -2492,8 +2495,8 @@ impl SeriesClock {
 }
 
 /// Series `master`'s clock, read from its occurrence `id`, which starts at
-/// `start` (Unix ms), against the user's `zone`. An all-day occurrence's
-/// day is its date anywhere.
+/// `start` (Unix ms; an all-day one's date), against the user's `zone`, and
+/// where in the series that occurrence is.
 async fn series_clock(
     graph: &Graph,
     id: &str,
@@ -2508,8 +2511,29 @@ async fn series_clock(
         .filter(|z| !z.is_empty())
         .unwrap_or(zone.name)
         .to_owned();
-    let wall = graph.start_in(id, &name).await?;
-    let day = wall.get(..10).unwrap_or_default().to_owned();
+    let (wall, original) = graph.start_in(id, &name).await?;
+    let current = wall.get(..10).unwrap_or_default().to_owned();
+    // Moved on its own, by as many days as its original start is from its
+    // start now (an all-day one's by their dates).
+    let day = match original {
+        Some(original) => {
+            let date = |t: i64| {
+                if all_day {
+                    calendar::utc_wall((t + 43_200_000).div_euclid(86_400_000) * 86_400_000)
+                } else {
+                    (zone.wall)(t)
+                }
+                .get(..10)
+                .unwrap_or_default()
+                .to_owned()
+            };
+            recurrence::add_days(
+                &current,
+                recurrence::days_between(&date(start), &date(original)),
+            )
+        }
+        None => current.clone(),
+    };
     let shift = if all_day || name == zone.name {
         0
     } else {
@@ -2519,7 +2543,12 @@ async fn series_clock(
             _ => 0,
         }
     };
-    Ok(SeriesClock { name, shift, day })
+    Ok(SeriesClock {
+        name,
+        shift,
+        current,
+        day,
+    })
 }
 
 pub fn config(account: &Account) -> Result<AccountConfig> {

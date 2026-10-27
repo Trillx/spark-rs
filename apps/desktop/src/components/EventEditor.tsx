@@ -354,10 +354,11 @@ export default function EventEditor({
               <select
                 aria-label="Repeat frequency"
                 className="select select-sm h-8 min-h-8 flex-1 rounded-lg border-hairline text-[13px]"
-                value={unknownRule ? "unknown" : kind}
+                value={unknownRule ? "unknown" : kind === "custom" ? "current" : kind}
                 disabled={unknownRule}
                 onChange={(e) => {
-                  const chosen = e.target.value as RepeatKind;
+                  const chosen = e.target.value as RepeatKind | "current";
+                  if (chosen === "current") return;
                   if (chosen === "custom") setCustomizing(true);
                   else set({ repeat: presetRule(chosen, draft) });
                 }}
@@ -368,7 +369,11 @@ export default function EventEditor({
                 <option value="week">Every week</option>
                 <option value="month">Every month</option>
                 <option value="year">Every year</option>
-                <option value="custom">{kind === "custom" && draft.repeat ? repeatText({ ...draft.repeat, ends: { kind: "never" } }) : "Custom…"}</option>
+                {kind === "custom" && draft.repeat && (
+                  // The rule it has; Custom… under it opens it to change.
+                  <option value="current">{repeatText({ ...draft.repeat, ends: { kind: "never" } })}</option>
+                )}
+                <option value="custom">Custom…</option>
               </select>
             </Row>
             {draft.repeat && <Ends rule={draft.repeat} onChange={(repeat) => set({ repeat })} />}
