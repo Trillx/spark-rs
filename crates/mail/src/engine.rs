@@ -1178,6 +1178,14 @@ impl Engine {
         id: i64,
         may: impl FnOnce(&Store) -> bool,
     ) -> Result<OwnDraft> {
+        let Some(account_id) = self.store().location(id)?.map(|at| at.account_id) else {
+            return Err(Error::Gone);
+        };
+        // One change to the server at a time, as rounds make theirs. Where
+        // its copy is, a round waited for may just have changed (uploaded
+        // it), so that's read once it's this one's turn.
+        let turn = self.turn(account_id);
+        let _turn = turn.lock().await;
         let (at, ours) = {
             let store = self.store();
             let Some(at) = store.location(id)? else {
@@ -1186,9 +1194,6 @@ impl Engine {
             (at, store.auto_draft_server_version(id)?)
         };
         let account = self.account(at.account_id)?;
-        // One change to the server at a time, as rounds make theirs.
-        let turn = self.turn(account.id);
-        let _turn = turn.lock().await;
         match config(&account)? {
             AccountConfig::Microsoft {
                 client_id, tenant, ..
@@ -3536,6 +3541,50 @@ mod tests {
             OwnDraft::Deleted
         );
         assert!(engine.store().message(ids[4]).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_waiting_on_a_round_sees_the_copy_it_uploaded() {
+        let (base, seen) = crate::graph::tests::serve(|asked, _| match asked.path.as_str() {
+            // Outlook changed it as soon as the round put it there.
+            "/me/messages/late?$select=changeKey" => {
+                Answer::json(serde_json::json!({ "changeKey": "v2" }))
+            }
+            _ => Answer::status(404),
+        })
+        .await;
+        let (engine, account) = microsoft_engine(base);
+        let id = own_draft(&mut engine.store(), account, None, None);
+        // A round has the account's turn, uploading it.
+        let turn = engine.turn(account);
+        let round = turn.lock().await;
+        let cleanup = engine.delete_own_draft(id, |_| true);
+        tokio::pin!(cleanup);
+        let waited = std::time::Duration::from_millis(50);
+        assert!(tokio::time::timeout(waited, &mut cleanup).await.is_err());
+        {
+            let mut store = engine.store();
+            let upload = store
+                .draft_uploads(account, i64::MAX)
+                .unwrap()
+                .into_iter()
+                .find(|u| u.message_id == id)
+                .unwrap();
+            let copy = spark_store::DraftCopy {
+                remote_id: Some("late".into()),
+                ..Default::default()
+            };
+            store.draft_uploaded(&upload, &copy, &[]).unwrap();
+            store.auto_draft_uploaded(id, Some("v1")).unwrap();
+        }
+        drop(round);
+        // Not taken for one only here, which would queue its copy's deletion
+        // with no check.
+        assert_eq!(cleanup.await.unwrap(), OwnDraft::Changed);
+        assert!(engine.store().message(id).unwrap().is_some());
+        assert!(engine.store().draft_removals(account).unwrap().is_empty());
+        let asked: Vec<_> = seen.take().into_iter().map(|a| a.path).collect();
+        assert_eq!(asked, ["/me/messages/late?$select=changeKey"]);
     }
 
     /// A scripted IMAP server: `reply` gives the untagged lines for each
