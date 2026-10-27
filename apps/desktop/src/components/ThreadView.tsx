@@ -70,7 +70,7 @@ import Avatar from "./Avatar";
 import Dropdown, { MenuItem, Popover } from "./Dropdown";
 import FindBar from "./FindBar";
 import InviteCard from "./InviteCard";
-import { BlockedImagesBar, HtmlBody, TextBody, hasInlineImages, hasRemoteImages } from "./MessageBody";
+import { HtmlBody, TextBody, hasInlineImages } from "./MessageBody";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
 
 export interface ThreadActions {
@@ -1096,15 +1096,18 @@ function Body({
 }) {
   const images = useRemoteImagesAllowed(m);
   const html = content.html;
-  const blocked = useMemo(() => html !== null && hasRemoteImages(html), [html]);
   const embeds = useMemo(() => html !== null && hasInlineImages(html), [html]);
   const inlineImages = useInlineImages(m.id, embeds);
   if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} />;
   return (
-    <>
-      {blocked && !images && <BlockedImagesBar onShow={() => allowRemoteImages(m)} onSettings={onImageSettings} />}
-      <HtmlBody html={html} remoteImages={images} inlineImages={inlineImages} quotes={quotes} />
-    </>
+    <HtmlBody
+      html={html}
+      remoteImages={images}
+      inlineImages={inlineImages}
+      quotes={quotes}
+      onShowImages={() => allowRemoteImages(m)}
+      onImageSettings={onImageSettings}
+    />
   );
 }
 

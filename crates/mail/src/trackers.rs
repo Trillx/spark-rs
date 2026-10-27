@@ -81,45 +81,67 @@ fn picture<'a>(img: &NodeRef<'a>) -> Option<NodeRef<'a>> {
         .filter(|p| p.node_name().as_deref() == Some("picture"))
 }
 
-/// A remote image that tracks opens: loaded from an open-tracking address,
-/// at most 1×1 pixels, or hidden by its own style with nothing to show it
+/// A remote image that tracks opens. Any picture it may show counts: the
+/// `<img>`'s own, or a `<source>` of its `<picture>`, at the size the browser
+/// gives it there. One is a tracker if it's at an open-tracking address, at
+/// most 1×1 pixels, or hidden by the image's own style with nothing to show it
 /// again (no class or id for a stylesheet to reach it by, no real size).
 fn is_tracker(img: &NodeRef) -> bool {
-    let attr = |name: &str| img.attr(name).map(|v| v.to_string());
-    let mut srcsets: Vec<String> = attr("srcset").into_iter().collect();
+    let attr = |node: &NodeRef, name: &str| node.attr(name).map(|v| v.to_string());
+    let length =
+        |node: &NodeRef, name: &str| attr(node, name).as_deref().and_then(attribute_length);
+    let own = (length(img, "width"), length(img, "height"));
+    let mut candidates = vec![(
+        attr(img, "src")
+            .as_deref()
+            .and_then(remote)
+            .into_iter()
+            .chain(
+                attr(img, "srcset")
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(srcset_urls),
+            )
+            .collect::<Vec<_>>(),
+        own,
+    )];
     if let Some(picture) = picture(img) {
-        srcsets.extend(
-            picture
-                .children()
-                .iter()
-                .filter(|c| c.node_name().as_deref() == Some("source"))
-                .filter_map(|c| c.attr("srcset").map(|v| v.to_string())),
-        );
+        for source in picture.children() {
+            if source.node_name().as_deref() != Some("source") {
+                continue;
+            }
+            let urls = attr(&source, "srcset")
+                .as_deref()
+                .into_iter()
+                .flat_map(srcset_urls)
+                .collect();
+            // A chosen source's width and height stand in for the image's.
+            let sized = source.has_attr("width") || source.has_attr("height");
+            let size = if sized {
+                (length(&source, "width"), length(&source, "height"))
+            } else {
+                own
+            };
+            candidates.push((urls, size));
+        }
     }
-    let sources: Vec<String> = attr("src")
-        .as_deref()
-        .and_then(remote)
-        .into_iter()
-        .chain(srcsets.iter().flat_map(|s| srcset_urls(s)))
-        .collect();
-    if sources.is_empty() {
-        return false;
-    }
-    if sources.iter().any(|url| tracks_opens(url)) {
-        return true;
-    }
-    let style = attr("style").unwrap_or_default();
-    let width =
-        css_length(&style, "width").or_else(|| attr("width").as_deref().and_then(attribute_length));
-    let height = css_length(&style, "height")
-        .or_else(|| attr("height").as_deref().and_then(attribute_length));
+    let style = attr(img, "style").unwrap_or_default();
+    let (css_width, css_height) = (css_length(&style, "width"), css_length(&style, "height"));
+    let hidden =
+        (img.has_attr("hidden") || hides(&style)) && !img.has_attr("class") && !img.has_attr("id");
     let tiny = |side: Option<f64>| side.is_some_and(|px| px <= 1.0);
-    if tiny(width) && tiny(height) {
-        return true;
-    }
     let small = |side: Option<f64>| side.is_none_or(|px| px <= 1.0);
-    let hidden = img.has_attr("hidden") || hides(&style);
-    hidden && !img.has_attr("class") && !img.has_attr("id") && small(width) && small(height)
+    candidates
+        .iter()
+        .filter(|(urls, _)| !urls.is_empty())
+        .any(|(urls, (width, height))| {
+            // The image's own style outranks either's attributes.
+            let width = css_width.or(*width);
+            let height = css_height.or(*height);
+            urls.iter().any(|url| tracks_opens(url))
+                || (tiny(width) && tiny(height))
+                || (hidden && small(width) && small(height))
+        })
 }
 
 /// An http(s) or protocol-relative URL, lowercase and without its scheme.
@@ -349,6 +371,20 @@ mod tests {
         )));
         assert!(kept(&around(
             r#"<img srcset="https://x.com/a.jpg 1x, https://x.com/a@2x.jpg 2x" width="300" height="200">"#
+        )));
+        // A source's own width and height are what the browser shows it at.
+        assert!(stripped(&around(
+            r#"<picture><source srcset="https://t.example.com/o.gif" width="1" height="1"><img src="cid:hero@x" width="600" height="300"></picture>"#
+        )));
+        assert!(kept(&around(
+            r#"<picture><source srcset="https://x.com/hero.jpg" width="600" height="300"><img src="cid:dot@x" width="1" height="1"></picture>"#
+        )));
+        // Without them it takes the image's; the image's style beats both.
+        assert!(kept(&around(
+            r#"<picture><source srcset="https://x.com/hero.jpg"><img src="cid:hero@x" width="600" height="300"></picture>"#
+        )));
+        assert!(stripped(&around(
+            r#"<picture><source srcset="https://t.example.com/o.gif" width="600" height="300"><img src="cid:x@x" style="width:1px;height:1px"></picture>"#
         )));
     }
 

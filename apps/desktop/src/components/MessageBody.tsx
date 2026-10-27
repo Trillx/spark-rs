@@ -1,6 +1,7 @@
 import { Ellipsis, ImageOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { openLink } from "../lib/links";
+import { cssIsRemote, isRemoteUrl, srcsetIsRemote } from "../lib/remoteImages";
 import { cidKey } from "../lib/richText";
 import { useDarkTheme } from "../lib/theme";
 import type { InlineImages } from "../types";
@@ -20,22 +21,13 @@ import type { InlineImages } from "../types";
 /** A runaway layout (e.g. `100vh` content) stops growing here. */
 const MAX_FRAME_HEIGHT = 50_000;
 
-/**
- * Whether the HTML loads anything from the network: img src/srcset, background="", CSS url().
- * Tracking pixels don't count: the backend has taken them out, so a newsletter with only a
- * tracker gets no bar, as in Spark.
- */
-export function hasRemoteImages(html: string) {
-  return /(?:\bsrc(?:set)?|\bbackground)\s*=\s*["']?\s*(?:https?:)?\/\/|url\(\s*["']?\s*(?:https?:)?\/\//i.test(html);
-}
-
 /** Whether the HTML embeds images with `cid:` URLs (the same test as `cid_refs` on the Rust side). */
 export function hasInlineImages(html: string) {
   return /["'=(]cid:/i.test(html);
 }
 
 /** Spark's bar above a body whose remote images are off: Show images for this email, or Settings to turn them on. */
-export function BlockedImagesBar({ onShow, onSettings }: { onShow: () => void; onSettings: () => void }) {
+function BlockedImagesBar({ onShow, onSettings }: { onShow: () => void; onSettings: () => void }) {
   return (
     <div className="mx-5 mb-1 mt-2 flex items-center gap-2 rounded-lg bg-base-200 px-3 py-1.5 text-xs leading-5 text-text-2">
       <ImageOff size={14} className="shrink-0" />
@@ -126,19 +118,25 @@ function linkify(text: string): ReactNode[] {
 
 /**
  * The email's HTML in a sandboxed frame sized to its content. Its embedded
- * images show once `inlineImages` has them; until then they're blank. A
- * reply's quote folds away unless `quotes` is off.
+ * images show once `inlineImages` has them; until then they're blank. While
+ * `remoteImages` is off, an email that loads anything from the web gets the
+ * bar to show it or open the setting. A reply's quote folds away unless
+ * `quotes` is off.
  */
 export function HtmlBody({
   html,
   remoteImages,
   inlineImages,
   quotes = true,
+  onShowImages,
+  onImageSettings,
 }: {
   html: string;
   remoteImages: boolean;
   inlineImages: InlineImages | null;
   quotes?: boolean;
+  onShowImages: () => void;
+  onImageSettings: () => void;
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   /** Kept across the reloads that "Show images" and arriving embedded images cause, so the card doesn't jump. */
@@ -208,6 +206,7 @@ export function HtmlBody({
 
   return (
     <>
+      {!remoteImages && frame.remote && <BlockedImagesBar onShow={onShowImages} onSettings={onImageSettings} />}
       {/* The light theme's sheet blends into the card. In the dark theme, emails
           that stay light sit on a white inset sheet; the rest take the card's color. */}
       <div
@@ -240,6 +239,8 @@ interface Frame {
   adapt: Rgb | null;
   /** A reply's quote of earlier mail is folded into `#spark-quoted`. */
   quoted: boolean;
+  /** It loads something from the web (`loadsRemote`). */
+  remote: boolean;
 }
 
 /**
@@ -274,6 +275,7 @@ function frameDocument(
     }
   }
   preferColorScheme(doc, dark);
+  const remote = loadsRemote(doc);
   const quoted = quotes && foldQuote(doc);
   const imgSrc = remoteImages ? "data: cid: https: http:" : "data: cid:";
   const css = card && dark ? FRAME_CSS + darkFrameCss(card, scheme === "adapt") : FRAME_CSS;
@@ -290,7 +292,29 @@ function frameDocument(
     sheet: !dark,
     adapt: card && scheme === "adapt" ? card : null,
     quoted,
+    remote,
   };
+}
+
+/**
+ * Whether an email loads anything from the web: an element's src, srcset or background, or a CSS
+ * url(). Read from the parsed document, so an attribute's entities count as the frame reads them.
+ * Tracking pixels don't count: the backend has taken them out, so a newsletter with only a tracker
+ * gets no bar, as in Spark.
+ */
+function loadsRemote(doc: Document) {
+  for (const el of doc.querySelectorAll("[src], [srcset], [background], [style]")) {
+    const attr = (name: string) => el.getAttribute(name) ?? "";
+    if (
+      isRemoteUrl(attr("src")) ||
+      isRemoteUrl(attr("background")) ||
+      srcsetIsRemote(attr("srcset")) ||
+      cssIsRemote(attr("style"))
+    ) {
+      return true;
+    }
+  }
+  return [...doc.querySelectorAll("style")].some((style) => cssIsRemote(style.textContent ?? ""));
 }
 
 // `:root:root` outranks the email's own html/body rules, so the document's

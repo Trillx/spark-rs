@@ -29,6 +29,21 @@ function changed() {
   for (const listener of listeners) listener();
 }
 
+/** Whether a URL, as an attribute gives it, loads from the web. Browsers drop tabs and newlines in URLs. */
+export function isRemoteUrl(url: string) {
+  return /^(?:https?:)?\/\//i.test(url.replace(/[\t\n\r]/g, "").trim());
+}
+
+/** Whether a `srcset` offers a picture from the web. */
+export function srcsetIsRemote(srcset: string) {
+  return srcset.split(/[\s,]+/).some(isRemoteUrl);
+}
+
+/** Whether CSS loads anything from the web: a `url()` with a web address. */
+export function cssIsRemote(css: string) {
+  return /url\(\s*["']?\s*(?:https?:)?\/\//i.test(css);
+}
+
 export function loadRemoteImages() {
   return (setting ??= localStorage.getItem(SETTING_KEY) !== "off");
 }
