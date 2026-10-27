@@ -313,18 +313,21 @@ function frameDocument(
 }
 
 /**
- * The elements that load something from the web: by src, srcset, background or inline style.
+ * The elements that load a picture from the web: by src, srcset, background, a video's poster or
+ * inline style. Video and audio themselves never load (the frame's policy has no media-src).
  * Read from the parsed document, so an attribute's entities count as the frame reads them.
  * Tracking pixels aren't among them: the backend has taken them out, so a newsletter with only a
  * tracker gets no bar, as in Spark.
  */
 function remoteElements(doc: Document) {
-  return [...doc.querySelectorAll("[src], [srcset], [background], [style]")].filter((el) => {
+  return [...doc.querySelectorAll("[src], [srcset], [background], [poster], [style]")].filter((el) => {
     const attr = (name: string) => el.getAttribute(name) ?? "";
+    const tag = el.tagName;
+    const media = tag === "VIDEO" || tag === "AUDIO" || (tag === "SOURCE" && el.parentElement?.tagName !== "PICTURE");
     return (
-      isRemoteUrl(attr("src")) ||
+      (!media && (isRemoteUrl(attr("src")) || srcsetIsRemote(attr("srcset")))) ||
       isRemoteUrl(attr("background")) ||
-      srcsetIsRemote(attr("srcset")) ||
+      isRemoteUrl(attr("poster")) ||
       cssIsRemote(attr("style"))
     );
   });

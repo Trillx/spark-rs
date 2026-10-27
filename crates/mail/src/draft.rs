@@ -97,9 +97,10 @@ pub struct Bodies {
 }
 
 impl Draft {
-    /// The signature as it goes out: cleaned, and `None` if nothing's left.
+    /// The signature as it goes out: cleaned, without a tracking pixel copied
+    /// in with it, and `None` if nothing's left.
     pub fn clean_signature(&self) -> Option<String> {
-        let clean = signature::sanitize(self.signature.as_deref()?);
+        let clean = signature::sanitize(&trackers::strip(self.signature.as_deref()?));
         (!signature::text(&clean).is_empty() || clean.contains("<img")).then_some(clean)
     }
 
@@ -499,6 +500,15 @@ mod tests {
         );
         let raw = String::from_utf8_lossy(&raw);
         assert!(raw.contains("multipart/alternative"), "{raw}");
+    }
+
+    #[test]
+    fn a_tracking_pixel_copied_into_a_signature_stays_behind() {
+        let mut d = draft("ana@x.com");
+        d.signature =
+            Some(r#"<div>Ana</div><img src="https://t.x/o.gif" width="1" height="1">"#.into());
+        let html = d.bodies(None, None).html.unwrap();
+        assert!(html.contains("Ana") && !html.contains("o.gif"), "{html}");
     }
 
     #[test]

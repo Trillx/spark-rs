@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 use spark_mail::signature::{self, MAX_IMAGE_BYTES};
+use spark_mail::trackers;
 use spark_store::{DefaultSignature, Signature, now_ms};
 use tauri::State;
 
@@ -112,9 +113,10 @@ pub fn resolve_signature(
     .map_err(text)
 }
 
-/// Cleaned HTML and its text; an error says what's wrong with it.
+/// Cleaned HTML, without a tracking pixel copied in from an email, and its
+/// text; an error says what's wrong with it.
 fn clean(html: &str) -> Result<(String, String), String> {
-    let html = signature::sanitize(html);
+    let html = signature::sanitize(&trackers::strip(html));
     let text = signature::text(&html);
     if text.is_empty() && !html.contains("<img") {
         return Err("Write a signature first.".into());
