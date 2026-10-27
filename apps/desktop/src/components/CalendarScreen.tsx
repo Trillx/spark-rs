@@ -1,13 +1,16 @@
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, LoaderCircle, PanelRight, Video, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, LoaderCircle, PanelRight, Plus, Video, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   answerEvent,
   cancelSignIn,
+  deleteEvent,
+  getPrefs,
   listCalendars,
   listEvents,
   openExternal,
   reconnectAccount,
   refreshCalendars,
+  saveEvent,
 } from "../api";
 import { useAccounts } from "../lib/accounts";
 import {
@@ -30,12 +33,24 @@ import {
   viewDays,
   type CalendarKind,
 } from "../lib/calendar";
-import { demoAnswer, demoCalendars, demoListEvents } from "../lib/demoCalendar";
+import { demoAnswer, demoCalendars, demoDeleteEvent, demoListEvents, demoSaveEvent } from "../lib/demoCalendar";
+import { draftOf, newDraft, newEventStart, type NewEventDefaults } from "../lib/eventDraft";
 import { isInsideOverlay, isTypingTarget } from "../lib/shortcuts";
-import type { AccountId, AccountView, CalendarEvent, CalendarInfo, CalendarList, InviteAnswer } from "../types";
+import type {
+  AccountId,
+  AccountView,
+  CalendarEvent,
+  CalendarInfo,
+  CalendarList,
+  EventDraft,
+  EventScope,
+  InviteAnswer,
+} from "../types";
 import AccountMark from "./AccountMark";
 import { MonthGrid, WeekGrid } from "./CalendarGrid";
+import { ChoiceDialog } from "./Dialog";
 import { Popover } from "./Dropdown";
+import EventEditor from "./EventEditor";
 import EventPreview from "./EventPreview";
 import { callService } from "./InviteCard";
 
@@ -58,21 +73,50 @@ interface Source {
   events: (start: number, end: number) => Promise<CalendarEvent[]>;
   refresh: (start: number, end: number) => Promise<void>;
   answer: (id: number, answer: InviteAnswer) => Promise<void>;
+  /** Makes or changes an event, then reads [start, end) of its calendar again. */
+  save: (id: number | null, draft: EventDraft, scope: EventScope, start: number, end: number) => Promise<void>;
+  remove: (id: number, scope: EventScope, start: number, end: number) => Promise<void>;
 }
 
-const LIVE: Source = { calendars: listCalendars, events: listEvents, refresh: refreshCalendars, answer: answerEvent };
+const LIVE: Source = {
+  calendars: listCalendars,
+  events: listEvents,
+  refresh: refreshCalendars,
+  answer: answerEvent,
+  save: saveEvent,
+  remove: deleteEvent,
+};
 const DEMO: Source = {
   calendars: () => Promise.resolve(demoCalendars()),
   events: (start, end) => Promise.resolve(demoListEvents(start, end)),
   refresh: () => Promise.resolve(),
   answer: demoAnswer,
+  save: (id, draft, scope) => demoSaveEvent(id, draft, scope),
+  remove: (id, scope) => demoDeleteEvent(id, scope),
 };
+
+/** Settings → Calendar's length and alerts for new events; the defaults if they can't be read. */
+async function newEventDefaults(): Promise<NewEventDefaults> {
+  const prefs = await getPrefs().catch(() => null);
+  return prefs
+    ? { minutes: prefs.eventMinutes, alert: prefs.eventAlert, allDayAlert: prefs.allDayAlert }
+    : { minutes: 60, alert: 10, allDayAlert: 720 };
+}
+
+/** A question the screen asks, and what to do with its answer. */
+interface Question {
+  title: string;
+  message: string;
+  choices: { label: string; value: string; primary?: boolean; danger?: boolean }[];
+  answer: (value: string | null) => void;
+}
 
 /**
  * The calendar, Spark's way, in place of the list and the reader: Day, Week
  * or Month of every account's calendars, an event's details beside it, and
- * a side panel with a small month and the next meeting. Read-only apart
- * from answering invitations.
+ * a side panel with a small month and the next meeting. New Event (Ctrl+E)
+ * and an own event's Edit open the editor; Delete asks first, and about
+ * repeating events which occurrences.
  */
 export default function CalendarScreen({
   demo,
@@ -93,6 +137,16 @@ export default function CalendarScreen({
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [preview, setPreview] = useState<{ id: number; anchor: DOMRect } | null>(null);
+  const [editor, setEditor] = useState<{
+    event?: CalendarEvent;
+    initial: EventDraft;
+    defaults: NewEventDefaults;
+    anchor: DOMRect;
+    modal: boolean;
+  } | null>(null);
+  const [question, setQuestion] = useState<Question | null>(null);
+  /** What went wrong deleting an event, until the next try. */
+  const [failed, setFailed] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now);
   const box = useRef<HTMLElement>(null);
   const [width, setWidth] = useState(1200);
@@ -213,17 +267,27 @@ export default function CalendarScreen({
     });
   };
 
-  // Keys: Esc closes; T today; D/W/M the view; arrows page. Others are kept from the hidden list.
+  // Keys: Esc closes; T today; D/W/M the view; arrows page; Ctrl+E a new event; Delete the
+  // event open. Others are kept from the hidden list. The editor and its questions have their own.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.defaultPrevented || editor || question) return;
       if (isTypingTarget(e.target) || isInsideOverlay(e.target) || document.querySelector("[data-composer]")) return;
       const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       const handled = () => {
         e.preventDefault();
         e.stopPropagation();
       };
-      if (key === "Escape") {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && key === "e") {
+        handled();
+        void newEvent();
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if ((key === "Delete" || key === "Backspace") && open && editable(open)) {
+        handled();
+        void removeEvent(open);
+      } else if (key === "Escape") {
         // An open menu or the event's details close first, on their own.
         if (document.querySelector("[role='dialog'], [role='menu']")) return;
         handled();
@@ -262,6 +326,101 @@ export default function CalendarScreen({
     block.scrollIntoView({ block: "nearest" });
     setPreview({ id, anchor: block.getBoundingClientRect() });
   }, [shown, focus]);
+
+  /** The user's own event, in their own calendar: they can change and delete it. */
+  const editable = (e: CalendarEvent) => calendars.get(e.calendar)?.own === true && e.response === "organizer";
+
+  const ask = (q: Omit<Question, "answer">) =>
+    new Promise<string | null>((answer) => setQuestion({ ...q, answer }));
+
+  /** Spark's New Event: the next quarter hour today (going to today first), in the default calendar. */
+  const newEvent = async () => {
+    const mine = list.calendars.filter((c) => c.own);
+    const target =
+      mine.find((c) => c.isDefault && !hidden.has(c.id)) ?? mine.find((c) => !hidden.has(c.id)) ?? mine[0];
+    if (!target) {
+      await ask({
+        title: "Turn on calendars",
+        message: "To create events, add a Microsoft 365 account with its calendar in Settings → Accounts.",
+        choices: [{ label: "Got it", value: "ok", primary: true }],
+      });
+      return;
+    }
+    const defaults = await newEventDefaults();
+    const today = startOfDay(Date.now());
+    if (!days.includes(today)) goToday();
+    setPreview(null);
+    setEditor({
+      initial: newDraft(target.id, newEventStart(Date.now(), today), false, defaults),
+      defaults,
+      anchor: new DOMRect(),
+      modal: true,
+    });
+  };
+
+  const editEvent = async (e: CalendarEvent, anchor: DOMRect) => {
+    const defaults = await newEventDefaults();
+    setPreview(null);
+    setEditor({ event: e, initial: draftOf(e), defaults, anchor, modal: kind === "day" });
+  };
+
+  /** Saves the editor's draft; a repeating event asks which occurrences first. False to go on editing. */
+  const saveDraft = async (event: CalendarEvent | undefined, draft: EventDraft) => {
+    let scope: EventScope = "one";
+    if (event?.repeats) {
+      const choice = await ask({
+        title: "You're changing a repeating event.",
+        message: "Do you want to change only this occurrence of the event, or all occurrences?",
+        choices: [
+          { label: "Back to edit", value: "back" },
+          { label: "All", value: "all" },
+          { label: "Only This Event", value: "one", primary: true },
+        ],
+      });
+      if (choice !== "one" && choice !== "all") return false;
+      scope = choice;
+    }
+    await source.save(event?.id ?? null, draft, scope, start - DAY_MS, end + DAY_MS);
+    await load();
+    return true;
+  };
+
+  /** Spark's Delete: are you sure, then for a repeating event which occurrences. Gone at once; back if it fails. */
+  const removeEvent = async (e: CalendarEvent) => {
+    const sure = await ask({
+      title: "Do you want to delete the event?",
+      message: "You can't undo this action.",
+      choices: [
+        { label: "No", value: "no" },
+        { label: "Yes", value: "yes", danger: true },
+      ],
+    });
+    if (sure !== "yes") return;
+    let scope: EventScope = "one";
+    if (e.repeats) {
+      const choice = await ask({
+        title: "Delete an event",
+        message: "Do you want to delete all occurrences or only this event?",
+        choices: [
+          { label: "Cancel", value: "cancel" },
+          { label: "All", value: "all" },
+          { label: "Only This Event", value: "one", primary: true },
+        ],
+      });
+      if (choice !== "one" && choice !== "all") return;
+      scope = choice;
+    }
+    setPreview(null);
+    setFailed(null);
+    const gone = (x: CalendarEvent) => x.id === e.id || (scope === "all" && e.series !== undefined && x.series === e.series);
+    setEvents((all) => all.filter((x) => !gone(x)));
+    try {
+      await source.remove(e.id, scope, start - DAY_MS, end + DAY_MS);
+    } catch (error) {
+      setFailed(`Couldn't delete "${e.title || "No Title"}": ${String(error)}`);
+    }
+    await load();
+  };
 
   const answer = (e: CalendarEvent, chosen: InviteAnswer) => {
     const before = e.response;
@@ -351,12 +510,30 @@ export default function CalendarScreen({
             saveHidden(next);
           }}
         />
+        <button
+          className="btn btn-primary btn-sm h-8 min-h-8 shrink-0 gap-1 rounded-lg pl-2 pr-3"
+          data-tip="New event (Ctrl+E)"
+          onClick={() => void newEvent()}
+        >
+          <Plus size={16} />
+          New event
+        </button>
         <HeaderButton tip={side ? "Hide Side Panel" : "Show Side Panel"} pressed={side} onClick={toggleSide}>
           <PanelRight size={18} />
         </HeaderButton>
       </header>
 
       <Notices list={list} accounts={accounts} onReconnected={() => void refresh()} />
+      {failed && (
+        <div className="flex shrink-0 items-center gap-2 px-4 pb-2 text-xs text-error">
+          <span className="min-w-0 flex-1 select-text truncate" data-tip={failed}>
+            {failed}
+          </span>
+          <button className="grid size-5 place-items-center rounded hover:bg-base-content/10" aria-label="Dismiss" onClick={() => setFailed(null)}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
 
       <div className="relative flex min-h-0 flex-1 border-t border-hairline">
         <div className="flex min-w-0 flex-1 flex-col">
@@ -368,7 +545,7 @@ export default function CalendarScreen({
               calendars={calendars}
               now={now}
               selected={open?.id}
-              onOpen={(e, rect) => setPreview({ id: e.id, anchor: rect })}
+              onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
               onPickDay={pickDay}
             />
           ) : (
@@ -379,7 +556,7 @@ export default function CalendarScreen({
               calendars={calendars}
               now={now}
               selected={open?.id}
-              onOpen={(e, rect) => setPreview({ id: e.id, anchor: rect })}
+              onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
               onPickDay={pickDay}
             />
           )}
@@ -397,7 +574,7 @@ export default function CalendarScreen({
               setPreview(null);
               if (!dockSide) toggleSide();
             }}
-            onOpen={(e, rect) => setPreview({ id: e.id, anchor: rect })}
+            onOpen={(e, rect) => !editor && setPreview({ id: e.id, anchor: rect })}
           />
         )}
       </div>
@@ -409,7 +586,33 @@ export default function CalendarScreen({
           anchor={preview.anchor}
           modal={kind === "day"}
           onAnswer={(a) => answer(open, a)}
+          onEdit={editable(open) ? () => void editEvent(open, preview.anchor) : undefined}
+          onDelete={editable(open) ? () => void removeEvent(open) : undefined}
           onClose={() => setPreview(null)}
+        />
+      )}
+      {editor && (
+        <EventEditor
+          event={editor.event}
+          initial={editor.initial}
+          calendars={list.calendars}
+          accounts={accounts}
+          anchor={editor.anchor}
+          modal={editor.modal}
+          defaults={editor.defaults}
+          onSave={(draft) => saveDraft(editor.event, draft)}
+          onClose={() => setEditor(null)}
+        />
+      )}
+      {question && (
+        <ChoiceDialog
+          title={question.title}
+          message={question.message}
+          choices={question.choices}
+          onChoose={(value) => {
+            setQuestion(null);
+            question.answer(value);
+          }}
         />
       )}
     </section>

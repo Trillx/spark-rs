@@ -117,6 +117,8 @@ fn main() {
             calendar::list_events,
             calendar::refresh_calendars,
             calendar::answer_event,
+            calendar::save_event,
+            calendar::delete_event,
             calendar::reconnect_account,
             meetings::meeting_popup_meetings,
             meetings::meeting_popup_act,

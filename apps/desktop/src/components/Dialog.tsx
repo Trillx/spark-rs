@@ -146,6 +146,43 @@ export function ConfirmDialog({
   );
 }
 
+/**
+ * A question with a few answers, as Spark asks before changing a repeating event or closing an
+ * edited one. Each button closes it and gives its answer; Esc or a click outside gives none.
+ */
+export function ChoiceDialog<T>({
+  title,
+  message,
+  choices,
+  onChoose,
+}: {
+  title: string;
+  message: string;
+  /** Left to right; the `primary` one has focus, and `danger` is red. */
+  choices: { label: string; value: T; primary?: boolean; danger?: boolean }[];
+  /** Null when it's closed without an answer. */
+  onChoose: (value: T | null) => void;
+}) {
+  return (
+    <Shell label={title} onClose={() => onChoose(null)}>
+      <h2 className="text-base font-semibold">{title}</h2>
+      <p className="mt-2 text-[13px] text-text-2">{message}</p>
+      <div className="mt-5 flex flex-wrap justify-end gap-2">
+        {choices.map((c) => (
+          <button
+            key={c.label}
+            className={`btn btn-sm ${c.danger ? "btn-error" : c.primary ? "btn-primary" : "btn-ghost"}`}
+            autoFocus={c.primary}
+            onClick={() => onChoose(c.value)}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+    </Shell>
+  );
+}
+
 /** A day and time to pick, in the future: Snooze's custom date. Starts at `initial` (Unix ms). */
 export function DateTimeDialog({
   title,

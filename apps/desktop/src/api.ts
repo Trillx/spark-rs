@@ -9,6 +9,8 @@ import type {
   AccountId,
   CalendarEvent,
   CalendarList,
+  EventDraft,
+  EventScope,
   Contact,
   AgentAccess,
   AgentSendingEvent,
@@ -268,6 +270,22 @@ export function refreshCalendars(start: number, end: number): Promise<void> {
 /** Answers an event through its calendar; the organizer is told. Resolves once the server has it. */
 export function answerEvent(id: number, answer: InviteAnswer): Promise<void> {
   if (isTauri()) return invoke("answer_event", { id, answer });
+  return Promise.resolve();
+}
+
+/**
+ * Makes an event (`id` null) or changes the user's event `id` (`scope`: that occurrence or the whole
+ * series), then reads its calendar for [start, end) again. Resolves once the server has it; Outlook
+ * mails the people invited.
+ */
+export function saveEvent(id: number | null, draft: EventDraft, scope: EventScope, start: number, end: number): Promise<void> {
+  if (isTauri()) return invoke("save_event", { id, draft, scope, start, end });
+  return Promise.resolve();
+}
+
+/** Deletes the user's event `id` (`scope`: that occurrence or the whole series), then reads its calendar for [start, end) again. */
+export function deleteEvent(id: number, scope: EventScope, start: number, end: number): Promise<void> {
+  if (isTauri()) return invoke("delete_event", { id, scope, start, end });
   return Promise.resolve();
 }
 
@@ -1364,6 +1382,9 @@ let browserPrefs: Prefs = {
   meetingPopupMinutes: 1,
   meetingPopupGuestsOnly: true,
   meetingPopupSound: true,
+  eventMinutes: 60,
+  eventAlert: 10,
+  allDayAlert: 720,
   suggestRecipients: true,
   autoDownloadAttachments: true,
   undoSendSeconds: 5,

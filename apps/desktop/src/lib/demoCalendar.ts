@@ -1,4 +1,4 @@
-import type { CalendarEvent, CalendarInfo, CalendarList, InviteAnswer, InvitePerson } from "../types";
+import type { CalendarEvent, CalendarInfo, CalendarList, EventDraft, EventScope, InviteAnswer, InvitePerson } from "../types";
 import { DAY_MS, addDays, startOfDay, utcDate } from "./calendar";
 
 // The demo accounts' calendars. They live here rather than on the Rust side
@@ -9,9 +9,9 @@ const PERSONAL = 1;
 const WORK = 2;
 
 const CALENDARS: CalendarInfo[] = [
-  { id: 1, account: WORK, name: "Calendar", color: "#3d8bff", isDefault: true },
-  { id: 2, account: WORK, name: "Team events", color: "#3ccb6e", isDefault: false },
-  { id: 3, account: PERSONAL, name: "Personal", color: "#ff9f2e", isDefault: true },
+  { id: 1, account: WORK, name: "Calendar", color: "#3d8bff", isDefault: true, own: true },
+  { id: 2, account: WORK, name: "Team events", color: "#3ccb6e", isDefault: false, own: true },
+  { id: 3, account: PERSONAL, name: "Personal", color: "#ff9f2e", isDefault: true, own: true },
 ];
 
 const ME_WORK: InvitePerson = { name: "Me", address: "me@outlook.com" };
@@ -27,9 +27,16 @@ const MEET = "https://meet.google.com/abc-defg-hij";
 
 /** Answers given in the demo, by event id. */
 const answers = new Map<number, InviteAnswer>();
+/** Events made, changed and deleted in the demo. */
+const made: CalendarEvent[] = [];
+const changes = new Map<number, Partial<CalendarEvent>>();
+const deleted = new Set<number>();
 
-type Spec = Omit<CalendarEvent, "id" | "calendar" | "account" | "start" | "end" | "allDay" | "attendees" | "response" | "canceled" | "repeats" | "showAs" | "private"> &
-  Partial<Pick<CalendarEvent, "attendees" | "response" | "canceled" | "repeats" | "showAs" | "private">>;
+type Spec = Omit<
+  CalendarEvent,
+  "id" | "calendar" | "account" | "start" | "end" | "allDay" | "attendees" | "response" | "canceled" | "repeats" | "showAs" | "private" | "onlineMeeting"
+> &
+  Partial<Pick<CalendarEvent, "attendees" | "response" | "canceled" | "repeats" | "showAs" | "private" | "onlineMeeting">>;
 
 /** The demo events of the weeks around today. */
 function demoEvents(now: number): CalendarEvent[] {
@@ -56,6 +63,7 @@ function demoEvents(now: number): CalendarEvent[] {
       repeats: spec.repeats ?? false,
       showAs: spec.showAs ?? (response === "tentative" ? "tentative" : "busy"),
       private: spec.private ?? false,
+      onlineMeeting: spec.onlineMeeting ?? spec.callLink === TEAMS,
       // Outlook's default reminder, unless the event sets its own.
       reminder: "reminder" in spec ? spec.reminder : allDay ? undefined : 15,
     });
@@ -85,6 +93,17 @@ function demoEvents(now: number): CalendarEvent[] {
       organizer: SAM,
       attendees: [ME_WORK, PRIYA, HANNAH],
       repeats: true,
+      series: "standup",
+    });
+  }
+  // Your own: a weekly planning hour on Mondays.
+  for (let day = -7; day <= 14; day++) {
+    if (new Date(addDays(today, day)).getDay() !== 1) continue;
+    add(1, ...at(day, "16:00", 60), false, {
+      title: "Weekly planning",
+      response: "organizer",
+      repeats: true,
+      series: "planning",
     });
   }
 
@@ -129,6 +148,7 @@ function demoEvents(now: number): CalendarEvent[] {
     attendees: [ME_WORK],
     canceled: true,
     repeats: true,
+    series: "one-on-one",
   });
   add(1, ...at(1, "16:00", 30), false, {
     title: "Budget check-in",
@@ -178,7 +198,61 @@ export function demoCalendars(): CalendarList {
 }
 
 export function demoListEvents(start: number, end: number): CalendarEvent[] {
-  return demoEvents(Date.now()).filter((e) => e.start < end && e.end > start);
+  return [...demoEvents(Date.now()), ...made]
+    .filter((e) => !deleted.has(e.id))
+    .map((e) => ({ ...e, ...changes.get(e.id) }))
+    .filter((e) => e.start < end && e.end > start);
+}
+
+/** The demo's events that a change with `scope` to `id` is for: it, or its whole series. */
+function scoped(id: number, scope: EventScope) {
+  const all = demoListEvents(-Infinity, Infinity);
+  const e = all.find((x) => x.id === id);
+  if (!e) return [];
+  return scope === "all" && e.series ? all.filter((x) => x.series === e.series) : [e];
+}
+
+/** As `saveEvent`, in the demo: made or changed here, the series moving by as much as the occurrence did. */
+export function demoSaveEvent(id: number | null, draft: EventDraft, scope: EventScope): Promise<void> {
+  const fields = {
+    calendar: draft.calendar,
+    title: draft.title.trim(),
+    allDay: draft.allDay,
+    location: draft.location.trim() || undefined,
+    notes: draft.notes.trim() || undefined,
+    attendees: draft.attendees.map((p) => ({ ...p, name: p.name || p.address })),
+    reminder: draft.reminder ?? undefined,
+    showAs: draft.showAs,
+    onlineMeeting: draft.teams,
+    callLink: draft.teams ? TEAMS : undefined,
+  };
+  if (id === null) {
+    made.push({
+      ...fields,
+      id: 10_000 + made.length,
+      account: CALENDARS.find((c) => c.id === draft.calendar)!.account,
+      start: draft.start,
+      end: draft.end,
+      response: "organizer",
+      canceled: false,
+      repeats: false,
+      private: false,
+    });
+  } else {
+    const before = scoped(id, "one")[0];
+    for (const e of scoped(id, scope)) {
+      const shift = draft.start - before.start;
+      const times = e.id === id ? { start: draft.start, end: draft.end } : { start: e.start + shift, end: e.start + shift + (draft.end - draft.start) };
+      changes.set(e.id, { ...changes.get(e.id), ...fields, ...times });
+    }
+  }
+  return new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+/** As `deleteEvent`, in the demo. */
+export function demoDeleteEvent(id: number, scope: EventScope): Promise<void> {
+  for (const e of scoped(id, scope)) deleted.add(e.id);
+  return new Promise((resolve) => setTimeout(resolve, 300));
 }
 
 export function demoAnswer(id: number, answer: InviteAnswer): Promise<void> {

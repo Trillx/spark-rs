@@ -62,10 +62,10 @@ Last full check: 2026-10-26.
 |---|:-:|---|
 | Unlimited Calendar Connections | ✅ | Every calendar of every Microsoft 365 account you add |
 | Multi-Provider Support | 🟡 | Microsoft 365 only; Gmail calendars need Google sign-in, which spark-rs doesn't have yet |
-| Create Events | ❌ | Events can be read and answered, not created or edited |
-| Zoom Integration | 🟡 | Join from the calendar and the meeting pop-up; adding a call to an event waits on Create Events |
-| Google Meet Integration | 🟡 | Same as Zoom |
-| Microsoft Teams Integration | 🟡 | Same as Zoom |
+| Create Events | 🟡 | New Event (Ctrl+E), Edit and Delete in Microsoft 365 calendars, with people to invite, an alert and a Teams call; repeat rules and dragging events on the grid aren't there yet |
+| Zoom Integration | 🟡 | Join from the calendar and the meeting pop-up; adding a Zoom call to an event needs a Zoom sign-in spark-rs doesn't have |
+| Google Meet Integration | 🟡 | Join from the calendar and the meeting pop-up; adding a Meet call needs a Google calendar |
+| Microsoft Teams Integration | 🟡 | Join from the calendar and the meeting pop-up, and add a Teams call to events in Microsoft 365 calendars |
 
 ## Spark +AI
 

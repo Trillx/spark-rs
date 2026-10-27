@@ -320,8 +320,16 @@ pick under Calendars. Clicking an event shows its details, a Join button for
 Teams, Zoom or Meet calls, and Yes / Maybe / No, which answers it in your
 calendar and tells the organizer. The calendar is read from Microsoft when you
 open it, every five minutes while it's open, and as you move to other weeks;
-what was read stays on this computer, so it opens at once. Creating and
-editing events isn't there yet, and neither are Gmail calendars.
+what was read stays on this computer, so it opens at once.
+
+New event (Ctrl+E) opens Spark's editor: the calendar, title, all day or
+the times, an alert, free or busy, a Teams call, the people to invite, the
+place and a note. An event of your own shows Edit and Delete in its details;
+for a repeating event they ask whether to change only that occurrence or all
+of them. Saving writes to your Microsoft 365 calendar at once, and Outlook
+mails the invitations and updates. Settings → Calendar has the length and
+alerts new events start with. Repeat rules, dragging events on the grid and
+Gmail calendars aren't there yet.
 
 Microsoft 365 accounts added before the calendar arrived signed in without
 the calendar permission: add `Calendars.ReadWrite` to the app registration

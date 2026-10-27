@@ -89,6 +89,14 @@ pub struct Prefs {
     pub meeting_popup_guests_only: bool,
     /// A chime as a meeting appears in the pop-up.
     pub meeting_popup_sound: bool,
+    /// How long a new event lasts, in minutes: Spark's Default event
+    /// duration (15, 30, 45, 60, 90 or 120).
+    pub event_minutes: u32,
+    /// A new event's alert, in minutes before it starts; `None` for none.
+    pub event_alert: Option<u32>,
+    /// A new all-day event's alert, in minutes before the midnight it
+    /// starts (720: noon the day before); `None` for none.
+    pub all_day_alert: Option<u32>,
     /// Suggest people from the user's mail while they type in To, Cc and Bcc.
     pub suggest_recipients: bool,
     /// Spark's Auto-download attachments: an email's files are fetched as
@@ -121,6 +129,9 @@ impl Default for Prefs {
             meeting_popup_minutes: 1,
             meeting_popup_guests_only: true,
             meeting_popup_sound: true,
+            event_minutes: 60,
+            event_alert: Some(10),
+            all_day_alert: Some(720),
             suggest_recipients: true,
             auto_download_attachments: true,
             told_keep_running: false,

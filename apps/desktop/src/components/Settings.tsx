@@ -91,6 +91,7 @@ import {
 import { isDemoMode, useAccounts } from "../lib/accounts";
 import { formatAgo, plural } from "../lib/format";
 import { PRIORITY_LINE_CHOICES } from "../lib/priority";
+import { alertChoices } from "../lib/eventDraft";
 import { CARDS, CARD_LIMIT, CARD_ORDER, type CardKey, type CardPrefs } from "../lib/layout";
 import {
   DEFAULT_SETTINGS as HOME_DEFAULTS,
@@ -1393,6 +1394,16 @@ const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
 ];
 
 /** When the meeting pop-up shows, as Spark offers it. */
+/** Spark's Default event duration choices, in minutes. */
+const DURATION_CHOICES: { minutes: number; label: string }[] = [
+  { minutes: 15, label: "15 minutes" },
+  { minutes: 30, label: "30 minutes" },
+  { minutes: 45, label: "45 minutes" },
+  { minutes: 60, label: "1 hour" },
+  { minutes: 90, label: "1 hour 30 minutes" },
+  { minutes: 120, label: "2 hours" },
+];
+
 const POPUP_CHOICES: { key: string; label: string }[] = [
   { key: "off", label: "Off" },
   { key: "0", label: "When meeting starts" },
@@ -1699,6 +1710,48 @@ function NotificationsPage() {
           htmlFor="event-alerts"
         >
           <Switch id="event-alerts" on={prefs.eventAlerts} onToggle={() => void change({ eventAlerts: !prefs.eventAlerts })} />
+        </Row>
+        <Row label="Default event duration" description="How long a new event lasts." htmlFor="event-minutes">
+          <select
+            id="event-minutes"
+            value={prefs.eventMinutes}
+            onChange={(e) => void change({ eventMinutes: Number(e.target.value) })}
+            className="select select-sm h-8 w-44 rounded-lg border-hairline text-[13px]"
+          >
+            {DURATION_CHOICES.map((c) => (
+              <option key={c.minutes} value={c.minutes}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </Row>
+        <Row label="Default alert for new events" htmlFor="event-alert">
+          <select
+            id="event-alert"
+            value={prefs.eventAlert ?? "none"}
+            onChange={(e) => void change({ eventAlert: e.target.value === "none" ? null : Number(e.target.value) })}
+            className="select select-sm h-8 w-44 rounded-lg border-hairline text-[13px]"
+          >
+            {alertChoices(false, prefs.eventAlert).map((c) => (
+              <option key={c.value ?? "none"} value={c.value ?? "none"}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </Row>
+        <Row label="Default all-day event alert" htmlFor="all-day-alert">
+          <select
+            id="all-day-alert"
+            value={prefs.allDayAlert ?? "none"}
+            onChange={(e) => void change({ allDayAlert: e.target.value === "none" ? null : Number(e.target.value) })}
+            className="select select-sm h-8 w-44 rounded-lg border-hairline text-[13px]"
+          >
+            {alertChoices(true, prefs.allDayAlert).map((c) => (
+              <option key={c.value ?? "none"} value={c.value ?? "none"}>
+                {c.label}
+              </option>
+            ))}
+          </select>
         </Row>
       </Group>
 

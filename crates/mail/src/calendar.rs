@@ -1,11 +1,12 @@
 //! The Microsoft 365 calendar through Graph: the user's calendars, their
 //! events over a stretch of time (each occurrence of a recurring event on its
 //! own, as Graph's calendar view expands them) with the reminder Outlook set
-//! for each, and answering an invitation there, which also tells the
-//! organizer.
+//! for each, answering an invitation there, which also tells the organizer,
+//! and making, changing and deleting the user's own events.
 //!
 //! Times are asked for in UTC. All-day events keep their days as written,
-//! read as UTC midnights, like all-day invites.
+//! read as UTC midnights, like all-day invites. Events are written in the
+//! user's own time zone (`Zone`), as Outlook writes them.
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ const EVENT_PAGE: usize = 250;
 
 const EVENT_SELECT: &str = "id,subject,start,end,isAllDay,location,onlineMeeting,onlineMeetingUrl,\
      organizer,attendees,responseStatus,responseRequested,isCancelled,isOrganizer,showAs,sensitivity,\
-     type,body,webLink,isReminderOn,reminderMinutesBeforeStart";
+     type,body,webLink,isReminderOn,reminderMinutesBeforeStart,seriesMasterId,isOnlineMeeting";
 
 /// The user's answer to an event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +86,12 @@ pub struct Event {
     /// back from the midnight its day starts, on the user's clock.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reminder: Option<i64>,
+    /// The repeating event an occurrence is of (Graph's series master), for
+    /// a change to all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    /// A Teams meeting Outlook made for it (`call_link` is its link).
+    pub online_meeting: bool,
 }
 
 impl Event {
@@ -137,12 +144,252 @@ struct GraphEvent {
     web_link: Option<String>,
     is_reminder_on: bool,
     reminder_minutes_before_start: Option<i64>,
+    series_master_id: Option<String>,
+    is_online_meeting: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphTime {
     date_time: String,
+}
+
+/// What an event says that the calendar view doesn't keep, read before
+/// changing it: its people as Graph has them (rooms and each one's
+/// required or optional kept), and its whole description.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct GraphEventDetails {
+    start: Option<GraphTime>,
+    end: Option<GraphTime>,
+    is_all_day: bool,
+    attendees: Vec<serde_json::Value>,
+    body: Option<GraphBody>,
+}
+
+/// An event's times, people and description as Graph has them
+/// (`Graph::event_details`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EventDetails {
+    /// Unix ms; an all-day event's as written, read as UTC midnights.
+    pub start: i64,
+    pub end: i64,
+    pub attendees: Vec<serde_json::Value>,
+    pub body: String,
+}
+
+/// Which occurrences of a repeating event a change is for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Scope {
+    /// Just the one (or the event, if it doesn't repeat).
+    #[default]
+    One,
+    /// Every occurrence: the series.
+    All,
+}
+
+/// The user's time zone, as an event is written in it: its Windows name,
+/// which Graph takes, and the wall-clock time there of a Unix ms time.
+#[derive(Clone, Copy, Debug)]
+pub struct Zone<'a> {
+    pub name: &'a str,
+    pub wall: fn(i64) -> String,
+}
+
+impl Zone<'_> {
+    /// UTC, where the user's own zone isn't known.
+    pub const UTC: Zone<'static> = Zone {
+        name: "UTC",
+        wall: utc_wall,
+    };
+
+    /// Graph's time for `ms`; an all-day event's day (a UTC midnight)
+    /// starts at midnight on the user's clock.
+    fn time(&self, ms: i64, all_day: bool) -> serde_json::Value {
+        let wall = if all_day {
+            utc_wall(ms)
+        } else {
+            (self.wall)(ms)
+        };
+        json!({ "dateTime": wall, "timeZone": self.name })
+    }
+}
+
+/// `ms` as wall-clock time in UTC, without the zone: "2026-10-27T09:30:00".
+pub fn utc_wall(ms: i64) -> String {
+    iso_date(ms).trim_end_matches('Z').to_owned()
+}
+
+/// An event as the editor saves it: all of what it says. Times are as in
+/// `Event`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EventDraft {
+    /// The calendar (store id) a new event goes in.
+    pub calendar: i64,
+    pub title: String,
+    pub start: i64,
+    pub end: i64,
+    pub all_day: bool,
+    pub location: String,
+    pub notes: String,
+    /// Everyone invited, besides the user.
+    pub attendees: Vec<Person>,
+    /// As `Event::reminder`.
+    pub reminder: Option<i64>,
+    pub show_as: ShowAs,
+    /// With a Teams meeting.
+    pub teams: bool,
+}
+
+/// The Graph fields of a new event saying what `draft` says.
+pub fn new_event_body(draft: &EventDraft, zone: Zone) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("subject".into(), json!(draft.title.trim()));
+    body.insert("start".into(), zone.time(draft.start, draft.all_day));
+    body.insert("end".into(), zone.time(draft.end, draft.all_day));
+    body.insert("isAllDay".into(), json!(draft.all_day));
+    if !draft.location.trim().is_empty() {
+        body.insert(
+            "location".into(),
+            json!({ "displayName": draft.location.trim() }),
+        );
+    }
+    if !draft.notes.trim().is_empty() {
+        body.insert(
+            "body".into(),
+            json!({ "contentType": "text", "content": draft.notes.trim() }),
+        );
+    }
+    body.insert(
+        "attendees".into(),
+        json!(draft.attendees.iter().map(attendee).collect::<Vec<_>>()),
+    );
+    insert_reminder(&mut body, draft.reminder);
+    body.insert("showAs".into(), json!(show_as(draft.show_as)));
+    if draft.teams {
+        body.insert("isOnlineMeeting".into(), json!(true));
+        body.insert("onlineMeetingProvider".into(), json!("teamsForBusiness"));
+    }
+    body.into()
+}
+
+/// The Graph fields to change for event `before` to say what `draft` says:
+/// only those that differ, so the rest stays as Outlook has it. `details`
+/// are the event's as Graph has them now (`Graph::event_details`): its
+/// rooms, and the meeting text after its notes, stay. With `shift`, the
+/// times move by as much as the draft's moved from `before`'s, from
+/// `details`' (the series' first occurrence, for every occurrence).
+pub fn changed_event_body(
+    draft: &EventDraft,
+    before: &Event,
+    details: &EventDetails,
+    zone: Zone,
+    shift: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if draft.title.trim() != before.title {
+        body.insert("subject".into(), json!(draft.title.trim()));
+    }
+    if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
+        let (start, end) = if shift {
+            let start = details.start + (draft.start - before.start);
+            (start, start + (draft.end - draft.start))
+        } else {
+            (draft.start, draft.end)
+        };
+        body.insert("start".into(), zone.time(start, draft.all_day));
+        body.insert("end".into(), zone.time(end, draft.all_day));
+        body.insert("isAllDay".into(), json!(draft.all_day));
+    }
+    if draft.location.trim() != before.location.as_deref().unwrap_or_default() {
+        body.insert(
+            "location".into(),
+            json!({ "displayName": draft.location.trim() }),
+        );
+    }
+    if draft.notes.trim() != before.notes.as_deref().unwrap_or_default() {
+        // The Teams text Outlook added after the notes stays.
+        let kept = without_boilerplate(&details.body);
+        let tail = details
+            .body
+            .trim()
+            .strip_prefix(kept.as_str())
+            .unwrap_or_default()
+            .trim();
+        let content = [draft.notes.trim(), tail]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        body.insert(
+            "body".into(),
+            json!({ "contentType": "text", "content": content }),
+        );
+    }
+    let key = |p: &Person| p.address.trim().to_lowercase();
+    let wanted: Vec<String> = draft.attendees.iter().map(key).collect();
+    let had: Vec<String> = before.attendees.iter().map(key).collect();
+    if wanted != had {
+        // Rooms, and the people kept, stay as they are (required or optional).
+        let address = |a: &serde_json::Value| {
+            a["emailAddress"]["address"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase()
+        };
+        let mut attendees: Vec<serde_json::Value> = details
+            .attendees
+            .iter()
+            .filter(|a| a["type"] == "resource" || wanted.contains(&address(a)))
+            .cloned()
+            .collect();
+        for p in &draft.attendees {
+            if !attendees.iter().any(|a| address(a) == key(p)) {
+                attendees.push(attendee(p));
+            }
+        }
+        body.insert("attendees".into(), json!(attendees));
+    }
+    if draft.reminder != before.reminder {
+        insert_reminder(&mut body, draft.reminder);
+    }
+    if draft.show_as != before.show_as {
+        body.insert("showAs".into(), json!(show_as(draft.show_as)));
+    }
+    if draft.teams && !before.online_meeting {
+        body.insert("isOnlineMeeting".into(), json!(true));
+        body.insert("onlineMeetingProvider".into(), json!("teamsForBusiness"));
+    }
+    body.into()
+}
+
+fn attendee(p: &Person) -> serde_json::Value {
+    let address = p.address.trim();
+    let name = Some(p.name.trim()).filter(|n| !n.is_empty() && *n != address);
+    json!({
+        "emailAddress": { "address": address, "name": name.unwrap_or(address) },
+        "type": "required",
+    })
+}
+
+fn insert_reminder(body: &mut serde_json::Map<String, serde_json::Value>, reminder: Option<i64>) {
+    body.insert("isReminderOn".into(), json!(reminder.is_some()));
+    if let Some(minutes) = reminder {
+        body.insert("reminderMinutesBeforeStart".into(), json!(minutes.max(0)));
+    }
+}
+
+fn show_as(s: ShowAs) -> &'static str {
+    match s {
+        ShowAs::Free => "free",
+        ShowAs::Tentative => "tentative",
+        ShowAs::Busy | ShowAs::Unknown => "busy",
+        ShowAs::Oof => "oof",
+        ShowAs::WorkingElsewhere => "workingElsewhere",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +514,72 @@ impl Graph {
         .await?;
         Ok(())
     }
+
+    /// Makes an event in calendar `calendar` (`new_event_body`); Outlook
+    /// sends the invitations. Returns its id.
+    pub async fn create_event(&self, calendar: &str, body: &serde_json::Value) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Created {
+            id: String,
+        }
+        let created: Created = self
+            .json(
+                self.request(
+                    Method::POST,
+                    &format!("/me/calendars/{}/events", path(calendar)),
+                )
+                .json(body),
+            )
+            .await?;
+        Ok(created.id)
+    }
+
+    /// Changes event `id` (an occurrence, or a series) as `body` says
+    /// (`changed_event_body`); Outlook sends the people invited the update.
+    pub async fn update_event(&self, id: &str, body: &serde_json::Value) -> Result<()> {
+        self.send(
+            self.request(Method::PATCH, &format!("/me/events/{}", path(id)))
+                .json(body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes event `id` (an occurrence, or a series); the people invited
+    /// to a meeting the user organized hear it's canceled.
+    pub async fn delete_event(&self, id: &str) -> Result<()> {
+        self.send(self.request(Method::DELETE, &format!("/me/events/{}", path(id))))
+            .await?;
+        Ok(())
+    }
+
+    /// Event `id`'s times, people and description as Graph has them now.
+    pub async fn event_details(&self, id: &str) -> Result<EventDetails> {
+        let e: GraphEventDetails = self
+            .json(
+                self.request(
+                    Method::GET,
+                    &format!(
+                        "/me/events/{}?$select=start,end,isAllDay,attendees,body",
+                        path(id)
+                    ),
+                )
+                .header("Prefer", "outlook.timezone=\"UTC\"")
+                .header("Prefer", "outlook.body-content-type=\"text\""),
+            )
+            .await?;
+        let all_day = e.is_all_day;
+        let time = |t: Option<GraphTime>| {
+            let ms = t.and_then(|t| parse_iso_date(&t.date_time))?;
+            Some(if all_day { nearest_midnight(ms) } else { ms })
+        };
+        Ok(EventDetails {
+            start: time(e.start).unwrap_or_default(),
+            end: time(e.end).unwrap_or_default(),
+            attendees: e.attendees,
+            body: e.body.and_then(|b| b.content).unwrap_or_default(),
+        })
+    }
 }
 
 /// An event from Graph; `None` without its times.
@@ -354,6 +667,8 @@ fn to_event(e: GraphEvent) -> Option<Event> {
             .then_some(e.reminder_minutes_before_start)
             .flatten()
             .filter(|m| *m >= 0),
+        series: e.series_master_id.filter(|id| !id.is_empty()),
+        online_meeting: e.is_online_meeting,
     })
 }
 
@@ -552,6 +867,260 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().last().unwrap(),
             "/me/events/e1/tentativelyAccept"
+        );
+    }
+
+    /// Wall-clock time in a zone 7 hours behind UTC, standing in for the user's.
+    fn pacific(ms: i64) -> String {
+        utc_wall(ms - 7 * 3_600_000)
+    }
+
+    const PACIFIC: Zone<'static> = Zone {
+        name: "Pacific Standard Time",
+        wall: pacific,
+    };
+
+    fn person(name: &str, address: &str) -> Person {
+        Person {
+            name: name.into(),
+            address: address.into(),
+            answer: None,
+        }
+    }
+
+    #[test]
+    fn a_new_event_is_written_in_the_users_zone() {
+        let start = parse_iso_date("2026-10-27T16:30:00Z").unwrap();
+        let draft = EventDraft {
+            calendar: 1,
+            title: " Design review ".into(),
+            start,
+            end: start + 3_600_000,
+            location: "Room 4".into(),
+            notes: "Bring the mocks.".into(),
+            attendees: vec![
+                person("Sam", "sam@contoso.com"),
+                person("", "kai@contoso.com"),
+            ],
+            reminder: Some(10),
+            teams: true,
+            ..Default::default()
+        };
+        let body = new_event_body(&draft, PACIFIC);
+        assert_eq!(body["subject"], "Design review");
+        assert_eq!(
+            body["start"],
+            json!({ "dateTime": "2026-10-27T09:30:00", "timeZone": "Pacific Standard Time" })
+        );
+        assert_eq!(body["end"]["dateTime"], "2026-10-27T10:30:00");
+        assert_eq!(body["isAllDay"], false);
+        assert_eq!(body["location"]["displayName"], "Room 4");
+        assert_eq!(
+            body["body"],
+            json!({ "contentType": "text", "content": "Bring the mocks." })
+        );
+        assert_eq!(
+            body["attendees"][1],
+            json!({ "emailAddress": { "address": "kai@contoso.com", "name": "kai@contoso.com" }, "type": "required" })
+        );
+        assert_eq!(body["isReminderOn"], true);
+        assert_eq!(body["reminderMinutesBeforeStart"], 10);
+        assert_eq!(body["showAs"], "busy");
+        assert_eq!(body["onlineMeetingProvider"], "teamsForBusiness");
+
+        // An all-day event's days start at midnight on the user's clock.
+        let day = parse_iso_date("2026-10-30T00:00:00Z").unwrap();
+        let body = new_event_body(
+            &EventDraft {
+                start: day,
+                end: day + DAY_MS,
+                all_day: true,
+                reminder: None,
+                ..draft
+            },
+            PACIFIC,
+        );
+        assert_eq!(body["start"]["dateTime"], "2026-10-30T00:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-10-31T00:00:00");
+        assert_eq!(body["isReminderOn"], false);
+        assert!(body.get("reminderMinutesBeforeStart").is_none());
+    }
+
+    #[test]
+    fn a_change_sends_only_what_changed() {
+        let start = parse_iso_date("2026-10-27T16:00:00Z").unwrap();
+        let before = Event {
+            title: "Standup".into(),
+            start,
+            end: start + 900_000,
+            notes: Some("Agenda".into()),
+            attendees: vec![
+                person("Sam", "sam@contoso.com"),
+                person("Kai", "kai@contoso.com"),
+            ],
+            response: Response::Organizer,
+            reminder: Some(15),
+            online_meeting: true,
+            ..Default::default()
+        };
+        let details = EventDetails {
+            start,
+            end: start + 900_000,
+            attendees: vec![
+                json!({ "type": "optional", "emailAddress": { "name": "Sam", "address": "Sam@contoso.com" } }),
+                json!({ "type": "required", "emailAddress": { "name": "Kai", "address": "kai@contoso.com" } }),
+                json!({ "type": "resource", "emailAddress": { "name": "Room 4", "address": "room4@contoso.com" } }),
+            ],
+            body: "Agenda\n\n________________________________________________________________________________\nMicrosoft Teams meeting\nJoin: https://teams.microsoft.com/l/x".into(),
+        };
+        let unchanged = EventDraft {
+            title: before.title.clone(),
+            start: before.start,
+            end: before.end,
+            notes: "Agenda".into(),
+            attendees: before.attendees.clone(),
+            reminder: Some(15),
+            teams: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            changed_event_body(&unchanged, &before, &details, PACIFIC, false),
+            json!({})
+        );
+
+        // Moved by an hour, Kai off, Alex on, new notes, no reminder.
+        let draft = EventDraft {
+            start: start + 3_600_000,
+            end: start + 3_600_000 + 900_000,
+            notes: "New agenda".into(),
+            attendees: vec![
+                person("Sam", "sam@contoso.com"),
+                person("Alex", "alex@contoso.com"),
+            ],
+            reminder: None,
+            ..unchanged.clone()
+        };
+        let body = changed_event_body(&draft, &before, &details, PACIFIC, false);
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "attendees",
+                "body",
+                "end",
+                "isAllDay",
+                "isReminderOn",
+                "start"
+            ],
+            "{body}"
+        );
+        assert_eq!(body["start"]["dateTime"], "2026-10-27T10:00:00");
+        let attendees: Vec<(&str, &str)> = body["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["emailAddress"]["address"].as_str().unwrap(),
+                    a["type"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            attendees,
+            [
+                ("Sam@contoso.com", "optional"),
+                ("room4@contoso.com", "resource"),
+                ("alex@contoso.com", "required")
+            ],
+            "rooms and kinds kept"
+        );
+        let content = body["body"]["content"].as_str().unwrap();
+        assert!(content.starts_with("New agenda\n\n____"), "{content}");
+        assert!(
+            content.ends_with("Join: https://teams.microsoft.com/l/x"),
+            "{content}"
+        );
+
+        // Every occurrence: the series moves from its own first time.
+        let series_start = start - 7 * DAY_MS;
+        let series = EventDetails {
+            start: series_start,
+            end: series_start + 900_000,
+            ..details
+        };
+        let body = changed_event_body(&draft, &before, &series, PACIFIC, true);
+        assert_eq!(
+            body["start"]["dateTime"],
+            pacific(series_start + 3_600_000).as_str()
+        );
+        assert_eq!(
+            body["end"]["dateTime"],
+            pacific(series_start + 4_500_000).as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn events_are_made_changed_and_deleted() {
+        use crate::graph::tests::{Answer as Reply, serve};
+        let (base, seen) = serve(|asked, _| match asked.method.as_str() {
+            "POST" => Reply::json(json!({ "id": "new1" })),
+            "GET" => Reply::json(json!({
+                "start": { "dateTime": "2026-10-20T08:00:00.0000000" },
+                "end": { "dateTime": "2026-10-20T09:00:00.0000000" },
+                "isAllDay": false,
+                "attendees": [],
+                "body": { "content": "Hi" }
+            })),
+            _ => Reply::json(json!({})),
+        })
+        .await;
+        let graph = Graph::with_base(&base, "token");
+        let id = graph
+            .create_event("cal/1", &json!({ "subject": "x" }))
+            .await
+            .unwrap();
+        assert_eq!(id, "new1");
+        let details = graph.event_details("ev1").await.unwrap();
+        assert_eq!(
+            details.start,
+            parse_iso_date("2026-10-20T08:00:00Z").unwrap()
+        );
+        assert_eq!(details.body, "Hi");
+        graph
+            .update_event("ev1", &json!({ "subject": "y" }))
+            .await
+            .unwrap();
+        graph.delete_event("ev1").await.unwrap();
+        let asked: Vec<(String, String, String)> = seen
+            .take()
+            .into_iter()
+            .map(|a| (a.method, a.path, a.body))
+            .collect();
+        assert_eq!(asked[0].0, "POST");
+        assert_eq!(asked[0].1, "/me/calendars/cal%2F1/events");
+        assert_eq!(asked[0].2, r#"{"subject":"x"}"#);
+        assert!(
+            asked[1].1.starts_with("/me/events/ev1?$select="),
+            "{}",
+            asked[1].1
+        );
+        assert_eq!(
+            (
+                asked[2].0.as_str(),
+                asked[2].1.as_str(),
+                asked[2].2.as_str()
+            ),
+            ("PATCH", "/me/events/ev1", r#"{"subject":"y"}"#)
+        );
+        assert_eq!(
+            (asked[3].0.as_str(), asked[3].1.as_str()),
+            ("DELETE", "/me/events/ev1")
         );
     }
 

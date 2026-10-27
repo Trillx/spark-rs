@@ -1,5 +1,19 @@
-import { Bell, CircleHelp, Check, ExternalLink, Lock, MapPin, Repeat, Users, Video, X, type LucideIcon } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  Bell,
+  CircleHelp,
+  Check,
+  ExternalLink,
+  Lock,
+  MapPin,
+  Pencil,
+  Repeat,
+  Trash2,
+  Users,
+  Video,
+  X,
+  type LucideIcon,
+} from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { openExternal } from "../api";
 import { useAccount } from "../lib/accounts";
 import { alertText, eventDate, eventTime } from "../lib/calendar";
@@ -18,35 +32,13 @@ const ATTENDING: { answer: InviteAnswer; label: string; Icon: LucideIcon; tone: 
 ];
 
 /**
- * An event's details, beside it (or centred, in Day view): its calendar,
- * title and time, the call to join, place, repeats, its alert, your answer,
- * who's invited, and the notes. Closes on Esc or a click elsewhere.
+ * Where an event's pop-up goes: beside `anchor` (the event's box), right of it or else left,
+ * centred on it at first and then only moving to stay in the window; with `modal`, centred
+ * in the window. Placed again whenever it or the window changes size ("Read more", an error,
+ * details that arrive later), so it never runs off the bottom. `key` starts it over.
  */
-export default function EventPreview({
-  event: e,
-  calendar,
-  anchor,
-  modal,
-  onAnswer,
-  onClose,
-}: {
-  event: CalendarEvent;
-  calendar?: CalendarInfo;
-  /** The event's box on screen. */
-  anchor: DOMRect;
-  /** Centred over a dimmed calendar rather than beside the event. */
-  modal: boolean;
-  /** Rejects with a user-facing error; the answer is then undone. */
-  onAnswer: (answer: InviteAnswer) => Promise<void>;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const account = useAccount(e.account);
-  const [error, setError] = useState<string | null>(null);
+export function usePopupPlace(ref: RefObject<HTMLElement | null>, anchor: DOMRect, modal: boolean, width: number, key: unknown) {
   const [place, setPlace] = useState<{ left: number; top: number } | null>(null);
-
-  // Placed again whenever it or the window changes size ("Read more", an error, details
-  // that arrive later), so it never runs off the bottom of the window.
   useLayoutEffect(() => {
     const box = ref.current;
     if (!box) return;
@@ -54,12 +46,11 @@ export default function EventPreview({
     const fit = () => {
       const height = box.offsetHeight;
       if (modal) {
-        setPlace({ left: (window.innerWidth - WIDTH) / 2, top: Math.max(48, (window.innerHeight - height) / 2) });
+        setPlace({ left: (window.innerWidth - width) / 2, top: Math.max(48, (window.innerHeight - height) / 2) });
         return;
       }
       const right = anchor.right + GAP;
-      const left = right + WIDTH <= window.innerWidth - GAP ? right : Math.max(GAP, anchor.left - GAP - WIDTH);
-      // Centred on the event at first; after that it only moves to stay in the window.
+      const left = right + width <= window.innerWidth - GAP ? right : Math.max(GAP, anchor.left - GAP - width);
       const wanted = top ?? anchor.top + anchor.height / 2 - height / 2;
       top = Math.max(TOP, Math.min(wanted, window.innerHeight - height - GAP));
       setPlace({ left, top });
@@ -72,15 +63,53 @@ export default function EventPreview({
       observer.disconnect();
       window.removeEventListener("resize", fit);
     };
-  }, [anchor, modal, e.id]);
+  }, [anchor, modal, width, key]);
+  return place;
+}
+
+/**
+ * An event's details, beside it (or centred, in Day view): its calendar,
+ * title and time, the call to join, place, repeats, its alert, your answer,
+ * who's invited, and the notes; Edit and Delete for the user's own. Closes
+ * on Esc or a click elsewhere.
+ */
+export default function EventPreview({
+  event: e,
+  calendar,
+  anchor,
+  modal,
+  onAnswer,
+  onEdit,
+  onDelete,
+  onClose,
+}: {
+  event: CalendarEvent;
+  calendar?: CalendarInfo;
+  /** The event's box on screen. */
+  anchor: DOMRect;
+  /** Centred over a dimmed calendar rather than beside the event. */
+  modal: boolean;
+  /** Rejects with a user-facing error; the answer is then undone. */
+  onAnswer: (answer: InviteAnswer) => Promise<void>;
+  /** The user's own event: Edit and Delete show. */
+  onEdit?: () => void;
+  onDelete?: () => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const account = useAccount(e.account);
+  const [error, setError] = useState<string | null>(null);
+  const place = usePopupPlace(ref, anchor, modal, WIDTH, e.id);
 
   useEffect(() => {
     const onPointer = (ev: PointerEvent) => {
+      // A question it asked (Delete) is above it, not elsewhere.
+      if (document.querySelector("[aria-modal]")) return;
       if (!ref.current?.contains(ev.target as Node)) onClose();
     };
     // Capture, so Esc closes the preview and not the calendar.
     const onKey = (ev: KeyboardEvent) => {
-      if (ev.key !== "Escape") return;
+      if (ev.key !== "Escape" || document.querySelector("[aria-modal]")) return;
       ev.stopPropagation();
       ev.preventDefault();
       onClose();
@@ -124,6 +153,16 @@ export default function EventPreview({
             {calendar?.name ?? "Calendar"}
             {account && ` · ${account.label}`}
           </span>
+          {onEdit && (
+            <IconButton tip="Edit" onClick={onEdit}>
+              <Pencil size={15} />
+            </IconButton>
+          )}
+          {onDelete && (
+            <IconButton tip="Delete" onClick={onDelete}>
+              <Trash2 size={15} />
+            </IconButton>
+          )}
           {e.webLink && (
             <IconButton tip="Open in Outlook" onClick={() => void openExternal(e.webLink!)}>
               <ExternalLink size={15} />

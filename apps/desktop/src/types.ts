@@ -264,6 +264,12 @@ export interface Prefs {
   meetingPopupGuestsOnly: boolean;
   /** A chime as a meeting appears in the pop-up. */
   meetingPopupSound: boolean;
+  /** How long a new event lasts, in minutes: 15, 30, 45, 60, 90 or 120. */
+  eventMinutes: number;
+  /** A new event's alert, in minutes before it starts; null for none. */
+  eventAlert: number | null;
+  /** A new all-day event's alert, in minutes before the midnight it starts (720: noon the day before); null for none. */
+  allDayAlert: number | null;
   /** Suggest people from the user's mail while they type in To, Cc and Bcc. */
   suggestRecipients: boolean;
   /** Spark's Auto-download attachments: an email's files are fetched as it's opened. */
@@ -374,6 +380,8 @@ export interface CalendarInfo {
   /** Hex color, e.g. "#0ea5e9". Applied with inline styles. */
   color: string;
   isDefault: boolean;
+  /** The user's own, where they can make and change events; not someone else's shared with them. */
+  own: boolean;
 }
 
 export interface CalendarList {
@@ -415,7 +423,34 @@ export interface CalendarEvent {
    * All-day events count back from the midnight their day starts.
    */
   reminder?: number;
+  /** The repeating event an occurrence is of, for a change to all of them. */
+  series?: string;
+  /** A Teams meeting Outlook made for it (`callLink` is its link). */
+  onlineMeeting: boolean;
 }
+
+/** An event as the editor saves it: all of what it says. Mirrors `EventDraft` on the Rust side. */
+export interface EventDraft {
+  /** The calendar a new event goes in. */
+  calendar: number;
+  title: string;
+  /** As `CalendarEvent`'s. */
+  start: number;
+  end: number;
+  allDay: boolean;
+  location: string;
+  notes: string;
+  /** Everyone invited, besides the user. */
+  attendees: { name: string; address: string }[];
+  /** As `CalendarEvent.reminder`; null for none. */
+  reminder: number | null;
+  showAs: CalendarEvent["showAs"];
+  /** With a Teams meeting. */
+  teams: boolean;
+}
+
+/** Which occurrences of a repeating event a change is for: that one, or all of them. */
+export type EventScope = "one" | "all";
 
 /** A meeting in the pop-up (src-tauri/src/meetings.rs). */
 export interface PopupMeeting {

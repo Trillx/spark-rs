@@ -18,7 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::attachment::{self, AttachmentData, InlineImage};
 use crate::cache::{AttachmentCache, Flight};
-use crate::calendar::{Event, Response};
+use crate::calendar::{self, Event, EventDraft, Response, Scope, Zone};
 use crate::draft::{self, Draft, Original, OutgoingAttachment};
 use crate::drafts::{self, DraftsReport};
 use crate::graph::{self, Graph};
@@ -1389,6 +1389,84 @@ impl Engine {
         };
         self.store().set_event_data(event_id, &event.to_json())?;
         Ok(())
+    }
+
+    /// Makes an event in the user's calendar `draft.calendar`, written in
+    /// `zone`; Outlook sends the invitations. The calendar's next refresh
+    /// brings it in.
+    pub async fn create_event(&self, draft: &EventDraft, zone: Zone<'_>) -> Result<()> {
+        let calendar = self
+            .store()
+            .calendars()?
+            .into_iter()
+            .find(|c| c.id == draft.calendar)
+            .ok_or_else(|| Error::Config("That calendar is no longer here.".into()))?;
+        let graph = self.calendar_graph(calendar.account_id).await?;
+        graph
+            .create_event(&calendar.remote_id, &calendar::new_event_body(draft, zone))
+            .await?;
+        Ok(())
+    }
+
+    /// Changes the user's stored event `event_id` to say what `draft` says:
+    /// that occurrence, or with `Scope::All` every occurrence of its series,
+    /// which move by as much as this one did. Outlook sends the people
+    /// invited the update.
+    pub async fn update_event(
+        &self,
+        event_id: i64,
+        draft: &EventDraft,
+        scope: Scope,
+        zone: Zone<'_>,
+    ) -> Result<()> {
+        let (target, event, graph) = self.event_target(event_id, scope).await?;
+        let details = graph.event_details(&target).await?;
+        let series = scope == Scope::All && event.series.as_deref() == Some(target.as_str());
+        let body = calendar::changed_event_body(draft, &event, &details, zone, series);
+        if body.as_object().is_some_and(|b| b.is_empty()) {
+            return Ok(());
+        }
+        graph.update_event(&target, &body).await
+    }
+
+    /// Deletes the user's stored event `event_id`: that occurrence, or with
+    /// `Scope::All` its whole series. The people invited hear it's
+    /// canceled.
+    pub async fn delete_event(&self, event_id: i64, scope: Scope) -> Result<()> {
+        let (target, _, graph) = self.event_target(event_id, scope).await?;
+        graph.delete_event(&target).await
+    }
+
+    /// What a change to stored event `event_id` goes to on the server (the
+    /// occurrence, or for `Scope::All` its series), the event, and its
+    /// account's Graph.
+    async fn event_target(&self, event_id: i64, scope: Scope) -> Result<(String, Event, Graph)> {
+        let stored = self
+            .store()
+            .event(event_id)?
+            .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
+        let event = Event::from_json(&stored.data);
+        let target = match (scope, &event.series) {
+            (Scope::All, Some(series)) => series.clone(),
+            _ => stored.remote_id.clone(),
+        };
+        let graph = self.calendar_graph(stored.account_id).await?;
+        Ok((target, event, graph))
+    }
+
+    /// Graph for changing the calendar of `account_id`, a Microsoft 365
+    /// account's.
+    async fn calendar_graph(&self, account_id: i64) -> Result<Graph> {
+        let account = self.account(account_id)?;
+        let AccountConfig::Microsoft {
+            client_id, tenant, ..
+        } = config(&account)?
+        else {
+            return Err(Error::Config(
+                "Only Microsoft 365 calendars can be changed here.".into(),
+            ));
+        };
+        self.graph(account.id, &client_id, &tenant).await
     }
 
     /// Answers the invitation message `message_id` carries, by email: a
