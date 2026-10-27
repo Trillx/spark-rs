@@ -107,6 +107,8 @@ import {
   onMailto,
   openThreadWindow,
   closeWindow,
+  editingDraft,
+  draftOpenElsewhere,
   onSearchInMain,
   onSettingsChanged,
   onThreadThen,
@@ -2469,6 +2471,11 @@ export default function App() {
     // Open in the composer: what's there is the latest, and sending closes it.
     const open = composer.current;
     if (open.draft && (open.draft.draftId === m.id || draftIds.current.get(open.key) === m.id)) return void send();
+    // Open in another window's composer: that window comes forward, to send from there.
+    if (await draftOpenElsewhere(m.id)) {
+      showToast("This draft is open in another window");
+      return;
+    }
     let d: Draft;
     try {
       d = savedDraft(await openDraft(m.id));
@@ -2752,11 +2759,23 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [draft, draftSaved, composerKey]);
 
-  /** A draft from Drafts, in the composer. Already open there, it stays as it is. */
+  // The saved draft the composer has open (each save says which, as one can replace it), so
+  // that no other window opens it too and saves its own copy over this one's.
+  const editingId = draft ? (draftIds.current.get(composerKey) ?? draft.draftId ?? null) : null;
+  useEffect(() => editingDraft(editingId), [editingId]);
+
+  /**
+   * A draft from Drafts, in the composer. Already open there, it stays as it is; open in
+   * another window's, that window comes forward.
+   */
   async function editDraft(m: Pick<Message, "id">) {
     setSelectedId(m.id);
     const open = composer.current;
     if (open.draft && (draftIds.current.get(open.key) ?? open.draft.draftId) === m.id) return;
+    if (await draftOpenElsewhere(m.id)) {
+      showToast("This draft is open in another window");
+      return;
+    }
     try {
       const next = savedDraft(await openDraft(m.id));
       openComposer(next, draftKey(next));

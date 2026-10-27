@@ -3,9 +3,14 @@
 //! it's for by a script that runs before the page (`window.__sparkThread`);
 //! it shows that conversation alone, and closes when it's done with it.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window,
+    WindowEvent,
+};
 
 use crate::background;
 
@@ -43,15 +48,59 @@ pub fn quit(app: &AppHandle) {
     }
 }
 
-/// The last conversation's window closing finishes a quit that waited for it.
+/// A window closing gives up the draft it had open. The last conversation's
+/// window closing finishes a quit that waited for it.
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
-    if matches!(event, WindowEvent::Destroyed)
-        && is_thread_window(window.label())
+    if !matches!(event, WindowEvent::Destroyed) {
+        return;
+    }
+    if let Some(editing) = window.try_state::<Editing>() {
+        editing.0.lock().unwrap().remove(window.label());
+    }
+    if is_thread_window(window.label())
         && QUITTING.load(Ordering::SeqCst)
         && !others_open(window.app_handle(), window.label())
     {
         window.app_handle().exit(0);
     }
+}
+
+/// The saved draft each window's composer has open, by window label. A
+/// draft is edited in one window at a time, so that two can't each save
+/// their own copy over the other's changes.
+#[derive(Default)]
+pub struct Editing(Mutex<HashMap<String, i64>>);
+
+/// This window's composer now has saved draft `id` open (none: no saved
+/// draft, or no composer).
+#[tauri::command]
+pub fn editing_draft(window: WebviewWindow, editing: State<'_, Editing>, id: Option<i64>) {
+    let mut open = editing.0.lock().unwrap();
+    match id {
+        Some(id) => open.insert(window.label().to_owned(), id),
+        None => open.remove(window.label()),
+    };
+}
+
+/// Whether saved draft `id` is open in another window's composer; if it
+/// is, that window comes forward.
+#[tauri::command]
+pub fn draft_open_elsewhere(window: WebviewWindow, editing: State<'_, Editing>, id: i64) -> bool {
+    let holder = editing
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(label, open)| **open == id && *label != window.label())
+        .map(|(label, _)| label.clone());
+    let Some(other) = holder.and_then(|label| window.app_handle().get_webview_window(&label))
+    else {
+        return false;
+    };
+    let _ = other.unminimize();
+    let _ = other.show();
+    let _ = other.set_focus();
+    true
 }
 
 /// A conversation's window stayed open when asked to close (its draft

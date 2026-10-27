@@ -18,8 +18,8 @@ mod prefs;
 mod secrets;
 mod signatures;
 mod templates;
-mod updates;
 mod thread_window;
+mod updates;
 
 use tauri::Manager;
 
@@ -41,6 +41,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(mailto::Pending::default())
+        .manage(thread_window::Editing::default())
         // First, so a second launch only brings this one's window forward,
         // with the email link it was given, if any.
         .plugin(tauri_plugin_single_instance::init(
@@ -161,6 +162,8 @@ fn main() {
             thread_window::open_thread_window,
             thread_window::search_in_main,
             thread_window::kept_open,
+            thread_window::editing_draft,
+            thread_window::draft_open_elsewhere,
             mailbox::prefetch_attachments,
             mailto::take_mailto,
             mailto::mail_app,

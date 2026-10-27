@@ -604,6 +604,17 @@ export function searchInMain(query: string): Promise<void> {
 /** For the main window: a conversation's own window asked for a search. */
 export const onSearchInMain = (handler: (query: string) => void) => on("search-in-main", handler);
 
+/** This window's composer has saved draft `id` open (null: none), so other windows leave it be. */
+export function editingDraft(id: number | null) {
+  if (isTauri()) void invoke("editing_draft", { id }).catch(() => {});
+}
+
+/** Saved draft `id` is open in another window's composer, which comes forward. */
+export function draftOpenElsewhere(id: number): Promise<boolean> {
+  if (isTauri()) return invoke<boolean>("draft_open_elsewhere", { id }).catch(() => false);
+  return Promise.resolve(false);
+}
+
 /** Closes this window (a conversation's own). */
 export function closeWindow() {
   if (isTauri()) void getCurrentWindow().close();
