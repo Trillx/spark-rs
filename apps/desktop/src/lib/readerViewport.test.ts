@@ -8,8 +8,11 @@ import {
   mountedBodies,
   movedByUser,
   overlaps,
+  reload,
   scrollToPlace,
+  type BodyScheduler,
   type Places,
+  type Shown,
 } from "./readerViewport.ts";
 
 /** Cards 1…n. */
@@ -321,6 +324,94 @@ test("A body seen again after scrolling back mounts in its last height", () => {
   assert.deepEqual(sorted(s.mounted), [1]);
 });
 
+test("Bodies a sync made stale load again a few at a time, showing what they had till then", () => {
+  // Review finding GR5-1: a body whose message a sync filled in loaded it
+  // again at once, outside the reader's limit. With Find open, eight did.
+  const s = bodyScheduler(undefined, () => {}, 4);
+  const r = readers(s);
+  const cards = thread(8);
+  s.cards(cards, true);
+  s.place(cards.map((id) => ({ id, near: id <= 2, visible: id === 1 })));
+  // Find is open: every body mounts and loads, a few at a time.
+  for (let fresh = [...s.mounted]; fresh.length > 0; fresh = [...s.mounted].filter((id) => !r.shows(id))) {
+    for (const id of fresh) r.show(id, "as stored");
+  }
+  assert.deepEqual(sorted(s.mounted), cards);
+  // A sync fills in all eight's files at once.
+  r.change(cards);
+  /** Loading again, in the order they started. */
+  const loads: number[] = [];
+  let most = 0;
+  while (cards.some((id) => r.step(id) !== null)) {
+    // A body given its turn loads again; the rest wait for theirs.
+    for (const id of cards) if (!loads.includes(id) && r.step(id) === "loading") loads.push(id);
+    most = Math.max(most, loads.length);
+    assert.ok(loads.length <= 4, `${loads.length} loading again at once`);
+    // Till its new content comes, each shows what it had, mounted all along.
+    assert.deepEqual(sorted(s.mounted), cards);
+    for (const id of cards) assert.equal(r.text(id), r.step(id) === null ? "filled in" : "as stored");
+    const done = loads.shift();
+    assert.ok(done !== undefined, "some wait, with none loading");
+    r.show(done, "filled in");
+  }
+  assert.equal(most, 4);
+  assert.equal(s.reloading.size, 0);
+});
+
+test("A body loading again keeps its turn while it's far, and lets it go as it unmounts", () => {
+  // Review finding GR5-1, its second half: a body loading again held no
+  // turn, so once far it unmounted with its load still going, and another
+  // started beside it.
+  const kept = new Set(thread(3));
+  const s = bodyScheduler(undefined, () => {}, 1, (id) => kept.has(id));
+  const r = readers(s);
+  const cards = thread(4);
+  s.cards(cards);
+  s.place(cards.map((id) => ({ id, near: id <= 3, visible: id <= 2 })));
+  for (const id of s.mounted) r.show(id, "as stored");
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3], "shown from the cache");
+  // A sync fills in 1's files: it loads again, in the reader's one turn.
+  kept.delete(1);
+  r.change([1]);
+  assert.equal(r.step(1), "loading");
+  // Scrolled down, 1 is far and 4 near: 1 stays, with the turn, and 4 waits.
+  s.place(cards.map((id) => ({ id, near: id >= 2, visible: id >= 3 })));
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3]);
+  // 1's card collapses: its article goes, then its body says so. 4 takes the turn.
+  s.forget(1);
+  s.content(1, null);
+  assert.deepEqual(sorted(s.mounted), [2, 3, 4]);
+  assert.equal(s.reloading.size, 0);
+});
+
+test("Bodies yet to show anything load before stale ones, and one done loading again far off unmounts", () => {
+  const s = bodyScheduler(undefined, () => {}, 1, (id) => id === 1);
+  const r = readers(s);
+  const cards = thread(3);
+  s.cards(cards);
+  s.place(cards.map((id) => ({ id, near: id <= 2, visible: id <= 2 })));
+  assert.deepEqual(sorted(s.mounted), [1, 2], "1 from the cache, 2 in the turn");
+  r.show(1, "as stored");
+  s.content(2, "loading");
+  // As 2 loads, a sync fills in 1's files, and 3 comes near: both wait.
+  r.change([1]);
+  s.place([{ id: 3, near: true }]);
+  assert.equal(r.step(1), "waiting");
+  assert.deepEqual(sorted(s.mounted), [1, 2]);
+  // 3 shows nothing yet, so it goes first; 1 shows what it had meanwhile.
+  r.show(2, "as stored");
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3]);
+  assert.equal(r.step(1), "waiting");
+  r.show(3, "as stored");
+  assert.equal(r.step(1), "loading");
+  // Scrolled down, 1 stays while it loads, and goes once it's done.
+  s.place(cards.map((id) => ({ id, near: id >= 2, visible: id === 3 })));
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3]);
+  r.show(1, "filled in");
+  assert.deepEqual(sorted(s.mounted), [2, 3]);
+  assert.equal(s.reloading.size, 0);
+});
+
 test("Reading starts with a little of the email before it in view", () => {
   assert.equal(scrollToPlace(0, 900, READING_CONTEXT), 800);
   assert.equal(scrollToPlace(300, 50, 100), 250);
@@ -332,3 +423,41 @@ test("Only a move with the same content is the user's", () => {
   assert.ok(!movedByUser({ top: 800, height: 5000 }, { top: 1100, height: 5300 }));
   assert.ok(!movedByUser({ top: 800, height: 5000 }, { top: 801, height: 5000 }));
 });
+
+/** What a body shows of its message as loaded from `version` of it: `text`. */
+const showing = (version: number, text: string): Shown => ({
+  version,
+  state: { status: "ready", content: { text: [text], html: null, to: [], cc: [], attachments: [] } },
+});
+
+/**
+ * Mounted bodies showing what they loaded, reporting it to `s` as
+ * useMessageContent and Body do: ready, and whether that's stale.
+ */
+function readers(s: BodyScheduler) {
+  /** Each message's version, as `forgetContent` counts them. */
+  const versions = new Map<number, number>();
+  const shown = new Map<number, Shown>();
+  const version = (id: number) => versions.get(id) ?? 0;
+  /** What the body does as its message changes: `reload`'s answer, its turn being the scheduler's. */
+  const step = (id: number) => reload(shown.get(id)!, version(id), s.reloading.has(id));
+  const report = (id: number) => s.content(id, "ready", false, step(id) !== null);
+  return {
+    step,
+    shows: (id: number) => shown.has(id),
+    text(id: number) {
+      const { state } = shown.get(id)!;
+      return state.status === "ready" ? state.content.text[0] : state.status;
+    },
+    /** The body shows `text`, its message as it is now. */
+    show(id: number, text: string) {
+      shown.set(id, showing(version(id), text));
+      report(id);
+    },
+    /** A sync changes these messages: their bodies say they're stale. */
+    change(ids: readonly number[]) {
+      for (const id of ids) versions.set(id, version(id) + 1);
+      for (const id of ids) report(id);
+    },
+  };
+}

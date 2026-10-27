@@ -2,14 +2,15 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { getInlineImages, getMessageContent } from "../api";
 import type { InlineImages, InviteAnswer, MessageContent } from "../types";
 import { loadCache } from "./cache";
+import { reload, type Shown } from "./readerViewport";
 
 // Message bodies load on demand and the most recently used stay cached while
 // the app runs, so reopening a thread (or forwarding it) is instant. Failed
 // loads aren't cached. Embedded images come from the server the same way, kept
 // to a budget of their own: being data URLs, they're big. Sizes are estimated
 // as two bytes a character (see `estimateBytes`). A message whose stored
-// content changes is forgotten, and readers showing it load it again
-// (`forgetContent`).
+// content changes is forgotten, and readers showing it load it again in
+// their turn (`forgetContent`).
 
 const MiB = 1024 * 1024;
 /** A few hundred ordinary bodies (their HTML and text, ~100–300 KiB as estimated): modest on an 8 GB ARM laptop. */
@@ -46,7 +47,8 @@ export function clearContent() {
 /**
  * Forgets what's kept of messages whose stored content changed since it was read, loads under way included: a
  * sync filled in the attachments or invite it stored them without (`staleContent`). Readers showing them load
- * them again, and show what they have till then. Their embedded images didn't change, so readers keep those.
+ * them again in their turn, and show what they have till then (`useMessageContent`). Their embedded images didn't
+ * change, so readers keep those.
  */
 export function forgetContent(ids: readonly number[]) {
   if (!ids.length) return;
@@ -114,39 +116,64 @@ export type ContentState =
   | { status: "ready"; content: MessageContent }
   | { status: "error"; message: string };
 
-export function useMessageContent(id: number): [ContentState, () => void] {
+const LOADING: ContentState = { status: "loading" };
+
+/**
+ * A message's content as a mounted body shows it, whether that's stale, and
+ * how to try again after a failure. Stale, the body shows what it had, and
+ * loads the message again only once the reader gives it a `turn` (see
+ * `reload`); a reload that fails keeps the content too. A body never has two
+ * loads under way, so the reader's limit counts them all: a new one starts
+ * once the last has settled.
+ */
+export function useMessageContent(id: number, turn: boolean): [ContentState, boolean, () => void] {
   const [attempt, setAttempt] = useState(0);
   const version = useSyncExternalStore(watchVersions, () => versions.get(id) ?? 0);
-  const [state, setState] = useState<ContentState>(() => {
+  const [shown, setShown] = useState<Shown & { id: number }>(() => {
     const cached = contents.get(id);
-    return cached ? { status: "ready", content: cached } : { status: "loading" };
+    return { id, version, state: cached ? { status: "ready", content: cached } : LOADING };
   });
-  /** The message and version last loaded. */
-  const loaded = useRef({ id, version });
+  /** Another message's, from before `id` changed, isn't this one's: this one's loading. */
+  const current = shown.id === id ? shown : { id, version, state: LOADING };
+  const again = reload(current, version, turn);
+  const waiting = again === "waiting";
+  /** The last load, settled or not. */
+  const last = useRef(Promise.resolve());
 
   useEffect(() => {
-    // Loading it again as `forgetContent` forgot it, what shows stays till the new content comes.
-    const again = loaded.current.id === id && loaded.current.version !== version;
-    loaded.current = { id, version };
+    if (waiting) return;
     let live = true;
+    const show = (state: ContentState) => setShown({ id, version, state });
     const cached = contents.get(id);
     if (cached) {
-      setState({ status: "ready", content: cached });
+      show({ status: "ready", content: cached });
       return;
     }
-    if (!again) setState({ status: "loading" });
-    loadContent(id).then(
-      (content) => live && setState({ status: "ready", content }),
-      (error) => {
-        if (!live) return;
-        const failed: ContentState = { status: "error", message: String(error) };
-        setState((was) => (again && was.status === "ready" ? was : failed));
-      },
-    );
+    // Loading it again, what shows stays till the new content comes.
+    if (!again) show(LOADING);
+    const start = () => {
+      if (!live) return;
+      return loadContent(id).then(
+        (content) => {
+          if (live) show({ status: "ready", content });
+        },
+        (error) => {
+          if (!live) return;
+          const failed: ContentState = { status: "error", message: String(error) };
+          setShown((was) => ({ id, version, state: again && was.state.status === "ready" ? was.state : failed }));
+        },
+      );
+    };
+    last.current = last.current.then(start, start);
     return () => {
       live = false;
     };
-  }, [id, attempt, version]);
+  }, [id, attempt, version, waiting]);
 
-  return [state, () => setAttempt((n) => n + 1)];
+  const retry = () => {
+    // At once, stale or not: the user asked.
+    setShown({ id, version, state: LOADING });
+    setAttempt((n) => n + 1);
+  };
+  return [current.state, again !== null, retry];
 }

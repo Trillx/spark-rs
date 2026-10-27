@@ -6,7 +6,9 @@ import type { ContentState } from "./content";
 // off becomes a placeholder of its last height, so nothing on screen moves.
 // This is the bookkeeping, without the DOM: ThreadView's observers say where
 // cards are, mounted bodies say what they're loading, and ThreadView mounts
-// the bodies `mounted` names.
+// the bodies `mounted` names. A mounted body whose message changed (a sync
+// filled in its files) loads it again the same way, in its turn, showing
+// what it had till then (`reload`).
 
 /** Bodies mount this many screens ahead, above and below the reader's. */
 export const OVERSCAN = 1;
@@ -54,6 +56,8 @@ export interface Places {
   loading: ReadonlySet<number>;
   /** Whether a body would show from the cache now, loading nothing: then it doesn't need a turn. */
   cached: (id: number) => boolean;
+  /** Mounted bodies that are stale (see `reload`), loading again or waiting to. */
+  stale?: ReadonlySet<number>;
 }
 
 /**
@@ -83,7 +87,64 @@ export function mountedBodies(
       inFlight++;
     }
   }
-  return next.size === mounted.size && [...next].every((id) => mounted.has(id)) ? mounted : next;
+  return same(next, mounted);
+}
+
+/** What a mounted body shows (see `useMessageContent`), and from which version of its message (`forgetContent`). */
+export interface Shown {
+  state: ContentState;
+  version: number;
+}
+
+/**
+ * What a mounted body does as its message changes, `version` being the
+ * message's now: nothing while it shows that version, or while it's still
+ * loading, as it loads the new version in the turn it has. Showing what it
+ * loaded of a version before, or that it couldn't, it's stale: "waiting" for
+ * a turn, then "loading" in the one the reader gives it (`turn`, see
+ * `reloadTurns`). It shows what it had till the new content comes.
+ */
+export function reload(shown: Shown, version: number, turn: boolean): "waiting" | "loading" | null {
+  if (shown.state.status === "loading" || shown.version === version) return null;
+  return turn ? "loading" : "waiting";
+}
+
+/**
+ * Which stale bodies load their content again (see `reload`). Loading again
+ * is one of the `limit` loads, as mounting is, and a body keeps its turn till
+ * it's no longer stale. Bodies yet to show anything had their turns first
+ * (`mountedBodies`), as a stale one shows what it had meanwhile. Then, in
+ * turn, a near one that isn't loading something else gets one while fewer
+ * than `limit` load. When nothing changes, `reloading` itself comes back.
+ */
+export function reloadTurns(
+  cards: readonly number[],
+  mounted: ReadonlySet<number>,
+  reloading: ReadonlySet<number>,
+  { near, visible, loading, stale = new Set() }: Places,
+  limit = LOADING_LIMIT,
+): ReadonlySet<number> {
+  const next = new Set([...reloading].filter((id) => mounted.has(id) && stale.has(id)));
+  // Every stale body has its turn, or none is stale.
+  if (next.size === stale.size) return same(next, reloading);
+  let inFlight = [...mounted].filter((id) => loading.has(id) || next.has(id)).length;
+  for (const id of mountOrder(cards, visible)) {
+    if (inFlight >= limit) break;
+    if (!stale.has(id) || !mounted.has(id) || !near.has(id) || loading.has(id) || next.has(id)) continue;
+    next.add(id);
+    inFlight++;
+  }
+  return same(next, reloading);
+}
+
+/** `next`, or `was` itself when they hold the same ids. */
+function same(next: Set<number>, was: ReadonlySet<number>): ReadonlySet<number> {
+  return next.size === was.size && [...next].every((id) => was.has(id)) ? was : next;
+}
+
+/** `set` without `id`: `set` itself when it doesn't hold it. */
+function without(set: ReadonlySet<number>, id: number): ReadonlySet<number> {
+  return set.has(id) ? new Set([...set].filter((x) => x !== id)) : set;
 }
 
 /** Where a card is: near the screen or not, on it or not. Either can be left out. */
@@ -97,13 +158,14 @@ export type BodyScheduler = ReturnType<typeof bodyScheduler>;
 
 /**
  * The reader's bodies as reports come in, calling `onChange` with the new
- * mounted set whenever it changes. The card reading starts at is mounted
- * from the start, without waiting for its place. `cached` says whether a
- * body would show from the cache now; left out, none would.
+ * mounted set, and the stale bodies that may load again, whenever either
+ * changes. The card reading starts at is mounted from the start, without
+ * waiting for its place. `cached` says whether a body would show from the
+ * cache now; left out, none would.
  */
 export function bodyScheduler(
   start: number | undefined,
-  onChange: (mounted: ReadonlySet<number>) => void,
+  onChange: (mounted: ReadonlySet<number>, reloading: ReadonlySet<number>) => void,
   limit = LOADING_LIMIT,
   cached: (id: number) => boolean = () => false,
 ) {
@@ -111,8 +173,10 @@ export function bodyScheduler(
   /** Every expanded body counts as near (see `cards`). */
   let all = false;
   let mounted: ReadonlySet<number> = new Set(start === undefined ? [] : [start]);
-  /** The mounted set `onChange` last heard of. */
-  let told = mounted;
+  /** Stale bodies given their turn to load again (see `reloadTurns`): they count as loading. */
+  let reloading: ReadonlySet<number> = new Set();
+  /** What `onChange` last heard of. */
+  let told = { mounted, reloading };
   const near = new Set<number>();
   const visible = new Set<number>();
   const known = new Set<number>();
@@ -126,6 +190,8 @@ export function bodyScheduler(
   const pending = new Set<number>(mounted);
   const loadingContent = new Set<number>();
   const fetchingImages = new Set<number>();
+  /** Bodies that said they're stale, loading again or waiting to. */
+  const stale = new Set<number>();
   const heights = new Map<number, number>();
 
   /** A body that can't be showing: it's not mounted, and nothing it was loading counts. */
@@ -133,22 +199,40 @@ export function bodyScheduler(
     pending.delete(id);
     loadingContent.delete(id);
     fetchingImages.delete(id);
-    if (mounted.has(id)) mounted = new Set([...mounted].filter((x) => x !== id));
+    stale.delete(id);
+    reloading = without(reloading, id);
+    mounted = without(mounted, id);
+  };
+
+  const tell = () => {
+    if (mounted === told.mounted && reloading === told.reloading) return;
+    told = { mounted, reloading };
+    onChange(mounted, reloading);
   };
 
   const run = () => {
     const present = cards.filter((id) => !gone.has(id));
-    const loading = new Set([...pending, ...loadingContent, ...fetchingImages]);
+    const loading = new Set([...pending, ...loadingContent, ...fetchingImages, ...reloading]);
     const nearNow = all ? new Set([...near, ...present]) : near;
-    const next = mountedBodies(present, mounted, { near: nearNow, visible, known, loading, cached }, limit);
-    for (const id of next) if (!mounted.has(id) && !cached(id)) pending.add(id);
+    const places = { near: nearNow, visible, known, loading, cached, stale };
+    const next = mountedBodies(present, mounted, places, limit);
+    for (const id of next) {
+      if (mounted.has(id) || cached(id)) continue;
+      pending.add(id);
+      loading.add(id);
+    }
     mounted = next;
-    if (mounted !== told) onChange((told = mounted));
+    reloading = reloadTurns(present, mounted, reloading, places, limit);
+    tell();
   };
 
   return {
     get mounted() {
       return mounted;
+    },
+    /** Stale bodies that may load again now (see `reloadTurns`). */
+    get reloading() {
+      return reloading;
     },
     /**
      * The expanded cards, oldest first; any other body goes, loading or not.
@@ -159,7 +243,8 @@ export function bodyScheduler(
       cards = expanded;
       all = everyOne;
       const open = new Set(expanded);
-      for (const id of [...mounted, ...pending, ...loadingContent, ...fetchingImages]) if (!open.has(id)) letGo(id);
+      const bodies = [...mounted, ...pending, ...loadingContent, ...fetchingImages, ...stale];
+      for (const id of bodies) if (!open.has(id)) letGo(id);
       run();
     },
     /** Where cards on the page are. */
@@ -187,13 +272,17 @@ export function bodyScheduler(
     },
     /**
      * A mounted body's state, all in one report: its content loading, ready
-     * or failed, and with `images`, ready but fetching its embedded images.
-     * Null once the body unmounts.
+     * or failed, with `images`, ready but fetching its embedded images, and
+     * with `isStale`, ready or failed but stale (see `reload`). A stale body
+     * waits for its turn to load again, and keeps it till it says it's no
+     * longer stale. Null once the body unmounts.
      */
-    content(id: number, status: ContentState["status"] | null, images = false) {
+    content(id: number, status: ContentState["status"] | null, images = false, isStale = false) {
       pending.delete(id);
       mark(loadingContent, id, status === "loading");
       mark(fetchingImages, id, status === "ready" && images);
+      mark(stale, id, isStale && (status === "ready" || status === "error"));
+      if (!stale.has(id)) reloading = without(reloading, id);
       // Only a mounted body reports, so one that does counts, even just after
       // its card was forgotten: Strict Mode remounts a new card to try it.
       if (status !== null && !mounted.has(id)) {
@@ -208,7 +297,7 @@ export function bodyScheduler(
       if (mounted.has(id)) return;
       if (!cached(id)) pending.add(id);
       mounted = new Set(mounted).add(id);
-      onChange((told = mounted));
+      tell();
     },
     /** A mounted body's height. A hidden reader's zero doesn't count. */
     measure(id: number, height: number) {

@@ -269,7 +269,7 @@ export default function ThreadView({
 
   // Its effects run after the one above, so cards are placed by hand where reading starts.
   // While Find is open every expanded body mounts, so it can search them all.
-  const [mounted, bodies] = useBodies(
+  const [{ mounted, reloading }, bodies] = useBodies(
     scrollRef,
     conversation.filter((x) => !collapsed.has(x.id)).map((x) => x.id),
     start,
@@ -393,6 +393,7 @@ export default function ThreadView({
                   <MessageCard
                     message={x}
                     mounted={mounted.has(x.id)}
+                    reload={reloading.has(x.id)}
                     bodies={bodies}
                     showReplyBar={!screening}
                     quickReplies={x === latest}
@@ -462,8 +463,9 @@ interface Bodies {
   /**
    * A body's state, as one report from whatever knows all of it: the card
    * while its content loads or fails, then what shows the content, with the
-   * embedded images it fetches. Null comes only as the body unmounts, so a
-   * change never lets its turn go in between.
+   * embedded images it fetches. Either says whether what it shows is stale,
+   * which `useMessageContent` knows. Null comes only as the body unmounts, so
+   * a change never lets its turn go in between.
    */
   content: BodyScheduler["content"];
   mount: BodyScheduler["mount"];
@@ -486,26 +488,44 @@ interface Kept extends KeptBody {
   prefetched?: boolean;
 }
 
+/** The cards whose bodies are mounted, and the stale ones of those that may load again (see `useBodies`). */
+interface Turns {
+  mounted: ReadonlySet<number>;
+  reloading: ReadonlySet<number>;
+}
+
 /**
  * Mounts the bodies of the expanded `cards` (oldest first) near the reader's
  * screen, a few loads at a time, as lib/readerViewport decides; the card
  * reading starts at mounts straight away. With `all` (Find in Conversation
- * open) every one mounts, still a few loads at a time, and stays. Returns the
- * cards whose bodies are mounted, and what cards use to report.
+ * open) every one mounts, still a few loads at a time, and stays. A mounted
+ * body gone stale loads again in its turn among those loads. Returns the
+ * cards whose bodies are mounted and the ones that may load again, and what
+ * cards use to report.
  */
 function useBodies(
   scrollRef: RefObject<HTMLDivElement | null>,
   cards: readonly number[],
   start: number | undefined,
   all: boolean,
-): [ReadonlySet<number>, Bodies] {
-  const [mounted, setMounted] = useState<ReadonlySet<number>>(() => new Set(start === undefined ? [] : [start]));
+): [Turns, Bodies] {
+  const [turns, setTurns] = useState<Turns>(() => ({
+    mounted: new Set(start === undefined ? [] : [start]),
+    reloading: new Set(),
+  }));
   const [bodies] = useState(() =>
-    readerBodies(bodyScheduler(start, setMounted, LOADING_LIMIT, (id) => shownFromCache(id, hasInlineImages))),
+    readerBodies(
+      bodyScheduler(
+        start,
+        (mounted, reloading) => setTurns({ mounted, reloading }),
+        LOADING_LIMIT,
+        (id) => shownFromCache(id, hasInlineImages),
+      ),
+    ),
   );
   useLayoutEffect(() => bodies.watch(scrollRef.current!), [bodies, scrollRef]);
   useLayoutEffect(() => bodies.update(cards, all));
-  return [mounted, bodies];
+  return [turns, bodies];
 }
 
 /**
@@ -1169,6 +1189,7 @@ function BlockedSenderCard({ message: m, actions }: { message: Message; actions:
 function MessageCard({
   message: m,
   mounted,
+  reload,
   bodies,
   showReplyBar,
   quickReplies,
@@ -1178,6 +1199,8 @@ function MessageCard({
   message: Message;
   /** Whether the body is mounted (see `useBodies`). */
   mounted: boolean;
+  /** Whether the body, stale, may load its content again now (see `useBodies`). */
+  reload: boolean;
   bodies: Bodies;
   showReplyBar: boolean;
   /** The quick replies, under the latest email. */
@@ -1195,6 +1218,7 @@ function MessageCard({
       {mounted ? (
         <CardContent
           message={m}
+          reload={reload}
           account={account}
           bodies={bodies}
           kept={kept}
@@ -1236,6 +1260,7 @@ function MessageCard({
 /** A card with its body mounted: the header with recipients, then the content as it loads, and attachments. */
 function CardContent({
   message: m,
+  reload,
   account,
   bodies,
   kept,
@@ -1243,18 +1268,20 @@ function CardContent({
   actions,
 }: {
   message: Message;
+  /** Whether its content, stale, may load again now (see `useBodies`). */
+  reload: boolean;
   account?: AccountView;
   bodies: Bodies;
   kept: Kept;
   onCollapse?: () => void;
   actions: ThreadActions;
 }) {
-  const [state, retry] = useMessageContent(m.id);
+  const [state, stale, retry] = useMessageContent(m.id, reload);
   const content = state.status === "ready" ? state.content : null;
   // Ready, the content is reported by what shows it (see `Bodies`).
   useLayoutEffect(() => {
-    if (state.status !== "ready") bodies.content(m.id, state.status);
-  }, [bodies, m.id, state.status]);
+    if (state.status !== "ready") bodies.content(m.id, state.status, false, stale);
+  }, [bodies, m.id, state.status, stale]);
   useLayoutEffect(() => () => bodies.content(m.id, null), [bodies, m.id]);
   const hasFiles = (content?.attachments.length ?? 0) > 0;
   useEffect(() => {
@@ -1286,6 +1313,7 @@ function CardContent({
             <InviteBody
               message={m}
               content={content}
+              stale={stale}
               account={account}
               bodies={bodies}
               kept={kept}
@@ -1295,6 +1323,7 @@ function CardContent({
             <Body
               message={m}
               content={content}
+              stale={stale}
               quotes={!isForward(m.subject)}
               bodies={bodies}
               kept={kept}
@@ -1378,6 +1407,7 @@ function CardHeader({
 function Body({
   message: m,
   content,
+  stale,
   quotes,
   bodies,
   kept,
@@ -1385,6 +1415,8 @@ function Body({
 }: {
   message: Message;
   content: MessageContent;
+  /** Whether `content` is stale: it reports that too (see `Bodies`). */
+  stale: boolean;
   quotes: boolean;
   bodies: Bodies;
   kept: KeptBody;
@@ -1397,7 +1429,7 @@ function Body({
   // Fetching embedded images takes a turn among the reader's loads, as the
   // content did: the content is ready, and its images are what's loading.
   const fetching = embeds && inlineImages === null;
-  useLayoutEffect(() => bodies.content(m.id, "ready", fetching), [bodies, m.id, fetching]);
+  useLayoutEffect(() => bodies.content(m.id, "ready", fetching, stale), [bodies, m.id, fetching, stale]);
   if (html === null) return <TextBody paragraphs={content.text} quotes={quotes} kept={kept} />;
   return (
     <HtmlBody
@@ -1419,6 +1451,7 @@ function Body({
 function InviteBody({
   message: m,
   content,
+  stale,
   account,
   bodies,
   kept,
@@ -1426,6 +1459,8 @@ function InviteBody({
 }: {
   message: Message;
   content: MessageContent;
+  /** Whether `content` is stale: it reports that too (see `Bodies`). */
+  stale: boolean;
   account?: AccountView;
   bodies: Bodies;
   kept: Kept;
@@ -1440,8 +1475,8 @@ function InviteBody({
   // Showing, the related message reports the content, with its embedded images.
   const bodyShown = hasBody && related;
   useLayoutEffect(() => {
-    if (!bodyShown) bodies.content(m.id, "ready");
-  }, [bodies, m.id, bodyShown]);
+    if (!bodyShown) bodies.content(m.id, "ready", false, stale);
+  }, [bodies, m.id, bodyShown, stale]);
   return (
     <>
       <InviteCard id={m.id} invite={content.invite!} account={account} />
@@ -1451,6 +1486,7 @@ function InviteBody({
             <Body
               message={m}
               content={content}
+              stale={stale}
               quotes
               bodies={bodies}
               kept={kept.related ?? {}}
