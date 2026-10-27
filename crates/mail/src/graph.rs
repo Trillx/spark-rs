@@ -57,8 +57,8 @@ const STORE_BATCH: usize = 50;
 /// Most requests a piece of work has out at once (`in_turns`): Exchange
 /// throttles an app with more than four at a time on one mailbox.
 const IN_FLIGHT: usize = 4;
-/// The longest pause Graph may ask for that's waited out; a request asked
-/// to wait longer fails as busy, for a later round.
+/// The longest pause Graph may ask for that's waited out. While a longer
+/// one lasts, requests fail as busy without going out, for a later round.
 const LONGEST_PAUSE: Duration = Duration::from_secs(30);
 /// How often a throttled request is tried again.
 const THROTTLED_RETRIES: u32 = 3;
@@ -265,7 +265,7 @@ enum Delta {
 pub struct Graph {
     token: String,
     base: String,
-    /// Until when Graph asked to be left alone (`send_patiently`).
+    /// Until when Graph asked to be left alone (`paused`).
     paused_until: Mutex<Option<tokio::time::Instant>>,
 }
 
@@ -295,8 +295,9 @@ impl Graph {
             .header("Prefer", "IdType=\"ImmutableId\"")
     }
 
+    /// Sends `request`, keeping to Graph's pause (`send_once`).
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response> {
-        let response = request.send().await.map_err(|e| Error::network(HOST, e))?;
+        let (response, _) = self.send_once(request, 0).await?;
         checked(response).await
     }
 
@@ -307,29 +308,40 @@ impl Graph {
         json_of(self.send(request).await?).await
     }
 
-    /// `send` for requests that go a few at a time (`in_turns`). When Graph
-    /// throttles one, all of them pause for as long as it asks, and that
-    /// one is tried again. `request` makes it anew for each try.
+    /// `send` for requests that go a few at a time (`in_turns`). One Graph
+    /// throttles is tried again once the pause is over, unless the pause
+    /// is longer than `LONGEST_PAUSE` or it was tried `THROTTLED_RETRIES`
+    /// times already. `request` makes it anew for each try.
     async fn send_patiently(
         &self,
         request: impl Fn() -> RequestBuilder,
     ) -> Result<reqwest::Response> {
         let mut retries = 0;
         loop {
-            self.paused().await;
-            let response = request()
-                .send()
-                .await
-                .map_err(|e| Error::network(HOST, e))?;
-            if retries < THROTTLED_RETRIES
-                && let Some(pause) = throttled(&response, retries)
-            {
-                self.pause(pause);
-                retries += 1;
-                continue;
+            match self.send_once(request(), retries).await? {
+                (_, Some(pause)) if retries < THROTTLED_RETRIES && pause <= LONGEST_PAUSE => {
+                    retries += 1;
+                }
+                (response, _) => return checked(response).await,
             }
-            return checked(response).await;
         }
+    }
+
+    /// Sends `request` once Graph's pause is over (`paused`). A throttled
+    /// answer comes with the pause it asks for (`throttled`), which every
+    /// request then keeps to, whether or not this one is tried again.
+    async fn send_once(
+        &self,
+        request: RequestBuilder,
+        retries: u32,
+    ) -> Result<(reqwest::Response, Option<Duration>)> {
+        self.paused().await?;
+        let response = request.send().await.map_err(|e| Error::network(HOST, e))?;
+        let pause = throttled(&response, retries);
+        if let Some(pause) = pause {
+            self.pause(pause);
+        }
+        Ok((response, pause))
     }
 
     async fn json_patiently<T: for<'de> Deserialize<'de>>(
@@ -339,24 +351,26 @@ impl Graph {
         json_of(self.send_patiently(request).await?).await
     }
 
-    /// Waits out the pause Graph asked for, if any.
-    async fn paused(&self) {
+    /// Waits out the pause Graph asked for, if any. While more than
+    /// `LONGEST_PAUSE` of it is left, fails as busy at once instead: the
+    /// request goes in a later round.
+    async fn paused(&self) -> Result<()> {
         loop {
             let until = *self
                 .paused_until
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = tokio::time::Instant::now();
             match until {
-                Some(until) if until > tokio::time::Instant::now() => {
-                    tokio::time::sleep_until(until).await;
-                }
-                _ => return,
+                Some(until) if until > now + LONGEST_PAUSE => return Err(busy()),
+                Some(until) if until > now => tokio::time::sleep_until(until).await,
+                _ => return Ok(()),
             }
         }
     }
 
-    /// Holds back requests sent patiently for `pause` from now, unless
-    /// they're held back longer already.
+    /// Holds back requests for `pause` from now, unless they're held back
+    /// longer already.
     fn pause(&self, pause: Duration) {
         let until = tokio::time::Instant::now() + pause;
         let mut paused = self
@@ -1950,11 +1964,14 @@ async fn checked(response: reqwest::Response) -> Result<reqwest::Response> {
             "Microsoft refused access ({detail}). Your organization may need to approve the app."
         )),
         StatusCode::NOT_FOUND | StatusCode::GONE => Error::Gone,
-        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-            Error::network(HOST, "Microsoft is busy; trying again shortly")
-        }
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => busy(),
         _ => Error::Server(format!("Microsoft Graph: {detail}")),
     })
+}
+
+/// What a throttled request fails with: it's tried again in a later round.
+fn busy() -> Error {
+    Error::network(HOST, "Microsoft is busy; trying again shortly")
 }
 
 async fn json_of<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> Result<T> {
@@ -1966,7 +1983,7 @@ async fn json_of<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> R
 
 /// How long Graph asks to be left alone when `response` is throttled: its
 /// Retry-After, else a pause that doubles with each of the `retries`.
-/// `None` if it isn't throttled, or asks for longer than `LONGEST_PAUSE`.
+/// `None` if it isn't throttled.
 fn throttled(response: &reqwest::Response, retries: u32) -> Option<Duration> {
     if !matches!(
         response.status(),
@@ -1974,12 +1991,15 @@ fn throttled(response: &reqwest::Response, retries: u32) -> Option<Duration> {
     ) {
         return None;
     }
+    // Read as a u32, so adding the pause to now can't overflow.
     let pause = response
         .headers()
         .get(RETRY_AFTER)
-        .and_then(|v| v.to_str().ok()?.trim().parse().ok())
-        .map_or(Duration::from_secs(1 << retries), Duration::from_secs);
-    (pause <= LONGEST_PAUSE).then_some(pause)
+        .and_then(|v| v.to_str().ok()?.trim().parse::<u32>().ok())
+        .map_or(Duration::from_secs(1 << retries), |s| {
+            Duration::from_secs(s.into())
+        });
+    Some(pause)
 }
 
 /// Runs `work` at most `IN_FLIGHT` at a time, handing each result to
@@ -3097,6 +3117,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn folder_states_from_the_dropped_folder_delta_still_read() {
+        let json = r#"{"limit":300,"complete":true,"deltaLink":"https://x","floor":1,"grown":2}"#;
+        let folder: FolderState = serde_json::from_str(json).unwrap();
+        let expected = FolderState {
+            limit: Some(300),
+            complete: true,
+        };
+        assert_eq!(folder, expected);
+    }
+
+    #[test]
     fn replies_leave_out_the_original_s_tracking_pixels() {
         let quoted = r#"<html><body><div id="divRplyFwdMsg">From: Ana</div><p>Sale!</p><img src="https://track.example/open.gif" width="1" height="1"></body></html>"#;
         let html = reply_html("<div>Thanks</div>", quoted);
@@ -3472,13 +3503,15 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         assert!(!done.contains("p7"), "gone: dropped, not pushed");
     }
 
-    /// Graph throttling `p0`'s move for an hour.
+    /// Graph throttling `p0`'s move for an hour, answered once the other
+    /// moves are under way.
     fn throttling(asked: &Asked, _: usize) -> Answer {
         if asked.path == "/me/messages/p0/move" {
             Answer {
                 retry_after: Some(3600),
                 ..Answer::status(429)
             }
+            .after(Duration::from_millis(100))
         } else {
             Answer::json(json!({})).after(Duration::from_millis(20))
         }
@@ -3506,5 +3539,77 @@ DTSTART:20261103T120000Z\r\nDTEND:20261103T130000Z\r\nEND:VEVENT\r\nEND:VCALENDA
             "p0 stays pending; what went alongside it is through"
         );
         assert_eq!(seen.take().len(), 3 + 3);
+    }
+
+    /// The `attached` stand-in, with Graph throttling m0's attachments for
+    /// a minute, answered at once, while other attachment listings take
+    /// their time.
+    fn throttled_for_a_minute(asked: &Asked, attempt: usize) -> Answer {
+        if asked.path.starts_with("/me/messages/m0/attachments") {
+            return Answer {
+                retry_after: Some(60),
+                ..Answer::status(429)
+            };
+        }
+        let answer = attached(asked, attempt);
+        if asked.path.contains("/attachments") {
+            answer.after(Duration::from_millis(100))
+        } else {
+            answer
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_throttle_holds_every_request_until_it_ends() {
+        let (base, seen) = serve(throttled_for_a_minute).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        let folder = projects(&store, account_id);
+        let mut state = FolderState {
+            limit: Some(STORE_BATCH),
+            ..Default::default()
+        };
+
+        // 50 new messages: m0's attachments are throttled while m1's to
+        // m3's are under way, and nothing more goes out.
+        let started = std::time::Instant::now();
+        let changed = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(changed.unwrap(), Some(50));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "not waited out"
+        );
+        let asked = seen.take();
+        let mut attachments = completing(&asked, "attachments");
+        attachments.sort_unstable();
+        assert_eq!(attachments, [0, 1, 2, 3]);
+        assert_eq!(asked.len(), 2 + 4, "the listing, its bodies and those four");
+        // Stored all the same; those held back without their attachments.
+        {
+            let s = lock(&store);
+            let members = s.folder_member_ids(folder.id).unwrap();
+            assert_eq!(members.len(), 50);
+            for id in members {
+                let subject = s.message(id).unwrap().unwrap().subject;
+                let remote = subject.strip_prefix("Message ").unwrap();
+                let content = s.content(id).unwrap().unwrap();
+                let has_files = !content.attachments.is_empty();
+                assert_eq!(has_files, (1..=3).contains(&number(remote)), "{remote}");
+            }
+        }
+
+        // Every request fails as busy without going out, until the end is near.
+        let held = graph.sync_folder(&store, &folder, &mut state).await;
+        assert!(matches!(held, Err(Error::Network { .. })), "{held:?}");
+        assert!(seen.take().is_empty());
+
+        // Then it waits for the end.
+        let end = tokio::time::Instant::now() + Duration::from_millis(300);
+        *graph.paused_until.lock().unwrap() = Some(end);
+        let synced = graph.sync_folder(&store, &folder, &mut state).await;
+        assert_eq!(synced.unwrap(), Some(0));
+        let asked = seen.take();
+        assert_eq!(asked.len(), 1, "the listing: nothing is new");
+        assert!(asked[0].at >= end.into_std());
     }
 }
