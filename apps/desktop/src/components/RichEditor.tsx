@@ -149,6 +149,9 @@ const RichEditor = forwardRef<
   /** The selection while a panel has focus, to format once it's chosen. */
   const saved = useRef<Range | null>(null);
   const plainPaste = useRef(false);
+  /** The picture under the pointer, which the resize handles are on. */
+  const hovered = useRef<HTMLImageElement | null>(null);
+  const resizing = useRef(false);
 
   const root = () => frameRef.current?.contentDocument?.getElementById("body") ?? null;
   const doc = () => frameRef.current?.contentDocument ?? null;
@@ -470,6 +473,66 @@ const RichEditor = forwardRef<
     emit();
   }
 
+  /** Spark's handles on a picture's left and right edges, or none. */
+  function placeHandles(img: HTMLImageElement | null) {
+    const d = doc();
+    const box = d?.getElementById("handles");
+    if (!d || !box) return;
+    hovered.current = img;
+    box.toggleAttribute("data-on", !!img);
+    if (!img) return;
+    const rect = img.getBoundingClientRect();
+    const view = d.defaultView!;
+    Object.assign(box.style, {
+      left: `${rect.left + view.scrollX}px`,
+      top: `${rect.top + view.scrollY}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+    });
+  }
+
+  /** Drags a handle: the picture keeps its shape, from 50px wide to as wide as its line. */
+  function startResize(e: PointerEvent, side: 1 | -1) {
+    const img = hovered.current;
+    const handle = e.target as HTMLElement;
+    if (!img || latest.current.readOnly) return;
+    const html = img.ownerDocument.documentElement;
+    const from = e.clientX;
+    const start = img.getBoundingClientRect().width;
+    resizing.current = true;
+    html.toggleAttribute("data-resizing", true);
+    handle.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) => {
+      const wanted = Math.max(50, Math.round(start + side * (ev.clientX - from)));
+      img.setAttribute("width", String(wanted));
+      img.removeAttribute("height");
+      img.style.removeProperty("width");
+      img.style.removeProperty("height");
+      if (!img.getAttribute("style")?.trim()) img.removeAttribute("style");
+      // No wider than it shows: its line may be narrower.
+      const shown = Math.round(img.getBoundingClientRect().width);
+      if (shown < wanted) img.setAttribute("width", String(shown));
+      placeHandles(img);
+    };
+    const end = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+      resizing.current = false;
+      html.removeAttribute("data-resizing");
+      // Bigger than an Image Size made it: the picture as it came, so it stays sharp.
+      const original = originals.get(img.dataset.original ?? "");
+      if (original && img.getAttribute("src") !== original && img.getBoundingClientRect().width > img.naturalWidth) {
+        img.setAttribute("src", original);
+      }
+      emit();
+      placeHandles(img);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  }
+
   useImperativeHandle(handle, () => ({
     focus(at = "end") {
       const r = root();
@@ -576,13 +639,17 @@ const RichEditor = forwardRef<
       r.innerHTML = html;
       arm(r);
       r.toggleAttribute("data-empty", empty(r));
+      placeHandles(null);
     }
   }, [wired, html]);
 
   useEffect(() => {
     if (!wired) return;
     wired.contentEditable = readOnly ? "false" : "true";
-    if (readOnly) setBar(null);
+    if (readOnly) {
+      setBar(null);
+      placeHandles(null);
+    }
   }, [wired, readOnly]);
 
   useEffect(() => {
@@ -664,6 +731,8 @@ const RichEditor = forwardRef<
         trackMention();
         trackBar();
         followCaret();
+        // What's typed may move the picture the handles are on, or delete it.
+        placeHandles(hovered.current?.isConnected ? hovered.current : null);
       };
       const onSelection = () => {
         trackMention();
@@ -692,7 +761,9 @@ const RichEditor = forwardRef<
       // Below the text is still the body's; and a link would open in the frame.
       const onPointerDown = (e: MouseEvent) => {
         host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-        if (e.target === d.documentElement || e.target === d.body) {
+        // A resize handle leaves the caret where it is.
+        if ((e.target as Element).closest?.("#handles")) e.preventDefault();
+        else if (e.target === d.documentElement || e.target === d.body) {
           e.preventDefault();
           view.focus();
           r.focus();
@@ -721,12 +792,29 @@ const RichEditor = forwardRef<
         latest.current.onMention?.(null);
       };
       const onScroll = () => trackBar();
+      // Handles come up on the picture under the pointer, as Spark's do.
+      const onHover = (e: MouseEvent) => {
+        const target = e.target as Element;
+        if (resizing.current || target.closest?.("#handles")) return;
+        const img = target.closest?.("img");
+        placeHandles(img && r.contains(img) && !latest.current.readOnly ? (img as HTMLImageElement) : null);
+      };
+      const onLeave = () => {
+        if (!resizing.current) placeHandles(null);
+      };
+      const onHandle = (e: PointerEvent) => {
+        const handle = (e.target as Element).closest?.("#handles span");
+        if (handle && e.button === 0) startResize(e, handle.classList.contains("left") ? -1 : 1);
+      };
       d.addEventListener("keydown", onKey);
       d.addEventListener("input", onInput);
       d.addEventListener("selectionchange", onSelection);
       d.addEventListener("paste", onPaste);
       d.addEventListener("mousedown", onPointerDown);
       d.addEventListener("click", onClick);
+      d.addEventListener("mousemove", onHover);
+      d.addEventListener("pointerdown", onHandle);
+      d.documentElement.addEventListener("mouseleave", onLeave);
       r.addEventListener("blur", onBlur);
       window.addEventListener("scroll", onScroll, true);
       unwire = () => {
@@ -737,6 +825,9 @@ const RichEditor = forwardRef<
         d.removeEventListener("paste", onPaste);
         d.removeEventListener("mousedown", onPointerDown);
         d.removeEventListener("click", onClick);
+        d.removeEventListener("mousemove", onHover);
+        d.removeEventListener("pointerdown", onHandle);
+        d.documentElement.removeEventListener("mouseleave", onLeave);
         r.removeEventListener("blur", onBlur);
         window.removeEventListener("scroll", onScroll, true);
       };
@@ -841,7 +932,15 @@ ul, ol { margin: 0; padding-left: 25px; }
 h1 { font-size: 1.6em; line-height: 1.3; margin: 0; }
 h2 { font-size: 1.25em; line-height: 1.35; margin: 0; }
 span[data-placeholder] { background: rgba(255, 184, 0, .28); border-radius: 4px; padding: 0 3px; cursor: pointer; }
-</style><style id="theme"></style></head><body><div id="body" spellcheck="true"></div></body></html>`;
+#handles { display: none; position: absolute; pointer-events: none; user-select: none; }
+#handles[data-on] { display: block; }
+#handles span { position: absolute; top: 50%; width: 6px; height: 60px; max-height: 40%; transform: translateY(-50%); box-sizing: border-box; border: 1px solid #fff; border-radius: 20px; background: rgba(0, 0, 0, .45); cursor: ew-resize; pointer-events: auto; }
+#handles span::before { content: ""; position: absolute; inset: -6px -8px; }
+#handles .left { left: 8px; }
+#handles .right { right: 8px; }
+html[data-resizing], html[data-resizing] * { cursor: ew-resize !important; user-select: none; }
+</style><style id="theme"></style></head><body><div id="body" spellcheck="true"></div>` +
+  `<div id="handles"><span class="left"></span><span class="right"></span></div></body></html>`;
 
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
