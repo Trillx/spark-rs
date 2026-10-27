@@ -1543,11 +1543,7 @@ pub fn sync_now(mailbox: State<'_, Mailbox>) {
 
 /// Queues a draft to go out at `draft.sendAt`; returns its outbox id.
 #[tauri::command]
-pub async fn send_message(
-    app: AppHandle,
-    mailbox: State<'_, Mailbox>,
-    draft: Draft,
-) -> Result<i64, String> {
+pub async fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
     if !mailbox.live() {
         // The demo pretends.
         let id = mailbox.demo.send(&draft);
@@ -1565,9 +1561,6 @@ pub async fn send_message(
         .await
         .map_err(text)??;
     signed(&mailbox, &draft)?;
-    if let Some(original) = draft.reply_to {
-        crate::automation::replied(&app, original);
-    }
     if draft.send_at <= now_ms() {
         mailbox.live.nudge(draft.account);
     }

@@ -452,6 +452,13 @@ async fn work(
         match engine.send_due(account_id).await {
             Ok(outcomes) => {
                 for outcome in outcomes {
+                    // Answered once it's gone, not when it was queued: Undo
+                    // and Send Later can still take it back.
+                    if matches!(outcome.result, Ok(true))
+                        && let Some(original) = outcome.reply_to
+                    {
+                        crate::automation::replied(&app, original);
+                    }
                     let event = match outcome.result {
                         Ok(true) => SendEvent {
                             id: outcome.id,

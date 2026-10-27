@@ -63,17 +63,20 @@ impl Automation {
     }
 }
 
-/// Starts the worker.
+/// Starts the worker, and the cleanup of untouched auto-drafts beside it:
+/// asking a slow server about those mustn't hold up new mail.
 pub fn start(app: &AppHandle) {
+    let cleaner = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            cleanup(&cleaner).await;
+            tokio::time::sleep(CLEANUP_EVERY).await;
+        }
+    });
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let mut cleaned: Option<std::time::Instant> = None;
         loop {
             let wait = round(&app).await;
-            if cleaned.is_none_or(|at| at.elapsed() >= CLEANUP_EVERY) {
-                cleanup(&app).await;
-                cleaned = Some(std::time::Instant::now());
-            }
             // After the provider failed, new mail doesn't cut the wait short.
             let held = wait == AFTER_FAILING;
             let until = tokio::time::Instant::now() + wait;
@@ -127,7 +130,8 @@ async fn round(app: &AppHandle) -> Duration {
         };
         let mut worked = false;
 
-        let batch = match next_batch(&engine.store(), &settings, &automation) {
+        let batch = next_batch(&engine.store(), &settings, &automation);
+        let batch = match batch {
             Ok(batch) => batch.filter(|b| !b.ids.is_empty() && b.ids != last),
             Err(e) => {
                 eprintln!("spark-rs: inbox automation: {e}");
@@ -195,13 +199,8 @@ async fn round(app: &AppHandle) -> Duration {
             let Some(settings) = saved_settings(&engine) else {
                 return LOOK_EVERY;
             };
-            match wanted(&engine.store(), &settings, id) {
-                Ok(Wanted::Yes) => {}
-                Ok(Wanted::Later) | Err(_) => continue,
-                Ok(Wanted::No) => {
-                    let _ = engine.store().draft_settled(id);
-                    continue;
-                }
+            if !due_now(&engine, &settings, id) {
+                continue;
             }
             // Being written on request already.
             if !automation.writing.lock().unwrap().insert(id) {
@@ -280,6 +279,23 @@ fn next_batch(
         request: prompts::sort_request(&user, &emails),
         ids,
     }))
+}
+
+/// Whether to write the reply due for email `id` now. One no longer wanted
+/// is settled; one for later stays due.
+fn due_now(engine: &Engine, settings: &AutomationSettings, id: i64) -> bool {
+    // Bound first: the store is let go before it's taken again below.
+    let wanted = wanted(&engine.store(), settings, id);
+    match wanted {
+        Ok(Wanted::Yes) => true,
+        Ok(Wanted::No) => {
+            if let Err(e) = engine.store().draft_settled(id) {
+                eprintln!("spark-rs: inbox automation: {e}");
+            }
+            false
+        }
+        Ok(Wanted::Later) | Err(_) => false,
+    }
 }
 
 /// Whether a reply to an email is wanted now.
@@ -1132,6 +1148,45 @@ mod tests {
         assert_eq!(
             wanted(&engine.store(), &for_new_senders, id).unwrap(),
             Wanted::Yes
+        );
+    }
+
+    #[test]
+    fn a_reply_no_longer_wanted_is_settled_without_locking_up() {
+        let (engine, account, id) = one_email();
+        let settings = AutomationSettings {
+            draft_accounts: [(account, now_ms() - 60_000)].into(),
+            ..Default::default()
+        };
+        {
+            let mut store = engine.store();
+            store.set_automation_settings(&settings).unwrap();
+            let respond = spark_store::Verdict {
+                label: None,
+                needs_reply: true,
+            };
+            store
+                .record_verdict(id, respond, &settings, false, now_ms())
+                .unwrap();
+            store.set_auto_draft_excluded("dana@x.com", true).unwrap();
+        }
+        let engine = Arc::new(engine);
+        let (done, finished) = std::sync::mpsc::channel();
+        let running = engine.clone();
+        let asked = settings.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(due_now(&running, &asked, id));
+        });
+        let due = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the store stays free");
+        assert!(!due);
+        assert!(
+            engine
+                .store()
+                .draft_candidates(&settings, now_ms(), 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

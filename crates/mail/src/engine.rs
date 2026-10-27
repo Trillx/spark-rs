@@ -173,6 +173,8 @@ pub struct SendOutcome {
     pub id: i64,
     /// The editable draft recovered after a permanent failure.
     pub draft_id: Option<i64>,
+    /// The email it replies to, if it's a reply.
+    pub reply_to: Option<i64>,
     /// `Ok(true)` sent; `Ok(false)` will be retried; `Err` failed for good.
     pub result: Result<bool>,
 }
@@ -1192,6 +1194,7 @@ impl Engine {
         for (id, json) in due {
             let parsed = serde_json::from_str::<Draft>(&json);
             let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
+            let reply_to = parsed.as_ref().ok().and_then(|d| d.reply_to);
             let recipients = parsed.as_ref().map(drafts::sent_to).unwrap_or_default();
             let result = match &parsed {
                 Ok(draft) => self.send_draft(account_id, id, draft).await,
@@ -1258,6 +1261,7 @@ impl Engine {
             outcomes.push(SendOutcome {
                 id,
                 draft_id,
+                reply_to,
                 result,
             });
         }
@@ -2479,6 +2483,46 @@ mod tests {
             drop(reopened);
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_sent_reply_says_what_it_answered() {
+        let (smtp, delivery) = smtp_delivery(250).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp);
+        let Added::New(original) = store
+            .add_incoming(
+                &Incoming {
+                    account_id: account.id,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(1),
+                    message_id: Some("<asked@example.com>".into()),
+                    from_address: "recipient@example.com".into(),
+                    subject: "Lunch?".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        else {
+            panic!("new");
+        };
+        let draft = Draft {
+            account: account.id,
+            to: "recipient@example.com".into(),
+            subject: "Re: Lunch?".into(),
+            body: "Yes.".into(),
+            reply_to: Some(original),
+            ..Default::default()
+        };
+        store
+            .queue_send(account.id, &to_json(&draft), 0, &[])
+            .unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let outcomes = engine.send_due(account.id).await.unwrap();
+        assert!(matches!(outcomes[0].result, Ok(true)));
+        assert_eq!(outcomes[0].reply_to, Some(original));
+        delivery.await.unwrap();
     }
 
     #[tokio::test]
