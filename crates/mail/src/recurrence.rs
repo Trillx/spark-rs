@@ -350,7 +350,9 @@ pub fn changed(
     }
     out["range"]["startDate"] = json!(first);
     out["range"]["recurrenceTimeZone"] = json!(zone);
-    if !new_pattern && days != 0 && start.is_some() {
+    // A rule the editor can't show ("on the last weekday") is left as it is.
+    let shown = new_pattern || Repeat::from_graph(old).is_some();
+    if !new_pattern && days != 0 && start.is_some() && shown {
         let p = &mut out["pattern"];
         match p["type"].as_str() {
             Some("weekly") => {
@@ -606,6 +608,22 @@ mod tests {
         );
         assert_eq!(out["pattern"]["daysOfWeek"], json!(["wednesday"]));
         assert_eq!(out["pattern"]["index"], "last");
+        // The last weekday of the month, a rule the editor can't show: its
+        // October one moved to Thursday leaves it as it is.
+        let last_weekday = json!({
+            "pattern": { "type": "relativeMonthly", "interval": 1, "index": "last",
+                "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"] },
+            "range": { "type": "noEnd", "startDate": "2026-10-30", "recurrenceTimeZone": "UTC" }
+        });
+        let out = changed(
+            &last_weekday,
+            None,
+            None,
+            -1,
+            Some(("2026-10-29", "UTC")),
+            "2026-10-29",
+        );
+        assert_eq!(out["pattern"], last_weekday["pattern"]);
         assert_eq!(days_between("2026-10-27", "2026-11-03"), 7);
         assert_eq!(add_days("2026-12-31", 1), "2027-01-01");
         assert_eq!(

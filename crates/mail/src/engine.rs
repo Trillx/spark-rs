@@ -1707,11 +1707,15 @@ impl Engine {
         // From here on, the series' own clock: the new series is written
         // there, as the old one was, so its days and dates mean the same.
         let zone = clock.zone(zone);
-        // The day it goes to there, and how far the user moved it. An all-day
-        // one goes by as many days from where it is on the series' clock: its
-        // date here is UTC's, a day off for a series 13 hours from it.
-        let all_day = draft.all_day && before.all_day;
-        let (from, moved) = if all_day {
+        // The day it goes to there, and how far the user moved it. One not
+        // moved here stays on the day Outlook has it now, which may be
+        // another than the copy here says (made all-day there since). An
+        // all-day one goes by as many days from where it is on the series'
+        // clock: its date here is UTC's, a day off for a series 13 hours from
+        // it.
+        let (from, moved) = if (draft.start, draft.all_day) == (before.start, before.all_day) {
+            (clock.current.clone(), 0)
+        } else if draft.all_day && before.all_day {
             let moved = (draft.start - before.start).div_euclid(86_400_000);
             (recurrence::add_days(&clock.current, moved), moved)
         } else {
@@ -1769,20 +1773,7 @@ impl Engine {
             .into_iter()
             .find(|c| c.id == stored.calendar_id)
             .ok_or_else(|| Error::Config("That calendar is no longer here.".into()))?;
-        // An all-day one's days as the series has them.
-        let placed;
-        let draft = if all_day {
-            let start = graph::parse_iso_date(&format!("{from}T00:00:00Z")).unwrap_or(draft.start);
-            placed = EventDraft {
-                start,
-                end: start + (draft.end - draft.start),
-                ..draft.clone()
-            };
-            &placed
-        } else {
-            draft
-        };
-        let mut body = calendar::series_from(&master, draft, before, zone, new);
+        let mut body = calendar::series_from(&master, draft, before, zone, &from, new);
         // Made once, however often it's sent: Graph knows a new series it
         // already made by this.
         let mut id = [0u8; 16];

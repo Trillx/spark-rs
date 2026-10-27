@@ -519,12 +519,14 @@ pub fn changed_event_body(
 /// with the user's additions and removals. A Teams meeting gets joining
 /// details of its own, so its description is the editor's note; any other
 /// keeps the series' description, with the note as the user changed it, so
-/// a Zoom call's joining details stay. It repeats by `recurrence`.
+/// a Zoom call's joining details stay. It starts on `first` ("2026-10-27",
+/// on `zone`'s clock) and repeats by `recurrence`.
 pub fn series_from(
     master: &serde_json::Value,
     draft: &EventDraft,
     before: &EventDraft,
     zone: Zone,
+    first: &str,
     recurrence: serde_json::Value,
 ) -> serde_json::Value {
     let mut body = serde_json::Map::new();
@@ -605,7 +607,6 @@ pub fn series_from(
         let ms = parse_iso_date(&format!("{}Z", wall.get(..19).unwrap_or(wall)))?;
         Some((ms, zone.wall_at(ms)))
     };
-    let first = date_in(zone, draft.start, draft.all_day);
     let all_day = if draft.all_day != before.all_day {
         draft.all_day
     } else {
@@ -626,7 +627,7 @@ pub fn series_from(
         };
         (
             format!("{first}T00:00:00"),
-            format!("{}T00:00:00", recurrence::add_days(&first, days)),
+            format!("{}T00:00:00", recurrence::add_days(first, days)),
         )
     } else {
         let user = !draft.all_day && !before.all_day;
@@ -648,7 +649,7 @@ pub fn series_from(
                 );
                 format!(
                     "{}{}",
-                    recurrence::add_days(&first, days),
+                    recurrence::add_days(first, days),
                     to_wall.get(10..).unwrap_or_default()
                 )
             }
@@ -1986,7 +1987,14 @@ mod tests {
             ..before.clone()
         };
         let rule = weekly_rule().to_graph("2026-11-03", "Pacific Standard Time");
-        let body = series_from(&master, &draft, &before, PACIFIC, rule.clone());
+        let body = series_from(
+            &master,
+            &draft,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, draft.start, draft.all_day),
+            rule.clone(),
+        );
         assert_eq!(body["subject"], "Standup");
         assert_eq!(body["location"]["displayName"], "Room 4");
         assert_eq!(body["start"]["dateTime"], "2026-11-03T10:00:00");
@@ -2132,7 +2140,14 @@ mod tests {
             end: start + 5_400_000,
             ..before.clone()
         };
-        let body = series_from(&master, &later, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &later,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, later.start, later.all_day),
+            json!(null),
+        );
         assert_eq!(body["body"]["contentType"], "html");
         let html = body["body"]["content"].as_str().unwrap();
         assert!(html.contains("Newer agenda"), "{html}");
@@ -2145,7 +2160,14 @@ mod tests {
             notes: "Mine".into(),
             ..later
         };
-        let body = series_from(&master, &renoted, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &renoted,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, renoted.start, renoted.all_day),
+            json!(null),
+        );
         assert_eq!(
             body["body"],
             json!({ "contentType": "text", "content": "Mine" })
@@ -2171,7 +2193,14 @@ mod tests {
             title: "Design review".into(),
             ..before.clone()
         };
-        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &renamed,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, renamed.start, renamed.all_day),
+            json!(null),
+        );
         assert_eq!(body["start"]["dateTime"], "2026-11-03T09:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T11:00:00");
         // Times the user changed are theirs.
@@ -2180,7 +2209,14 @@ mod tests {
             end: start + 5_400_000,
             ..renamed
         };
-        let body = series_from(&master, &later, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &later,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, later.start, later.all_day),
+            json!(null),
+        );
         assert_eq!(body["start"]["dateTime"], "2026-11-03T09:30:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T10:30:00");
     }
@@ -2206,7 +2242,14 @@ mod tests {
             title: "Team retreat".into(),
             ..before.clone()
         };
-        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &renamed,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, renamed.start, renamed.all_day),
+            json!(null),
+        );
         assert_eq!(body["start"]["dateTime"], "2026-11-10T00:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-13T00:00:00");
     }
@@ -2237,7 +2280,14 @@ mod tests {
             notes: "New".into(),
             ..before.clone()
         };
-        let body = series_from(&master, &renoted, &before, EASTERN, json!(null));
+        let body = series_from(
+            &master,
+            &renoted,
+            &before,
+            EASTERN,
+            &date_in(EASTERN, renoted.start, renoted.all_day),
+            json!(null),
+        );
         assert_eq!(body["start"]["dateTime"], "2026-11-08T00:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-08T04:00:00");
     }
@@ -2266,7 +2316,14 @@ mod tests {
             title: "Daily standup".into(),
             ..before.clone()
         };
-        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &renamed,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, renamed.start, renamed.all_day),
+            json!(null),
+        );
         assert_eq!(body["isAllDay"], false);
         assert_eq!(body["start"]["dateTime"], "2026-11-03T09:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T10:00:00");
@@ -2309,7 +2366,14 @@ mod tests {
             start: start + 1_800_000,
             ..before.clone()
         };
-        let body = series_from(&master, &later, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &later,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, later.start, later.all_day),
+            json!(null),
+        );
         assert_eq!(body["start"]["dateTime"], "2026-11-03T09:30:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T10:00:00");
     }
@@ -2334,7 +2398,14 @@ mod tests {
             title: "Vendor sync".into(),
             ..before.clone()
         };
-        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &renamed,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, renamed.start, renamed.all_day),
+            json!(null),
+        );
         assert_eq!(
             body["body"],
             json!({ "contentType": "html", "content": zoom })
@@ -2343,7 +2414,14 @@ mod tests {
             notes: "New agenda".into(),
             ..before.clone()
         };
-        let body = series_from(&master, &new_note, &before, PACIFIC, json!(null));
+        let body = series_from(
+            &master,
+            &new_note,
+            &before,
+            PACIFIC,
+            &date_in(PACIFIC, new_note.start, new_note.all_day),
+            json!(null),
+        );
         let html = body["body"]["content"].as_str().unwrap();
         assert!(html.contains("<div>New agenda</div>"), "{html}");
         assert!(html.contains("https://us02web.zoom.us/j/123"), "{html}");
