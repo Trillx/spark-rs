@@ -379,6 +379,34 @@ pub fn changed(
     out
 }
 
+/// The first day a monthly or yearly series (Graph's `old`, first on
+/// `first`) has when its occurrence on `was` moves to `on`, for all of them:
+/// as many months before `on` as `first` was before `was`, on `on`'s date or
+/// week of the month. A series every third month or every other year keeps
+/// its rhythm, with `on` among its days.
+pub fn aligned_first(old: &Value, first: &str, was: &str, on: &str) -> String {
+    let month = |d: &str| -> i64 {
+        let y: i64 = d.get(0..4).and_then(|s| s.parse().ok()).unwrap_or(1970);
+        let m: i64 = d.get(5..7).and_then(|s| s.parse().ok()).unwrap_or(1);
+        y * 12 + m - 1
+    };
+    let at = month(on) - (month(was) - month(first));
+    let (y, m) = (at.div_euclid(12), at.rem_euclid(12) + 1);
+    let length = days_from_civil(y + (m == 12) as i64, m % 12 + 1, 1) - days_from_civil(y, m, 1);
+    let day = match old["pattern"]["type"].as_str() {
+        Some("relativeMonthly" | "relativeYearly") => {
+            let starts = (days_from_civil(y, m, 1) + 4).rem_euclid(7);
+            let first_one = 1 + (weekday(on) as i64 - starts).rem_euclid(7);
+            match week_of_month(on) {
+                "last" => first_one + 7 * ((length - first_one) / 7),
+                nth => first_one + 7 * NTH.iter().position(|n| *n == nth).unwrap_or(0) as i64,
+            }
+        }
+        _ => i64::from(day_of(on)).min(length),
+    };
+    format!("{y:04}-{m:02}-{day:02}")
+}
+
 fn day_of(date: &str) -> u32 {
     date.get(8..10).and_then(|d| d.parse().ok()).unwrap_or(1)
 }
@@ -540,6 +568,39 @@ mod tests {
         assert_eq!(
             ending_on(&tuesdays, "2027-01-26")["range"]["endDate"],
             "2027-01-26"
+        );
+    }
+
+    #[test]
+    fn a_moved_monthly_series_keeps_its_rhythm() {
+        let quarterly =
+            json!({ "pattern": { "type": "absoluteMonthly", "interval": 3, "dayOfMonth": 15 } });
+        // From January 15; April's moved to May 1: from February 1.
+        assert_eq!(
+            aligned_first(&quarterly, "2027-01-15", "2027-04-15", "2027-05-01"),
+            "2027-02-01"
+        );
+        // The 31st, in a month without one: its last day.
+        assert_eq!(
+            aligned_first(&quarterly, "2027-01-15", "2027-01-15", "2027-01-31"),
+            "2027-01-31"
+        );
+        assert_eq!(
+            aligned_first(&quarterly, "2027-01-15", "2027-04-15", "2027-05-31"),
+            "2027-02-28"
+        );
+        let second_tuesday =
+            json!({ "pattern": { "type": "relativeMonthly", "interval": 1, "index": "second" } });
+        // Moved to the last Friday of November: the series' first, the last
+        // Friday of October.
+        assert_eq!(
+            aligned_first(&second_tuesday, "2026-10-13", "2026-11-10", "2026-11-27"),
+            "2026-10-30"
+        );
+        let other_year = json!({ "pattern": { "type": "absoluteYearly", "interval": 2, "dayOfMonth": 31, "month": 12 } });
+        assert_eq!(
+            aligned_first(&other_year, "2026-12-31", "2028-12-31", "2029-01-02"),
+            "2027-01-02"
         );
     }
 

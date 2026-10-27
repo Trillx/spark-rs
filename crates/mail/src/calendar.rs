@@ -366,36 +366,49 @@ pub fn changed_event_body(
         &date_in(zone, draft.start, draft.all_day),
     );
     // A monthly or yearly series moved to another date goes by the date it
-    // went to (the 1st, the second Tuesday), so its own first day stays.
+    // went to (the 1st, the second Tuesday), from its own first day as many
+    // months before, so its rhythm (every third month) stays.
     let by_date = shift && days != 0 && recurrence::by_date(&details.recurrence);
     if (draft.start, draft.end, draft.all_day) != (before.start, before.end, before.all_day) {
         // The series' own first time moves by as much as this occurrence's
         // did on the clock (days and hours), so its own length stays and a
         // DST change between them doesn't move it an hour.
-        let stay = if by_date { days * DAY_MS } else { 0 };
         let moved = |series: i64, was: i64, now: i64| {
             if !shift {
                 zone.time(now, draft.all_day)
             } else if draft.all_day {
-                zone.time(series + (now - was) - stay, true)
+                zone.time(series + (now - was), true)
             } else {
                 // Clock times, counted as if they were UTC's.
                 let clock = |t: i64| parse_iso_date(&format!("{}Z", zone.wall_at(t))).unwrap_or(t);
-                let at = clock(series) + (clock(now) - clock(was)) - stay;
+                let at = clock(series) + (clock(now) - clock(was));
                 json!({ "dateTime": utc_wall(at), "timeZone": zone.name })
             }
         };
+        let mut start = moved(details.start, before.start, draft.start);
+        let mut end = moved(details.end, before.end, draft.end);
+        if by_date {
+            let first = recurrence::aligned_first(
+                &details.recurrence,
+                &date_in(zone, details.start, before.all_day),
+                &date_in(zone, before.start, before.all_day),
+                &date_in(zone, draft.start, draft.all_day),
+            );
+            let wall = start["dateTime"].as_str().unwrap_or_default();
+            let at = format!("{first}{}", wall.get(10..).unwrap_or_default());
+            let length = draft.end - draft.start;
+            let ends = parse_iso_date(&format!("{at}Z")).map(|t| utc_wall(t + length));
+            start["dateTime"] = json!(at);
+            end["dateTime"] = json!(ends.unwrap_or_default());
+        }
         // Only the ones that changed, so a start moved in Outlook meanwhile
         // stays when only the end changes; all day or back changes both.
         let both = draft.all_day != before.all_day;
         if both || draft.start != before.start {
-            body.insert(
-                "start".into(),
-                moved(details.start, before.start, draft.start),
-            );
+            body.insert("start".into(), start);
         }
         if both || draft.end != before.end {
-            body.insert("end".into(), moved(details.end, before.end, draft.end));
+            body.insert("end".into(), end);
         }
         if both {
             body.insert("isAllDay".into(), json!(draft.all_day));
@@ -571,7 +584,7 @@ pub fn series_from(
 /// What `series_from` reads of a series.
 pub const MASTER_SELECT: &str = "subject,body,start,end,isAllDay,location,attendees,hideAttendees,\
      isReminderOn,reminderMinutesBeforeStart,showAs,sensitivity,isOnlineMeeting,\
-     onlineMeetingProvider,recurrence,originalStartTimeZone";
+     onlineMeetingProvider,recurrence,originalStartTimeZone,hasAttachments";
 
 /// `html`, an event's description, with `notes` in place of what comes
 /// before the Teams meeting Outlook put in it (found by its rule of
@@ -884,23 +897,23 @@ impl Graph {
         Ok((start.to_owned(), original))
     }
 
-    /// The day ("2026-10-27") of series `id`'s last occurrence from
-    /// `start` to before `end` (Unix ms), in the Windows time zone `zone`;
-    /// none if it has none there.
-    pub async fn last_occurrence(
+    /// The days ("2026-10-27") of series `id`'s first and last occurrences
+    /// from `start` to before `end` (Unix ms), in the Windows time zone
+    /// `zone`; none if it has none there.
+    pub async fn occurrence_span(
         &self,
         id: &str,
         start: i64,
         end: i64,
         zone: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, String)>> {
         let mut next = Some(format!(
             "/me/events/{}/instances?startDateTime={}&endDateTime={}&$select=start&$top={EVENT_PAGE}",
             path(id),
             iso_date(start),
             iso_date(end)
         ));
-        let mut last: Option<String> = None;
+        let mut span: Option<(String, String)> = None;
         while let Some(url) = next.take() {
             let page: Page<serde_json::Value> = self
                 .json(
@@ -909,16 +922,38 @@ impl Graph {
                 )
                 .await?;
             for e in &page.value {
-                let date = e["start"]["dateTime"].as_str().and_then(|d| d.get(..10));
-                if let Some(date) = date
-                    && last.as_deref().is_none_or(|l| date > l)
-                {
-                    last = Some(date.to_owned());
-                }
+                let Some(date) = e["start"]["dateTime"].as_str().and_then(|d| d.get(..10)) else {
+                    continue;
+                };
+                span = Some(match span {
+                    None => (date.to_owned(), date.to_owned()),
+                    Some((first, last)) => (first.min(date.to_owned()), last.max(date.to_owned())),
+                });
             }
             next = page.next_link;
         }
-        Ok(last)
+        Ok(span)
+    }
+
+    /// Event `id`'s attachments, files with their content.
+    pub async fn event_attachments(&self, id: &str) -> Result<Vec<serde_json::Value>> {
+        let page: Page<serde_json::Value> = self
+            .json(self.request(Method::GET, &format!("/me/events/{}/attachments", path(id))))
+            .await?;
+        Ok(page.value)
+    }
+
+    /// Adds `attachment` (a file, as `event_attachments` lists it) to event `id`.
+    pub async fn add_attachment(&self, id: &str, attachment: &serde_json::Value) -> Result<()> {
+        self.send(
+            self.request(
+                Method::POST,
+                &format!("/me/events/{}/attachments", path(id)),
+            )
+            .json(attachment),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Event `id`'s times, people and description as Graph has them now.
@@ -1831,11 +1866,11 @@ mod tests {
         };
         let body = changed_event_body(&draft, &before, &details, PACIFIC, true);
         assert_eq!(
-            body["start"]["dateTime"], "2027-01-15T10:00:00",
-            "its own first day stays"
+            body["start"]["dateTime"], "2027-02-01T10:00:00",
+            "a month before March 1, as January 15 was before February 15"
         );
         assert_eq!(body["recurrence"]["pattern"]["dayOfMonth"], 1);
-        assert_eq!(body["recurrence"]["range"]["startDate"], "2027-01-15");
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2027-02-01");
     }
 
     #[test]
@@ -2031,8 +2066,8 @@ mod tests {
         }
         let (base, _) = crate::graph::tests::stand_in(reply).await;
         let graph = Graph::with_base(&base, "token");
-        let last = graph
-            .last_occurrence(
+        let span = graph
+            .occurrence_span(
                 "ser1",
                 parse_iso_date("2026-10-06T16:30:00Z").unwrap(),
                 parse_iso_date("2027-11-03T16:30:00Z").unwrap(),
@@ -2040,7 +2075,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(last.as_deref(), Some("2026-10-27"));
+        assert_eq!(
+            span,
+            Some(("2026-10-13".to_owned(), "2026-10-27".to_owned()))
+        );
         assert_eq!(
             graph.start_in("occ1", "Tokyo Standard Time").await.unwrap(),
             ("2026-10-28T00:30:00.0000000".to_owned(), None)

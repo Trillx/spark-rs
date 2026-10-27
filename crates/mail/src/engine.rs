@@ -1688,7 +1688,6 @@ impl Engine {
         let graph = self.calendar_graph(stored.account_id).await?;
         let master = graph.event_json(&series, calendar::MASTER_SELECT).await?;
         let old = master["recurrence"].clone();
-        let first = old["range"]["startDate"].as_str().unwrap_or_default();
         let clock = series_clock(
             &graph,
             &stored.remote_id,
@@ -1699,7 +1698,7 @@ impl Engine {
         )
         .await?;
         let split = clock.day.clone();
-        if split.is_empty() || split.as_str() <= first {
+        if begins_on(&graph, &series, &old, &split, &clock.name).await? {
             return self
                 .update_scoped(event_id, draft, Some(before), Scope::All, zone)
                 .await;
@@ -1735,8 +1734,8 @@ impl Engine {
             };
             let span = (i64::from(was.interval) * i64::from(times) * period + 366) * 86_400_000;
             let from_ms = stored.start - 86_400_000;
-            if let Some(last) = graph
-                .last_occurrence(&series, from_ms, from_ms + span, zone.name)
+            if let Some((_, last)) = graph
+                .occurrence_span(&series, from_ms, from_ms + span, zone.name)
                 .await?
             {
                 new = recurrence::ending_on(&new, &recurrence::add_days(&last, moved));
@@ -1754,11 +1753,35 @@ impl Engine {
         // on as it was.
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(&old, &split) });
         graph.update_event(&series, &ended).await?;
-        if let Err(e) = graph.create_event(&calendar.remote_id, &body).await {
-            let _ = graph
-                .update_event(&series, &serde_json::json!({ "recurrence": old }))
-                .await;
-            return Err(e);
+        let created = match graph.create_event(&calendar.remote_id, &body).await {
+            Ok(created) => created,
+            Err(e) => {
+                let _ = graph
+                    .update_event(&series, &serde_json::json!({ "recurrence": old }))
+                    .await;
+                return Err(e);
+            }
+        };
+        // Its files (an agenda) go with it, those Graph takes in one go (up
+        // to 3 MB each).
+        if master["hasAttachments"] == true {
+            for file in graph.event_attachments(&series).await.unwrap_or_default() {
+                let small = file["size"].as_u64().is_some_and(|s| s <= 3_000_000);
+                if file["@odata.type"] == "#microsoft.graph.fileAttachment"
+                    && small
+                    && file["contentBytes"].is_string()
+                {
+                    let copy = serde_json::json!({
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": file["name"],
+                        "contentType": file["contentType"],
+                        "contentBytes": file["contentBytes"],
+                        "isInline": file["isInline"],
+                        "contentId": file["contentId"],
+                    });
+                    let _ = graph.add_attachment(&created, &copy).await;
+                }
+            }
         }
         Ok(())
     }
@@ -1800,9 +1823,8 @@ impl Engine {
             .event_json(&series, "recurrence,originalStartTimeZone")
             .await?;
         let old = &master["recurrence"];
-        let first = old["range"]["startDate"].as_str().unwrap_or_default();
         let all_day = Event::from_json(&stored.data).all_day;
-        let split = series_clock(
+        let clock = series_clock(
             &graph,
             &stored.remote_id,
             stored.start,
@@ -1810,9 +1832,9 @@ impl Engine {
             &master,
             zone,
         )
-        .await?
-        .day;
-        if old.is_null() || split.is_empty() || split.as_str() <= first {
+        .await?;
+        let split = clock.day;
+        if old.is_null() || begins_on(&graph, &series, old, &split, &clock.name).await? {
             return graph.delete_event(&series).await;
         }
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(old, &split) });
@@ -2513,27 +2535,6 @@ async fn series_clock(
         .to_owned();
     let (wall, original) = graph.start_in(id, &name).await?;
     let current = wall.get(..10).unwrap_or_default().to_owned();
-    // Moved on its own, by as many days as its original start is from its
-    // start now (an all-day one's by their dates).
-    let day = match original {
-        Some(original) => {
-            let date = |t: i64| {
-                if all_day {
-                    calendar::utc_wall((t + 43_200_000).div_euclid(86_400_000) * 86_400_000)
-                } else {
-                    (zone.wall)(t)
-                }
-                .get(..10)
-                .unwrap_or_default()
-                .to_owned()
-            };
-            recurrence::add_days(
-                &current,
-                recurrence::days_between(&date(start), &date(original)),
-            )
-        }
-        None => current.clone(),
-    };
     let shift = if all_day || name == zone.name {
         0
     } else {
@@ -2543,12 +2544,54 @@ async fn series_clock(
             _ => 0,
         }
     };
+    // Moved on its own: the day it was to be on, on this clock (an all-day
+    // one's date, wherever it was made).
+    let day = match original {
+        Some(original) if all_day => {
+            calendar::utc_wall((original + 43_200_000).div_euclid(86_400_000) * 86_400_000)
+        }
+        Some(original) => Zone {
+            name: &name,
+            wall: zone.wall,
+            shift,
+        }
+        .wall_at(original),
+        None => wall,
+    }
+    .get(..10)
+    .unwrap_or_default()
+    .to_owned();
     Ok(SeriesClock {
         name,
         shift,
         current,
         day,
     })
+}
+
+/// Whether series `series` (Graph's `old` recurrence) begins on `split`
+/// ("2026-10-27"), its own time zone `zone`'s day: on or before its range's
+/// start, or before any occurrence it has, as a range can start days before
+/// the first day its pattern has.
+async fn begins_on(
+    graph: &Graph,
+    series: &str,
+    old: &serde_json::Value,
+    split: &str,
+    zone: &str,
+) -> Result<bool> {
+    let first = old["range"]["startDate"].as_str().unwrap_or_default();
+    if split.is_empty() || split <= first {
+        return Ok(true);
+    }
+    let day = |d: &str| graph::parse_iso_date(&format!("{d}T00:00:00Z"));
+    let (Some(from), Some(to)) = (day(first), day(split)) else {
+        return Ok(false);
+    };
+    let span = graph
+        .occurrence_span(series, from - 86_400_000, to + 86_400_000, zone)
+        .await?;
+    Ok(span.is_none_or(|(earliest, _)| earliest.as_str() >= split))
 }
 
 pub fn config(account: &Account) -> Result<AccountConfig> {
