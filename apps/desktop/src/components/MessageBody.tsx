@@ -342,16 +342,16 @@ function loadsRemote(doc: Document) {
 
 /**
  * Whether the laid-out email shows anything from the web. A hidden picture, like a newsletter's
- * banner for phones on a wide screen, doesn't count: Show images wouldn't show it. A `<source>`
- * shows through its picture's `<img>`.
+ * banner for phones on a wide screen, doesn't count: Show images wouldn't show it. Nor does a
+ * `<picture>`'s web alternative for another screen size: an image counts by the source it picked
+ * (`currentSrc`, set once it has; its `src` until then).
  */
 function showsRemote(doc: Document) {
+  const visible = (el: Element) => el.checkVisibility({ visibilityProperty: true, opacityProperty: true });
   return (
     sheetsLoadRemote(doc) ||
-    remoteElements(doc).some((el) => {
-      const shown = el.tagName === "SOURCE" ? el.parentElement?.querySelector("img") : el;
-      return shown?.checkVisibility({ visibilityProperty: true, opacityProperty: true }) ?? false;
-    })
+    [...doc.images].some((img) => isRemoteUrl(img.currentSrc || (img.getAttribute("src") ?? "")) && visible(img)) ||
+    remoteElements(doc).some((el) => el.tagName !== "IMG" && el.tagName !== "SOURCE" && visible(el))
   );
 }
 

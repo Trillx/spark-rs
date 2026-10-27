@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attachment::{AttachmentData, InlineImage};
 use crate::signature::{self, Parts, Quote};
-use crate::{Error, Result};
+use crate::{Error, Result, trackers};
 
 /// Most servers (Gmail, Microsoft 365) refuse messages whose attachments add
 /// up to more than this.
@@ -138,7 +138,11 @@ impl Draft {
         } else {
             signature::sanitize
         };
-        let body_html = self.body_html.as_deref().map(clean);
+        // Without tracking pixels pasted in, or quoted in a draft from another app.
+        let body_html = self
+            .body_html
+            .as_deref()
+            .map(|html| clean(&trackers::strip(html)));
         let signature = self.clean_signature();
         let original = original.filter(|o| !o.text.trim().is_empty());
         let quoted = original.and_then(|o| o.html.as_deref().map(signature::sanitize_quoted));
@@ -582,6 +586,17 @@ mod tests {
         // Without a signature, plain text still goes as plain text.
         let plain = draft("ana@x.com").bodies(None, None);
         assert_eq!((plain.text.as_str(), plain.html), ("Sounds good.", None));
+    }
+
+    #[test]
+    fn tracking_pixels_in_the_body_stay_behind() {
+        let mut d = draft("ana@x.com");
+        d.body_html = Some(r#"<p>Hi</p><img src="https://t.x/o.gif" width="1" height="1">"#.into());
+        let html = d.bodies(None, None).html.unwrap();
+        assert!(
+            html.contains("<p>Hi</p>") && !html.contains("o.gif"),
+            "{html}"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::engine::Engine;
 use crate::graph::Graph;
 use crate::imap::{self, Session, SyncState};
 use crate::signature::{self, BODY_SECTION, SIGNATURE_SECTION};
-use crate::{Error, Result, parse};
+use crate::{Error, Result, parse, trackers};
 
 /// What a round did with the account's drafts.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -244,6 +244,9 @@ struct StoredParts {
 /// formatting: its section of the HTML, or all of a draft written elsewhere
 /// that has neither a signature nor a forward here.
 fn stored_parts(store: &Store, text: &str, html: Option<&str>) -> Result<StoredParts> {
+    // A reply saved in another app quotes the original, tracking pixels and all.
+    let html = html.map(trackers::strip);
+    let html = html.as_deref();
     // What the HTML version adds after a body (`Parts::html`) isn't typed.
     let body_html = html
         .and_then(|h| signature::section(h, BODY_SECTION))
@@ -1137,6 +1140,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(elsewhere.body_html.as_deref(), Some("<p><i>Hello</i></p>"));
+        // A reply saved in Outlook or Gmail quotes the original's tracking pixel; it doesn't load here.
+        let reply = stored_parts(
+            &store,
+            "Sounds good",
+            Some(r#"<div>Sounds good</div><div id="divRplyFwdMsg">From: Shop</div><p>Sale</p><img src="https://t.example.com/open.gif" width="1" height="1">"#),
+        )
+        .unwrap();
+        let html = reply.body_html.unwrap();
+        assert!(
+            html.contains("<p>Sale</p>") && !html.contains("open.gif"),
+            "{html}"
+        );
     }
 
     #[test]
