@@ -648,3 +648,90 @@ async fn sent_searches_check_every_match_for_the_exact_address() {
     );
     task.abort();
 }
+
+/// An inbox with UID 1 (or none, once `present` is false) on a server that
+/// refuses moves for being over quota, with a Blocked folder.
+async fn over_quota(present: bool) -> (Server, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        security: Security::Plain,
+        trusted_cert: None,
+    };
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(b"* OK synthetic server\r\n").await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let (tag, command) = line.split_once(' ').unwrap();
+            let upper = command.to_ascii_uppercase();
+            let reply = if upper.starts_with("LOGIN ") {
+                format!("{tag} OK complete\r\n")
+            } else if upper == "CAPABILITY" {
+                format!("* CAPABILITY IMAP4rev1 MOVE UIDPLUS\r\n{tag} OK complete\r\n")
+            } else if upper.starts_with("SELECT ") {
+                format!("* 1 EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n{tag} OK complete\r\n")
+            } else if upper.starts_with("UID MOVE ") {
+                format!("{tag} NO [OVERQUOTA] Quota exceeded\r\n")
+            } else if upper.starts_with("LIST ") {
+                format!("* LIST () \"/\" Blocked\r\n{tag} OK complete\r\n")
+            } else if upper.starts_with("UID FETCH ") {
+                let found = if present { "* 1 FETCH (UID 1)\r\n" } else { "" };
+                format!("{found}{tag} OK complete\r\n")
+            } else if upper == "LOGOUT" {
+                format!("* BYE\r\n{tag} OK complete\r\n")
+            } else {
+                panic!("unexpected command: {command}");
+            };
+            write.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+    (server, task)
+}
+
+#[tokio::test]
+async fn a_refused_move_waits_unless_the_message_is_gone() {
+    for present in [true, false] {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = account(&store);
+        let spam = Incoming {
+            account_id: account.id,
+            mailbox: Some("INBOX".into()),
+            uid: Some(1),
+            message_id: Some("<offer@z.net>".into()),
+            from_address: "spam@z.net".into(),
+            ..Default::default()
+        };
+        store.add_incoming(&spam, false).unwrap();
+        let block = spark_store::Change {
+            screen: spark_store::Screen::Sender("spam@z.net".into()),
+            decision: Some(spark_store::Decision::Blocked),
+        };
+        store.decide(&[block], 1).unwrap();
+        let pending = store.pending(account.id, 2, 0).unwrap();
+        assert_eq!(pending.len(), 1);
+        let store = Mutex::new(store);
+        let (server, task) = over_quota(present).await;
+        let mut session = imap::login(&server, "me", "pw").await.unwrap();
+        let mut state = SyncState {
+            blocked: Some("Blocked".into()),
+            ..state()
+        };
+        assert_eq!(
+            imap::push(&mut session, &store, &mut state, pending)
+                .await
+                .unwrap(),
+            0
+        );
+        let waiting = store
+            .lock()
+            .unwrap()
+            .pending(account.id, 2, 0)
+            .unwrap()
+            .len();
+        assert_eq!(waiting, usize::from(present), "present: {present}");
+        task.abort();
+    }
+}

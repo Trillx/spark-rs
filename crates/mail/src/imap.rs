@@ -674,6 +674,16 @@ pub async fn delete_folders(session: &mut Session, mailboxes: &[String]) -> Resu
     Ok(())
 }
 
+/// Whether the selected mailbox still has `uid`.
+async fn still_there(session: &mut Session, uid: u32) -> Result<bool> {
+    let fetched: Vec<Fetch> = session
+        .uid_fetch(uid.to_string(), "(UID)")
+        .await?
+        .try_collect()
+        .await?;
+    Ok(fetched.iter().any(|f| f.uid == Some(uid)))
+}
+
 /// Whether the server has `mailbox`.
 async fn exists(session: &mut Session, mailbox: &str) -> Result<bool> {
     let names: Vec<_> = session
@@ -1071,7 +1081,8 @@ async fn fetch_messages(
 /// Sends local changes to the server: flags (read, pinned as flagged), then
 /// the move for Done, Delete, blocking, filing into a folder, or back to the
 /// inbox. Returns how many messages were updated. A message the server no
-/// longer has is skipped for good. Records the Blocked folder in `state`
+/// longer has is skipped for good; a move the server refuses waits for the
+/// next round. Records the Blocked folder in `state`
 /// when it's first needed, and forgets it if it's gone (renamed or deleted
 /// elsewhere), leaving those moves to the next round.
 pub async fn push(
@@ -1173,8 +1184,12 @@ pub async fn push(
                     state.blocked = None;
                     continue;
                 }
+                // Refused while the message is still there (over quota, say):
+                // the move waits for the next round. Gone meanwhile: it's dropped.
                 Err(async_imap::error::Error::No(_)) => {
-                    lock(store).drop_pending(p.id)?;
+                    if !still_there(session, uid).await? {
+                        lock(store).drop_pending(p.id)?;
+                    }
                     continue;
                 }
                 Err(e) => return Err(e.into()),

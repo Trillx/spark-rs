@@ -19,13 +19,16 @@ const PUBLIC_DOMAINS = new Set([
   "yandex.com", "yandex.ru", "mail.ru", "qq.com", "163.com", "126.com", "comcast.net", "verizon.net", "att.net",
   "sbcglobal.net", "btinternet.com", "orange.fr", "free.fr", "t-online.de", "libero.it", "seznam.cz", "naver.com",
 ]);
+/** Their country versions (hotmail.co.uk, yahoo.com.br, gmx.de), not an organisation's (live.example.org). */
 const PUBLIC_PREFIXES = ["hotmail.", "outlook.", "live.", "yahoo.", "gmx.", "yandex."];
+const COUNTRY_DOMAIN = /^((co|com)\.)?[a-z]{2}$/;
 
 /** The domain of `address` if it can be accepted or blocked as a whole: not a free mail provider's. */
 export function decidableDomain(address: string): string | undefined {
   const domain = domainOf(address);
-  if (!domain || PUBLIC_DOMAINS.has(domain) || PUBLIC_PREFIXES.some((p) => domain.startsWith(p))) return undefined;
-  return domain;
+  if (!domain || PUBLIC_DOMAINS.has(domain)) return undefined;
+  const country = PUBLIC_PREFIXES.some((p) => domain.startsWith(p) && COUNTRY_DOMAIN.test(domain.slice(p.length)));
+  return country ? undefined : domain;
 }
 
 export const sender = (address: string): Screen => ({ sender: address });

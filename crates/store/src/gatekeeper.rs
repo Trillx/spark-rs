@@ -180,7 +180,8 @@ const PUBLIC_DOMAINS: &[&str] = &[
     "naver.com",
 ];
 
-/// Country versions of the big ones (hotmail.co.uk, yahoo.fr, …).
+/// Country versions of the big ones (hotmail.co.uk, yahoo.fr, …), followed
+/// by a country's domain (`country_domain`).
 const PUBLIC_PREFIXES: &[&str] = &["hotmail.", "outlook.", "live.", "yahoo.", "gmx.", "yandex."];
 
 /// Senders Spark accepts without asking: big companies' notifications.
@@ -211,7 +212,19 @@ pub fn domain_of(address: &str) -> Option<String> {
 pub fn is_public_domain(domain: &str) -> bool {
     let domain = domain.to_lowercase();
     PUBLIC_DOMAINS.contains(&domain.as_str())
-        || PUBLIC_PREFIXES.iter().any(|p| domain.starts_with(p))
+        || PUBLIC_PREFIXES
+            .iter()
+            .any(|p| domain.strip_prefix(p).is_some_and(country_domain))
+}
+
+/// A country's domain, as the providers' country versions end: `fr`,
+/// `co.uk`, `com.br`. Not an organisation's (`example.org` after `live.`).
+fn country_domain(rest: &str) -> bool {
+    let code = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_lowercase());
+    match rest.split_once('.') {
+        None => code(rest),
+        Some((second, country)) => matches!(second, "co" | "com") && code(country),
+    }
 }
 
 fn is_well_known(domain: &str) -> bool {
@@ -611,7 +624,9 @@ mod tests {
         assert_eq!(domain_of("Ana@Parts.COM").as_deref(), Some("parts.com"));
         assert_eq!(domain_of("nobody"), None);
         assert!(is_public_domain("gmail.com") && is_public_domain("hotmail.co.uk"));
+        assert!(is_public_domain("yahoo.com.br") && is_public_domain("gmx.de"));
         assert!(!is_public_domain("livenation.com") && !is_public_domain("contoso.com"));
+        assert!(!is_public_domain("live.example.org") && !is_public_domain("outlook.company.com"));
         assert!(is_well_known("github.com") && is_well_known("accounts.google.com"));
         assert!(!is_well_known("notgoogle.com") && !is_well_known("evilgithub.com"));
     }

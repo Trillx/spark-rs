@@ -30,6 +30,9 @@ test("decisions cover one address, or everyone at a domain", () => {
   assert.equal(decidableDomain("ana@Parts.com"), "parts.com");
   assert.equal(decidableDomain("ana@gmail.com"), undefined);
   assert.equal(decidableDomain("ana@hotmail.co.uk"), undefined);
+  assert.equal(decidableDomain("ana@yahoo.com.br"), undefined);
+  assert.equal(decidableDomain("ana@live.example.org"), "live.example.org");
+  assert.equal(decidableDomain("ana@outlook.company.com"), "outlook.company.com");
 });
 
 test("mail follows its sender's decision", () => {
