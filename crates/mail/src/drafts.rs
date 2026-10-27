@@ -14,8 +14,8 @@ use lettre::address::Envelope;
 use lettre::message::Mailbox;
 use lettre::message::header::{HeaderName, HeaderValue};
 use spark_store::{
-    Account, Attachment, Contact, DraftCopy, DraftSave, DraftUpload, FolderRole, Location,
-    OutboxFile, Store,
+    Account, Attachment, Contact, DraftCopy, DraftFile, DraftSave, DraftUpload, FolderRole,
+    Location, OutboxFile, Store,
 };
 
 use crate::attachment::{self, AttachmentData, mime_for};
@@ -39,29 +39,20 @@ pub struct DraftsReport {
 }
 
 impl Engine {
-    /// Saves the composer's draft here, with copies of its files from this
-    /// computer in order; the account's next rounds put it on the server.
-    /// Returns the draft's message id.
-    pub fn save_draft(&self, draft: &Draft, files: &[OutboxFile]) -> Result<i64> {
-        let mut store = self.store();
-        let account = store
-            .account(draft.account)?
-            .ok_or_else(|| Error::Config("That account was removed.".into()))?;
-        save(&mut store, &account, draft, files, spark_store::now_ms())
-    }
-
     /// A saved draft for the composer; `None` if `id` isn't a draft.
     pub fn open_draft(&self, id: i64) -> Result<Option<Draft>> {
         open(&self.store(), id)
     }
 }
 
-/// Saves the composer's draft as of `now` (see `Store::save_draft`).
+/// Saves the composer's draft as of `now` (see `Store::save_draft`), with
+/// its files from this computer in order; the account's next rounds put it
+/// on the server. Returns the draft's message id.
 pub fn save(
     store: &mut Store,
     account: &Account,
     draft: &Draft,
-    files: &[OutboxFile],
+    files: &[DraftFile],
     now: i64,
 ) -> Result<i64> {
     save_with(store, account, draft, files, now, None)
@@ -76,14 +67,15 @@ pub(crate) fn recover_failed_send(
     now: i64,
     outbox_id: i64,
 ) -> Result<i64> {
-    save_with(store, account, draft, files, now, Some(outbox_id))
+    let files: Vec<DraftFile> = files.iter().map(DraftFile::Copy).collect();
+    save_with(store, account, draft, &files, now, Some(outbox_id))
 }
 
 fn save_with(
     store: &mut Store,
     account: &Account,
     draft: &Draft,
-    files: &[OutboxFile],
+    files: &[DraftFile],
     now: i64,
     outbox_id: Option<i64>,
 ) -> Result<i64> {

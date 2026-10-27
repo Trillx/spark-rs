@@ -30,7 +30,7 @@ mod templates;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use contacts::Contact;
-pub use drafts::{DraftCopy, DraftRemoval, DraftSave, DraftUpload};
+pub use drafts::{DraftCopy, DraftFile, DraftRemoval, DraftSave, DraftUpload, SavedFile};
 pub use gatekeeper::{
     Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
 };

@@ -1,8 +1,11 @@
 //! What the UI talks to: real accounts once one is added, the demo mailbox
 //! until then. Types here are the UI's shapes (`src/types.ts` mirrors them).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Read as _};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use spark_mail::attachment::{AttachmentData, InlineImage, cid_refs, mime_for};
@@ -14,8 +17,9 @@ use spark_mail::unsubscribe::Unsubscribed;
 use spark_mail::{Error, Service, Untrusted};
 use spark_mail::{signature, trackers};
 use spark_store::{
-    Account, AccountKind, Category, Change, Contact, DueReminder, Folder, FolderRole,
-    GatekeeperMode, MessageState, OutboxFile, Patch, PriorityUndo, SenderStatus, now_ms,
+    Account, AccountKind, Category, Change, Contact, DraftFile, DueReminder, Folder, FolderRole,
+    GatekeeperMode, MessageState, OutboxFile, Patch, PriorityUndo, SavedFile, SenderStatus, Store,
+    now_ms,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -1454,7 +1458,7 @@ pub fn sync_now(mailbox: State<'_, Mailbox>) {
 
 /// Queues a draft to go out at `draft.sendAt`; returns its outbox id.
 #[tauri::command]
-pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
+pub async fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
     if !mailbox.live() {
         // The demo pretends.
         let id = mailbox.demo.send(&draft);
@@ -1466,33 +1470,41 @@ pub fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, St
         draft::recipients(field).map_err(text)?;
     }
     draft.check_size().map_err(text)?;
+    let engine = mailbox.live.engine.clone();
+    let queued = draft.clone();
+    let id = tauri::async_runtime::spawn_blocking(move || queue_live(&engine, &queued))
+        .await
+        .map_err(text)??;
+    signed(&mailbox, &draft)?;
+    if draft.send_at <= now_ms() {
+        mailbox.live.nudge(draft.account);
+    }
+    Ok(id)
+}
+
+/// Queues a real account's draft. Copies of its files from this computer go
+/// into the outbox, so a later send doesn't depend on the originals; they're
+/// read before the store is locked.
+fn queue_live(engine: &spark_mail::Engine, draft: &Draft) -> Result<i64, String> {
+    let json = serde_json::to_string(draft).map_err(text)?;
+    let read: Vec<io::Result<Vec<u8>>> = attached(draft)
+        .iter()
+        .map(|f| std::fs::read(f.path))
+        .collect();
+    let mut store = engine.store();
     // One send per saved draft: another would send it twice.
     if let Some(saved) = draft.draft_id
-        && mailbox
-            .live
-            .engine
-            .store()
-            .draft_held(saved)
-            .map_err(text)?
+        && store.draft_held(saved).map_err(text)?
     {
         return Err("This draft is already on its way.".into());
     }
-    // Copies of local files go into the outbox, so a later send doesn't
-    // depend on the originals.
-    let json = serde_json::to_string(&draft).map_err(text)?;
-    let mut store = mailbox.live.engine.store();
-    let queued = local_files(&draft, &store)?;
+    let queued = outbox_files(draft, read, &store)?;
     let id = store
         .queue_send(draft.account, &json, draft.send_at, &queued)
         .map_err(text)?;
     // The saved draft it came from waits with it, out of the lists.
     if let Some(saved) = draft.draft_id {
         store.hold_draft_for_send(id, saved).map_err(text)?;
-    }
-    drop(store);
-    signed(&mailbox, &draft)?;
-    if draft.send_at <= now_ms() {
-        mailbox.live.nudge(draft.account);
     }
     Ok(id)
 }
@@ -1523,63 +1535,385 @@ pub fn cancel_send(mailbox: State<'_, Mailbox>, id: i64) -> Result<bool, String>
     mailbox.live.engine.store().cancel_send(id).map_err(text)
 }
 
-/// Copies of a draft's files from this computer, in order. A recovered draft
-/// can use its saved bytes after the original file has moved or disappeared.
-fn local_files(draft: &Draft, store: &spark_store::Store) -> Result<Vec<OutboxFile>, String> {
+/// A file from this computer attached to a draft.
+struct Attached<'a> {
+    attachment: &'a OutgoingAttachment,
+    path: &'a str,
+    name: &'a str,
+    size: u64,
+}
+
+/// A draft's files from this computer, in order.
+fn attached(draft: &Draft) -> Vec<Attached<'_>> {
+    draft
+        .attachments
+        .iter()
+        .filter_map(|a| match a {
+            OutgoingAttachment::File { path, name, size } => Some(Attached {
+                attachment: a,
+                path,
+                name,
+                size: *size,
+            }),
+            OutgoingAttachment::Message { .. } => None,
+        })
+        .collect()
+}
+
+/// The draft as last saved, and its id, for files that can't be read from
+/// this computer: a recovered draft can use its saved bytes after the
+/// original file has moved or disappeared. `missing` is the error without it.
+fn saved_draft(
+    store: &Store,
+    draft: &Draft,
+    missing: &dyn Fn() -> String,
+) -> Result<(i64, Draft), String> {
+    let id = draft.draft_id.ok_or_else(missing)?;
+    let json = store.draft(id).map_err(text)?.ok_or_else(missing)?;
+    Ok((id, serde_json::from_str(&json).map_err(text)?))
+}
+
+/// Where the draft as saved has exactly this attachment among its files:
+/// the first place not `used` yet, else the first. Locating this exact
+/// attachment, rather than one in its place, keeps a removed file from
+/// standing in when the composer changed their order or added another.
+fn saved_position(original: &Draft, file: &Attached, used: &[bool]) -> Option<usize> {
+    let same: Vec<usize> = attached(original)
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.attachment == file.attachment)
+        .map(|(p, _)| p)
+        .collect();
+    let unused = same
+        .iter()
+        .find(|&&p| !used.get(p).copied().unwrap_or(false));
+    unused.or(same.first()).copied()
+}
+
+/// Copies of a draft's files for the outbox, in order, given what reading
+/// each from this computer gave.
+fn outbox_files(
+    draft: &Draft,
+    read: Vec<io::Result<Vec<u8>>>,
+    store: &Store,
+) -> Result<Vec<OutboxFile>, String> {
     let mut files = Vec::new();
     let mut saved: Option<(Draft, Vec<OutboxFile>)> = None;
-    for a in &draft.attachments {
-        let OutgoingAttachment::File { path, name, size } = a else {
-            continue;
-        };
-        let file = match std::fs::read(path) {
+    let mut used = Vec::new();
+    for (file, read) in attached(draft).iter().zip(read) {
+        let name = file.name;
+        let copy = match read {
             Ok(data) => OutboxFile {
-                name: name.clone(),
+                name: name.to_owned(),
                 mime: mime_for(name).into(),
                 data,
             },
             Err(e) => {
                 let missing = || format!("Couldn't read {name}: {e}");
                 if saved.is_none() {
-                    let id = draft.draft_id.ok_or_else(missing)?;
-                    let json = store.draft(id).map_err(text)?.ok_or_else(missing)?;
-                    saved = Some((
-                        serde_json::from_str(&json).map_err(text)?,
-                        store.draft_files(id).map_err(text)?,
-                    ));
+                    let (id, original) = saved_draft(store, draft, &missing)?;
+                    let copies = store.draft_files(id).map_err(text)?;
+                    used = vec![false; copies.len()];
+                    saved = Some((original, copies));
                 }
                 let (original, copies) = saved.as_ref().expect("loaded above");
-                // Copies contain only File attachments. Locate this exact
-                // saved attachment rather than substituting a removed file
-                // when the composer changed their order or added another.
-                let position = original
-                    .attachments
-                    .iter()
-                    .filter(|a| matches!(a, OutgoingAttachment::File { .. }))
-                    .position(|original| original == a)
-                    .ok_or_else(missing)?;
+                let position = saved_position(original, file, &used).ok_or_else(missing)?;
+                used[position] = true;
                 copies
                     .get(position)
-                    .filter(|f| f.name == *name && f.data.len() as u64 == *size)
+                    .filter(|f| f.name == name && f.data.len() as u64 == file.size)
                     .cloned()
                     .ok_or_else(missing)?
             }
         };
-        files.push(file);
+        files.push(copy);
     }
     Ok(files)
+}
+
+/// What a file from this computer was when a draft saved it. A save while
+/// its size and modified time are the same keeps the saved copy rather than
+/// reading it again; a file replaced or written since changes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Source {
+    path: String,
+    len: u64,
+    modified: SystemTime,
+}
+
+impl Source {
+    fn of(path: &str, meta: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            path: path.to_owned(),
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+        })
+    }
+
+    /// The file at `path` as it is now.
+    fn now(path: &str) -> Option<Self> {
+        Self::of(path, &std::fs::metadata(path).ok()?)
+    }
+}
+
+/// A modified time this close to a read isn't trusted: the coarsest (FAT's,
+/// two seconds) can't tell a write just before the read from one just after.
+const SETTLED: Duration = Duration::from_secs(2);
+
+/// A copy of a file read from this computer, and its source if a later save
+/// can trust the file unchanged by it.
+struct LocalCopy {
+    file: OutboxFile,
+    source: Option<Source>,
+}
+
+/// Reads a file attached from this computer.
+fn read_local(path: &str, name: &str) -> io::Result<LocalCopy> {
+    let started = SystemTime::now();
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    // Written while it was read, or just before: the next save reads it again.
+    let source = Source::of(path, &before).filter(|s| {
+        s.len == data.len() as u64
+            && file
+                .metadata()
+                .ok()
+                .and_then(|m| Source::of(path, &m))
+                .as_ref()
+                == Some(s)
+            && s.modified
+                .checked_add(SETTLED)
+                .is_some_and(|t| t <= started)
+    });
+    Ok(LocalCopy {
+        file: OutboxFile {
+            name: name.to_owned(),
+            mime: mime_for(name).into(),
+            data,
+        },
+        source,
+    })
+}
+
+/// A draft's saved files as this run of the app last saved them.
+#[derive(Clone)]
+struct Snapshot {
+    /// The save they're from (`Store::draft_saved_at`). Any later save
+    /// changes it, a failed send's recovery from the outbox too.
+    saved_at: i64,
+    /// Where each came from, in order: `None` for one not known to match
+    /// a file on this computer.
+    sources: Vec<Option<Source>>,
+}
+
+/// Snapshots by the draft's message id, so an autosave that changed only
+/// the text doesn't read its files again. After a restart, the first save
+/// reads them once.
+#[derive(Default)]
+struct SavedFiles(Mutex<BTreeMap<i64, Snapshot>>);
+
+static SAVED_FILES: SavedFiles = SavedFiles(Mutex::new(BTreeMap::new()));
+
+impl SavedFiles {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<i64, Snapshot>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Draft `id`'s snapshot, if it's still what the store has.
+    fn current(
+        &self,
+        store: &Store,
+        id: i64,
+        saved: &[SavedFile],
+    ) -> Result<Option<Snapshot>, String> {
+        let Some(saved_at) = store.draft_saved_at(id).map_err(text)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .lock()
+            .get(&id)
+            .filter(|s| s.saved_at == saved_at && s.sources.len() == saved.len())
+            .cloned())
+    }
+
+    /// Takes the snapshot of draft `id` just saved, over `was` (the draft it
+    /// was saved over).
+    fn saved(
+        &self,
+        store: &Store,
+        was: Option<i64>,
+        id: i64,
+        sources: Vec<Option<Source>>,
+    ) -> Result<(), String> {
+        let saved_at = store.draft_saved_at(id).map_err(text)?;
+        let mut snapshots = self.lock();
+        if let Some(was) = was {
+            snapshots.remove(&was);
+        }
+        if let Some(saved_at) = saved_at {
+            snapshots.insert(id, Snapshot { saved_at, sources });
+        }
+        Ok(())
+    }
+
+    fn forget(&self, id: i64) {
+        self.lock().remove(&id);
+    }
+}
+
+/// How a save gets one of the draft's files.
+enum Pick<'a> {
+    Read(&'a LocalCopy),
+    /// The copy the draft has saved at this index of its files; and the
+    /// file it came from, if that's known.
+    Saved(usize, Option<Source>),
+}
+
+/// How a save gets the draft's files.
+enum Picked<'a> {
+    /// Each of them, in order.
+    All(Vec<Pick<'a>>),
+    /// It has to read these first (by index among them).
+    Unread(Vec<usize>),
+}
+
+/// How a save gets the draft's files: `found` is each as it is on this
+/// computer, `read` what reading it gave, if it was read.
+fn pick<'a>(
+    store: &Store,
+    draft: &Draft,
+    saved: &[SavedFile],
+    snapshot: Option<&Snapshot>,
+    found: &[Option<Source>],
+    read: &'a [Option<io::Result<LocalCopy>>],
+) -> Result<Picked<'a>, String> {
+    let mut picks = Vec::new();
+    let mut unread = Vec::new();
+    let mut used = vec![false; saved.len()];
+    let mut original = None;
+    for (k, file) in attached(draft).iter().enumerate() {
+        let e = match &read[k] {
+            Some(Ok(copy)) => {
+                picks.push(Pick::Read(copy));
+                continue;
+            }
+            Some(Err(e)) => Some(e),
+            None => None,
+        };
+        // Unchanged since this run saved it: the copy it has stays.
+        let unchanged = snapshot.zip(found[k].as_ref()).and_then(|(snapshot, now)| {
+            (0..saved.len()).find(|&p| {
+                !used[p]
+                    && snapshot.sources[p].as_ref() == Some(now)
+                    && saved[p].name == file.name
+                    && saved[p].size == now.len
+            })
+        });
+        if let Some(p) = unchanged {
+            used[p] = true;
+            picks.push(Pick::Saved(p, found[k].clone()));
+            continue;
+        }
+        let Some(e) = e else {
+            unread.push(k);
+            continue;
+        };
+        let name = file.name;
+        let missing = || format!("Couldn't read {name}: {e}");
+        if original.is_none() {
+            original = Some(saved_draft(store, draft, &missing)?.1);
+        }
+        let position = saved_position(original.as_ref().expect("loaded above"), file, &used)
+            .filter(|&p| {
+                saved
+                    .get(p)
+                    .is_some_and(|s| s.name == name && s.size == file.size)
+            })
+            .ok_or_else(missing)?;
+        used[position] = true;
+        picks.push(Pick::Saved(position, None));
+    }
+    Ok(if unread.is_empty() {
+        Picked::All(picks)
+    } else {
+        Picked::Unread(unread)
+    })
+}
+
+/// Saves a real account's draft with its files from this computer. A file
+/// unchanged since this run of the app saved it isn't read again; one that
+/// can't be read keeps the copy the draft saved. Files are read while the
+/// store isn't locked.
+fn save_live(
+    engine: &spark_mail::Engine,
+    snapshots: &SavedFiles,
+    draft: &Draft,
+    read_file: impl Fn(&str, &str) -> io::Result<LocalCopy>,
+) -> Result<i64, String> {
+    let local = attached(draft);
+    let found: Vec<Option<Source>> = local.iter().map(|f| Source::now(f.path)).collect();
+    let mut read: Vec<Option<io::Result<LocalCopy>>> = local.iter().map(|_| None).collect();
+    loop {
+        let mut store = engine.store();
+        let (saved, snapshot) = match draft.draft_id {
+            Some(id) => {
+                let saved = store.saved_files(id).map_err(text)?;
+                let snapshot = snapshots.current(&store, id, &saved)?;
+                (saved, snapshot)
+            }
+            None => (Vec::new(), None),
+        };
+        let unread = match pick(&store, draft, &saved, snapshot.as_ref(), &found, &read)? {
+            Picked::All(picks) => {
+                let files: Vec<DraftFile> = picks
+                    .iter()
+                    .map(|p| match p {
+                        Pick::Read(copy) => DraftFile::Copy(&copy.file),
+                        Pick::Saved(p, _) => DraftFile::Saved(&saved[*p]),
+                    })
+                    .collect();
+                let account = store
+                    .account(draft.account)
+                    .map_err(text)?
+                    .ok_or_else(|| "That account was removed.".to_owned())?;
+                let id = spark_mail::drafts::save(&mut store, &account, draft, &files, now_ms())
+                    .map_err(text)?;
+                let sources = picks
+                    .into_iter()
+                    .map(|p| match p {
+                        Pick::Read(copy) => copy.source.clone(),
+                        Pick::Saved(_, source) => source,
+                    })
+                    .collect();
+                snapshots.saved(&store, draft.draft_id, id, sources)?;
+                return Ok(id);
+            }
+            Picked::Unread(unread) => unread,
+        };
+        // The store may change meanwhile; what's read is checked against it again.
+        drop(store);
+        for k in unread {
+            read[k] = Some(read_file(local[k].path, local[k].name));
+        }
+    }
 }
 
 /// Saves the composer's draft in its account's Drafts folder: here at once,
 /// on the server with the account's next round, replacing the copy it was
 /// opened from. Returns the draft's message id, for saving it again.
 #[tauri::command]
-pub fn save_draft(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
+pub async fn save_draft(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i64, String> {
     if !mailbox.live() {
         return mailbox.demo.save_draft(draft);
     }
-    let files = local_files(&draft, &mailbox.live.engine.store())?;
-    mailbox.live.engine.save_draft(&draft, &files).map_err(text)
+    let engine = mailbox.live.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_live(&engine, &SAVED_FILES, &draft, read_local)
+    })
+    .await
+    .map_err(text)?
 }
 
 /// A draft from Drafts, for the composer.
@@ -1630,6 +1964,7 @@ pub fn discard_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<(), String>
         .store()
         .discard_draft(id)
         .map_err(text)?;
+    SAVED_FILES.forget(id);
     Ok(())
 }
 
@@ -1662,8 +1997,12 @@ const REFUSED_SCHEMES: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::sync::Arc;
+
     use super::*;
-    use spark_store::{NewAccount, Store};
+    use spark_store::NewAccount;
 
     #[test]
     fn script_file_and_attack_links_never_open() {
@@ -1711,19 +2050,52 @@ mod tests {
         }
     }
 
+    struct NoSecrets;
+
+    impl spark_mail::Secrets for NoSecrets {
+        fn get(&self, _: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// An engine with an account and no network.
+    fn engine() -> (spark_mail::Engine, Account) {
+        let store = Store::open_in_memory().unwrap();
+        let account = draft_account(&store);
+        let engine = spark_mail::Engine::new(Arc::new(Mutex::new(store)), Arc::new(NoSecrets));
+        (engine, account)
+    }
+
+    /// Writes a file to attach, last modified at `modified`.
+    fn write_file(path: &Path, data: &[u8], modified: SystemTime) {
+        std::fs::write(path, data).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+
+    fn ago(secs: u64) -> SystemTime {
+        SystemTime::now() - Duration::from_secs(secs)
+    }
+
+    /// The draft's files for the outbox, read now.
+    fn copies(draft: &Draft, store: &Store) -> Result<Vec<OutboxFile>, String> {
+        let read = attached(draft)
+            .iter()
+            .map(|f| std::fs::read(f.path))
+            .collect();
+        outbox_files(draft, read, store)
+    }
+
+    fn bytes(files: &[OutboxFile]) -> Vec<&[u8]> {
+        files.iter().map(|f| &f.data[..]).collect()
+    }
+
     #[tokio::test]
     async fn a_recovered_draft_can_save_and_send_after_its_original_file_is_deleted() {
-        struct NoSecrets;
-        impl spark_mail::Secrets for NoSecrets {
-            fn get(&self, _: &str) -> Result<Option<String>, String> {
-                Ok(None)
-            }
-            fn set(&self, _: &str, _: &str) -> Result<(), String> {
-                Ok(())
-            }
-        }
-        let mut store = Store::open_in_memory().unwrap();
-        let account = draft_account(&store);
+        let (engine, account) = engine();
         let dir = attachment_dir("recovered-files");
         let path = dir.join("plan.txt");
         std::fs::write(&path, b"saved attachment").unwrap();
@@ -1734,48 +2106,30 @@ mod tests {
             attachments: vec![file_attachment(&path, 16)],
             ..Default::default()
         };
-        let files = local_files(&draft, &store).unwrap();
-        let queued = store
-            .queue_send(
-                account.id,
-                &serde_json::to_string(&draft).unwrap(),
-                0,
-                &files,
-            )
-            .unwrap();
+        let queued = queue_live(&engine, &draft).unwrap();
+        let files = engine.store().outbox_files(queued).unwrap();
+        assert_eq!(bytes(&files), [b"saved attachment"]);
         std::fs::remove_file(&path).unwrap();
-        let engine = spark_mail::Engine::new(
-            std::sync::Arc::new(std::sync::Mutex::new(store)),
-            std::sync::Arc::new(NoSecrets),
-        );
         let result = engine.send_due(account.id).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].result.is_err());
-        let mut store = engine.store();
-        assert!(store.outbox_files(queued).unwrap().is_empty());
-        let id = store.messages().unwrap()[0].id;
-        let recovered = spark_mail::drafts::open(&store, id).unwrap().unwrap();
-        let copied = local_files(&recovered, &store).unwrap();
-        assert_eq!(copied, files);
-        let id =
-            spark_mail::drafts::save(&mut store, &account, &recovered, &copied, now_ms()).unwrap();
-        assert_eq!(store.draft_files(id).unwrap(), files);
-        let retry = store
-            .queue_send(
-                account.id,
-                &serde_json::to_string(&recovered).unwrap(),
-                0,
-                &copied,
-            )
+        assert!(engine.store().outbox_files(queued).unwrap().is_empty());
+        let id = engine.store().messages().unwrap()[0].id;
+        let recovered = spark_mail::drafts::open(&engine.store(), id)
+            .unwrap()
             .unwrap();
-        assert_eq!(store.outbox_files(retry).unwrap(), files);
+        assert_eq!(copies(&recovered, &engine.store()).unwrap(), files);
+        let saved = save_live(&engine, &SavedFiles::default(), &recovered, read_local).unwrap();
+        assert_eq!(saved, id);
+        assert_eq!(engine.store().draft_files(id).unwrap(), files);
+        let retry = queue_live(&engine, &recovered).unwrap();
+        assert_eq!(engine.store().outbox_files(retry).unwrap(), files);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn saved_files_match_the_original_attachment_after_reordering() {
-        let mut store = Store::open_in_memory().unwrap();
-        let account = draft_account(&store);
+        let (engine, account) = engine();
         let dir = attachment_dir("file-identity");
         let first = dir.join("first.txt");
         let second = dir.join("second.txt");
@@ -1795,23 +2149,303 @@ mod tests {
             ],
             ..Default::default()
         };
-        let files = local_files(&draft, &store).unwrap();
-        let id = spark_mail::drafts::save(&mut store, &account, &draft, &files, now_ms()).unwrap();
+        let id = save_live(&engine, &SavedFiles::default(), &draft, read_local).unwrap();
+        let files = engine.store().draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [b"one", b"two"]);
         std::fs::remove_file(&first).unwrap();
         std::fs::remove_file(&second).unwrap();
+        let store = engine.store();
         let mut opened = spark_mail::drafts::open(&store, id).unwrap().unwrap();
         opened.attachments.remove(0);
-        assert_eq!(
-            local_files(&opened, &store).unwrap(),
-            vec![files[1].clone()]
-        );
+        assert_eq!(copies(&opened, &store).unwrap(), vec![files[1].clone()]);
         // The same name and size at a different path is a new attachment.
         opened.attachments[1] = file_attachment(&dir.join("elsewhere/second.txt"), 3);
-        assert!(local_files(&opened, &store).is_err());
+        assert!(copies(&opened, &store).is_err());
+        drop(store);
+        assert!(save_live(&engine, &SavedFiles::default(), &opened, read_local).is_err());
         // When its original exists, use its current bytes rather than an old copy.
         opened.attachments[1] = file_attachment(&second, 3);
         std::fs::write(&second, b"new").unwrap();
-        assert_eq!(local_files(&opened, &store).unwrap()[0].data, b"new");
+        assert_eq!(bytes(&copies(&opened, &engine.store()).unwrap()), [b"new"]);
+        save_live(&engine, &SavedFiles::default(), &opened, read_local).unwrap();
+        assert_eq!(bytes(&engine.store().draft_files(id).unwrap()), [b"new"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn text_only_autosaves_read_their_files_once() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("autosaves");
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        let size = 12 << 20;
+        write_file(&a, &vec![1; size], ago(3_600));
+        write_file(&b, &vec![2; size], ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            subject: "Plan".into(),
+            attachments: vec![
+                file_attachment(&a, size as u64),
+                file_attachment(&b, size as u64),
+            ],
+            ..Default::default()
+        };
+        let saved = SavedFiles::default();
+        let reads = Cell::new(0);
+        let read = |path: &str, name: &str| {
+            reads.set(reads.get() + 1);
+            read_local(path, name)
+        };
+        let id = save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 2);
+        draft.draft_id = Some(id);
+        for i in 0..20 {
+            draft.body = format!("Draft {i}");
+            draft.subject = format!("Plan {}", i / 2);
+            assert_eq!(save_live(&engine, &saved, &draft, read).unwrap(), id);
+        }
+        assert_eq!(reads.get(), 2);
+        // Each kept the copies saved, so the store didn't read them either.
+        let store = engine.store();
+        let kept = store.saved_files(id).unwrap();
+        let snapshot = saved.current(&store, id, &kept).unwrap();
+        let found: Vec<_> = attached(&draft)
+            .iter()
+            .map(|f| Source::now(f.path))
+            .collect();
+        let unread: Vec<_> = found.iter().map(|_| None).collect();
+        let picked = pick(&store, &draft, &kept, snapshot.as_ref(), &found, &unread).unwrap();
+        let Picked::All(picks) = picked else {
+            panic!("it reads files again");
+        };
+        assert!(
+            picks
+                .iter()
+                .enumerate()
+                .all(|(i, p)| matches!(p, Pick::Saved(at, Some(_)) if *at == i))
+        );
+        let opened = spark_mail::drafts::open(&store, id).unwrap().unwrap();
+        assert_eq!((&*opened.subject, &*opened.body), ("Plan 9", "Draft 19"));
+        let files = store.draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [&vec![1; size][..], &vec![2; size][..]]);
+        drop(store);
+
+        // After a restart, the first save reads them again.
+        let restarted = SavedFiles::default();
+        save_live(&engine, &restarted, &draft, read).unwrap();
+        save_live(&engine, &restarted, &draft, read).unwrap();
+        assert_eq!(reads.get(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_replaced_or_written_since_it_was_saved_is_read_again() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("replaced");
+        let path = dir.join("report.pdf");
+        write_file(&path, b"version one", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            attachments: vec![file_attachment(&path, 11)],
+            ..Default::default()
+        };
+        let saved = SavedFiles::default();
+        let reads = Cell::new(0);
+        let read = |path: &str, name: &str| {
+            reads.set(reads.get() + 1);
+            read_local(path, name)
+        };
+        let id = save_live(&engine, &saved, &draft, read).unwrap();
+        draft.draft_id = Some(id);
+        save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 1);
+
+        // The same name and size, other bytes and modified time.
+        write_file(&path, b"version two", ago(1_800));
+        draft.body = "Updated".into();
+        save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 2);
+        let files = engine.store().draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [b"version two"]);
+
+        // Modified as it's read, it isn't trusted unchanged by the next save.
+        write_file(
+            &path,
+            b"version 3!!",
+            SystemTime::now() + Duration::from_secs(60),
+        );
+        save_live(&engine, &saved, &draft, read).unwrap();
+        save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 4);
+        let files = engine.store().draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [b"version 3!!"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reordered_and_removed_files_keep_their_saved_copies() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("reordered");
+        let [a, b, c] = ["a.txt", "b.txt", "c.txt"].map(|name| dir.join(name));
+        write_file(&a, b"one", ago(3_600));
+        write_file(&b, b"two", ago(3_600));
+        write_file(&c, b"three", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            attachments: vec![
+                file_attachment(&a, 3),
+                file_attachment(&b, 3),
+                file_attachment(&c, 5),
+            ],
+            ..Default::default()
+        };
+        let saved = SavedFiles::default();
+        let reads = Cell::new(0);
+        let read = |path: &str, name: &str| {
+            reads.set(reads.get() + 1);
+            read_local(path, name)
+        };
+        let id = save_live(&engine, &saved, &draft, read).unwrap();
+        draft.draft_id = Some(id);
+        assert_eq!(reads.get(), 3);
+
+        draft.attachments = vec![file_attachment(&c, 5), file_attachment(&a, 3)];
+        save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 3);
+        let files = engine.store().draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [&b"three"[..], b"one"]);
+
+        // B was removed from the draft: back, it's read again.
+        draft.attachments.insert(1, file_attachment(&b, 3));
+        save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 4);
+        let files = engine.store().draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [&b"three"[..], b"two", b"one"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_original_keeps_the_copy_saved_with_the_draft() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("missing");
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        write_file(&a, b"one", ago(3_600));
+        write_file(&b, b"two", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            attachments: vec![file_attachment(&a, 3), file_attachment(&b, 3)],
+            ..Default::default()
+        };
+        let saved = SavedFiles::default();
+        let reads = Cell::new(0);
+        let read = |path: &str, name: &str| -> io::Result<LocalCopy> {
+            let copy = read_local(path, name)?;
+            reads.set(reads.get() + 1);
+            Ok(copy)
+        };
+        let id = save_live(&engine, &saved, &draft, read).unwrap();
+        draft.draft_id = Some(id);
+        std::fs::remove_file(&a).unwrap();
+        for body in ["Edited", "Edited again"] {
+            draft.body = body.into();
+            assert_eq!(save_live(&engine, &saved, &draft, read).unwrap(), id);
+        }
+        assert_eq!(reads.get(), 2);
+        let files = engine.store().draft_files(id).unwrap();
+        assert_eq!(bytes(&files), [b"one", b"two"]);
+        let queued = queue_live(&engine, &draft).unwrap();
+        assert_eq!(engine.store().outbox_files(queued).unwrap(), files);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_draft_moved_to_another_account_keeps_its_files_unread() {
+        let (engine, account) = engine();
+        let other = engine
+            .store()
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.org",
+                name: "Me",
+                label: "Other",
+                config: "{}",
+            })
+            .unwrap();
+        let dir = attachment_dir("moved");
+        let path = dir.join("plan.txt");
+        write_file(&path, b"the plan", ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            attachments: vec![file_attachment(&path, 8)],
+            ..Default::default()
+        };
+        let saved = SavedFiles::default();
+        let reads = Cell::new(0);
+        let read = |path: &str, name: &str| {
+            reads.set(reads.get() + 1);
+            read_local(path, name)
+        };
+        draft.draft_id = Some(save_live(&engine, &saved, &draft, read).unwrap());
+        draft.account = other.id;
+        let moved = save_live(&engine, &saved, &draft, read).unwrap();
+        draft.draft_id = Some(moved);
+        save_live(&engine, &saved, &draft, read).unwrap();
+        assert_eq!(reads.get(), 1);
+        let store = engine.store();
+        assert_eq!(store.messages().unwrap().len(), 1);
+        assert_eq!(bytes(&store.draft_files(moved).unwrap()), [b"the plan"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saves_and_sends_at_once_queue_it_once_with_its_exact_files() {
+        let (engine, account) = engine();
+        let dir = attachment_dir("concurrent");
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        write_file(&a, &vec![1; 1 << 20], ago(3_600));
+        write_file(&b, &vec![2; 1 << 20], ago(3_600));
+        let mut draft = Draft {
+            account: account.id,
+            to: "ana@example.test".into(),
+            attachments: vec![file_attachment(&a, 1 << 20), file_attachment(&b, 1 << 20)],
+            ..Default::default()
+        };
+        let saved = SavedFiles::default();
+        let id = save_live(&engine, &saved, &draft, read_local).unwrap();
+        draft.draft_id = Some(id);
+        let expected = engine.store().draft_files(id).unwrap();
+        let (sends, saves) = std::thread::scope(|s| {
+            let sends: Vec<_> = (0..2)
+                .map(|_| s.spawn(|| queue_live(&engine, &draft)))
+                .collect();
+            let saves: Vec<_> = (0..4)
+                .map(|i| {
+                    let edited = Draft {
+                        body: format!("Edit {i}"),
+                        ..draft.clone()
+                    };
+                    let (engine, saved) = (&engine, &saved);
+                    s.spawn(move || save_live(engine, saved, &edited, read_local))
+                })
+                .collect();
+            let joined = |handles: Vec<std::thread::ScopedJoinHandle<_>>| {
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<Result<i64, String>>>()
+            };
+            (joined(sends), joined(saves))
+        });
+        let queued: Vec<i64> = sends.iter().filter_map(|r| r.clone().ok()).collect();
+        assert_eq!(queued.len(), 1, "{sends:?}");
+        assert!(sends.contains(&Err("This draft is already on its way.".into())));
+        assert!(saves.iter().all(|r| r == &Ok(id)), "{saves:?}");
+        let store = engine.store();
+        assert!(store.draft_held(id).unwrap());
+        assert_eq!(store.outbox_files(queued[0]).unwrap(), expected);
+        assert_eq!(store.draft_files(id).unwrap(), expected);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

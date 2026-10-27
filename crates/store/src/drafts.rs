@@ -66,8 +66,29 @@ pub struct DraftSave<'a> {
     pub references: Option<&'a str>,
     /// What's attached, for the list.
     pub attachments: &'a [Attachment],
-    /// Copies of the files from this computer, in order.
-    pub files: &'a [OutboxFile],
+    /// The files from this computer, in order.
+    pub files: &'a [DraftFile<'a>],
+}
+
+/// One of the files `DraftSave` gives a draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftFile<'a> {
+    /// A copy of the file.
+    Copy(&'a OutboxFile),
+    /// One the draft saved over (`existing`) has saved already
+    /// (`Store::saved_files`), kept as it is without reading it. A save
+    /// naming one the draft doesn't have fails.
+    Saved(&'a SavedFile),
+}
+
+/// A file saved with a draft, without its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedFile {
+    /// Its place among the draft's files.
+    pub position: usize,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
 }
 
 /// A draft's copy on the server: its Graph id, or its IMAP mailbox and UID
@@ -170,6 +191,26 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    /// When the draft was last saved here, while it waits to be uploaded.
+    /// Every save changes it.
+    pub fn draft_saved_at(&self, id: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT saved_at FROM draft_uploads WHERE message_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// The files saved with a draft, in order, without reading them.
+    pub fn saved_files(&self, id: i64) -> Result<Vec<SavedFile>> {
+        Ok(saved_rows(&self.conn, id)?
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect())
     }
 
     /// The files saved with a draft, in order.
@@ -377,20 +418,19 @@ impl Store {
 
 /// Writes the draft inside the caller's transaction.
 fn save_in(conn: &Connection, existing: Option<i64>, save: &DraftSave, now: i64) -> Result<i64> {
-    let kept = match existing {
+    let (kept, moved) = match existing {
         Some(id) if is_draft_in(conn, id)? => {
             let account_id: i64 =
                 conn.query_row("SELECT account_id FROM messages WHERE id = ?1", [id], |r| {
                     r.get(0)
                 })?;
             if account_id == save.account_id {
-                Some(id)
+                (Some(id), None)
             } else {
-                discard_in(conn, id)?;
-                None
+                (None, Some(id))
             }
         }
-        _ => None,
+        _ => (None, None),
     };
     let id = match kept {
         Some(id) => {
@@ -469,34 +509,100 @@ fn save_in(conn: &Connection, existing: Option<i64>, save: &DraftSave, now: i64)
             saved_at = MAX(excluded.saved_at, draft_uploads.saved_at + 1)",
         params![id, save.draft, now],
     )?;
-    // Autosaves mostly change the text: files that are the same stay.
-    let same_files = {
-        let mut stmt = conn.prepare(
-            "SELECT name, mime, data FROM draft_files WHERE message_id = ?1 ORDER BY position",
-        )?;
-        let stored: Vec<OutboxFile> = stmt
-            .query_map([id], |r| {
-                Ok(OutboxFile {
-                    name: r.get(0)?,
-                    mime: r.get(1)?,
-                    data: r.get(2)?,
-                })
-            })?
-            .collect::<Result<_>>()?;
-        stored == save.files
-    };
-    if same_files {
-        return Ok(id);
-    }
-    conn.execute("DELETE FROM draft_files WHERE message_id = ?1", [id])?;
-    for (position, f) in save.files.iter().enumerate() {
+    if let Some(old) = moved {
+        // Started over in another account, it takes its saved files along.
         conn.execute(
-            "INSERT INTO draft_files (message_id, position, name, mime, data)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, position as i64, f.name, f.mime, f.data],
+            "UPDATE draft_files SET message_id = ?2 WHERE message_id = ?1",
+            params![old, id],
         )?;
+        discard_in(conn, old)?;
     }
+    save_files(conn, id, save.files)?;
     Ok(id)
+}
+
+/// Makes a draft's saved files `files`, in order. Autosaves mostly change
+/// the text: files it has already stay as they are, moved if they were
+/// reordered, and aren't read; a copy the same as the file saved in its
+/// place isn't written again.
+fn save_files(conn: &Connection, id: i64, files: &[DraftFile]) -> Result<()> {
+    let saved = saved_rows(conn, id)?;
+    let mut kept = vec![false; saved.len()];
+    for (position, file) in files.iter().enumerate() {
+        match *file {
+            DraftFile::Saved(f) => {
+                let i = saved
+                    .iter()
+                    .position(|(_, s)| s == f)
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                let row = saved[i].0;
+                if std::mem::replace(&mut kept[i], true) {
+                    // Attached twice: the second is a copy of the first.
+                    conn.execute(
+                        "INSERT INTO draft_files (message_id, position, name, mime, data)
+                         SELECT message_id, ?2, name, mime, data FROM draft_files WHERE id = ?1",
+                        params![row, position as i64],
+                    )?;
+                } else if f.position != position {
+                    conn.execute(
+                        "UPDATE draft_files SET position = ?2 WHERE id = ?1",
+                        params![row, position as i64],
+                    )?;
+                }
+            }
+            DraftFile::Copy(f) => {
+                let same = saved.iter().enumerate().find(|(i, (_, s))| {
+                    !kept[*i]
+                        && s.position == position
+                        && s.name == f.name
+                        && s.mime == f.mime
+                        && s.size == f.data.len() as u64
+                });
+                if let Some((i, (row, _))) = same
+                    && conn.query_row(
+                        "SELECT data = ?2 FROM draft_files WHERE id = ?1",
+                        params![row, f.data],
+                        |r| r.get(0),
+                    )?
+                {
+                    kept[i] = true;
+                    continue;
+                }
+                conn.execute(
+                    "INSERT INTO draft_files (message_id, position, name, mime, data)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, position as i64, f.name, f.mime, f.data],
+                )?;
+            }
+        }
+    }
+    for ((row, _), kept) in saved.iter().zip(kept) {
+        if !kept {
+            conn.execute("DELETE FROM draft_files WHERE id = ?1", [row])?;
+        }
+    }
+    Ok(())
+}
+
+/// A draft's saved files with their row ids, in order, without their bytes
+/// (SQLite tells a BLOB's length without reading it).
+fn saved_rows(conn: &Connection, id: i64) -> Result<Vec<(i64, SavedFile)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, position, name, mime, length(data) FROM draft_files
+         WHERE message_id = ?1 ORDER BY position",
+    )?;
+    stmt.query_map([id], |r| {
+        Ok((
+            r.get(0)?,
+            SavedFile {
+                position: r.get::<_, i64>(1)? as usize,
+                name: r.get(2)?,
+                mime: r.get(3)?,
+                size: r.get::<_, i64>(4)? as u64,
+            },
+        ))
+    })?
+    .collect()
 }
 
 fn is_draft_in(conn: &Connection, id: i64) -> Result<bool> {

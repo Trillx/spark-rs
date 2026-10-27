@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use super::*;
 use crate::{AccountKind, FolderRole, NewAccount, RemoteFolder, SCHEMA, SCHEMA_2, SCHEMA_3};
 
@@ -31,11 +33,11 @@ fn store_with_drafts() -> (Store, i64, i64) {
 
 fn save(store: &mut Store, account_id: i64, existing: Option<i64>, body: &str, now: i64) -> i64 {
     let to = ["Ana Ruiz <ana@x.com>".to_owned()];
-    let files = [OutboxFile {
+    let file = OutboxFile {
         name: "plan.pdf".into(),
         mime: "application/pdf".into(),
         data: body.as_bytes().to_vec(),
-    }];
+    };
     let attachments = [Attachment {
         name: "plan.pdf".into(),
         mime: "application/pdf".into(),
@@ -61,11 +63,96 @@ fn save(store: &mut Store, account_id: i64, existing: Option<i64>, body: &str, n
                 in_reply_to: Some("1@x.com"),
                 references: Some("0@x.com 1@x.com"),
                 attachments: &attachments,
-                files: &files,
+                files: &[DraftFile::Copy(&file)],
             },
             now,
         )
         .unwrap()
+}
+
+/// Saves a draft that says `draft` and has `files`.
+fn save_with_files(
+    store: &mut Store,
+    account_id: i64,
+    existing: Option<i64>,
+    draft: &str,
+    files: &[DraftFile],
+) -> Result<i64> {
+    store.save_draft(
+        existing,
+        &DraftSave {
+            account_id,
+            draft,
+            send_later: None,
+            from_name: "Me",
+            from_address: "me@example.com",
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            subject: "Files",
+            snippet: draft,
+            text: draft,
+            html: None,
+            in_reply_to: None,
+            references: None,
+            attachments: &[],
+            files,
+        },
+        1_000,
+    )
+}
+
+fn file(name: &str, data: &[u8]) -> OutboxFile {
+    OutboxFile {
+        name: name.into(),
+        mime: "application/octet-stream".into(),
+        data: data.to_vec(),
+    }
+}
+
+/// The statements the store runs from now on. (Running one while holding
+/// the log waits forever.)
+fn statements(store: &Store) -> &'static Mutex<Vec<String>> {
+    use std::ffi::{CStr, c_int, c_uint, c_void};
+
+    unsafe extern "C" fn traced(
+        _: c_uint,
+        log: *mut c_void,
+        _: *mut c_void,
+        sql: *mut c_void,
+    ) -> c_int {
+        // SAFETY: `log` is the log below, which is never freed, and a
+        // statement's trace comes with its SQL text.
+        let (log, sql) = unsafe {
+            (
+                &*log.cast::<Mutex<Vec<String>>>(),
+                CStr::from_ptr(sql.cast_const().cast()),
+            )
+        };
+        if let Ok(mut log) = log.lock() {
+            log.push(sql.to_string_lossy().into_owned());
+        }
+        0
+    }
+    let log: &'static Mutex<Vec<String>> = Box::leak(Box::default());
+    // SAFETY: the connection is open, and the log outlives it.
+    unsafe {
+        rusqlite::ffi::sqlite3_trace_v2(
+            store.conn.handle(),
+            rusqlite::ffi::SQLITE_TRACE_STMT,
+            Some(traced),
+            std::ptr::from_ref(log).cast_mut().cast(),
+        );
+    }
+    log
+}
+
+/// Whether a statement changes a draft's saved files or reads their bytes;
+/// reading their sizes doesn't.
+fn touches_files(sql: &str) -> bool {
+    sql.contains("draft_files")
+        && (sql.replace("length(data)", "").contains("data")
+            || !sql.trim_start().starts_with("SELECT"))
 }
 
 fn imap_copy(uid: u32, message_id: &str) -> DraftCopy {
@@ -124,7 +211,7 @@ fn failed_send_recovery_rolls_back_without_losing_outbox_or_old_draft() {
             in_reply_to: None,
             references: None,
             attachments: &[],
-            files: &files,
+            files: &[DraftFile::Copy(&files[0])],
         },
         2,
     );
@@ -483,4 +570,192 @@ fn version_3_databases_gain_the_draft_queue() {
     assert_eq!(store.draft_uploads(1, 5).unwrap()[0].message_id, id);
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn text_only_saves_keep_the_saved_files_without_reading_them() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let files = [
+        file("a.bin", &vec![1; 4 << 20]),
+        file("b.bin", &vec![2; 4 << 20]),
+    ];
+    let copies: Vec<DraftFile> = files.iter().map(DraftFile::Copy).collect();
+    let id = save_with_files(&mut store, account_id, None, "v0", &copies).unwrap();
+    let log = statements(&store);
+    let mut saved_at = store.draft_saved_at(id).unwrap().unwrap();
+    for i in 1..=20 {
+        let saved = store.saved_files(id).unwrap();
+        let kept: Vec<DraftFile> = saved.iter().map(DraftFile::Saved).collect();
+        let again = save_with_files(&mut store, account_id, Some(id), &format!("v{i}"), &kept);
+        assert_eq!(again.unwrap(), id);
+        let now = store.draft_saved_at(id).unwrap().unwrap();
+        assert!(now > saved_at, "every save changes it");
+        saved_at = now;
+    }
+    let log = std::mem::take(&mut *log.lock().unwrap());
+    assert!(log.iter().any(|sql| sql.contains("length(data)")));
+    let touched: Vec<_> = log.iter().filter(|sql| touches_files(sql)).collect();
+    assert!(touched.is_empty(), "{touched:#?}");
+    assert_eq!(store.draft(id).unwrap().as_deref(), Some("v20"));
+    assert_eq!(store.draft_files(id).unwrap(), files);
+}
+
+#[test]
+fn saved_files_move_go_and_repeat_without_being_read_again() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let [a, b, c, d] = [
+        file("a", b"one"),
+        file("b", b"two"),
+        file("c", b"three"),
+        file("d", b"four"),
+    ];
+    let first = [
+        DraftFile::Copy(&a),
+        DraftFile::Copy(&b),
+        DraftFile::Copy(&c),
+    ];
+    let id = save_with_files(&mut store, account_id, None, "v1", &first).unwrap();
+    let saved = store.saved_files(id).unwrap();
+    let described: Vec<_> = saved
+        .iter()
+        .map(|f| (f.position, f.name.as_str(), f.mime.as_str(), f.size))
+        .collect();
+    let mime = "application/octet-stream";
+    assert_eq!(
+        described,
+        [(0, "a", mime, 3), (1, "b", mime, 3), (2, "c", mime, 5)]
+    );
+
+    // C moves first, B goes, A is attached twice, and D is new.
+    let log = statements(&store);
+    let next = [
+        DraftFile::Saved(&saved[2]),
+        DraftFile::Saved(&saved[0]),
+        DraftFile::Saved(&saved[0]),
+        DraftFile::Copy(&d),
+    ];
+    save_with_files(&mut store, account_id, Some(id), "v2", &next).unwrap();
+    let read: Vec<_> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|sql| touches_files(sql) && sql.contains("SELECT"))
+        .cloned()
+        .collect();
+    assert_eq!(read.len(), 1, "only the second A is copied: {read:#?}");
+    assert_eq!(store.draft_files(id).unwrap(), [c, a.clone(), a, d]);
+    let positions: Vec<_> = store
+        .saved_files(id)
+        .unwrap()
+        .iter()
+        .map(|f| f.position)
+        .collect();
+    assert_eq!(positions, [0, 1, 2, 3]);
+
+    save_with_files(&mut store, account_id, Some(id), "v3", &[]).unwrap();
+    assert!(store.draft_files(id).unwrap().is_empty());
+}
+
+#[test]
+fn a_copy_the_same_as_the_saved_file_is_not_written_again() {
+    // A draft reopened after a restart is read from disk once.
+    let (mut store, account_id, _) = store_with_drafts();
+    let (a, b) = (file("a", b"one"), file("b", b"two"));
+    let id = save_with_files(
+        &mut store,
+        account_id,
+        None,
+        "v1",
+        &[DraftFile::Copy(&a), DraftFile::Copy(&b)],
+    )
+    .unwrap();
+    let log = statements(&store);
+    let writes = || {
+        let log = log.lock().unwrap();
+        let writes = log.iter().filter(|sql| {
+            sql.contains("INSERT INTO draft_files")
+                || sql.contains("DELETE FROM draft_files")
+                || sql.contains("UPDATE draft_files")
+        });
+        writes.count()
+    };
+    let same = [DraftFile::Copy(&a), DraftFile::Copy(&b)];
+    save_with_files(&mut store, account_id, Some(id), "v2", &same).unwrap();
+    assert_eq!(writes(), 0);
+
+    // The same name and size, other bytes: written anew.
+    let changed = file("b", b"TWO");
+    let next = [DraftFile::Copy(&a), DraftFile::Copy(&changed)];
+    save_with_files(&mut store, account_id, Some(id), "v3", &next).unwrap();
+    assert_eq!(writes(), 2, "one in, one out");
+    assert_eq!(store.draft_files(id).unwrap(), [a, changed]);
+}
+
+#[test]
+fn a_save_keeping_a_file_the_draft_lacks_fails_and_changes_nothing() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let a = file("a", b"one");
+    let id = save_with_files(&mut store, account_id, None, "v1", &[DraftFile::Copy(&a)]).unwrap();
+    let saved = store.saved_files(id).unwrap();
+    let other = SavedFile {
+        size: 4,
+        ..saved[0].clone()
+    };
+    let result = save_with_files(
+        &mut store,
+        account_id,
+        Some(id),
+        "v2",
+        &[DraftFile::Saved(&other)],
+    );
+    assert!(result.is_err());
+    assert_eq!(store.draft(id).unwrap().as_deref(), Some("v1"));
+    assert_eq!(store.draft_files(id).unwrap(), [a]);
+
+    // A new draft has none to keep.
+    let result = save_with_files(
+        &mut store,
+        account_id,
+        None,
+        "new",
+        &[DraftFile::Saved(&saved[0])],
+    );
+    assert!(result.is_err());
+    assert_eq!(store.messages().unwrap().len(), 1);
+}
+
+#[test]
+fn a_draft_moved_to_another_account_takes_its_files_along() {
+    let (mut store, account_id, _) = store_with_drafts();
+    let other = store
+        .add_account(&NewAccount {
+            kind: AccountKind::Gmail,
+            email: "me@gmail.com",
+            name: "Me",
+            label: "Personal",
+            config: "{}",
+        })
+        .unwrap()
+        .id;
+    let (a, b) = (file("a", b"one"), file("b", b"two"));
+    let first = [DraftFile::Copy(&a), DraftFile::Copy(&b)];
+    let id = save_with_files(&mut store, account_id, None, "v1", &first).unwrap();
+    let saved = store.saved_files(id).unwrap();
+    let log = statements(&store);
+    let next = [DraftFile::Saved(&saved[1])];
+    let moved = save_with_files(&mut store, other, Some(id), "v2", &next).unwrap();
+    let read: Vec<_> = std::mem::take(&mut *log.lock().unwrap())
+        .into_iter()
+        .filter(|sql| touches_files(sql) && sql.contains("SELECT"))
+        .collect();
+    assert!(read.is_empty(), "{read:#?}");
+    let listed = store.messages().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].id, listed[0].account_id), (moved, other));
+    assert_eq!(store.draft_files(moved).unwrap(), [b]);
+    let left: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM draft_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 1);
 }
