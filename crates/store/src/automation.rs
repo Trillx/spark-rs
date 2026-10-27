@@ -1085,11 +1085,12 @@ fn settings(conn: &Connection) -> Result<AutomationSettings> {
 }
 
 /// Whether the user wrote in email `id`'s conversation after it. Mail of
-/// theirs in Trash or Spam doesn't count, whatever else lists it (a draft
-/// deleted in another app lands there; Gmail's All Mail may still list it
-/// until it's synced again), and mail kept for a folder must be in one: a
-/// draft out of Drafts here (or past the newest a listing holds) wasn't
-/// sent.
+/// theirs in Sent was sent, whatever else lists it (a Bcc to themselves
+/// they deleted is the same message). Otherwise, in Trash or Spam it
+/// doesn't count, whatever else lists it (a draft deleted in another app
+/// lands there; Gmail's All Mail may still list it until it's synced
+/// again), and mail kept for a folder must be in one: a draft out of
+/// Drafts here (or past the newest a listing holds) wasn't sent.
 fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
     conn.query_row(
         &format!(
@@ -1098,12 +1099,17 @@ fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
                  SELECT 1 FROM members JOIN messages m ON m.id = members.id, o
                  JOIN accounts a ON a.email = m.from_address COLLATE NOCASE
                  WHERE m.id != ?1 AND m.date > o.date AND {NOT_DRAFT}
-                   AND m.state NOT IN ('deleted', 'blocked')
-                   AND NOT EXISTS (SELECT 1 FROM folder_members fm
-                                   JOIN folders f ON f.id = fm.folder_id
-                                   WHERE fm.message_id = m.id AND f.role IN ('trash', 'spam'))
-                   AND (m.state != 'filed'
-                        OR EXISTS (SELECT 1 FROM folder_members fm WHERE fm.message_id = m.id)))"
+                   AND (EXISTS (SELECT 1 FROM folder_members fm
+                                JOIN folders f ON f.id = fm.folder_id
+                                WHERE fm.message_id = m.id AND f.role = 'sent')
+                        OR (m.state NOT IN ('deleted', 'blocked')
+                            AND NOT EXISTS (SELECT 1 FROM folder_members fm
+                                            JOIN folders f ON f.id = fm.folder_id
+                                            WHERE fm.message_id = m.id
+                                              AND f.role IN ('trash', 'spam'))
+                            AND (m.state != 'filed'
+                                 OR EXISTS (SELECT 1 FROM folder_members fm
+                                            WHERE fm.message_id = m.id)))))"
         ),
         [id],
         |r| r.get(0),

@@ -767,6 +767,16 @@ fn a_draft_in_trash_wasnt_a_reply_but_one_in_sent_was() {
         &format!("INSERT INTO folder_members (folder_id, message_id) VALUES ({sent}, {draft});"),
     );
     assert!(store.answered_after(id).unwrap());
+    // Sent with a Bcc to themselves whose copy they deleted: one message,
+    // in Sent and Trash. Still sent.
+    moved(
+        &store,
+        &format!(
+            "INSERT INTO folder_members (folder_id, message_id) VALUES ({sent}, {draft});
+             INSERT INTO folder_members (folder_id, message_id) VALUES ({trash}, {draft});"
+        ),
+    );
+    assert!(store.answered_after(id).unwrap());
 }
 
 #[test]
