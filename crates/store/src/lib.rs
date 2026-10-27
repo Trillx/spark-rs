@@ -8,6 +8,7 @@
 //! the sync engine knows what to push, and a server change only overwrites
 //! local state that has nothing waiting to be pushed.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -430,6 +431,8 @@ pub struct Folder {
 
 pub struct Store {
     conn: Connection,
+    /// Who to suggest as a recipient, kept between queries (see `contacts`).
+    people: RefCell<Option<contacts::People>>,
 }
 
 /// Sync writes that commit together, so a fetched chunk or page of mail
@@ -815,7 +818,11 @@ impl Store {
             tx.pragma_update(None, "user_version", 22)?;
             tx.commit()?;
         }
-        Ok(Self { conn })
+        conn.execute_batch(contacts::WATCH_CONTACTS)?;
+        Ok(Self {
+            conn,
+            people: RefCell::default(),
+        })
     }
 
     /// Version of the SQLite library compiled into the binary.

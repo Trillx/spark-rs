@@ -428,18 +428,25 @@ pub async fn search_messages(
 const SUGGESTIONS: usize = 20;
 
 /// The people to suggest for what's typed in a recipient field, best first.
+/// After mail changes, finding them again reads all of it, so it's done off
+/// the main thread.
 #[tauri::command]
-pub fn suggest_contacts(
+pub async fn suggest_contacts(
     mailbox: State<'_, Mailbox>,
     query: String,
 ) -> Result<Vec<Contact>, String> {
     if !mailbox.live() {
         return Ok(mailbox.demo.suggest_contacts(&query, SUGGESTIONS));
     }
-    let store = mailbox.live.engine.store();
-    store
-        .suggest_contacts(&query, now_ms(), SUGGESTIONS)
-        .map_err(text)
+    let engine = mailbox.live.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .store()
+            .suggest_contacts(&query, now_ms(), SUGGESTIONS)
+    })
+    .await
+    .map_err(text)?
+    .map_err(text)
 }
 
 /// Stops suggesting `address` (the ✕ on a suggestion).
