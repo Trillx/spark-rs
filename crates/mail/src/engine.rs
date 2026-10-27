@@ -1638,10 +1638,13 @@ impl Engine {
 
     /// "All future": a new series from occurrence `event_id` on, saying
     /// what `draft` says (`calendar::series_from`), and its old series
-    /// ending the day before. A series' first occurrence changes the whole
-    /// series instead. A series ending after so many times goes on for as
-    /// many as it had left. If the old series can't be ended, the new one
-    /// is taken back, so the occurrences aren't there twice.
+    /// ending the day before, that day counted in the series' own time
+    /// zone. A series' first occurrence changes the whole series instead.
+    /// The new series' days move as the occurrence did
+    /// (`recurrence::changed`). One ending after so many times ends on the
+    /// day the old one would have, unless its end changed. If the old
+    /// series can't be ended, the new one is taken back, so the
+    /// occurrences aren't there twice.
     async fn split_series(
         &self,
         event_id: i64,
@@ -1665,39 +1668,50 @@ impl Engine {
         let master = graph.event_json(&series, calendar::MASTER_SELECT).await?;
         let old = master["recurrence"].clone();
         let first = old["range"]["startDate"].as_str().unwrap_or_default();
-        let split = calendar::date_in(zone, before.start, before.all_day);
-        if split.as_str() <= first {
+        let split = occurrence_day(&graph, &stored.remote_id, &master, zone).await?;
+        if split.is_empty() || split.as_str() <= first {
             return self
                 .update_scoped(event_id, draft, Some(before), Scope::All, zone)
                 .await;
         }
         let from = calendar::date_in(zone, draft.start, draft.all_day);
-        let recurrence = match &draft.repeat {
-            Some(rule) if draft.repeat != before.repeat => rule.to_graph(&from, zone.name),
-            _ => {
-                let mut rest = old.clone();
-                rest["range"]["startDate"] = serde_json::json!(from);
-                if let Some(Ends::After { times }) = Repeat::from_graph(&old).map(|r| r.ends) {
-                    let start = master["start"]["dateTime"]
-                        .as_str()
-                        .and_then(graph::parse_iso_date)
-                        .unwrap_or(before.start);
-                    let gone = graph
-                        .count_occurrences(&series, start, before.start)
-                        .await?;
-                    let left = (times as usize).saturating_sub(gone).max(1);
-                    rest["range"]["numberOfOccurrences"] = serde_json::json!(left);
-                }
-                rest
-            }
+        let days = recurrence::days_between(
+            &calendar::date_in(zone, before.start, before.all_day),
+            &from,
+        );
+        let rule = if draft.repeat != before.repeat {
+            draft.repeat.as_ref()
+        } else {
+            None
         };
+        let mut new = recurrence::changed(&old, rule, days, Some((&from, zone.name)));
+        let was = Repeat::from_graph(&old);
+        let ends_kept = rule.is_none_or(|r| was.as_ref().is_some_and(|w| w.ends == r.ends));
+        if let Some(was) = was.as_ref().filter(|_| ends_kept)
+            && let Ends::After { times } = was.ends
+        {
+            let period = match was.every {
+                recurrence::Every::Day => 1,
+                recurrence::Every::Week => 7,
+                recurrence::Every::Month => 31,
+                recurrence::Every::Year => 366,
+            };
+            let span = (i64::from(was.interval) * i64::from(times) * period + 366) * 86_400_000;
+            let from_ms = stored.start - 86_400_000;
+            if let Some(last) = graph
+                .last_occurrence(&series, from_ms, from_ms + span, zone.name)
+                .await?
+            {
+                new = recurrence::ending_on(&new, &recurrence::add_days(&last, days));
+            }
+        }
         let calendar = self
             .store()
             .calendars()?
             .into_iter()
             .find(|c| c.id == stored.calendar_id)
             .ok_or_else(|| Error::Config("That calendar is no longer here.".into()))?;
-        let body = calendar::series_from(&master, draft, before, zone, recurrence);
+        let body = calendar::series_from(&master, draft, before, zone, new);
         let created = graph.create_event(&calendar.remote_id, &body).await?;
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(&old, &split) });
         if let Err(e) = graph.update_event(&series, &ended).await {
@@ -1724,19 +1738,29 @@ impl Engine {
 
     /// Deletes the user's stored event `event_id`: that occurrence, with
     /// `Scope::All` its whole series, or with `Scope::Future` the series
-    /// from this occurrence on (it ends the day before; all of it, if this
-    /// is its first). The people invited hear it's canceled.
+    /// from this occurrence on (it ends the day before, in its own time
+    /// zone; all of it, if this is its first). The people invited hear it's
+    /// canceled.
     pub async fn delete_event(&self, event_id: i64, scope: Scope, zone: Zone<'_>) -> Result<()> {
         if scope != Scope::Future {
             let (target, _, graph) = self.event_target(event_id, scope).await?;
             return graph.delete_event(&target).await;
         }
-        let (series, event, graph) = self.event_target(event_id, Scope::All).await?;
-        let master = graph.event_json(&series, "recurrence").await?;
+        let stored = self
+            .store()
+            .event(event_id)?
+            .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
+        let graph = self.calendar_graph(stored.account_id).await?;
+        let Some(series) = Event::from_json(&stored.data).series else {
+            return graph.delete_event(&stored.remote_id).await;
+        };
+        let master = graph
+            .event_json(&series, "recurrence,originalStartTimeZone")
+            .await?;
         let old = &master["recurrence"];
         let first = old["range"]["startDate"].as_str().unwrap_or_default();
-        let split = calendar::date_in(zone, event.start, event.all_day);
-        if event.series.is_none() || old.is_null() || split.as_str() <= first {
+        let split = occurrence_day(&graph, &stored.remote_id, &master, zone).await?;
+        if old.is_null() || split.is_empty() || split.as_str() <= first {
             return graph.delete_event(&series).await;
         }
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(old, &split) });
@@ -2391,6 +2415,24 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The day ("2026-10-27") occurrence `id` of series `master` is on, as the
+/// series counts its days: in its own time zone, where its range's dates
+/// are, which can be another than the user's (`zone`).
+async fn occurrence_day(
+    graph: &Graph,
+    id: &str,
+    master: &serde_json::Value,
+    zone: Zone<'_>,
+) -> Result<String> {
+    let series_zone = master["recurrence"]["range"]["recurrenceTimeZone"]
+        .as_str()
+        .or_else(|| master["originalStartTimeZone"].as_str())
+        .filter(|z| !z.is_empty())
+        .unwrap_or(zone.name);
+    let start = graph.start_in(id, series_zone).await?;
+    Ok(start.get(..10).unwrap_or_default().to_owned())
 }
 
 pub fn config(account: &Account) -> Result<AccountConfig> {

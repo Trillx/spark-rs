@@ -213,12 +213,178 @@ pub fn ended_before(recurrence: &Value, date: &str) -> Value {
 
 /// The date before `date`, both "2026-10-27".
 pub fn day_before(date: &str) -> String {
+    add_days(date, -1)
+}
+
+/// `date` ("2026-10-27") as days since 1970-01-01.
+pub fn day_number(date: &str) -> Option<i64> {
     let part = |r: std::ops::Range<usize>| date.get(r).and_then(|s| s.parse::<i64>().ok());
-    let (Some(y), Some(m), Some(d)) = (part(0..4), part(5..7), part(8..10)) else {
+    Some(days_from_civil(part(0..4)?, part(5..7)?, part(8..10)?))
+}
+
+/// `date` ("2026-10-27") `days` later (or earlier).
+pub fn add_days(date: &str, days: i64) -> String {
+    let Some(n) = day_number(date) else {
         return date.to_owned();
     };
-    let (y, m, d) = civil_from_days(days_from_civil(y, m, d) - 1);
+    let (y, m, d) = civil_from_days(n + days);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The days from `from` to `to`, both "2026-10-27".
+pub fn days_between(from: &str, to: &str) -> i64 {
+    match (day_number(from), day_number(to)) {
+        (Some(a), Some(b)) => b - a,
+        _ => 0,
+    }
+}
+
+/// `date`'s weekday, 0 (Sunday) to 6.
+fn weekday(date: &str) -> usize {
+    // 1970-01-01 was a Thursday.
+    day_number(date).map_or(0, |n| (n + 4).rem_euclid(7) as usize)
+}
+
+/// Which week of its month `date` is in, as Graph names it: "first" to
+/// "fourth", or "last" when it's the month's last.
+fn week_of_month(date: &str) -> &'static str {
+    let day = date
+        .get(8..10)
+        .and_then(|d| d.parse::<usize>().ok())
+        .unwrap_or(1);
+    let next_week = add_days(date, 7);
+    if next_week.get(5..7) != date.get(5..7) {
+        "last"
+    } else {
+        NTH[((day - 1) / 7).min(3)]
+    }
+}
+
+/// What a rule's pattern says, its end aside, to tell whether only its
+/// end changed.
+fn pattern(rule: &Repeat) -> Repeat {
+    Repeat {
+        ends: Ends::Never,
+        ..rule.clone()
+    }
+}
+
+/// What a series' Graph `old` recurrence becomes for a change: `rule` if
+/// the editor changed it, else `old` itself. Moved `days` days (the event
+/// dragged to another day), a pattern that was the series' own moves with
+/// it: weekly days by as many, monthly and yearly to the new first day's
+/// date or week. With `start`, the series' first day and time zone moved
+/// there; else they stay. What `old` says that a rule doesn't, the week's
+/// first day, stays, and so does all of its pattern if only the end
+/// changed.
+pub fn changed(
+    old: &Value,
+    rule: Option<&Repeat>,
+    days: i64,
+    start: Option<(&str, &str)>,
+) -> Value {
+    let first = start.map_or_else(
+        || {
+            old["range"]["startDate"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        },
+        |(first, _)| first.to_owned(),
+    );
+    let zone = start.map_or_else(
+        || {
+            old["range"]["recurrenceTimeZone"]
+                .as_str()
+                .unwrap_or("UTC")
+                .to_owned()
+        },
+        |(_, zone)| zone.to_owned(),
+    );
+    let was = Repeat::from_graph(old);
+    let own_pattern = match (rule, &was) {
+        (None, _) => true,
+        (Some(rule), Some(was)) => pattern(rule) == pattern(was),
+        (Some(_), None) => false,
+    };
+    let mut out = match rule {
+        Some(rule) if !own_pattern => {
+            let mut out = rule.to_graph(&first, &zone);
+            if let Some(day) = old["pattern"]
+                .get("firstDayOfWeek")
+                .filter(|_| rule.every == Every::Week)
+            {
+                out["pattern"]["firstDayOfWeek"] = day.clone();
+            }
+            return out;
+        }
+        Some(rule) => {
+            let mut out = old.clone();
+            out["range"] = rule.to_graph(&first, &zone)["range"].clone();
+            out
+        }
+        None => {
+            let mut out = old.clone();
+            out["range"]["startDate"] = json!(first);
+            out["range"]["recurrenceTimeZone"] = json!(zone);
+            out
+        }
+    };
+    if days != 0 && start.is_some() {
+        let p = &mut out["pattern"];
+        match p["type"].as_str() {
+            Some("weekly") => {
+                if let Some(list) = p["daysOfWeek"].as_array() {
+                    let moved: Vec<Value> = list
+                        .iter()
+                        .filter_map(|d| {
+                            let i = WEEKDAYS.iter().position(|w| Some(*w) == d.as_str())?;
+                            Some(json!(WEEKDAYS[(i as i64 + days).rem_euclid(7) as usize]))
+                        })
+                        .collect();
+                    p["daysOfWeek"] = json!(moved);
+                }
+            }
+            Some("absoluteMonthly") => p["dayOfMonth"] = json!(day_of(&first)),
+            Some("relativeMonthly") => {
+                p["daysOfWeek"] = json!([WEEKDAYS[weekday(&first)]]);
+                p["index"] = json!(week_of_month(&first));
+            }
+            Some("absoluteYearly") => {
+                p["dayOfMonth"] = json!(day_of(&first));
+                p["month"] = json!(month_of(&first));
+            }
+            Some("relativeYearly") => {
+                p["daysOfWeek"] = json!([WEEKDAYS[weekday(&first)]]);
+                p["index"] = json!(week_of_month(&first));
+                p["month"] = json!(month_of(&first));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn day_of(date: &str) -> u32 {
+    date.get(8..10).and_then(|d| d.parse().ok()).unwrap_or(1)
+}
+
+fn month_of(date: &str) -> u32 {
+    date.get(5..7).and_then(|d| d.parse().ok()).unwrap_or(1)
+}
+
+/// `recurrence` ending on `date` (its last occurrence's day) rather than
+/// after so many: a series split for "All future" ends where the old one
+/// would have.
+pub fn ending_on(recurrence: &Value, date: &str) -> Value {
+    let mut recurrence = recurrence.clone();
+    let range = &mut recurrence["range"];
+    range["type"] = json!("endDate");
+    range["endDate"] = json!(date);
+    if let Some(range) = range.as_object_mut() {
+        range.remove("numberOfOccurrences");
+    }
+    recurrence
 }
 
 #[cfg(test)]
@@ -287,6 +453,63 @@ mod tests {
         assert_eq!(
             Repeat::from_graph(&json!({ "pattern": { "type": "hourly" } })),
             None
+        );
+    }
+
+    #[test]
+    fn a_series_keeps_its_own_pattern_and_moves_with_its_day() {
+        // Every other Saturday and Sunday, weeks starting on Monday.
+        let old = json!({
+            "pattern": { "type": "weekly", "interval": 2, "daysOfWeek": ["saturday", "sunday"], "firstDayOfWeek": "monday" },
+            "range": { "type": "noEnd", "startDate": "2026-10-31", "recurrenceTimeZone": "W. Europe Standard Time" }
+        });
+        // Only its end changed: the pattern stays exactly as it was.
+        let mut rule = Repeat::from_graph(&old).unwrap();
+        rule.ends = Ends::After { times: 6 };
+        let out = changed(&old, Some(&rule), 0, None);
+        assert_eq!(out["pattern"], old["pattern"]);
+        assert_eq!(
+            out["range"],
+            json!({ "type": "numbered", "startDate": "2026-10-31", "numberOfOccurrences": 6, "recurrenceTimeZone": "W. Europe Standard Time" })
+        );
+        // A new pattern keeps the week's first day.
+        rule.weekdays = vec![6];
+        assert_eq!(
+            changed(&old, Some(&rule), 0, None)["pattern"]["firstDayOfWeek"],
+            "monday"
+        );
+
+        // Dragged a day later: the days move with it, from its new first day.
+        let tuesdays = Repeat {
+            every: Every::Week,
+            interval: 1,
+            weekdays: vec![2],
+            nth: None,
+            day: None,
+            month: None,
+            ends: Ends::Never,
+        }
+        .to_graph("2026-11-10", "Pacific Standard Time");
+        let out = changed(
+            &tuesdays,
+            None,
+            1,
+            Some(("2026-11-11", "Pacific Standard Time")),
+        );
+        assert_eq!(out["pattern"]["daysOfWeek"], json!(["wednesday"]));
+        assert_eq!(out["range"]["startDate"], "2026-11-11");
+        let monthly = json!({
+            "pattern": { "type": "relativeMonthly", "interval": 1, "daysOfWeek": ["tuesday"], "index": "second" },
+            "range": { "type": "noEnd", "startDate": "2026-10-13", "recurrenceTimeZone": "UTC" }
+        });
+        let out = changed(&monthly, None, 15, Some(("2026-10-28", "UTC")));
+        assert_eq!(out["pattern"]["daysOfWeek"], json!(["wednesday"]));
+        assert_eq!(out["pattern"]["index"], "last");
+        assert_eq!(days_between("2026-10-27", "2026-11-03"), 7);
+        assert_eq!(add_days("2026-12-31", 1), "2027-01-01");
+        assert_eq!(
+            ending_on(&tuesdays, "2027-01-26")["range"]["endDate"],
+            "2027-01-26"
         );
     }
 

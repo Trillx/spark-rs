@@ -16,7 +16,7 @@ use spark_store::{RemoteCalendar, RemoteEvent};
 use crate::Result;
 use crate::graph::{Graph, Page, iso_date, parse_iso_date, path};
 use crate::invite::{Answer, Person, meeting_url, without_boilerplate};
-use crate::recurrence::Repeat;
+use crate::recurrence::{self, Repeat};
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -166,6 +166,7 @@ struct GraphEventDetails {
     is_all_day: bool,
     attendees: Vec<serde_json::Value>,
     body: Option<GraphBody>,
+    recurrence: serde_json::Value,
 }
 
 /// An event's times, people and description (HTML) as Graph has them
@@ -177,6 +178,8 @@ pub struct EventDetails {
     pub end: i64,
     pub attendees: Vec<serde_json::Value>,
     pub body: String,
+    /// A series' Graph `recurrence`; null for an event that isn't one.
+    pub recurrence: serde_json::Value,
 }
 
 /// Which occurrences of a repeating event a change is for.
@@ -434,25 +437,33 @@ pub fn changed_event_body(
         let sensitivity = if draft.private { "private" } else { "normal" };
         body.insert("sensitivity".into(), json!(sensitivity));
     }
-    if draft.repeat != before.repeat {
+    let ruled = draft.repeat != before.repeat;
+    let old = &details.recurrence;
+    if shift && !old.is_null() {
+        // A series: its rule as changed, and its days moved with the event's.
+        let days = recurrence::days_between(
+            &date_in(zone, before.start, before.all_day),
+            &date_in(zone, draft.start, draft.all_day),
+        );
+        if ruled && draft.repeat.is_none() {
+            body.insert("recurrence".into(), serde_json::Value::Null);
+        } else if ruled || days != 0 {
+            let first = body
+                .get("start")
+                .and_then(|s| s["dateTime"].as_str())
+                .and_then(|s| s.get(..10))
+                .map(str::to_owned);
+            let rule = if ruled { draft.repeat.as_ref() } else { None };
+            let start = first.as_deref().map(|first| (first, zone.name));
+            body.insert(
+                "recurrence".into(),
+                recurrence::changed(old, rule, days, start),
+            );
+        }
+    } else if ruled {
+        // An event made to repeat, from its own day, or no longer repeating.
         let recurrence = match &draft.repeat {
-            // From the series' own first day (moved by this change, if it
-            // was), or this event's.
-            Some(rule) => {
-                let first = body
-                    .get("start")
-                    .and_then(|s| s["dateTime"].as_str())
-                    .and_then(|s| s.get(..10))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        date_in(
-                            zone,
-                            if shift { details.start } else { draft.start },
-                            draft.all_day,
-                        )
-                    });
-                rule.to_graph(&first, zone.name)
-            }
+            Some(rule) => rule.to_graph(&date_in(zone, draft.start, draft.all_day), zone.name),
             None => serde_json::Value::Null,
         };
         body.insert("recurrence".into(), recurrence);
@@ -477,6 +488,7 @@ pub fn series_from(
     for key in [
         "subject",
         "location",
+        "hideAttendees",
         "isReminderOn",
         "reminderMinutesBeforeStart",
         "showAs",
@@ -501,6 +513,7 @@ pub fn series_from(
         end: draft.end,
         attendees: attendees.clone(),
         body: String::new(),
+        recurrence: serde_json::Value::Null,
     };
     body.insert("attendees".into(), json!(attendees));
     let changes = changed_event_body(draft, before, &details, zone, false);
@@ -521,8 +534,9 @@ pub fn series_from(
 }
 
 /// What `series_from` reads of a series.
-pub const MASTER_SELECT: &str = "subject,start,end,isAllDay,location,attendees,isReminderOn,\
-     reminderMinutesBeforeStart,showAs,sensitivity,isOnlineMeeting,onlineMeetingProvider,recurrence";
+pub const MASTER_SELECT: &str = "subject,start,end,isAllDay,location,attendees,hideAttendees,\
+     isReminderOn,reminderMinutesBeforeStart,showAs,sensitivity,isOnlineMeeting,\
+     onlineMeetingProvider,recurrence,originalStartTimeZone";
 
 /// `html`, an event's description, with `notes` in place of what comes
 /// before the Teams meeting Outlook put in it (found by its rule of
@@ -817,22 +831,59 @@ impl Graph {
         .await
     }
 
-    /// How many occurrences series `id` has from `start` to before `end`
-    /// (Unix ms).
-    pub async fn count_occurrences(&self, id: &str, start: i64, end: i64) -> Result<usize> {
+    /// Event `id`'s start as wall-clock time ("2026-10-27T09:30:00") in the
+    /// Windows time zone `zone`.
+    pub async fn start_in(&self, id: &str, zone: &str) -> Result<String> {
+        let event: serde_json::Value = self
+            .json(
+                self.request(
+                    Method::GET,
+                    &format!("/me/events/{}?$select=start", path(id)),
+                )
+                .header("Prefer", format!("outlook.timezone=\"{zone}\"")),
+            )
+            .await?;
+        Ok(event["start"]["dateTime"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    /// The day ("2026-10-27") of series `id`'s last occurrence from
+    /// `start` to before `end` (Unix ms), in the Windows time zone `zone`;
+    /// none if it has none there.
+    pub async fn last_occurrence(
+        &self,
+        id: &str,
+        start: i64,
+        end: i64,
+        zone: &str,
+    ) -> Result<Option<String>> {
         let mut next = Some(format!(
-            "/me/events/{}/instances?startDateTime={}&endDateTime={}&$select=id&$top={EVENT_PAGE}",
+            "/me/events/{}/instances?startDateTime={}&endDateTime={}&$select=start&$top={EVENT_PAGE}",
             path(id),
             iso_date(start),
             iso_date(end)
         ));
-        let mut count = 0;
+        let mut last: Option<String> = None;
         while let Some(url) = next.take() {
-            let page: Page<serde_json::Value> = self.json(self.request(Method::GET, &url)).await?;
-            count += page.value.len();
+            let page: Page<serde_json::Value> = self
+                .json(
+                    self.request(Method::GET, &url)
+                        .header("Prefer", format!("outlook.timezone=\"{zone}\"")),
+                )
+                .await?;
+            for e in &page.value {
+                let date = e["start"]["dateTime"].as_str().and_then(|d| d.get(..10));
+                if let Some(date) = date
+                    && last.as_deref().is_none_or(|l| date > l)
+                {
+                    last = Some(date.to_owned());
+                }
+            }
             next = page.next_link;
         }
-        Ok(count)
+        Ok(last)
     }
 
     /// Event `id`'s times, people and description as Graph has them now.
@@ -842,7 +893,7 @@ impl Graph {
                 self.request(
                     Method::GET,
                     &format!(
-                        "/me/events/{}?$select=start,end,isAllDay,attendees,body",
+                        "/me/events/{}?$select=start,end,isAllDay,attendees,body,recurrence",
                         path(id)
                     ),
                 )
@@ -859,6 +910,7 @@ impl Graph {
             end: time(e.end).unwrap_or_default(),
             attendees: e.attendees,
             body: e.body.and_then(|b| b.content).unwrap_or_default(),
+            recurrence: e.recurrence,
         })
     }
 }
@@ -1273,6 +1325,7 @@ mod tests {
                  <div class=\"me-email-text\">Microsoft Teams meeting <a href=\"https://teams.microsoft.com/l/x\">Join</a></div></div></body></html>",
                 "_".repeat(80)
             ),
+            recurrence: serde_json::Value::Null,
         };
         let unchanged = EventDraft {
             title: before.title.clone(),
@@ -1551,6 +1604,7 @@ mod tests {
         // A series' rule changed from an occurrence: from the series' first day.
         let series = EventDetails {
             start: start - 14 * DAY_MS,
+            recurrence: weekly_rule().to_graph("2026-10-13", "Pacific Standard Time"),
             ..details.clone()
         };
         let every_two = EventDraft {
@@ -1566,6 +1620,25 @@ mod tests {
         // No longer repeating.
         let body = changed_event_body(&single, &draft, &series, PACIFIC, true);
         assert_eq!(body["recurrence"], serde_json::Value::Null);
+        // Dragged a day later for every occurrence (the grid doesn't read the
+        // rule): the series' days move with it.
+        let wednesday = EventDraft {
+            start: draft.start + DAY_MS,
+            end: draft.end + DAY_MS,
+            repeat: None,
+            ..draft.clone()
+        };
+        let moved = EventDraft {
+            repeat: None,
+            ..draft.clone()
+        };
+        let body = changed_event_body(&wednesday, &moved, &series, PACIFIC, true);
+        assert_eq!(body["start"]["dateTime"], "2026-10-14T09:30:00");
+        assert_eq!(
+            body["recurrence"]["pattern"]["daysOfWeek"],
+            json!(["wednesday"])
+        );
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-10-14");
     }
 
     #[test]
@@ -1584,6 +1657,7 @@ mod tests {
             "sensitivity": "normal",
             "isOnlineMeeting": true,
             "onlineMeetingProvider": "teamsForBusiness",
+            "hideAttendees": true,
             "recurrence": null
         });
         let before = EventDraft {
@@ -1614,6 +1688,7 @@ mod tests {
         assert_eq!(body["start"]["dateTime"], "2026-11-03T10:00:00");
         assert_eq!(body["end"]["dateTime"], "2026-11-03T10:15:00");
         assert_eq!(body["isOnlineMeeting"], true);
+        assert_eq!(body["hideAttendees"], true, "who's invited stays hidden");
         assert_eq!(
             body["body"],
             json!({ "contentType": "text", "content": "Agenda" })
@@ -1777,27 +1852,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_series_occurrences_are_counted_page_by_page() {
+    async fn a_series_last_occurrence_is_found_page_by_page() {
         fn reply(path: &str) -> Option<serde_json::Value> {
             Some(match path {
-                p if p.starts_with("/me/events/ser1/instances?startDateTime=2026-10-06T16:30:00Z&endDateTime=2026-11-03T16:30:00Z&") => {
-                    json!({ "value": [{ "id": "a" }, { "id": "b" }], "@odata.nextLink": "/me/events/ser1/instances?page=2" })
+                p if p.starts_with(
+                    "/me/events/ser1/instances?startDateTime=2026-10-06T16:30:00Z&endDateTime=2027-11-03T16:30:00Z&",
+                ) =>
+                {
+                    json!({ "value": [
+                        { "start": { "dateTime": "2026-10-13T09:30:00.0000000" } },
+                        { "start": { "dateTime": "2026-10-27T09:30:00.0000000" } }
+                    ], "@odata.nextLink": "/me/events/ser1/instances?page=2" })
                 }
-                "/me/events/ser1/instances?page=2" => json!({ "value": [{ "id": "c" }] }),
+                "/me/events/ser1/instances?page=2" => {
+                    json!({ "value": [{ "start": { "dateTime": "2026-10-20T09:30:00.0000000" } }] })
+                }
+                "/me/events/occ1?$select=start" => {
+                    json!({ "start": { "dateTime": "2026-10-28T00:30:00.0000000", "timeZone": "Tokyo Standard Time" } })
+                }
                 _ => return None,
             })
         }
         let (base, _) = crate::graph::tests::stand_in(reply).await;
         let graph = Graph::with_base(&base, "token");
-        let count = graph
-            .count_occurrences(
+        let last = graph
+            .last_occurrence(
                 "ser1",
                 parse_iso_date("2026-10-06T16:30:00Z").unwrap(),
-                parse_iso_date("2026-11-03T16:30:00Z").unwrap(),
+                parse_iso_date("2027-11-03T16:30:00Z").unwrap(),
+                "Pacific Standard Time",
             )
             .await
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(last.as_deref(), Some("2026-10-27"));
+        assert_eq!(
+            graph.start_in("occ1", "Tokyo Standard Time").await.unwrap(),
+            "2026-10-28T00:30:00.0000000"
+        );
     }
 
     #[test]
