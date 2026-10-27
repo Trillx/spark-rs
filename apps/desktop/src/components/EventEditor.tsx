@@ -500,7 +500,7 @@ function TimeField({ label, value, onChange }: { label: string; value: number; o
           if (e.key === "Enter" && !composing(e)) {
             e.preventDefault();
             e.currentTarget.blur();
-          } else if (e.key === "Escape") {
+          } else if (e.key === "Escape" && !composing(e)) {
             // Closes the list, keeping what's typed; the next Esc closes the editor.
             e.currentTarget.blur();
           }

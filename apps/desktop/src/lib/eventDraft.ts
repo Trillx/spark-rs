@@ -179,10 +179,11 @@ export function withDays(d: EventDraft, first: number, last: number): EventDraft
 
 /**
  * Minutes after midnight from a typed time: "9", "930", "9:30", "9.30", "9h30", "9:30pm", "9 am",
- * "21:30", "12am". Null if it isn't one.
+ * "21:30", "12am", "１０：３０". Null if it isn't one.
  */
 export function parseTime(text: string): number | null {
-  const m = /^\s*(\d{1,2})(?:[:.h]?(\d{2}))?\s*([ap])?\.?\s*m?\.?\s*$/i.exec(text);
+  // Full-width digits and colons, as a Japanese or Chinese input method types them, as ASCII.
+  const m = /^\s*(\d{1,2})(?:[:.h]?(\d{2}))?\s*([ap])?\.?\s*m?\.?\s*$/i.exec(text.normalize("NFKC"));
   if (!m) return null;
   let hours = Number(m[1]);
   const minutes = m[2] === undefined ? 0 : Number(m[2]);

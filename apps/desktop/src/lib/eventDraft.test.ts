@@ -38,6 +38,8 @@ test("typed times are read loosely, as Spark reads them", () => {
     ["12am", 0],
     ["12 pm", 720],
     ["21:30", 1290],
+    ["１０", 600],
+    ["１０：３０", 630],
     ["0:05", 5],
     ["24:00", null],
     ["9:75", null],
