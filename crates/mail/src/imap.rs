@@ -13,6 +13,10 @@
 //! Of mail already stored only flags are asked for again (Message-ID and
 //! Reply-To never change), and with CONDSTORE only the flags that changed
 //! since the last sync.
+//!
+//! FETCH and UID SEARCH go through `fetch`, `uid_fetch` and `uid_search`
+//! here, not async-imap's: a server's NO or BAD fails them, where
+//! async-imap's take it for an answer with nothing (or only part) in it.
 
 use std::collections::HashSet;
 use std::io;
@@ -22,7 +26,10 @@ use std::sync::MutexGuard;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_imap::imap_proto::NameAttribute;
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, NameAttribute, Outcome, Response, SectionPath,
+    Status,
+};
 use async_imap::types::{Fetch, Flag};
 use async_imap::{Client, Session as ImapSession};
 use futures_util::TryStreamExt;
@@ -535,7 +542,7 @@ pub async fn sync_folder(
     let mut window: Vec<u32> = Vec::new();
     if mailbox.exists > 0 {
         let first = mailbox.exists.saturating_sub(limit) + 1;
-        let fetched = session.fetch(format!("{first}:*"), "(UID FLAGS)").await?;
+        let fetched = fetch(session, format!("{first}:*"), "(UID FLAGS)").await?;
         flags_in_chunks(fetched, |chunk| {
             window.extend(chunk.iter().map(|(uid, ..)| *uid));
             store_flags(store, folder.account_id, &folder.remote_id, chunk, |uid| {
@@ -571,11 +578,14 @@ pub async fn sync_folder(
         .filter(|uid| !known.contains_key(uid))
         .collect();
     for batch in new.chunks(FETCH_BATCH * 4) {
-        let heads: Vec<Fetch> = session
-            .uid_fetch(uid_set(batch), format!("(UID FLAGS {REPLY_TO_HEADERS})"))
-            .await?
-            .try_collect()
-            .await?;
+        let heads: Vec<Fetched> = uid_fetch(
+            session,
+            uid_set(batch),
+            format!("(UID FLAGS {REPLY_TO_HEADERS})"),
+        )
+        .await?
+        .try_collect()
+        .await?;
         let heads: Vec<Incoming> = heads
             .iter()
             .filter_map(|f| {
@@ -704,8 +714,7 @@ pub async fn delete_folders(session: &mut Session, mailboxes: &[String]) -> Resu
 
 /// Whether the selected mailbox still has `uid`.
 async fn still_there(session: &mut Session, uid: u32) -> Result<bool> {
-    let fetched: Vec<Fetch> = session
-        .uid_fetch(uid.to_string(), "(UID)")
+    let fetched: Vec<Fetched> = uid_fetch(session, uid.to_string(), "(UID)")
         .await?
         .try_collect()
         .await?;
@@ -748,8 +757,7 @@ pub async fn written_to(
         .filter(|a| a.is_ascii() && !a.contains(['"', '\\']))
     {
         let q = quoted(address);
-        let mut uids: Vec<u32> = session
-            .uid_search(format!("OR OR TO {q} CC {q} BCC {q}"))
+        let mut uids: Vec<u32> = uid_search(session, format!("OR OR TO {q} CC {q} BCC {q}"))
             .await?
             .into_iter()
             .collect();
@@ -758,14 +766,14 @@ pub async fn written_to(
         }
         uids.sort_unstable();
         let newest = &uids[uids.len().saturating_sub(SENT_CANDIDATES)..];
-        let headers: Vec<Fetch> = session
-            .uid_fetch(
-                uid_set(newest),
-                "(UID BODY.PEEK[HEADER.FIELDS (TO CC BCC)])",
-            )
-            .await?
-            .try_collect()
-            .await?;
+        let headers: Vec<Fetched> = uid_fetch(
+            session,
+            uid_set(newest),
+            "(UID BODY.PEEK[HEADER.FIELDS (TO CC BCC)])",
+        )
+        .await?
+        .try_collect()
+        .await?;
         let wanted = address.to_lowercase();
         if headers.iter().any(|f| {
             f.header()
@@ -789,7 +797,27 @@ pub async fn sync_inbox(
     account_id: i64,
     state: &mut SyncState,
 ) -> Result<SyncReport> {
-    let mailbox = session.select(INBOX).await?;
+    // SELECT turns CONDSTORE on, and until then a server may keep
+    // HIGHESTMODSEQ back. A modseq kept means the server has it; without
+    // one, CAPABILITY says. A server that turns it away is selected
+    // plainly, and asked for every flag.
+    let mut condstore =
+        state.modseq.is_some() || session.capabilities().await?.has_str("CONDSTORE");
+    let mut selected = None;
+    if condstore {
+        match session.select_condstore(INBOX).await {
+            Ok(mailbox) => selected = Some(mailbox),
+            Err(async_imap::error::Error::Bad(_)) => condstore = false,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mailbox = match selected {
+        Some(mailbox) => mailbox,
+        None => session.select(INBOX).await?,
+    };
+    if !condstore {
+        state.modseq = None;
+    }
     if mailbox.uid_validity != state.uid_validity {
         // The server renumbered the inbox. Stored messages are found again
         // by Message-ID as they're fetched.
@@ -811,8 +839,7 @@ pub async fn sync_inbox(
                     .await?
                     .is_none_or(|lowest| lowest >= floor);
             // "floor:*" also matches the newest message if that's below it.
-            let present: HashSet<u32> = session
-                .uid_search(format!("UID {floor}:*"))
+            let present: HashSet<u32> = uid_search(session, format!("UID {floor}:*"))
                 .await?
                 .into_iter()
                 .filter(|uid| *uid >= floor)
@@ -825,8 +852,7 @@ pub async fn sync_inbox(
             let mut present = HashSet::new();
             if mailbox.exists > 0 {
                 let first = mailbox.exists.saturating_sub(limit) + 1;
-                let fetched: Vec<Fetch> = session
-                    .fetch(format!("{first}:*"), "(UID)")
+                let fetched: Vec<Fetched> = fetch(session, format!("{first}:*"), "(UID)")
                     .await?
                     .try_collect()
                     .await?;
@@ -877,19 +903,15 @@ pub async fn sync_inbox(
             }
             _ => "(UID FLAGS)".into(),
         };
-        let fetched = session.uid_fetch(format!("{floor}:*"), query).await?;
+        let fetched = uid_fetch(session, format!("{floor}:*"), query).await?;
         flags_in_chunks(fetched, |chunk| {
             store_flags(store, account_id, INBOX, chunk, tracked)
         })
         .await?;
     }
-    state.modseq = match (state.modseq, mailbox.highest_modseq) {
-        (Some(_), now) => now,
-        // HIGHESTMODSEQ is CONDSTORE's, but a server that sends it without
-        // CHANGEDSINCE would fail every sync.
-        (None, Some(now)) if session.capabilities().await?.has_str("CONDSTORE") => Some(now),
-        (None, _) => None,
-    };
+    // Only from a SELECT that turned CONDSTORE on: a server that sends
+    // HIGHESTMODSEQ without CHANGEDSINCE would fail every sync.
+    state.modseq = mailbox.highest_modseq.filter(|_| condstore);
 
     // Mail a search brought in from below the floor isn't tracked until
     // reaching back gets to it.
@@ -939,8 +961,7 @@ pub async fn older_inbox(
     let mut span = OLDER_SPAN;
     while let Some(lowest) = lowest.filter(|lowest| !more && *lowest < top) {
         let bottom = top.saturating_sub(span).max(lowest);
-        let mut page: Vec<u32> = session
-            .uid_search(format!("UID {bottom}:{}", top - 1))
+        let mut page: Vec<u32> = uid_search(session, format!("UID {bottom}:{}", top - 1))
             .await?
             .into_iter()
             .filter(|uid| (bottom..top).contains(uid))
@@ -989,7 +1010,7 @@ async fn lowest_uid(session: &mut Session, exists: u32) -> Result<Option<u32>> {
     if exists == 0 {
         return Ok(None);
     }
-    let first: Vec<Fetch> = session.fetch("1", "(UID)").await?.try_collect().await?;
+    let first: Vec<Fetched> = fetch(session, "1", "(UID)").await?.try_collect().await?;
     Ok(first.iter().filter_map(|f| f.uid).min())
 }
 
@@ -999,7 +1020,7 @@ async fn lowest_uid(session: &mut Session, exists: u32) -> Result<Option<u32>> {
 /// the rest is read (to leave the session ready for its next command)
 /// and the failure returned.
 async fn flags_in_chunks(
-    fetched: impl futures_util::Stream<Item = async_imap::error::Result<Fetch>>,
+    fetched: impl futures_util::Stream<Item = async_imap::error::Result<Fetched>>,
     mut each: impl FnMut(&[(u32, bool, bool)]) -> Result<()>,
 ) -> Result<()> {
     let mut fetched = std::pin::pin!(fetched);
@@ -1053,11 +1074,11 @@ async fn fetch_reply_to(
 ) -> Result<usize> {
     let mut changed = 0;
     for chunk in uids.chunks(OBSERVE_BATCH) {
-        let fetched: Vec<Fetch> = session
-            .uid_fetch(uid_set(chunk), format!("(UID {REPLY_TO_HEADERS})"))
-            .await?
-            .try_collect()
-            .await?;
+        let fetched: Vec<Fetched> =
+            uid_fetch(session, uid_set(chunk), format!("(UID {REPLY_TO_HEADERS})"))
+                .await?
+                .try_collect()
+                .await?;
         let headers: Vec<Incoming> = fetched
             .iter()
             .filter_map(|f| {
@@ -1113,7 +1134,7 @@ pub async fn search_server(
         && session.examine(INBOX).await?.uid_validity == state.uid_validity
     {
         let known = lock(store).uids(account.id, INBOX)?;
-        let hits = newest(session.uid_search(&keys).await?, |uid| {
+        let hits = newest(uid_search(session, &keys).await?, |uid| {
             uid < floor && !known.contains(&uid)
         });
         for batch in hits.chunks(FETCH_BATCH) {
@@ -1141,19 +1162,19 @@ pub async fn search_server(
         Err(e) => return Err(e.into()),
     }
     let known = lock(store).folder_uids(folder.id)?;
-    let hits = newest(session.uid_search(&keys).await?, |uid| {
+    let hits = newest(uid_search(session, &keys).await?, |uid| {
         !known.contains_key(&uid)
     });
     for batch in hits.chunks(FETCH_BATCH) {
         // Mail stored from elsewhere (the inbox, another label) is left as it is.
-        let heads: Vec<Fetch> = session
-            .uid_fetch(
-                uid_set(batch),
-                "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-            )
-            .await?
-            .try_collect()
-            .await?;
+        let heads: Vec<Fetched> = uid_fetch(
+            session,
+            uid_set(batch),
+            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await?
+        .try_collect()
+        .await?;
         let heads: Vec<(u32, Option<String>)> = heads
             .iter()
             .filter_map(|f| Some((f.uid?, f.header().and_then(parse::message_id))))
@@ -1234,8 +1255,7 @@ async fn fetch_messages(
     if uids.is_empty() {
         return Ok(Vec::new());
     }
-    let sizes: Vec<Fetch> = session
-        .uid_fetch(uid_set(uids), "(UID RFC822.SIZE)")
+    let sizes: Vec<Fetched> = uid_fetch(session, uid_set(uids), "(UID RFC822.SIZE)")
         .await?
         .try_collect()
         .await?;
@@ -1254,7 +1274,7 @@ async fn fetch_messages(
     }
     let mut messages = Vec::new();
     for (uids, query) in fetches {
-        let fetched = session.uid_fetch(uid_set(&uids), query).await?;
+        let fetched = uid_fetch(session, uid_set(&uids), query).await?;
         parse_each(fetched, incoming, &mut messages).await?;
     }
     for m in &mut messages {
@@ -1287,13 +1307,15 @@ fn batches(sized: &[(u32, u32)]) -> Vec<Vec<u32>> {
 
 /// Parses each fetched message on a blocking thread as it arrives, one at a
 /// time, reading the next meanwhile: at most two raw messages are held, the
-/// one being parsed and the one being read. Messages that can't be parsed
-/// are left out; a failed read fails the lot.
+/// one being parsed and the one being read (for a moment twice, as
+/// `Fetched` copies it out of its response). Messages that can't be parsed
+/// are left out; a failed read (or a refused fetch) fails the lot.
 async fn parse_each<T: Send + 'static>(
-    mut fetched: impl futures_util::Stream<Item = async_imap::error::Result<T>> + Unpin,
+    fetched: impl futures_util::Stream<Item = async_imap::error::Result<T>>,
     parse: fn(T) -> Option<Incoming>,
     messages: &mut Vec<Incoming>,
 ) -> Result<()> {
+    let mut fetched = std::pin::pin!(fetched);
     let mut parsing = None;
     while let Some(fetch) = fetched.try_next().await? {
         if let Some(previous) = parsing.take() {
@@ -1318,7 +1340,7 @@ async fn parsed(parse: JoinHandle<Option<Incoming>>) -> Result<Option<Incoming>>
 
 /// A fetched message with its UID, flags and arrival time; `None` if it
 /// can't be parsed. A big one, fetched without its body, says so instead.
-fn incoming(fetch: Fetch) -> Option<Incoming> {
+fn incoming(fetch: Fetched) -> Option<Incoming> {
     let uid = fetch.uid?;
     let raw = fetch.body().or_else(|| fetch.header()).unwrap_or_default();
     let mut m = parse::parse_message(raw)?;
@@ -1330,8 +1352,8 @@ fn incoming(fetch: Fetch) -> Option<Incoming> {
     m.uid = Some(uid);
     m.unread = unread;
     m.flagged = flagged;
-    if let Some(date) = fetch.internal_date() {
-        m.date = date.timestamp_millis();
+    if let Some(date) = fetch.arrived {
+        m.date = date;
     }
     Some(m)
 }
@@ -1626,7 +1648,7 @@ pub async fn fetch_raw_checked(
             Err(e) => return Err(e.into()),
         }
         let query = format!("HEADER Message-ID {}", quoted(message_id));
-        let found = session.uid_search(query).await?;
+        let found = uid_search(session, query).await?;
         if let Some(uid) = found.into_iter().max()
             && let Some(raw) = fetch_body(session, uid).await?
         {
@@ -1637,12 +1659,11 @@ pub async fn fetch_raw_checked(
 }
 
 async fn fetch_body(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
-    let fetched: Vec<Fetch> = session
-        .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+    let fetched: Vec<Fetched> = uid_fetch(session, uid.to_string(), "(UID BODY.PEEK[])")
         .await?
         .try_collect()
         .await?;
-    Ok(fetched.iter().find_map(|f| f.body().map(<[u8]>::to_vec)))
+    Ok(fetched.into_iter().find_map(|f| f.body))
 }
 
 /// Where a message with no usable location is now, with that mailbox
@@ -1774,18 +1795,18 @@ async fn search(
 /// substrings, so candidates must be checked before destructive commands.
 pub(crate) async fn find_message_id(session: &mut Session, message_id: &str) -> Result<Vec<u32>> {
     let query = format!("HEADER Message-ID {}", quoted(message_id));
-    let found: Vec<u32> = session.uid_search(query).await?.into_iter().collect();
+    let found: Vec<u32> = uid_search(session, query).await?.into_iter().collect();
     if found.is_empty() {
         return Ok(Vec::new());
     }
-    let headers: Vec<Fetch> = session
-        .uid_fetch(
-            uid_set(&found),
-            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-        )
-        .await?
-        .try_collect()
-        .await?;
+    let headers: Vec<Fetched> = uid_fetch(
+        session,
+        uid_set(&found),
+        "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+    )
+    .await?
+    .try_collect()
+    .await?;
     let expected = parse::bare_id(message_id);
     Ok(headers
         .iter()
@@ -1859,17 +1880,191 @@ fn folder(state: &SyncState, place: Place) -> Option<String> {
 }
 
 /// (unread, flagged)
-fn read_flags(fetch: &Fetch) -> (bool, bool) {
-    let mut seen = false;
-    let mut flagged = false;
-    for flag in fetch.flags() {
-        match flag {
-            Flag::Seen => seen = true,
-            Flag::Flagged => flagged = true,
+fn read_flags(fetch: &Fetched) -> (bool, bool) {
+    (!fetch.seen, fetch.flagged)
+}
+
+/// What a FETCH response says about a message, as far as syncing reads it:
+/// taken out of the response as it's read, header and body copied, and the
+/// response dropped.
+#[derive(Debug, Default)]
+struct Fetched {
+    /// The message's sequence number.
+    message: u32,
+    uid: Option<u32>,
+    size: Option<u32>,
+    seen: bool,
+    flagged: bool,
+    header: Option<Vec<u8>>,
+    body: Option<Vec<u8>>,
+    /// INTERNALDATE, in milliseconds.
+    arrived: Option<i64>,
+}
+
+impl Fetched {
+    fn read(message: u32, attributes: &[AttributeValue<'_>]) -> Self {
+        let mut fetched = Self {
+            message,
+            ..Default::default()
+        };
+        for attribute in attributes {
+            match attribute {
+                AttributeValue::Uid(uid) => fetched.uid = Some(*uid),
+                AttributeValue::Rfc822Size(size) => fetched.size = Some(*size),
+                AttributeValue::Flags(flags) => {
+                    for flag in flags {
+                        match Flag::from(flag.as_ref()) {
+                            Flag::Seen => fetched.seen = true,
+                            Flag::Flagged => fetched.flagged = true,
+                            _ => {}
+                        }
+                    }
+                }
+                // The header, or the fields of it asked for.
+                AttributeValue::BodySection {
+                    section: Some(SectionPath::Full(MessageSection::Header)),
+                    data: Some(data),
+                    ..
+                }
+                | AttributeValue::Rfc822Header(Some(data)) => {
+                    fetched.header.get_or_insert_with(|| data.to_vec());
+                }
+                AttributeValue::BodySection {
+                    section: None,
+                    data: Some(data),
+                    ..
+                }
+                | AttributeValue::Rfc822(Some(data)) => {
+                    fetched.body.get_or_insert_with(|| data.to_vec());
+                }
+                AttributeValue::InternalDate(date) => fetched.arrived = internal_date(date),
+                _ => {}
+            }
+        }
+        fetched
+    }
+
+    fn header(&self) -> Option<&[u8]> {
+        self.header.as_deref()
+    }
+
+    fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
+}
+
+/// An INTERNALDATE ("26-Oct-2026 10:00:00 +0000"), in milliseconds.
+fn internal_date(date: &str) -> Option<i64> {
+    // A Date header's form, but for the dashes.
+    let date = mail_parser::DateTime::parse_rfc822(&date.trim().replacen('-', " ", 2))?;
+    date.is_valid().then(|| date.to_timestamp() * 1000)
+}
+
+/// FETCH by sequence numbers, read as `run_fetch` reads it.
+async fn fetch(
+    session: &mut Session,
+    set: impl AsRef<str>,
+    query: impl AsRef<str>,
+) -> Result<impl futures_util::Stream<Item = async_imap::error::Result<Fetched>> + '_> {
+    run_fetch(
+        session,
+        format!("FETCH {} {}", set.as_ref(), query.as_ref()),
+    )
+    .await
+}
+
+/// UID FETCH, read as `run_fetch` reads it.
+async fn uid_fetch(
+    session: &mut Session,
+    set: impl AsRef<str>,
+    query: impl AsRef<str>,
+) -> Result<impl futures_util::Stream<Item = async_imap::error::Result<Fetched>> + '_> {
+    run_fetch(
+        session,
+        format!("UID FETCH {} {}", set.as_ref(), query.as_ref()),
+    )
+    .await
+}
+
+/// Sends a FETCH and reads what each response says as it comes, up to the
+/// command's tagged completion. A NO or BAD there fails the stream: what
+/// came before it may be only part of the answer, or none of it, and taken
+/// for all of it would lose mail and flag changes for good. Responses that
+/// aren't FETCH (EXISTS, EXPUNGE) are passed over, as the next SELECT
+/// brings the same news. Read to its end, it leaves the session ready for
+/// the next command.
+async fn run_fetch(
+    session: &mut Session,
+    command: String,
+) -> Result<impl futures_util::Stream<Item = async_imap::error::Result<Fetched>> + '_> {
+    let tag = session.run_command(command).await?;
+    Ok(futures_util::stream::try_unfold(session, move |session| {
+        let tag = tag.clone();
+        async move {
+            loop {
+                let Some(response) = session.read_response().await? else {
+                    return Err(async_imap::error::Error::ConnectionLost);
+                };
+                match response.parsed() {
+                    Response::Fetch(message, attributes) => {
+                        return Ok(Some((Fetched::read(*message, attributes), session)));
+                    }
+                    Response::Done {
+                        tag: done,
+                        status,
+                        outcome,
+                    } if *done == tag => return completion(status, outcome).map(|()| None),
+                    _ => {}
+                }
+            }
+        }
+    }))
+}
+
+/// UID SEARCH. A NO or BAD fails it, where async-imap's search finds
+/// nothing: mail a sync can't see would be taken for gone.
+async fn uid_search(session: &mut Session, query: impl AsRef<str>) -> Result<HashSet<u32>> {
+    let tag = session
+        .run_command(format!("UID SEARCH {}", query.as_ref()))
+        .await?;
+    let mut found = HashSet::new();
+    loop {
+        let Some(response) = session.read_response().await? else {
+            return Err(async_imap::error::Error::ConnectionLost.into());
+        };
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::Search(uids)) => found.extend(uids),
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if *done == tag => {
+                completion(status, outcome)?;
+                return Ok(found);
+            }
             _ => {}
         }
     }
-    (!seen, flagged)
+}
+
+/// A command's tagged completion: OK, or the NO or BAD it failed with.
+fn completion(status: &Status, outcome: &Outcome<'_>) -> async_imap::error::Result<()> {
+    let said = || {
+        outcome
+            .information
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    match status {
+        Status::Ok => Ok(()),
+        Status::No => Err(async_imap::error::Error::No(said())),
+        Status::Bad => Err(async_imap::error::Error::Bad(said())),
+        other => Err(async_imap::error::Error::Io(io::Error::other(format!(
+            "{other:?} {}",
+            said()
+        )))),
+    }
 }
 
 /// "1:3,7" style set from sorted or unsorted UIDs.
@@ -2003,6 +2198,20 @@ mod tests {
         assert_eq!(counts.most_parsing.load(SeqCst), 1);
         assert!(counts.most_held.load(SeqCst) <= 2);
         assert_eq!(counts.held.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn arrival_times_read_as_imap_writes_them() {
+        assert_eq!(
+            internal_date("26-Oct-2026 10:00:00 +0000"),
+            Some(1_793_008_800_000)
+        );
+        // A day of one digit is padded with a space.
+        assert_eq!(
+            internal_date(" 6-Oct-2026 05:00:00 -0500"),
+            Some(1_791_280_800_000)
+        );
+        assert_eq!(internal_date("yesterday"), None);
     }
 
     #[tokio::test]

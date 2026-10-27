@@ -117,6 +117,9 @@ impl Tally {
 struct Shared {
     mailboxes: HashMap<String, Remote>,
     condstore: bool,
+    /// Commands containing the first get the first half of their answer,
+    /// then the second (NO or BAD) as their completion.
+    refuse: Option<(&'static str, &'static str)>,
     tally: Tally,
 }
 
@@ -144,6 +147,7 @@ impl StandIn {
         let state = Arc::new(Mutex::new(Shared {
             mailboxes,
             condstore,
+            refuse: None,
             tally: Tally::default(),
         }));
         let shared = state.clone();
@@ -173,6 +177,15 @@ impl StandIn {
 
     fn take_tally(&self) -> Tally {
         std::mem::take(&mut self.state.lock().unwrap().tally)
+    }
+
+    /// Refuses commands containing `command` with `status` from now on.
+    fn refuse(&self, command: &'static str, status: &'static str) {
+        self.state.lock().unwrap().refuse = Some((command, status));
+    }
+
+    fn heal(&self) {
+        self.state.lock().unwrap().refuse = None;
     }
 }
 
@@ -220,6 +233,10 @@ fn respond(
         .iter()
         .find_map(|verb| upper.starts_with(verb).then(|| &command[verb.len()..]))
     {
+        let condstore = name.ends_with(" (CONDSTORE)");
+        if condstore && !state.condstore {
+            return (String::new(), 0, "BAD");
+        }
         let name = name.trim_end_matches(" (CONDSTORE)").trim_matches('"');
         let Some(mailbox) = state.mailboxes.get(name) else {
             return (String::new(), 0, "NO");
@@ -231,16 +248,22 @@ fn respond(
             mailbox.validity,
             mailbox.next_uid
         );
-        if state.condstore {
+        // Only once SELECT turns CONDSTORE on, as RFC 7162 lets a server.
+        if condstore {
             data.push_str(&format!("* OK [HIGHESTMODSEQ {}] .\r\n", mailbox.modseq));
         }
         return (data, 0, "OK");
     }
+    let refused = state
+        .refuse
+        .filter(|(refused, _)| command.contains(refused))
+        .map(|(_, status)| status);
+    let status = refused.unwrap_or("OK");
     let mailbox = &state.mailboxes[selected.as_deref().expect("a mailbox is selected")];
     let max_uid = mailbox.by_uid.keys().last().copied().unwrap_or(0);
     let exists = mailbox.by_uid.len() as u32;
     if let Some(query) = upper.strip_prefix("UID SEARCH ") {
-        let hits: Vec<u32> = match query.strip_prefix("UID ") {
+        let mut hits: Vec<u32> = match query.strip_prefix("UID ") {
             _ if query == "ALL" => mailbox.by_uid.keys().copied().collect(),
             Some(set) => mailbox
                 .by_uid
@@ -250,8 +273,11 @@ fn respond(
                 .collect(),
             None => panic!("unexpected search {command}"),
         };
+        if refused.is_some() {
+            hits.truncate(hits.len() / 2);
+        }
         let listed: String = hits.iter().map(|uid| format!(" {uid}")).collect();
-        return (format!("* SEARCH{listed}\r\n"), hits.len(), "OK");
+        return (format!("* SEARCH{listed}\r\n"), hits.len(), status);
     }
     let (by_uid, rest) = match upper.strip_prefix("UID FETCH ") {
         Some(rest) => (true, rest),
@@ -267,8 +293,7 @@ fn respond(
     if changed_since.is_some() && !state.condstore {
         return (String::new(), 0, "BAD");
     }
-    let mut data = String::new();
-    let mut records = 0;
+    let mut records = Vec::new();
     for (seq, (uid, m)) in (1..).zip(&mailbox.by_uid) {
         let wanted = if by_uid {
             in_set(set, *uid, max_uid)
@@ -317,10 +342,12 @@ fn respond(
                 header.len()
             ));
         }
-        data.push_str(&format!("* {seq} FETCH ({})\r\n", parts.join(" ")));
-        records += 1;
+        records.push(format!("* {seq} FETCH ({})\r\n", parts.join(" ")));
     }
-    (data, records, "OK")
+    if refused.is_some() {
+        records.truncate(records.len() / 2);
+    }
+    (records.concat(), records.len(), status)
 }
 
 /// Whether `n` is in an IMAP set like "1:3,7,9:*", where `*` is `max`
@@ -398,24 +425,116 @@ const TRACKED: u32 = 1000;
 /// Inbox UIDs are every third: the rest were archived.
 const SPACING: u32 = 3;
 
+/// An account with a session on the stand-in, whose inbox has `ON_SERVER`
+/// messages, and the newest `TRACKED` of them cached.
+struct Cached {
+    stand_in: StandIn,
+    store: Mutex<Store>,
+    account_id: i64,
+    state: SyncState,
+    session: Session,
+}
+
+impl Cached {
+    /// Cached before Reply-To was kept: its state's JSON has none of the
+    /// fields added since.
+    async fn old(condstore: bool) -> Self {
+        let stand_in = StandIn::start(
+            HashMap::from([(INBOX.to_owned(), Remote::new(ON_SERVER, SPACING))]),
+            condstore,
+        )
+        .await;
+        let oldest_tracked = ON_SERVER - TRACKED + 1;
+        let (store, account_id) = cached(&stand_in, oldest_tracked..=ON_SERVER);
+        let state: SyncState = serde_json::from_value(serde_json::json!({
+            "uidValidity": 1,
+            "floor": oldest_tracked * SPACING,
+            "archive": "Archive",
+            "trash": "Trash",
+        }))
+        .unwrap();
+        let session = login(&stand_in.server, "me", "pw").await.unwrap();
+        stand_in.take_tally();
+        Self {
+            stand_in,
+            store,
+            account_id,
+            state,
+            session,
+        }
+    }
+
+    /// `old`, then synced: Reply-To fetched, and with CONDSTORE a modseq kept.
+    async fn synced(condstore: bool) -> Self {
+        let mut cached = Self::old(condstore).await;
+        cached.sync().await.unwrap();
+        assert!(cached.state.reply_to_fetched);
+        assert_eq!(cached.state.modseq.is_some(), condstore);
+        cached.stand_in.take_tally();
+        cached
+    }
+
+    async fn sync(&mut self) -> Result<SyncReport> {
+        sync_inbox(
+            &mut self.session,
+            &self.store,
+            self.account_id,
+            &mut self.state,
+        )
+        .await
+    }
+
+    async fn older(&mut self) -> Result<usize> {
+        older_inbox(
+            &mut self.session,
+            &self.store,
+            self.account_id,
+            &mut self.state,
+        )
+        .await
+    }
+
+    /// How many messages are in the inbox.
+    fn in_inbox(&self) -> usize {
+        lock(&self.store)
+            .messages()
+            .unwrap()
+            .iter()
+            .filter(|m| m.state == spark_store::MessageState::Inbox)
+            .count()
+    }
+
+    /// Syncs (or with `older`, reaches back) while the stand-in refuses
+    /// commands containing `command` with `status`, and checks that it
+    /// failed and left the state and the inbox as they were.
+    async fn refused(&mut self, command: &'static str, status: &'static str, older: bool) {
+        let before = self.state.clone();
+        let inbox = self.in_inbox();
+        self.stand_in.refuse(command, status);
+        let failed = if older {
+            self.older().await.map(drop)
+        } else {
+            self.sync().await.map(drop)
+        };
+        self.stand_in.heal();
+        assert!(
+            failed.is_err(),
+            "{command} was refused, yet it went through"
+        );
+        assert_eq!(self.state, before, "{command}");
+        assert_eq!(self.in_inbox(), inbox, "{command}");
+    }
+}
+
 async fn inbox_scenarios(condstore: bool) -> Vec<(&'static str, Tally)> {
-    let stand_in = StandIn::start(
-        HashMap::from([(INBOX.to_owned(), Remote::new(ON_SERVER, SPACING))]),
-        condstore,
-    )
-    .await;
     let oldest_tracked = ON_SERVER - TRACKED + 1;
-    let (store, account_id) = cached(&stand_in, oldest_tracked..=ON_SERVER);
-    // A cache from before this change: its JSON has none of the new fields.
-    let mut state: SyncState = serde_json::from_value(serde_json::json!({
-        "uidValidity": 1,
-        "floor": oldest_tracked * SPACING,
-        "archive": "Archive",
-        "trash": "Trash",
-    }))
-    .unwrap();
-    let mut session = login(&stand_in.server, "me", "pw").await.unwrap();
-    stand_in.take_tally();
+    let Cached {
+        stand_in,
+        store,
+        account_id,
+        mut state,
+        mut session,
+    } = Cached::old(condstore).await;
     let mut tallies = Vec::new();
 
     let report = sync_inbox(&mut session, &store, account_id, &mut state)
@@ -554,6 +673,7 @@ async fn inbox_polls_without_condstore() {
     assert_eq!(
         quiet,
         &[
+            "CAPABILITY",
             "SELECT \"INBOX\"",
             "FETCH 1 (UID)",
             "UID SEARCH UID 6003:*",
@@ -565,18 +685,19 @@ async fn inbox_polls_without_condstore() {
         "without CONDSTORE",
         &tallies,
         &[
-            // Lowest UID, the tracked UIDs, their headers, their flags.
-            ("old cache, first poll", 6, 1 + k + k + k),
-            ("quiet poll", 4, 1 + k + k),
-            ("one flag change", 4, 1 + k + k),
-            ("one expunge", 4, 1 + (k - 1) + (k - 1)),
+            // CAPABILITY (for CONDSTORE, every poll), the lowest UID, the
+            // tracked UIDs, their headers, their flags.
+            ("old cache, first poll", 7, 1 + k + k + k),
+            ("quiet poll", 5, 1 + k + k),
+            ("one flag change", 5, 1 + k + k),
+            ("one expunge", 5, 1 + (k - 1) + (k - 1)),
             // The new one's size and body, and its flags with the rest.
-            ("one arrival", 6, 1 + k + 2 + k),
+            ("one arrival", 7, 1 + k + 2 + k),
             // Two searches below the floor (200 UIDs and 400, a third of
             // them in the inbox) and 100 sizes and bodies, 25 at a time.
             ("one older page", 12, 1 + 200 + 2 * OLDER_STEP),
             // The newest 300 again, refetched to be found by Message-ID.
-            ("UIDVALIDITY change", 26, 3 * FIRST_SYNC_LIMIT),
+            ("UIDVALIDITY change", 27, 3 * FIRST_SYNC_LIMIT),
         ],
     );
 }
@@ -585,14 +706,19 @@ async fn inbox_polls_without_condstore() {
 async fn inbox_polls_with_condstore() {
     let tallies = inbox_scenarios(true).await;
     headers_asked_once(&tallies);
+    // The stand-in sends HIGHESTMODSEQ only to a SELECT that turns
+    // CONDSTORE on, which CAPABILITY first says it can.
+    let first = &tallies[0].1.commands;
+    assert_eq!(first[..2], ["CAPABILITY", "SELECT \"INBOX\" (CONDSTORE)"]);
     let quiet = &tallies[1].1.commands;
+    assert_eq!(quiet[0], "SELECT \"INBOX\" (CONDSTORE)");
     assert!(quiet[3].starts_with("UID FETCH 6003:* (UID FLAGS) (CHANGEDSINCE "));
     let k = TRACKED as usize;
     check(
         "with CONDSTORE",
         &tallies,
         &[
-            // As without, and CAPABILITY before the modseq is first kept.
+            // As without; then, with a modseq kept, no more CAPABILITY.
             ("old cache, first poll", 7, 1 + k + k + k),
             // Flags only of what changed.
             ("quiet poll", 4, 1 + k),
@@ -600,7 +726,7 @@ async fn inbox_polls_with_condstore() {
             ("one expunge", 4, 1 + (k - 1)),
             ("one arrival", 6, 1 + k + 2 + 1),
             ("one older page", 12, 1 + 200 + 2 * OLDER_STEP),
-            ("UIDVALIDITY change", 27, 3 * FIRST_SYNC_LIMIT),
+            ("UIDVALIDITY change", 26, 3 * FIRST_SYNC_LIMIT),
         ],
     );
 }
@@ -775,5 +901,146 @@ async fn folder_polls() {
             // The one that joins it is fetched as on a first sync.
             ("one expunge", 5, window + 3),
         ],
+    );
+}
+
+/// A server that turns CONDSTORE away now (it moved to software without
+/// it, say) is selected plainly and asked for every flag.
+#[tokio::test]
+async fn a_server_without_condstore_any_more_is_synced_plainly() {
+    let mut cached = Cached::synced(true).await;
+    cached.stand_in.state.lock().unwrap().condstore = false;
+    let flagged = ON_SERVER - 10;
+    cached
+        .stand_in
+        .with(INBOX, |b| b.set_flags(flagged, false, true));
+    cached.sync().await.unwrap();
+    assert!(message(&cached.store, flagged).pinned);
+    assert_eq!(cached.state.modseq, None);
+    let tally = cached.stand_in.take_tally();
+    assert_eq!(
+        tally.commands[..2],
+        ["SELECT \"INBOX\" (CONDSTORE)", "SELECT \"INBOX\""]
+    );
+    assert!(tally.asked("(UID FLAGS)") && !tally.asked("CHANGEDSINCE"));
+
+    cached.sync().await.unwrap();
+    let tally = cached.stand_in.take_tally();
+    assert_eq!(tally.commands[..2], ["CAPABILITY", "SELECT \"INBOX\""]);
+}
+
+/// A first sync whose FETCH is refused keeps no position: the next, with
+/// the server well again, is a first sync too, and takes the whole inbox.
+#[tokio::test]
+async fn a_refused_first_sync_keeps_no_position() {
+    let stand_in = StandIn::start(
+        HashMap::from([(INBOX.to_owned(), Remote::new(100, 1))]),
+        false,
+    )
+    .await;
+    let (store, account_id) = cached(&stand_in, std::iter::empty());
+    let mut state = SyncState::default();
+    let mut session = login(&stand_in.server, "me", "pw").await.unwrap();
+
+    stand_in.refuse("FETCH 1:* (UID)", "NO");
+    let refused = sync_inbox(&mut session, &store, account_id, &mut state).await;
+    assert!(refused.is_err(), "{refused:?}");
+    let renumbered = SyncState {
+        uid_validity: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(state, renumbered);
+    assert!(lock(&store).messages().unwrap().is_empty());
+
+    stand_in.heal();
+    let report = sync_inbox(&mut session, &store, account_id, &mut state)
+        .await
+        .unwrap();
+    assert!(report.first && report.new.len() == 100, "{report:?}");
+    assert_eq!((state.floor, state.complete), (Some(1), true));
+}
+
+/// A refused check for the lowest UID doesn't take the inbox for complete.
+#[tokio::test]
+async fn a_refused_lowest_uid_check_leaves_the_inbox_incomplete() {
+    let mut cached = Cached::synced(false).await;
+    let before = cached.state.clone();
+    assert!(!before.complete);
+    cached.refused("FETCH 1 (UID)", "NO", false).await;
+    cached.sync().await.unwrap();
+    assert_eq!(cached.state, before);
+}
+
+/// Mail a refused search didn't list isn't taken for gone.
+#[tokio::test]
+async fn a_refused_search_takes_no_mail_for_gone() {
+    let mut cached = Cached::synced(false).await;
+    cached.refused("UID SEARCH UID", "NO", false).await;
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.gone, 0);
+    assert_eq!(cached.in_inbox(), TRACKED as usize);
+}
+
+/// The modseq stays put when CHANGEDSINCE is refused, so the next sync
+/// asks for the same changes again.
+#[tokio::test]
+async fn a_refused_changedsince_keeps_the_modseq() {
+    let mut cached = Cached::synced(true).await;
+    let changed = [ON_SERVER - 10, ON_SERVER - 20];
+    for id in changed {
+        cached
+            .stand_in
+            .with(INBOX, |b| b.set_flags(id, false, true));
+    }
+    cached.refused("CHANGEDSINCE", "BAD", false).await;
+    cached.stand_in.take_tally();
+    cached.sync().await.unwrap();
+    assert!(cached.stand_in.take_tally().asked("CHANGEDSINCE"));
+    for id in changed {
+        let m = message(&cached.store, id);
+        assert!(m.unread && m.pinned, "{id}");
+    }
+}
+
+/// A refused fetch of stored mail's headers leaves Reply-To to fetch.
+#[tokio::test]
+async fn a_refused_header_fetch_leaves_reply_to_to_fetch() {
+    let mut cached = Cached::old(false).await;
+    cached.refused("HEADER.FIELDS", "NO", false).await;
+    let report = cached.sync().await.unwrap();
+    assert_eq!(report.headers, TRACKED as usize);
+    assert!(cached.state.reply_to_fetched);
+    assert_eq!(
+        message(&cached.store, ON_SERVER).reply_to,
+        [format!("Desk <desk{ON_SERVER}@x.test>")]
+    );
+}
+
+/// Reaching back past UIDs a refused search didn't list neither passes
+/// them nor takes the inbox for complete.
+#[tokio::test]
+async fn a_refused_search_below_the_floor_reaches_back_no_further() {
+    let mut cached = Cached::synced(false).await;
+    cached.refused("UID SEARCH UID", "NO", true).await;
+    assert_eq!(cached.older().await.unwrap(), OLDER_STEP);
+    let oldest_tracked = ON_SERVER - TRACKED + 1;
+    assert_eq!(
+        cached.state.floor,
+        Some((oldest_tracked - OLDER_STEP as u32) * SPACING)
+    );
+    assert!(!cached.state.complete);
+}
+
+/// Mail whose body fetch is refused isn't passed by reaching back.
+#[tokio::test]
+async fn a_refused_body_fetch_drops_no_mail() {
+    let mut cached = Cached::synced(false).await;
+    cached.refused("BODY.PEEK[]", "NO", true).await;
+    assert_eq!(cached.older().await.unwrap(), OLDER_STEP);
+    assert_eq!(cached.in_inbox(), TRACKED as usize + OLDER_STEP);
+    let oldest_tracked = ON_SERVER - TRACKED + 1;
+    assert_eq!(
+        cached.state.floor,
+        Some((oldest_tracked - OLDER_STEP as u32) * SPACING)
     );
 }

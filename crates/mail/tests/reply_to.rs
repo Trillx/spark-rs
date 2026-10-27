@@ -219,6 +219,8 @@ async fn cached_imap_mail_gains_reply_to_without_downloading_the_body() {
             commands.push(command.to_owned());
             let data = if command.starts_with("LOGIN ") {
                 String::new()
+            } else if command == "CAPABILITY" {
+                "* CAPABILITY IMAP4rev1\r\n".into()
             } else if command.starts_with("SELECT ") {
                 "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n* OK [UIDNEXT 2] next\r\n".into()
             } else if command == "FETCH 1 (UID)" {
