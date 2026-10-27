@@ -198,6 +198,37 @@ export function replaceText(html: string, [start, end]: [number, number], text: 
   return root.innerHTML;
 }
 
+/** A template placeholder as the editor holds it: a chip with its label, typed over to fill it. */
+export function placeholderHtml(kind: string, label: string) {
+  const name = escapeHtml(label);
+  return `<span data-placeholder="${escapeHtml(kind)}" data-label="${name}" contenteditable="false">${name}</span>`;
+}
+
+/** A template's HTML with the placeholders that have a value written in; the others stay to be filled. */
+export function fillPlaceholders(html: string, values: Partial<Record<string, string>>) {
+  const doc = new DOMParser().parseFromString("<!doctype html><body></body>", "text/html");
+  doc.body.innerHTML = html;
+  for (const chip of doc.body.querySelectorAll<HTMLElement>("span[data-placeholder]")) {
+    const value = values[chip.dataset.placeholder ?? ""]?.trim();
+    if (value) chip.replaceWith(value);
+    else chip.setAttribute("contenteditable", "false");
+  }
+  return doc.body.innerHTML;
+}
+
+/** Whether a body still has placeholders to fill. */
+export function hasPlaceholders(html: string | undefined) {
+  return /\bdata-placeholder=/.test(html ?? "");
+}
+
+/** A body with its unfilled placeholders taken out, and its text: what "Send Anyway" sends. */
+export function dropPlaceholders(html: string) {
+  const doc = new DOMParser().parseFromString("<!doctype html><body></body>", "text/html");
+  doc.body.innerHTML = html;
+  for (const chip of doc.body.querySelectorAll("span[data-placeholder]")) chip.remove();
+  return { html: doc.body.innerHTML, text: bodyText(doc.body) };
+}
+
 /**
  * Plain text as the editor's HTML: a line to a `<div>`, as the editor writes them, with its
  * runs of spaces kept (HTML would show them as one).

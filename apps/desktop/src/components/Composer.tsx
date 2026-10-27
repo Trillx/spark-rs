@@ -4,6 +4,7 @@ import {
   ChevronsUpDown,
   CircleCheck,
   ImageDown,
+  LayoutTemplate,
   Maximize2,
   Minimize2,
   Paperclip,
@@ -23,13 +24,25 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import { describeFiles, getPrefs, onFileDrag, pickFiles, readImage, resolveSignature, type DragPoint } from "../api";
-import type { Contact, LocalFile, Signature } from "../types";
+import {
+  describeFiles,
+  getPrefs,
+  listTemplates,
+  onFileDrag,
+  pickFiles,
+  readImage,
+  resolveSignature,
+  suggestContacts,
+  templateUsed,
+  type DragPoint,
+} from "../api";
+import type { Contact, LocalFile, Signature, Template } from "../types";
 import type { Draft } from "../lib/composeDraft";
 import { useAccounts } from "../lib/accounts";
 import { entryFor, joinAddresses, parseEntry, splitAddresses } from "../lib/addresses";
 import { formatBytes, formatLater, laterPresets, pickLater, presetDetail } from "../lib/format";
-import { IMAGE_SIZES, textToHtml, type ImageSize } from "../lib/richText";
+import { IMAGE_SIZES, fillPlaceholders, textToHtml, type ImageSize } from "../lib/richText";
+import { placeholderValues, recentTemplates } from "../lib/templates";
 import { IS_MAC } from "../lib/shortcuts";
 import AiMark from "./AiMark";
 import AiMenu, { type AiRequest } from "./AiMenu";
@@ -47,6 +60,7 @@ export { emptyDraft, draftHasContent, draftKey, outgoingDraft, savedDraft, type 
 /** What mail servers take; the Rust side refuses more. */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const ATTACH_KEYS = IS_MAC ? "⇧⌘A" : "Ctrl+Shift+A";
+const TEMPLATE_KEYS = IS_MAC ? "⇧⌘T" : "Ctrl+Shift+T";
 /** How many people an @mention suggests, as in Spark. */
 const MENTION_SUGGESTIONS = 6;
 
@@ -101,6 +115,8 @@ export default function Composer({
   onSend,
   onError,
   onSignatureSettings,
+  onTemplateFromDraft,
+  onTemplateSettings,
   ai,
 }: {
   draft: Draft;
@@ -118,9 +134,14 @@ export default function Composer({
   onError: (text: string) => void;
   /** Settings → Signatures. */
   onSignatureSettings: () => void;
+  /** Spark's "Create a New Template from draft": Settings → Templates, with this email in a new one. */
+  onTemplateFromDraft: () => void;
+  /** Settings → Templates. */
+  onTemplateSettings: () => void;
   /** While AI writes the body, it's read-only and can't be sent. */
   ai?: ComposerAi;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const recipientsRef = useRef<RecipientsHandle>(null);
   const editorRef = useRef<RichEditorHandle>(null);
   const quoteRef = useRef<HTMLTextAreaElement>(null);
@@ -133,6 +154,14 @@ export default function Composer({
   // File drops arrive through a listener set up once; it reads these.
   const latest = useRef({ draft, onChange });
   latest.current = { draft, onChange };
+  /** Unmounted: another email has the composer (it's keyed by session). */
+  const closed = useRef(false);
+  useEffect(() => {
+    closed.current = false;
+    return () => {
+      closed.current = true;
+    };
+  }, []);
 
   function addFiles(files: LocalFile[]) {
     const { draft: current, onChange: change } = latest.current;
@@ -195,6 +224,33 @@ export default function Composer({
     window.setTimeout(() => signatureRef.current?.focus(), 50);
   }
 
+  // Templates, read again each time the menu opens: they're edited in Settings.
+  const [templates, setTemplates] = useState<Template[] | null>(null);
+  function loadTemplates() {
+    listTemplates().then(setTemplates, (error) => onError(String(error)));
+  }
+
+  /**
+   * Puts a template in at the caret, its placeholders filled in where the names are known (the
+   * first recipient's from To or, for a bare address, their contact); its subject too if there's none.
+   */
+  async function applyTemplate(t: Template) {
+    const first = splitAddresses(draft.to)[0];
+    const entry = first ? parseEntry(first) : null;
+    const mine = account?.name ?? "";
+    let name = entry?.name ?? "";
+    if (entry && !name) {
+      const contacts = await suggestContacts(entry.address).catch(() => []);
+      name = contacts.find((c) => c.address.toLowerCase() === entry.address.toLowerCase())?.name ?? "";
+      // This composer may be gone by now, with another email open.
+      if (closed.current) return;
+    }
+    editorRef.current?.insertHtml(fillPlaceholders(t.html, placeholderValues(name, mine)));
+    const { draft: now, onChange: change } = latest.current;
+    if (!now.subject.trim() && t.subject) change({ subject: t.subject });
+    void templateUsed(t.id).catch(() => {});
+  }
+
   // Replies arrive with a recipient, so they start in the body; anything else starts in To.
   const [startInTo] = useState(() => !draft.to);
 
@@ -220,6 +276,9 @@ export default function Composer({
     } else if (mod && e.shiftKey && (key === "c" || key === "b")) {
       e.preventDefault();
       recipientsRef.current?.focus(key === "c" ? "cc" : "bcc");
+    } else if (mod && e.shiftKey && key === "t") {
+      e.preventDefault();
+      rootRef.current?.querySelector<HTMLButtonElement>("[data-templates] button")?.click();
     }
   }
 
@@ -328,6 +387,7 @@ export default function Composer({
 
   return (
     <div
+      ref={rootRef}
       data-composer
       role="dialog"
       aria-label={draft.title}
@@ -605,6 +665,41 @@ export default function Composer({
         >
           <Paperclip size={17} />
         </IconButton>
+        <span data-templates className="contents">
+          <Dropdown
+            direction="up"
+            width="w-72"
+            trigger={({ toggle, open }) => (
+              <IconButton
+                title={{ label: "Use a Template", keys: TEMPLATE_KEYS }}
+                active={open}
+                onClick={() => {
+                  if (!open) loadTemplates();
+                  toggle();
+                }}
+              >
+                <LayoutTemplate size={17} />
+              </IconButton>
+            )}
+          >
+            {templates && templates.length > 0 && recentTemplates(templates).length > 0 && (
+              <>
+                <li className="menu-title px-2 py-1 text-[11px]">Recent</li>
+                {recentTemplates(templates).map((t) => (
+                  <MenuItem key={`recent-${t.id}`} label={t.name} detail={t.subject || undefined} onSelect={() => void applyTemplate(t)} />
+                ))}
+              </>
+            )}
+            <li className="menu-title px-2 py-1 text-[11px]">My Templates</li>
+            {templates?.length === 0 && <li className="px-2 py-1 text-xs text-text-2">No templates yet</li>}
+            {templates?.map((t) => (
+              <MenuItem key={t.id} label={t.name} detail={t.subject || undefined} onSelect={() => void applyTemplate(t)} />
+            ))}
+            <li role="none" className="my-0.5 h-px bg-hairline" />
+            <MenuItem label="Create a New Template from draft" onSelect={onTemplateFromDraft} />
+            <MenuItem label="Edit Templates…" onSelect={onTemplateSettings} />
+          </Dropdown>
+        </span>
         <Dropdown
           direction="up"
           width="w-64"

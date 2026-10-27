@@ -11,18 +11,27 @@ mod demo;
 mod files;
 mod live;
 mod mailbox;
+mod mailto;
 mod meetings;
 mod notify;
 mod prefs;
 mod secrets;
 mod signatures;
+mod templates;
 mod updates;
 
 use tauri::Manager;
 
+/// The uninstaller asks to delete saved passwords too, when the user
+/// deletes their data: that flag alone. An email link's launch carries
+/// arguments whoever made the link wrote (Windows passes it on unescaped), so
+/// the flag among others doesn't count.
+fn forget_requested(args: &[String]) -> bool {
+    matches!(args, [_, flag] if flag == "--forget-saved-passwords")
+}
+
 fn main() {
-    // From the uninstaller, when the user asks to delete their data too.
-    if std::env::args().any(|arg| arg == "--forget-saved-passwords") {
+    if forget_requested(&std::env::args().collect::<Vec<_>>()) {
         if let Err(error) = secrets::forget_all() {
             eprintln!("spark-rs: couldn't remove saved passwords: {error}");
             std::process::exit(1);
@@ -30,13 +39,20 @@ fn main() {
         return;
     }
     tauri::Builder::default()
-        // First, so a second launch only brings this one's window forward.
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            background::second_launch(app, args)
-        }))
+        .manage(mailto::Pending::default())
+        // First, so a second launch only brings this one's window forward,
+        // with the email link it was given, if any.
+        .plugin(tauri_plugin_single_instance::init(
+            |app, args, _cwd| match mailto::link_in(&args) {
+                Some(link) => mailto::received(app, link),
+                None => background::second_launch(app, args),
+            },
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             files::clear_opened();
+            mailto::started_with(app.handle());
+            mailto::refresh();
             let config_dir = app.path().app_config_dir()?;
             app.manage(prefs::PrefsState::load(config_dir.clone()));
             app.manage(meetings::Meetings::default());
@@ -126,6 +142,11 @@ fn main() {
             signatures::delete_signature,
             signatures::set_default_signature,
             signatures::resolve_signature,
+            templates::list_templates,
+            templates::save_template,
+            templates::delete_template,
+            templates::order_templates,
+            templates::template_used,
             mailbox::open_external,
             mailbox::open_attachment,
             mailbox::save_attachment,
@@ -134,6 +155,9 @@ fn main() {
             mailbox::pick_files,
             mailbox::describe_files,
             mailbox::read_image,
+            mailto::take_mailto,
+            mailto::mail_app,
+            mailto::make_default_mail_app,
             ai::get_ai_settings,
             ai::save_ai_settings,
             ai::test_ai_connection,
@@ -160,4 +184,26 @@ fn main() {
                 agents::stopped(app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_uninstaller_can_forget_passwords() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert!(forget_requested(&args(&[
+            "spark.exe",
+            "--forget-saved-passwords"
+        ])));
+        // A link that slips the flag in, as `"%1"` lets it.
+        assert!(!forget_requested(&args(&[
+            "spark.exe",
+            "mailto:a@x.com",
+            "--forget-saved-passwords",
+            "",
+        ])));
+        assert!(!forget_requested(&args(&["spark.exe"])));
+    }
 }

@@ -101,6 +101,7 @@ import {
   listReminders,
   listScheduled,
   getInlineImages,
+  onMailto,
   openDraft,
   patched,
   prioritizeSenders,
@@ -119,6 +120,7 @@ import {
   setSenderCategory,
   syncFolders,
   syncNow,
+  takeMailto,
   trustCertificate,
   undoPrioritize,
   unscheduleSend,
@@ -146,6 +148,7 @@ import MessageList, { Splitter, type GatekeeperActions } from "./components/Mess
 import type { CardSettings } from "./components/SmartInboxCard";
 import type { RowActions } from "./components/MessageRow";
 import Settings, { type SettingsPage } from "./components/Settings";
+import type { TemplateDraft } from "./components/TemplatesPage";
 import { useUpdates } from "./lib/updates";
 import Sidebar, { type SidebarActions, type SidebarMode } from "./components/Sidebar";
 import { reduceSummary, startSummary, type SummaryState } from "./components/SummaryCard";
@@ -267,7 +270,8 @@ import {
   shortcutLabel,
   type ActionId,
 } from "./lib/shortcuts";
-import { htmlText, replaceText, resendHtml, textToHtml } from "./lib/richText";
+import { parseMailto } from "./lib/mailto";
+import { dropPlaceholders, hasPlaceholders, htmlText, replaceText, resendHtml, textToHtml } from "./lib/richText";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import { forgetSearch, loadRecentSearches, rememberSearch, useSearchHits, useServerSearch } from "./lib/search";
 import { stepZoom } from "./lib/zoom";
@@ -325,6 +329,9 @@ interface Confirm {
   title: string;
   message: string;
   confirmLabel: string;
+  cancelLabel?: string;
+  /** The composer session it's about: it closes when that one does. */
+  session?: number;
   danger?: boolean;
   run: () => Promise<void> | void;
 }
@@ -340,7 +347,10 @@ interface PickTime {
   run: (at: number) => Promise<void> | void;
 }
 
-type AppPrefs = Pick<Prefs, "badge" | "badgeExcluded" | "undoSendSeconds" | "sendAndDone" | "autoCc" | "autoBcc">;
+type AppPrefs = Pick<
+  Prefs,
+  "badge" | "badgeExcluded" | "undoSendSeconds" | "sendAndDone" | "replyAttachments" | "autoCc" | "autoBcc"
+>;
 
 /** Until the saved settings load: the Rust side's defaults. */
 const DEFAULT_APP_PREFS: AppPrefs = {
@@ -348,6 +358,7 @@ const DEFAULT_APP_PREFS: AppPrefs = {
   badgeExcluded: [],
   undoSendSeconds: 5,
   sendAndDone: false,
+  replyAttachments: "never",
   autoCc: {},
   autoBcc: {},
 };
@@ -504,6 +515,8 @@ export default function App() {
   const [summaries, setSummaries] = useState<ReadonlyMap<number, SummaryState>>(new Map());
   const summaryRun = useRef(0);
   const [settingsPage, setSettingsPage] = useState<SettingsPage | null>(null);
+  /** A template made from the open draft, for Settings → Templates to start with. */
+  const [newTemplate, setNewTemplate] = useState<TemplateDraft | null>(null);
   const [gatekeeperMode, setGatekeeperMode] = useState<GatekeeperMode>("beforeInbox");
   /** The calendar shows in place of the list and the reader. */
   const [calendarOpen, setCalendarOpen] = useState(false);
@@ -845,8 +858,8 @@ export default function App() {
       () => {},
     );
     void getPrefs().then(
-      ({ badge, badgeExcluded, undoSendSeconds, sendAndDone, autoCc, autoBcc }) =>
-        setAppPrefs({ badge, badgeExcluded, undoSendSeconds, sendAndDone, autoCc, autoBcc }),
+      ({ badge, badgeExcluded, undoSendSeconds, sendAndDone, replyAttachments, autoCc, autoBcc }) =>
+        setAppPrefs({ badge, badgeExcluded, undoSendSeconds, sendAndDone, replyAttachments, autoCc, autoBcc }),
       () => {},
     );
     reloadPlanned();
@@ -855,6 +868,49 @@ export default function App() {
   useEffect(() => {
     void setBadge(badge, badge > 0 ? badgeIcon(badge) : null).catch(() => {});
   }, [badge]);
+
+  // Email links (mailto:) open a new email: the one spark-rs was started with, and any after,
+  // once the accounts to send from are known.
+  const latestCompose = useRef(compose);
+  latestCompose.current = compose;
+  const latestSend = useRef(send);
+  latestSend.current = send;
+
+  // A question about one email goes once its composer closes or another opens.
+  const composing = draft !== null;
+  useEffect(() => {
+    setConfirm((c) => (c?.session !== undefined && (c.session !== composerKey || !composing) ? null : c));
+  }, [composerKey, composing]);
+  const accountsKnown = accounts.length > 0;
+  useEffect(() => {
+    if (!accountsKnown) return;
+    const open = () =>
+      void takeMailto().then((link) => {
+        const m = link ? parseMailto(link) : null;
+        if (!m) return;
+        latestCompose.current({
+          to: m.to,
+          cc: m.cc,
+          showCc: m.cc !== "",
+          bcc: m.bcc,
+          showBcc: m.bcc !== "",
+          subject: m.subject,
+          body: m.body,
+        });
+      }, () => {});
+    // Listening first, so a link that comes in meanwhile isn't missed; then the one waiting.
+    let stop: (() => void) | null = null;
+    let gone = false;
+    void onMailto(open).then((unlisten) => {
+      if (gone) return unlisten();
+      stop = unlisten;
+      open();
+    });
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  }, [accountsKnown]);
 
   // Rows that left the list leave the selection.
   useEffect(() => {
@@ -2069,6 +2125,12 @@ export default function App() {
       showToast("Add at least one recipient");
       return;
     }
+    // Placeholders nobody filled in: in the composer, where Send asks about them.
+    if (hasPlaceholders(d.bodyHtml)) {
+      openComposer(d, draftKey(d));
+      showToast("This email has empty placeholders");
+      return;
+    }
     moveOffMessages([m.id]);
     let id: number;
     try {
@@ -2424,7 +2486,7 @@ export default function App() {
   const fromYou = (m: Message) => isFromYou(m, accounts.find((a) => a.id === m.account));
 
   /** To Reply-To (or From); on sent mail, follow up with its recipients. */
-  const reply = (m: Message) =>
+  function reply(m: Message) {
     compose({
       title: "Reply",
       to: replyRecipients(m, accounts.find((a) => a.id === m.account)?.email).to.join(", "),
@@ -2433,6 +2495,49 @@ export default function App() {
       replyTo: m.id,
       doneAfter: appPrefs.sendAndDone,
     });
+    withReplied(m);
+  }
+
+  /**
+   * Spark's Attachments with Replies: the files of the email being answered
+   * go in the reply too, always or when you say so. They're added once the
+   * list is read, unless the composer has moved on to another email.
+   */
+  function withReplied(m: Message) {
+    if (appPrefs.replyAttachments === "never" || !m.attachment) return;
+    // The reply just opened; another composer by then isn't this one's to change.
+    const session = composer.current.key;
+    const current = () => composer.current.key === session && composer.current.draft !== null;
+    void loadContent(m.id).then((content) => {
+      if (!current()) return;
+      const files = (content?.attachments ?? []).map((a, index) => ({
+        kind: "message" as const,
+        message: m.id,
+        index,
+        name: a.name,
+        size: a.size,
+      }));
+      if (!files.length) return;
+      const add = () =>
+        setDraft((d) => {
+          if (!d || !current() || d.replyTo !== m.id || d.forward) return d;
+          const fresh = files.filter(
+            (f) => !d.attachments.some((a) => a.kind === "message" && a.message === f.message && a.index === f.index),
+          );
+          return { ...d, attachments: [...d.attachments, ...fresh] };
+        });
+      if (appPrefs.replyAttachments === "always") return add();
+      setConfirm({
+        title: files.length === 1 ? "Include the attachment?" : "Include the attachments?",
+        message: `The email you're replying to has ${plural(files.length, "attachment")}: ${files.map((f) => f.name).join(", ")}.`,
+        confirmLabel: "Include",
+        cancelLabel: "Don't Include",
+        danger: false,
+        session,
+        run: add,
+      });
+    }, () => {});
+  }
 
   /** A quick-reply chip: a reply your AI provider writes, or without one set up, a stock line. */
   function quickReply(m: Message, chip: QuickReply) {
@@ -2578,6 +2683,7 @@ export default function App() {
       replyTo: m.id,
       doneAfter: appPrefs.sendAndDone,
     });
+    withReplied(m);
   }
 
   async function forward(m: Message) {
@@ -2641,19 +2747,42 @@ export default function App() {
    * Queues the message to go out when the undo window ends (or at the Send
    * Later time). Undo cancels it in the outbox and reopens the composer.
    */
-  async function send() {
+  async function send(anyway = false) {
     if (!draft || writing?.status === "writing") return;
     // Cc or Bcc alone will do, as for a mailing list sent in Bcc.
     if (![draft.to, draft.cc, draft.bcc].some((field) => field.trim())) {
       showToast("Add at least one recipient");
       return;
     }
+    // A template's placeholders nobody filled in: Spark asks, and they're left out.
+    const unfilled = hasPlaceholders(draft.bodyHtml);
+    if (unfilled && !anyway) {
+      const asked = composerKey;
+      setConfirm({
+        title: "An empty placeholder",
+        message: "This email has empty placeholders. Send it anyway?",
+        confirmLabel: "Send Anyway",
+        cancelLabel: "Edit Placeholder",
+        danger: false,
+        session: asked,
+        // The email as it is then, if it's still the one asked about.
+        run: () => {
+          if (composer.current.key === asked) void latestSend.current(true);
+        },
+      });
+      return;
+    }
+    const filled = unfilled ? dropPlaceholders(draft.bodyHtml!) : null;
     const session = composerKey;
     const repliedTo = draft.doneAfter ? messages.find((m) => m.id === draft.replyTo && m.state !== "done") : undefined;
     setDraft(null);
     const undoDone = repliedTo ? apply([repliedTo], () => ({ state: "done" })) : undefined;
     // A saved draft goes with it: deleted once it's sent, back in Drafts on Undo.
-    const sent = { ...draft, draftId: await savedDraftId(draft, session) };
+    const sent = {
+      ...draft,
+      ...(filled && { body: filled.text, bodyHtml: filled.html }),
+      draftId: await savedDraftId(draft, session),
+    };
     let id: number;
     try {
       id = await sendMessage(outgoingDraft(sent, sent.sendLater?.at ?? Date.now() + undoMs));
@@ -3678,9 +3807,19 @@ export default function App() {
             onToggleFull={() => setComposerFull((f) => !f)}
             onClose={() => void closeComposer()}
             onDiscard={() => void discardComposer()}
-            onSend={send}
+            onSend={() => void send()}
             onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
             onSignatureSettings={() => openSettings("signatures")}
+            onTemplateFromDraft={() => {
+              setNewTemplate({
+                id: null,
+                name: draft.subject.trim(),
+                subject: draft.subject.trim(),
+                html: draft.bodyHtml ?? textToHtml(draft.body),
+              });
+              openSettings("templates");
+            }}
+            onTemplateSettings={() => openSettings("templates")}
             ai={{
               writing: writing?.composer === composerKey ? writing : null,
               quickReplies: draftReference(draft)?.relation === "reply",
@@ -3747,6 +3886,8 @@ export default function App() {
         {settingsPage && (
           <Settings
             updates={updates}
+            newTemplate={newTemplate}
+            onNewTemplateTaken={() => setNewTemplate(null)}
             page={settingsPage}
             onPage={(page) => {
               lastSettingsPage.current = page;
@@ -3787,6 +3928,7 @@ export default function App() {
             title={confirm.title}
             message={confirm.message}
             confirmLabel={confirm.confirmLabel}
+            cancelLabel={confirm.cancelLabel}
             danger={confirm.danger}
             onConfirm={confirm.run}
             onClose={() => setConfirm(null)}

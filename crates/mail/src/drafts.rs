@@ -444,7 +444,7 @@ pub fn mime(
             references.join(" "),
         ));
     }
-    let built = draft.bodies(None, None).build(builder, files);
+    let built = draft.draft_bodies(None).build(builder, files);
     Ok(built.map_err(|e| invalid(&e))?.formatted())
 }
 
@@ -1091,6 +1091,32 @@ mod tests {
         assert_eq!(
             (parts.body.as_str(), parts.body_html.as_deref()),
             ("Hi Bo", Some("<div>Hi <b>Bo</b></div>"))
+        );
+        // A template's placeholders stay for the composer to show.
+        let template = Draft {
+            body_html: Some(
+                r#"<div>Hi <span data-placeholder="custom" data-label="Company">Company</span></div>"#
+                    .into(),
+            ),
+            ..rich.clone()
+        };
+        let raw = mime(from.clone(), &template, "d3@x.com", None, &[]).unwrap();
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        let text = parsed.body_text(0).unwrap().replace("\r\n", "\n");
+        let parts = stored_parts(&store, &text, parsed.body_html(0).as_deref()).unwrap();
+        assert_eq!(
+            parts.body_html.as_deref(),
+            Some(
+                r#"<div>Hi <span data-placeholder="custom" data-label="Company">Company</span></div>"#
+            )
+        );
+        assert!(
+            !template
+                .bodies(None, None)
+                .html
+                .unwrap()
+                .contains("data-placeholder"),
+            "sent mail goes without them"
         );
         // With a signature, the body is still its own section.
         let signed = Draft {

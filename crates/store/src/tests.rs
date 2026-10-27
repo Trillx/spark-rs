@@ -3230,3 +3230,53 @@ fn only_the_address_mail_went_to_counts_not_one_in_its_name() {
     assert!(arrive(&mut store, account, 8, "ann@old-vendor.org").screening);
     assert!(!arrive(&mut store, account, 9, "ann@new-vendor.org").screening);
 }
+
+#[test]
+fn templates_keep_their_order_and_note_when_they_were_used() {
+    let mut store = Store::open_in_memory().unwrap();
+    let new = |name| NewTemplate {
+        name,
+        subject: "",
+        html: "<div>Hi</div>",
+        text: "Hi",
+    };
+    let a = store.add_template(new("Thanks")).unwrap();
+    let b = store
+        .add_template(NewTemplate {
+            subject: "Intro",
+            ..new("Intro")
+        })
+        .unwrap();
+    let c = store.add_template(new("Follow up")).unwrap();
+    let names = |store: &Store| -> Vec<String> {
+        store
+            .templates()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+    assert_eq!(names(&store), ["Thanks", "Intro", "Follow up"]);
+    store.order_templates(&[c.id, a.id]).unwrap();
+    assert_eq!(names(&store), ["Follow up", "Thanks", "Intro"]);
+    assert!(
+        store
+            .update_template(
+                b.id,
+                NewTemplate {
+                    name: "Introduction",
+                    ..new("")
+                }
+            )
+            .unwrap()
+    );
+    store.template_used(b.id, 5).unwrap();
+    let b = store.template(b.id).unwrap().unwrap();
+    assert_eq!(
+        (b.name.as_str(), b.subject.as_str(), b.used_at),
+        ("Introduction", "", Some(5))
+    );
+    store.remove_template(a.id).unwrap();
+    assert!(!store.update_template(a.id, new("Gone")).unwrap());
+    assert_eq!(names(&store), ["Follow up", "Introduction"]);
+}

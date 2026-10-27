@@ -248,6 +248,19 @@ makes them Small, Medium or Large. Typing @ and a name links the person and
 adds them to To; Undo takes them off again. A reply quotes the original
 with its formatting.
 
+Templates are in Settings → Templates, and the template button in the
+composer (or Ctrl+Shift+T) puts one in, under Recent once you've used it.
+Placeholders fill in the first recipient's name and yours; a custom one
+stays highlighted until you click it and type, and Send asks first if any
+are left. "Create a New Template from draft" starts one from what you're
+writing. Settings → Composer → Attachments with Replies makes replies take
+the original's files always, never, or when you say so.
+
+Make Default under Settings → Composer → Default email app registers
+spark-rs as an email app, and Windows' Default apps opens for you to choose
+it. Email links (`mailto:`) then start a new email in spark-rs, with the
+addresses, subject and text they carry.
+
 Signatures are in Settings → Signatures, where you write them or paste one
 in (or edit the HTML). Each address starts new mail with its default: Most
 recent (the signature last sent from it), No signature, or a particular one.

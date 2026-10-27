@@ -1398,7 +1398,7 @@ impl Graph {
         draft: &Draft,
         files: &[AttachmentData],
     ) -> Result<(String, Option<String>)> {
-        let bodies = draft.bodies(None, Some(OUTLOOK_BODY));
+        let bodies = draft.draft_bodies(Some(OUTLOOK_BODY));
         let message = draft_message(draft, &bodies);
         let update = update.filter(|_| bodies.images.is_empty());
         if let Some(id) = update {

@@ -39,6 +39,7 @@ import type {
   SenderStatus,
   Signature,
   SignaturesView,
+  Template,
   DefaultSignature,
   SyncStatusEvent,
   Unsubscribed,
@@ -535,6 +536,30 @@ export function onFileDrag(handler: (e: FileDrag) => void): () => void {
   return () => void stop.then((unlisten) => unlisten());
 }
 
+/** The `mailto:` link spark-rs was opened with, if the window hasn't taken it yet. */
+export function takeMailto(): Promise<string | null> {
+  if (isTauri()) return invoke("take_mailto");
+  return Promise.resolve(null);
+}
+
+/** A `mailto:` link arrived while spark-rs runs: `takeMailto` has it. Resolves to the unsubscribe once it's listening. */
+export function onMailto(handler: () => void): Promise<() => void> {
+  if (!isTauri()) return Promise.resolve(() => {});
+  return listen("mailto", handler);
+}
+
+/** Whether spark-rs can be, and is, the computer's email app. */
+export function mailApp(): Promise<{ supported: boolean; default: boolean }> {
+  if (isTauri()) return invoke("mail_app");
+  return Promise.resolve({ supported: false, default: false });
+}
+
+/** Registers spark-rs as an email app and opens Windows' Default apps to choose it. */
+export function makeDefaultMailApp(): Promise<void> {
+  if (isTauri()) return invoke("make_default_mail_app");
+  return Promise.reject("Run the desktop app on Windows to make it your email app.");
+}
+
 /** A picture file dropped on the composer's body, as a data URL. */
 export function readImage(path: string): Promise<string> {
   if (isTauri()) return invoke("read_image", { path });
@@ -782,6 +807,60 @@ export function deleteSignature(id: number): Promise<void> {
   if (isTauri()) return invoke("delete_signature", { id });
   browserSignatures = browserSignatures.filter((x) => x.id !== id);
   for (const [address, d] of browserSignatureDefaults) if (d.type === "custom" && d.id === id) browserSignatureDefaults.delete(address);
+  return Promise.resolve();
+}
+
+// ---- templates ----
+
+/** Templates in the user's order. */
+export function listTemplates(): Promise<Template[]> {
+  if (isTauri()) return invoke("list_templates");
+  return Promise.resolve(structuredClone(browserTemplates));
+}
+
+/** Saves template `id`, or a new one with null; returns it as kept. */
+export function saveTemplate(id: number | null, name: string, subject: string, html: string): Promise<Template> {
+  if (isTauri()) return invoke("save_template", { id, name, subject, html });
+  if (!name.trim()) return Promise.reject("Give the template a name.");
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  for (const el of doc.querySelectorAll("script, style, iframe, object, embed, form, input, button, link, meta")) el.remove();
+  for (const el of doc.body.querySelectorAll("*")) {
+    for (const attr of [...el.attributes]) if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+  }
+  const clean = doc.body.innerHTML.trim();
+  const text = htmlText(clean);
+  if (!text && !clean.includes("<img")) return Promise.reject("Write the template first.");
+  const old = browserTemplates.find((t) => t.id === id);
+  const saved: Template = {
+    ...old,
+    id: id ?? Math.max(0, ...browserTemplates.map((t) => t.id)) + 1,
+    name: name.trim(),
+    subject: subject.trim(),
+    html: clean,
+    text,
+  };
+  browserTemplates = old ? browserTemplates.map((t) => (t.id === id ? saved : t)) : [...browserTemplates, saved];
+  return Promise.resolve(structuredClone(saved));
+}
+
+export function deleteTemplate(id: number): Promise<void> {
+  if (isTauri()) return invoke("delete_template", { id });
+  browserTemplates = browserTemplates.filter((t) => t.id !== id);
+  return Promise.resolve();
+}
+
+/** Puts the templates in the order of `ids`. */
+export function orderTemplates(ids: number[]): Promise<void> {
+  if (isTauri()) return invoke("order_templates", { ids });
+  const rank = (t: Template) => (ids.includes(t.id) ? ids.indexOf(t.id) : ids.length);
+  browserTemplates = [...browserTemplates].sort((a, b) => rank(a) - rank(b));
+  return Promise.resolve();
+}
+
+/** A template was applied: it comes first under Recent. */
+export function templateUsed(id: number): Promise<void> {
+  if (isTauri()) return invoke("template_used", { id });
+  browserTemplates = browserTemplates.map((t) => (t.id === id ? { ...t, usedAt: Date.now() } : t));
   return Promise.resolve();
 }
 
@@ -1062,6 +1141,9 @@ const browserDrafts = new Map<number, OutgoingDraft>();
 /** Drafts out of Drafts while their send can be undone, by outbox id. */
 const browserSending = new Map<number, Message>();
 
+/** Templates in the preview, in order. */
+let browserTemplates: Template[] = [];
+
 /** Signatures in the preview; defaults and the last one sent, by lowercased address. */
 let browserSignatures: Signature[] = [];
 const browserSignatureDefaults = new Map<string, DefaultSignature>();
@@ -1122,6 +1204,7 @@ let browserPrefs: Prefs = {
   suggestRecipients: true,
   undoSendSeconds: 5,
   sendAndDone: false,
+  replyAttachments: "never",
   autoCc: {},
   autoBcc: {},
 };

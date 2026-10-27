@@ -43,6 +43,16 @@ pub enum Badge {
     Off,
 }
 
+/// Spark's Attachments with Replies: whether a reply takes the original's files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReplyAttachments {
+    #[default]
+    Never,
+    Ask,
+    Always,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Prefs {
@@ -55,6 +65,7 @@ pub struct Prefs {
     pub undo_send_seconds: u32,
     /// Replies start with "Mark as Done after sending" on.
     pub send_and_done: bool,
+    pub reply_attachments: ReplyAttachments,
     /// Addresses every new message from an account gets in Cc and Bcc, by account id.
     pub auto_cc: BTreeMap<i64, String>,
     pub auto_bcc: BTreeMap<i64, String>,
@@ -95,6 +106,7 @@ impl Default for Prefs {
             snooze_alert: true,
             undo_send_seconds: 5,
             send_and_done: false,
+            reply_attachments: ReplyAttachments::Never,
             auto_cc: BTreeMap::new(),
             auto_bcc: BTreeMap::new(),
             badge: Badge::New,

@@ -107,6 +107,7 @@ export function ConfirmDialog({
   title,
   message,
   confirmLabel,
+  cancelLabel = "Cancel",
   danger = true,
   onConfirm,
   onClose,
@@ -114,6 +115,8 @@ export function ConfirmDialog({
   title: string;
   message: string;
   confirmLabel: string;
+  /** The other button, which only closes it. */
+  cancelLabel?: string;
   /** Red for what can't be undone; off for a plain "are you sure". */
   danger?: boolean;
   onConfirm: () => Promise<void> | void;
@@ -127,7 +130,7 @@ export function ConfirmDialog({
       {error && <p className="mt-2 text-[13px] text-error">{error}</p>}
       <div className="mt-5 flex justify-end gap-2">
         <button className="btn btn-ghost btn-sm" onClick={onClose}>
-          Cancel
+          {cancelLabel}
         </button>
         <button
           className={`btn btn-sm ${danger ? "btn-error" : "btn-primary"}`}

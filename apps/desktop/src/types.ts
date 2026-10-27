@@ -235,6 +235,8 @@ export interface Prefs {
   undoSendSeconds: number;
   /** Replies start with "Mark as Done after sending" on. */
   sendAndDone: boolean;
+  /** Spark's Attachments with Replies: whether a reply takes the original's files. */
+  replyAttachments: "never" | "ask" | "always";
   /** Addresses every new message from an account gets in Cc and Bcc, by account id. */
   autoCc: Record<string, string>;
   autoBcc: Record<string, string>;
@@ -457,6 +459,20 @@ export interface Signature {
   html: string;
   /** As plain text, line by line; empty for one that's only an image. */
   text: string;
+}
+
+/** A saved template. Mirrors `Template` on the Rust side. */
+export interface Template {
+  id: number;
+  name: string;
+  /** Can be empty. */
+  subject: string;
+  /** Cleaned HTML, placeholders kept. */
+  html: string;
+  /** The body as plain text. */
+  text: string;
+  /** When it was last applied (Unix ms). */
+  usedAt?: number;
 }
 
 /** Which signature an address starts new mail with. */

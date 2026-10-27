@@ -109,13 +109,20 @@ impl Draft {
     ///
     /// Embedded (`data:`) images become parts of their own.
     pub fn bodies(&self, original: Option<&Original>, body_style: Option<&str>) -> Bodies {
-        self.bodies_with(original, body_style, true)
+        self.bodies_with(original, body_style, true, false)
     }
 
-    /// The draft as it's kept here while it's saved: no reply quote, and the
-    /// images left in its HTML.
+    /// The draft as the Drafts folder keeps it: like [`Draft::bodies`]
+    /// without a reply quote, and with a template's placeholders still in
+    /// it, for the composer to show when it's opened again.
+    pub fn draft_bodies(&self, body_style: Option<&str>) -> Bodies {
+        self.bodies_with(None, body_style, true, true)
+    }
+
+    /// The draft as it's kept here while it's saved: no reply quote, the
+    /// images left in its HTML, and its placeholders kept.
     pub fn saved_bodies(&self) -> Bodies {
-        self.bodies_with(None, None, false)
+        self.bodies_with(None, None, false, true)
     }
 
     fn bodies_with(
@@ -123,8 +130,15 @@ impl Draft {
         original: Option<&Original>,
         body_style: Option<&str>,
         embed: bool,
+        draft: bool,
     ) -> Bodies {
-        let body_html = self.body_html.as_deref().map(signature::sanitize);
+        // Placeholders are for the composer; mail that's sent goes without.
+        let clean = if draft {
+            signature::sanitize_template
+        } else {
+            signature::sanitize
+        };
+        let body_html = self.body_html.as_deref().map(clean);
         let signature = self.clean_signature();
         let original = original.filter(|o| !o.text.trim().is_empty());
         let quoted = original.and_then(|o| o.html.as_deref().map(signature::sanitize_quoted));

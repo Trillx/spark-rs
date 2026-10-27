@@ -49,7 +49,7 @@ Last full check: 2026-10-26.
 | Group by Sender & Domain | ✅ | A sender's or custom domain's mail folds into one row in the Inbox, opening as a list of its own |
 | Smart Folders | ✅ | Save any search as a smart folder; its search can't be edited afterwards |
 | Mute Threads | ✅ | New mail in a muted conversation doesn't notify |
-| Templates | ❌ | |
+| Templates | ✅ | Your own templates with a name, subject and rich text, a Recent section, and placeholders for the recipient's name, yours and custom fill-ins; Send asks if any are left empty. Make one from a draft |
 | Productivity Integrations | ❌ | |
 | Home Screen | ✅ | Opens at launch and after 15 minutes in the background (adjustable), with what came in while you were away, a Priority, People or All preview, and Email Focus times with reminders. Wallpapers are gradients, not photos |
 | CRM Integrations | ❌ | |

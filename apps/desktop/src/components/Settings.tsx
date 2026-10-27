@@ -23,6 +23,7 @@ import {
   House,
   Inbox,
   Info,
+  LayoutTemplate,
   KeyRound,
   LoaderCircle,
   Mail,
@@ -70,6 +71,8 @@ import {
   failureOf,
   getAgents,
   getPrefs,
+  mailApp,
+  makeDefaultMailApp,
   openExternal,
   previewMeetingPopup,
   removeAccount,
@@ -118,12 +121,14 @@ import { CertificateDialog } from "./Dialog";
 import type { Updates } from "../lib/updates";
 import Dropdown, { MenuItem } from "./Dropdown";
 import SignatureFrame, { type SignatureFrameHandle } from "./SignatureFrame";
+import TemplatesPage, { type TemplateDraft } from "./TemplatesPage";
 import { tipAttrs } from "../lib/tooltip";
 
 export type SettingsPage =
   | "accounts"
   | "composer"
   | "signatures"
+  | "templates"
   | "ai"
   | "agents"
   | "home"
@@ -139,6 +144,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
     { key: "accounts", label: "Accounts", Icon: UsersRound },
     { key: "composer", label: "Composer", Icon: SquarePen },
     { key: "signatures", label: "Signatures", Icon: SignatureIcon },
+    { key: "templates", label: "Templates", Icon: LayoutTemplate },
     { key: "ai", label: "AI", Icon: Sparkles },
     { key: "agents", label: "Agents", Icon: Bot },
   ],
@@ -178,6 +184,8 @@ export default function Settings({
   home,
   onHome,
   updates,
+  newTemplate,
+  onNewTemplateTaken,
 }: {
   page: SettingsPage;
   onPage: (page: SettingsPage) => void;
@@ -203,6 +211,9 @@ export default function Settings({
   home: HomeSettings;
   onHome: (settings: HomeSettings) => void;
   updates: Updates;
+  /** A template to start writing on the Templates page (made from a draft). */
+  newTemplate?: TemplateDraft | null;
+  onNewTemplateTaken?: () => void;
 }) {
   const tabRefs = useRef<Partial<Record<SettingsPage, HTMLButtonElement | null>>>({});
   const title = PAGES.find((p) => p.key === page)!.label;
@@ -283,6 +294,7 @@ export default function Settings({
               {page === "accounts" && <AccountsPage onChanged={onAccountsChanged} />}
               {page === "composer" && <ComposerPage />}
               {page === "signatures" && <SignaturesPage />}
+              {page === "templates" && <TemplatesPage start={newTemplate} onStarted={onNewTemplateTaken} />}
               {page === "ai" && <AiPage />}
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "about" && <About updates={updates} />}
@@ -317,7 +329,7 @@ export default function Settings({
 
 // ---- shared rows ----
 
-function Group({ title, children, note }: { title?: string; children: ReactNode; note?: ReactNode }) {
+export function Group({ title, children, note }: { title?: string; children: ReactNode; note?: ReactNode }) {
   return (
     <section className="mb-7">
       {title && <h3 className="mb-2 px-1 text-[13px] font-semibold text-text-2">{title}</h3>}
@@ -382,7 +394,7 @@ function Switch({
   );
 }
 
-const INPUT = "input input-sm h-8 w-64 rounded-lg border-hairline bg-base-100 text-[13px] focus:outline-primary";
+export const INPUT = "input input-sm h-8 w-64 rounded-lg border-hairline bg-base-100 text-[13px] focus:outline-primary";
 
 // ---- Accounts ----
 
@@ -1762,6 +1774,15 @@ const UNDO_SEND_SECONDS = [5, 10, 15, 30, 60];
 function ComposerPage() {
   const { prefs, status, change } = usePrefs();
   const accounts = useAccounts().filter((a) => !a.demo);
+  const [mail, setMail] = useState<{ supported: boolean; default: boolean } | null>(null);
+  const [mailStatus, setMailStatus] = useState<Status>({ kind: "idle" });
+  useEffect(() => {
+    const check = () => void mailApp().then(setMail, () => {});
+    check();
+    // Back from Windows' Default apps, it may be the default now.
+    window.addEventListener("focus", check);
+    return () => window.removeEventListener("focus", check);
+  }, []);
   if (!prefs) return <StatusLine status={status} />;
   const setAuto = (field: "autoCc" | "autoBcc", account: number, value: string) => {
     const next = { ...prefs[field] };
@@ -1797,7 +1818,55 @@ function ComposerPage() {
         >
           <Switch id="send-and-done" on={prefs.sendAndDone} onToggle={() => void change({ sendAndDone: !prefs.sendAndDone })} />
         </Row>
+        <Row
+          label="Attachments with Replies"
+          description="Whether a reply takes the files of the email you answer."
+          htmlFor="reply-attachments"
+        >
+          <select
+            id="reply-attachments"
+            value={prefs.replyAttachments}
+            onChange={(e) => void change({ replyAttachments: e.target.value as Prefs["replyAttachments"] })}
+            className="select select-sm h-8 w-40 rounded-lg border-hairline text-[13px]"
+          >
+            <option value="never">Never include</option>
+            <option value="ask">Ask Every Time</option>
+            <option value="always">Always include</option>
+          </select>
+        </Row>
       </Group>
+      {mail?.supported && (
+        <Group
+          title="Default email app"
+          note="Windows asks you to choose spark-rs for email in its Default apps settings."
+        >
+          <Row label="Open email links in spark-rs" description="Email links (mailto:) start a new email here.">
+            {mail.default ? (
+              <span className="flex items-center gap-1.5 text-[13px] text-success">
+                <CircleCheck size={14} />
+                Default
+              </span>
+            ) : (
+              <button
+                className="btn btn-sm"
+                onClick={() =>
+                  void makeDefaultMailApp().then(
+                    () => setMailStatus({ kind: "idle" }),
+                    (error) => setMailStatus({ kind: "error", text: String(error) }),
+                  )
+                }
+              >
+                Make Default
+              </button>
+            )}
+          </Row>
+          {mailStatus.kind !== "idle" && (
+            <div className="px-4 py-2">
+              <StatusLine status={mailStatus} />
+            </div>
+          )}
+        </Group>
+      )}
       {accounts.length > 0 && (
         <Group title="Automatic Cc and Bcc" note="Added to every new message, reply and forward from the account.">
           {accounts.map((a) => (
@@ -2299,7 +2368,7 @@ function SignatureEditor({ id, html: initial, onDone }: { id: number | null; htm
   );
 }
 
-type Status =
+export type Status =
   | { kind: "idle" }
   | { kind: "busy"; what: string }
   | { kind: "ok"; text: string }
@@ -2602,7 +2671,7 @@ function AiPage() {
   );
 }
 
-function StatusLine({ status }: { status: Status }) {
+export function StatusLine({ status }: { status: Status }) {
   if (status.kind === "idle") return null;
   if (status.kind === "busy") return <span className="text-xs text-text-2">{status.what}</span>;
   const ok = status.kind === "ok";

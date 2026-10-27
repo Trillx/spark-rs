@@ -85,6 +85,8 @@ export interface RichEditorHandle {
   resizeImages: (size: ImageSize) => Promise<void>;
   /** Whether a window point (px) is over the body. */
   covers: (x: number, y: number) => boolean;
+  /** Puts HTML in at the caret, or at the end with none there (a template, a placeholder). */
+  insertHtml: (html: string) => void;
 }
 
 type Block = "div" | "h1" | "h2";
@@ -156,6 +158,23 @@ const RichEditor = forwardRef<
     if (!sel?.rangeCount) return null;
     const range = sel.getRangeAt(0);
     return r.contains(range.commonAncestorContainer) ? { sel, range } : null;
+  }
+
+  /** Placeholders are chips: typed over or deleted whole, never typed into. */
+  function arm(r: HTMLElement) {
+    for (const chip of r.querySelectorAll<HTMLElement>("span[data-placeholder]")) chip.contentEditable = "false";
+  }
+
+  /** The caret in the body: where it was, else at the end. */
+  function caretIn(r: HTMLElement) {
+    const d = r.ownerDocument;
+    d.defaultView?.focus();
+    if (selectionIn(r)) return;
+    const end = d.createRange();
+    end.selectNodeContents(r);
+    end.collapse(false);
+    d.getSelection()?.removeAllRanges();
+    d.getSelection()?.addRange(end);
   }
 
   function empty(r: HTMLElement) {
@@ -421,18 +440,13 @@ const RichEditor = forwardRef<
       }),
     );
     d.defaultView?.focus();
-    const sel = d.getSelection();
     const frame = frameRef.current!.getBoundingClientRect();
     const dropped = at && d.caretRangeFromPoint(at.x - frame.left, at.y - frame.top);
     if (dropped && r.contains(dropped.startContainer)) {
-      sel?.removeAllRanges();
-      sel?.addRange(dropped);
-    } else if (!selectionIn(r)) {
-      const end = d.createRange();
-      end.selectNodeContents(r);
-      end.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(end);
+      d.getSelection()?.removeAllRanges();
+      d.getSelection()?.addRange(dropped);
+    } else {
+      caretIn(r);
     }
     run("insertHTML", pictures.join(""));
   }
@@ -506,6 +520,26 @@ const RichEditor = forwardRef<
       const rect = frameRef.current?.getBoundingClientRect();
       return !!rect && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
     },
+    insertHtml(html) {
+      const r = root();
+      if (!r || latest.current.readOnly) return;
+      r.focus();
+      caretIn(r);
+      run("insertHTML", html);
+      arm(r);
+      // Ending on a placeholder leaves the caret in it, where nothing can be typed: it goes after.
+      const sel = r.ownerDocument.getSelection();
+      const anchor = sel?.anchorNode;
+      const chip = (anchor?.nodeType === 1 ? (anchor as Element) : anchor?.parentElement)?.closest("[contenteditable='false']");
+      if (sel && chip && r.contains(chip)) {
+        const after = r.ownerDocument.createRange();
+        after.setStartAfter(chip);
+        after.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(after);
+      }
+      emit();
+    },
   }));
 
   const shortcuts: Record<string, () => void> = {
@@ -540,6 +574,7 @@ const RichEditor = forwardRef<
     if (html !== held.current) {
       held.current = html;
       r.innerHTML = html;
+      arm(r);
       r.toggleAttribute("data-empty", empty(r));
     }
   }, [wired, html]);
@@ -573,6 +608,7 @@ const RichEditor = forwardRef<
       const view = d.defaultView!;
       held.current = latest.current.html;
       r.innerHTML = latest.current.html;
+      arm(r);
       r.toggleAttribute("data-empty", empty(r));
       r.setAttribute("data-placeholder", latest.current.placeholder);
       const measure = () => setHeight(Math.ceil(r.getBoundingClientRect().height));
@@ -668,7 +704,16 @@ const RichEditor = forwardRef<
         }
       };
       const onClick = (e: MouseEvent) => {
-        if ((e.target as Element | null)?.closest?.("a[href]")) e.preventDefault();
+        const target = e.target as Element | null;
+        if (target?.closest?.("a[href]")) e.preventDefault();
+        // A placeholder is filled by typing over it.
+        const chip = target?.closest?.("span[data-placeholder]");
+        if (chip && r.contains(chip) && !latest.current.readOnly) {
+          const range = d.createRange();
+          range.selectNode(chip);
+          d.getSelection()?.removeAllRanges();
+          d.getSelection()?.addRange(range);
+        }
       };
       const onBlur = () => {
         if (!panelRef.current) setBar(null);
@@ -795,6 +840,7 @@ p { margin: 0; }
 ul, ol { margin: 0; padding-left: 25px; }
 h1 { font-size: 1.6em; line-height: 1.3; margin: 0; }
 h2 { font-size: 1.25em; line-height: 1.35; margin: 0; }
+span[data-placeholder] { background: rgba(255, 184, 0, .28); border-radius: 4px; padding: 0 3px; cursor: pointer; }
 </style><style id="theme"></style></head><body><div id="body" spellcheck="true"></div></body></html>`;
 
 function loadImage(url: string): Promise<HTMLImageElement> {

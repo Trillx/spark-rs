@@ -24,6 +24,7 @@ mod priority;
 mod reminders;
 mod search;
 mod signatures;
+mod templates;
 
 pub use calendar::{Calendar, RemoteCalendar, RemoteEvent, StoredEvent};
 pub use contacts::Contact;
@@ -36,6 +37,7 @@ pub use reminders::{NewReminder, Reminder};
 pub use rusqlite::Error;
 pub use search::{Query, Term};
 pub use signatures::{DefaultSignature, Signature};
+pub use templates::{NewTemplate, Template};
 pub type Result<T> = rusqlite::Result<T>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,6 +749,12 @@ impl Store {
                  );",
             )?;
             tx.pragma_update(None, "user_version", 19)?;
+            tx.commit()?;
+        }
+        if version < 20 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(templates::SCHEMA_TEMPLATES)?;
+            tx.pragma_update(None, "user_version", 20)?;
             tx.commit()?;
         }
         Ok(Self { conn })

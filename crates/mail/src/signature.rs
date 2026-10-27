@@ -94,10 +94,35 @@ const IMAGE_TYPES: &[&str] = &[
 /// keep http(s), embedded raster images and `cid:` parts. Colors from
 /// Outlook's dark mode are turned back (see [`undo_dark_mode`]).
 pub fn sanitize(html: &str) -> String {
-    let tag_attributes: HashMap<&str, HashSet<&str>> = TAG_ATTRIBUTES
+    clean(html, false)
+}
+
+/// The placeholders a template can hold (Spark's `TemplatePlaceholder`).
+pub const PLACEHOLDERS: &[&str] = &[
+    "custom",
+    "recipientFirstName",
+    "recipientLastName",
+    "recipientFullName",
+    "myFirstName",
+    "myLastName",
+    "myFullName",
+];
+
+/// A template's HTML: cleaned like a signature, keeping its placeholders,
+/// `<span data-placeholder="…" data-label="…">`. Mail that's sent still
+/// loses them ([`sanitize`]).
+pub fn sanitize_template(html: &str) -> String {
+    clean(html, true)
+}
+
+fn clean(html: &str, placeholders: bool) -> String {
+    let mut tag_attributes: HashMap<&str, HashSet<&str>> = TAG_ATTRIBUTES
         .iter()
         .map(|(tag, attributes)| (*tag, attributes.iter().copied().collect()))
         .collect();
+    if placeholders {
+        tag_attributes.insert("span", ["data-placeholder", "data-label"].into());
+    }
     Builder::default()
         .tags(TAGS.iter().copied().collect())
         .generic_attributes(GENERIC_ATTRIBUTES.iter().copied().collect())
@@ -120,6 +145,7 @@ pub fn sanitize(html: &str) -> String {
                             .any(|t| url.starts_with(&format!("data:{t};base64,")))
                 }
                 ("a", "href") => !url.starts_with("data:") && !url.starts_with("cid:"),
+                ("span", "data-placeholder") => PLACEHOLDERS.contains(&value),
                 _ => true,
             };
             keep.then(|| value.into())
@@ -939,6 +965,19 @@ mod tests {
             parts.html(None),
             "<div name=\"messageBodySection\"><div><br></div></div><div name=\"messageSignatureSection\"><div>Ana</div></div>",
             "an empty body gets no gap"
+        );
+    }
+
+    #[test]
+    fn templates_keep_their_placeholders_and_mail_loses_them() {
+        let html = r#"<div>Hi <span data-placeholder="recipientFirstName" data-label="Recipient's first name" onclick="x()">Recipient's first name</span>, <span data-placeholder="evil">x</span></div>"#;
+        assert_eq!(
+            sanitize_template(html),
+            r#"<div>Hi <span data-placeholder="recipientFirstName" data-label="Recipient's first name">Recipient's first name</span>, <span>x</span></div>"#
+        );
+        assert_eq!(
+            sanitize(html),
+            "<div>Hi <span>Recipient's first name</span>, <span>x</span></div>"
         );
     }
 

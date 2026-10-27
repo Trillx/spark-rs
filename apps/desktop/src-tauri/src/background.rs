@@ -68,7 +68,9 @@ pub fn second_launch(app: &AppHandle, args: Vec<String>) {
 }
 
 fn started_in_background<S: AsRef<str>>(args: impl IntoIterator<Item = S>) -> bool {
-    args.into_iter().any(|arg| arg.as_ref() == BACKGROUND_ARG)
+    let args: Vec<S> = args.into_iter().collect();
+    // An email link's launch shows the window, whatever else its arguments say.
+    crate::mailto::link_in(&args).is_none() && args.iter().any(|arg| arg.as_ref() == BACKGROUND_ARG)
 }
 
 /// Brings the window back from the tray, the taskbar or behind other windows.
@@ -165,6 +167,12 @@ mod tests {
     fn the_sign_in_entry_starts_hidden() {
         assert!(started_in_background([r"C:\spark-rs.exe", "--background"]));
         assert!(!started_in_background([r"C:\spark-rs.exe"]));
+        // A link can't hide the window by naming the flag.
+        assert!(!started_in_background([
+            r"C:\spark-rs.exe",
+            "mailto:a@x.com",
+            "--background"
+        ]));
     }
 }
 
