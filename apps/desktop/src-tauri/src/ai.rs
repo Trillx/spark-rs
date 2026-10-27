@@ -41,8 +41,9 @@ pub struct AiState {
 /// One run at a time for each of these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum RunKey {
-    /// A message's summary.
-    Summary(i64),
+    /// A message's summary, for one of the app's windows (the UI's number
+    /// for it): two windows summarizing the same email don't stop each other.
+    Summary(i64, u64),
     /// What AI writes in a composer, by the UI's number for it.
     Composer(u64),
 }
@@ -226,20 +227,23 @@ pub async fn summarize_message(
     mailbox: State<'_, Mailbox>,
     id: i64,
     style: Option<SummaryStyle>,
+    window: Option<u64>,
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     let mail = mailbox
         .with_body(id)
         .ok_or_else(|| format!("no message with id {id}"))?;
     let request = summary::summary_request(&mail, style.unwrap_or_default());
-    state.start(app, RunKey::Summary(id), request, on_event);
+    let key = RunKey::Summary(id, window.unwrap_or(0));
+    state.start(app, key, request, on_event);
     Ok(())
 }
 
-/// Stops a running summary. The UI keeps whatever text already arrived.
+/// Stops a running summary (of `window`'s). The UI keeps whatever text
+/// already arrived.
 #[tauri::command]
-pub fn cancel_summary(state: State<'_, AiState>, id: i64) {
-    state.cancel(RunKey::Summary(id));
+pub fn cancel_summary(state: State<'_, AiState>, id: i64, window: Option<u64>) {
+    state.cancel(RunKey::Summary(id, window.unwrap_or(0)));
 }
 
 /// Starts AI writing for the UI's composer number `composer` and returns at

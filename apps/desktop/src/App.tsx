@@ -1111,6 +1111,7 @@ export default function App() {
       setGrouped((g) => same(g, loadGrouped()));
       setCardPrefs((c) => same(c, loadCardPrefs()));
       setSeen((s) => same(s, loadSeen()));
+      setHomeSettings((h) => same(h, loadHomeSettings()));
       setMinimize(loadMinimize());
       setAlwaysPopOut(loadPopOut());
       setPriorityLines(loadPriorityLines());

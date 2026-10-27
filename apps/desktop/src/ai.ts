@@ -151,21 +151,23 @@ export function summarizeMessage(
   style: SummaryStyle,
   onEvent: (event: AiEvent) => void,
 ): Promise<void> {
-  if (isTauri()) return invoke("summarize_message", { id: message.id, style, onEvent: channel(onEvent) });
+  if (isTauri()) {
+    return invoke("summarize_message", { id: message.id, style, window: RUNS, onEvent: channel(onEvent) });
+  }
   browserSummarize(message, style, onEvent);
   return Promise.resolve();
 }
 
 export function cancelSummary(id: number): Promise<void> {
-  if (isTauri()) return invoke("cancel_summary", { id });
+  if (isTauri()) return invoke("cancel_summary", { id, window: RUNS });
   browserStop(`summary:${id}`);
   return Promise.resolve();
 }
 
 /**
- * Composers are numbered from 1 in each of the app's windows; this window's own range keeps
- * their AI runs apart where the backend keys them (two windows' first replies would stop
- * each other). Under 2^52, so it stays exact.
+ * This window's own range for its AI runs where the backend keys them: composers are numbered
+ * from 1 in each of the app's windows, and two windows can summarize the same email (they'd
+ * stop each other). Under 2^52, so it stays exact.
  */
 const RUNS = crypto.getRandomValues(new Uint32Array(1))[0] * 2 ** 20;
 
