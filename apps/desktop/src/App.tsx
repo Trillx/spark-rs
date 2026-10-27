@@ -613,6 +613,7 @@ export default function App() {
   /** The configured provider's name, for "Anthropic declined…". */
   const [aiProvider, setAiProvider] = useState("The AI provider");
   const [toast, setToast] = useState<ToastData | null>(null);
+  const toastNow = useRef<ToastData | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   const updates = useUpdates((build) => showToast(`Updated to build ${build}`));
   const searchRef = useRef<HTMLInputElement>(null);
@@ -1014,11 +1015,14 @@ export default function App() {
   // looked at again each time, as a sync can join two conversations into one.
   const ownMessage = THREAD_WINDOW === null ? undefined : byId.get(THREAD_WINDOW);
   const ownConversation = ownMessage ? (ownMessage.conversation ?? ownMessage.id) : null;
+  // While its Undo is up (Send and Done, Done), it waits, still showing the conversation.
   useEffect(() => {
     if (THREAD_WINDOW === null || !threadOpened.current) return;
     const here = openMessage ? (openMessage.conversation ?? openMessage.id) : null;
-    if (here === null || here !== ownConversation) void closeThreadWindow();
-  }, [openMessage, ownConversation]);
+    if (here !== null && here === ownConversation) return;
+    if (toast?.undo) return;
+    void closeThreadWindow();
+  }, [openMessage, ownConversation, toast]);
 
   /** Work a window mustn't close in the middle of: sends being queued, drafts being saved. */
   const inFlight = useRef(new Set<Promise<unknown>>());
@@ -1064,7 +1068,10 @@ export default function App() {
   latestCloseComposer.current = closeComposer;
 
   async function closeThreadWindow() {
-    if (await latestSettle.current(false)) closeWindow();
+    if (!(await latestSettle.current(false))) return;
+    // A send queued meanwhile put up its Undo: the window waits for it.
+    if (toastNow.current?.undo) return;
+    closeWindow();
   }
 
   // The window's own close button: the draft is saved and a send queued first; one that
@@ -1394,16 +1401,21 @@ export default function App() {
     window.clearTimeout(toastTimer.current);
     const next = { id: Date.now(), text, undo, icon, ...options };
     setToast(next);
-    toastTimer.current = window.setTimeout(
-      () => setToast((t) => (t?.id === next.id ? null : t)),
-      options.duration ?? TOAST_MS,
-    );
+    // At once, for a window deciding whether it can close (an Undo keeps it open).
+    toastNow.current = next;
+    toastTimer.current = window.setTimeout(() => {
+      setToast((t) => (t?.id === next.id ? null : t));
+      if (toastNow.current?.id === next.id) toastNow.current = null;
+    }, options.duration ?? TOAST_MS);
   }
 
   function undoToast() {
     window.clearTimeout(toastTimer.current);
     toast?.undo?.();
     setToast(null);
+    toastNow.current = null;
+    // A conversation's own window, undoing what took it off its conversation, shows it again.
+    if (THREAD_WINDOW !== null) setOpenId((id) => id ?? THREAD_WINDOW);
   }
 
   /** Applies patches as one step, moving the cursor off messages that leave the list. Returns the undo. */
@@ -4056,6 +4068,10 @@ export default function App() {
     home: goHome,
   };
 
+  // A conversation's own window shows its conversation, even while an Undo keeps it open after Done.
+  const windowShown = THREAD_WINDOW === null ? null : (openMessage ?? (toast?.undo ? ownMessage : undefined) ?? null);
+  const windowConversation =
+    windowShown && windowShown !== openMessage ? conversationOf(conversations, windowShown) : conversation;
   const showList = twoColumns || !openMessage;
   const showReader = twoColumns || openMessage !== null;
   const readerLeft = THREAD_WINDOW !== null ? 0 : sidebarSpace + (twoColumns && !homeShown ? listWidthUsed : 0);
@@ -4235,15 +4251,15 @@ export default function App() {
               className="flex min-h-0 flex-1 flex-col pt-8"
               onPointerDownCapture={() => (scrollPane.current = "reader")}
             >
-              {openMessage ? (
+              {windowShown ? (
                 <ThreadView
-                  key={openMessage.id}
-                  message={asThread(openMessage, conversation)}
-                  conversation={conversation}
+                  key={windowShown.id}
+                  message={asThread(windowShown, windowConversation)}
+                  conversation={windowConversation}
                   unread={openedUnread}
                   minimize={minimize}
                   singleColumn={false}
-                  summary={summaries.get(openMessage.id)}
+                  summary={summaries.get(windowShown.id)}
                   aiProvider={aiProvider}
                   actions={threadActions}
                   scrollRef={readerScroll}

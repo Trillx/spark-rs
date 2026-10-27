@@ -158,6 +158,13 @@ export function cancelSummary(id: number): Promise<void> {
 }
 
 /**
+ * Composers are numbered from 1 in each of the app's windows; this window's own range keeps
+ * their AI runs apart where the backend keys them (two windows' first replies would stop
+ * each other). Under 2^52, so it stays exact.
+ */
+const RUNS = crypto.getRandomValues(new Uint32Array(1))[0] * 2 ** 20;
+
+/**
  * Starts AI writing for composer number `composer`, whose draft is from
  * `account` and about `reference`; the text arrives on `onEvent`. Resolves
  * once it has started.
@@ -172,14 +179,21 @@ export function composeWithAi(
   onEvent: (event: AiEvent) => void,
 ): Promise<void> {
   if (isTauri()) {
-    return invoke("compose_with_ai", { composer, action, account, reference, signed, onEvent: channel(onEvent) });
+    return invoke("compose_with_ai", {
+      composer: RUNS + composer,
+      action,
+      account,
+      reference,
+      signed,
+      onEvent: channel(onEvent),
+    });
   }
   browserStream(`composer:${composer}`, browserComposed(action), onEvent);
   return Promise.resolve();
 }
 
 export function cancelCompose(composer: number): Promise<void> {
-  if (isTauri()) return invoke("cancel_compose", { composer });
+  if (isTauri()) return invoke("cancel_compose", { composer: RUNS + composer });
   browserStop(`composer:${composer}`);
   return Promise.resolve();
 }
