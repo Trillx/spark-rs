@@ -456,9 +456,9 @@ impl Store {
         )?;
         let mut changed = false;
         if let (Some(account), Some(label)) = (account, verdict.label)
-            && settings.applies(account, label)
             // A label the user chose, or took off, stays as they left it.
             && !has_label_row(&tx, id)?
+            && let Some(label) = answered_as(&tx, settings, account, id, label)?
         {
             changed = set_label(&tx, id, Some(label), push)?;
         }
@@ -845,17 +845,7 @@ impl Store {
     /// Whether the user wrote in email `id`'s conversation after it: then
     /// there's nothing left to reply to.
     pub fn answered_after(&self, id: i64) -> Result<bool> {
-        self.conn.query_row(
-            &format!(
-                "WITH {MEMBERS}
-                 SELECT EXISTS (
-                     SELECT 1 FROM members JOIN messages m ON m.id = members.id, o
-                     JOIN accounts a ON a.email = m.from_address COLLATE NOCASE
-                     WHERE m.id != ?1 AND m.date > o.date AND {NOT_DRAFT})"
-            ),
-            [id],
-            |r| r.get(0),
-        )
+        answered_after(&self.conn, id)
     }
 
     /// Up to `limit` emails of email `id`'s conversation from before it,
@@ -982,6 +972,39 @@ fn settings(conn: &Connection) -> Result<AutomationSettings> {
         .unwrap_or_default())
 }
 
+fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
+    conn.query_row(
+        &format!(
+            "WITH {MEMBERS}
+             SELECT EXISTS (
+                 SELECT 1 FROM members JOIN messages m ON m.id = members.id, o
+                 JOIN accounts a ON a.email = m.from_address COLLATE NOCASE
+                 WHERE m.id != ?1 AND m.date > o.date AND {NOT_DRAFT})"
+        ),
+        [id],
+        |r| r.get(0),
+    )
+}
+
+/// The label AI's `label` becomes on email `id`, if the settings apply it:
+/// To respond on mail the user has answered since (before AI looked, or in
+/// the past week's mail labeled as it's turned on) is Actioned, as replying
+/// would have made it.
+fn answered_as(
+    conn: &Connection,
+    settings: &AutomationSettings,
+    account_id: i64,
+    id: i64,
+    label: AutoLabel,
+) -> Result<Option<AutoLabel>> {
+    let label = if label == AutoLabel::ToRespond && answered_after(conn, id)? {
+        AutoLabel::Actioned
+    } else {
+        label
+    };
+    Ok(settings.applies(account_id, label).then_some(label))
+}
+
 /// Whether email `id` has a label the user or AI gave it, or one the user
 /// took off.
 fn has_label_row(conn: &Connection, id: i64) -> Result<bool> {
@@ -1056,7 +1079,7 @@ fn apply_checked(
     };
     for (id, label, kind) in found {
         if let Some(label) = AutoLabel::parse(&label)
-            && settings.applies(account_id, label)
+            && let Some(label) = answered_as(conn, settings, account_id, id, label)?
         {
             set_label(conn, id, Some(label), kind != "imap")?;
         }

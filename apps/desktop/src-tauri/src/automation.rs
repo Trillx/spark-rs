@@ -58,8 +58,14 @@ impl Automation {
         }
     }
 
-    fn problem(&self, problem: Option<String>) {
-        *self.problem.lock().unwrap() = problem;
+    /// Why it isn't working now, if it isn't: Settings hears of a change
+    /// (`inbox-automation-problem`) while it's open.
+    fn problem(&self, app: &AppHandle, problem: Option<String>) {
+        let mut now = self.problem.lock().unwrap();
+        if *now != problem {
+            let _ = app.emit("inbox-automation-problem", &problem);
+            *now = problem;
+        }
     }
 }
 
@@ -115,7 +121,7 @@ async fn round(app: &AppHandle) -> Duration {
             return LOOK_EVERY;
         };
         if !settings.is_on() {
-            automation.problem(None);
+            automation.problem(app, None);
             return LOOK_EVERY;
         }
         let (client, key) = match app
@@ -124,7 +130,7 @@ async fn round(app: &AppHandle) -> Duration {
         {
             Ok(ready) => ready,
             Err(message) => {
-                automation.problem(Some(message));
+                automation.problem(app, Some(message));
                 return LOOK_EVERY;
             }
         };
@@ -155,7 +161,7 @@ async fn round(app: &AppHandle) -> Duration {
                 Err(e) => {
                     // The provider can't be reached or refuses the key: nothing
                     // is held against the emails, which wait for it.
-                    automation.problem(Some(redact(describe(&e), key.as_deref())));
+                    automation.problem(app, Some(redact(describe(&e), key.as_deref())));
                     return AFTER_FAILING;
                 }
             };
@@ -219,7 +225,7 @@ async fn round(app: &AppHandle) -> Duration {
                     store.draft_failed(id, now_ms())
                 }
                 Err(Failed::Provider(message)) => {
-                    automation.problem(Some(message));
+                    automation.problem(app, Some(message));
                     return AFTER_FAILING;
                 }
             };
@@ -229,7 +235,7 @@ async fn round(app: &AppHandle) -> Duration {
         }
 
         if !worked {
-            automation.problem(None);
+            automation.problem(app, None);
             return LOOK_EVERY;
         }
     }

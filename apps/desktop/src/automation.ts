@@ -118,6 +118,13 @@ export function removeDraftInstruction(id: number): Promise<DraftInstruction[]> 
   return invoke("remove_draft_instruction", { id });
 }
 
+/** Why inbox automation isn't working changed (`null`: it works now). Returns the unsubscribe. */
+export function onAutomationProblem(handler: (problem: string | null) => void): () => void {
+  if (!isTauri()) return () => {};
+  const off = listen<string | null>("inbox-automation-problem", (e) => handler(e.payload));
+  return () => void off.then((unlisten) => unlisten());
+}
+
 /** A reply to email `id` started or stopped being written. Returns the unsubscribe. */
 export function onAutoDraftWriting(handler: (id: number, writing: boolean) => void): () => void {
   if (!isTauri()) return () => {};

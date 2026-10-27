@@ -1033,6 +1033,37 @@ fn version_24_databases_gain_server_versions() {
 }
 
 #[test]
+fn mail_answered_before_ai_looked_is_actioned_not_to_respond() {
+    let (mut store, account) = store();
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - DAY));
+    let mut reply = incoming(account, 2, "me@example.com", NOW - DAY + 1000);
+    reply.subject = "Re: Message 1".into();
+    reply.in_reply_to = Some("<1@example.com>".into());
+    add(&mut store, &reply);
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    let settings = on(account);
+    store
+        .record_verdict(id, respond, &settings, true, NOW)
+        .unwrap();
+    assert_eq!(store.auto_label(id).unwrap(), Some(AutoLabel::Actioned));
+    // Actioned turned off: no label rather than To respond.
+    let other = add(&mut store, &incoming(account, 3, "c@x.com", NOW - DAY));
+    let mut answer = incoming(account, 4, "me@example.com", NOW - DAY + 1000);
+    answer.subject = "Re: Message 3".into();
+    answer.in_reply_to = Some("<3@example.com>".into());
+    add(&mut store, &answer);
+    let mut no_actioned = settings.clone();
+    no_actioned.labels_off = vec![AutoLabel::Actioned];
+    store
+        .record_verdict(other, respond, &no_actioned, true, NOW)
+        .unwrap();
+    assert_eq!(store.auto_label(other).unwrap(), None);
+}
+
+#[test]
 fn labels_have_ids_and_names() {
     for label in AutoLabel::ALL {
         assert_eq!(AutoLabel::parse(label.as_str()), Some(label));

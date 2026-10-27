@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   addDraftInstruction,
   getInboxAutomation,
+  onAutomationProblem,
   removeDraftInstruction,
   saveInboxAutomation,
   setAutoDraftExcluded,
@@ -63,6 +64,15 @@ export default function InboxAutomationPage({ onOpenAi }: { onOpenAi: () => void
       (error) => setStatus({ kind: "error", text: String(error) }),
     );
   }, []);
+
+  // The worker finds out it can't work (no AI key, say) after a save returns.
+  useEffect(
+    () =>
+      onAutomationProblem((problem) => {
+        if (latest.current) show({ ...latest.current, problem: problem ?? undefined });
+      }),
+    [],
+  );
 
   if (view === null) {
     return status.kind === "error" ? <StatusLine status={status} /> : <LoaderCircle size={18} className="animate-spin text-text-2" />;
