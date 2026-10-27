@@ -285,7 +285,17 @@ export function HtmlBody({
         />
       </div>
       {frame.quoted && <QuoteToggle shown={quoteShown} onToggle={toggleQuote} />}
-      {viewing && <ImageViewer images={viewing.images} start={viewing.start} onClose={() => setViewing(null)} />}
+      {viewing && (
+        <ImageViewer
+          images={viewing.images}
+          start={viewing.start}
+          onClose={() => {
+            setViewing(null);
+            // Back to the email, in the frame that's there now: images allowed from another window replace it.
+            frameRef.current?.focus();
+          }}
+        />
+      )}
     </>
   );
 }
@@ -558,8 +568,9 @@ function adaptColors(doc: Document, card: Rgb) {
 
 /**
  * A picture the viewer can open: loaded (an embedded one that hasn't arrived,
- * or a blocked one from the web, hasn't), shown, more than a spacer, and not
- * a link, which a click opens instead.
+ * or a blocked one from the web, hasn't), shown (not squeezed away like a
+ * newsletter's picture for phones), more than a spacer, and not a link, which
+ * a click opens instead.
  */
 function viewable(img: HTMLImageElement) {
   return (
@@ -568,7 +579,8 @@ function viewable(img: HTMLImageElement) {
     img.naturalHeight > 2 &&
     /^(?:data|https?):/i.test(img.currentSrc) &&
     !img.closest("a[href]") &&
-    img.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+    img.checkVisibility({ visibilityProperty: true, opacityProperty: true }) &&
+    !squeezed(img)
   );
 }
 

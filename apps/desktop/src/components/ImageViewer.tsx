@@ -14,7 +14,8 @@ export interface ViewedImage {
  * A picture bigger than the window fits it; clicking it (or Z) shows it at its
  * own size, centred on the spot clicked, to scroll around. ← and → step
  * through the email's other pictures. Esc, × or a click beside the picture
- * closes it, and focus goes back to the email.
+ * closes it. Focus stays in the viewer while it's open, so the app's
+ * shortcuts don't act on the email behind.
  */
 export function ImageViewer({ images, start, onClose }: { images: ViewedImage[]; start: number; onClose: () => void }) {
   const [index, setIndex] = useState(start);
@@ -52,13 +53,18 @@ export function ImageViewer({ images, start, onClose }: { images: ViewedImage[];
     setShrunk(img.naturalWidth > img.clientWidth + 1 || img.naturalHeight > img.clientHeight + 1);
   };
 
+  /** Tab goes round the buttons and never to the app behind. */
+  const cycleFocus = (by: number) => {
+    const buttons = [...rootRef.current!.querySelectorAll("button")];
+    const i = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    buttons[i < 0 ? (by > 0 ? 0 : buttons.length - 1) : (i + by + buttons.length) % buttons.length]?.focus();
+  };
+
+  // Takes focus when it opens, and back from a button that goes away (zoom, for a picture that fits).
   useEffect(() => {
-    const opener = document.activeElement;
-    rootRef.current?.focus();
-    return () => {
-      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
-    };
-  }, []);
+    const root = rootRef.current;
+    if (root && !root.contains(document.activeElement)) root.focus();
+  });
 
   useEffect(() => {
     // Capture phase, so these keys act here and not on the email behind.
@@ -68,6 +74,7 @@ export function ImageViewer({ images, start, onClose }: { images: ViewedImage[];
       else if (e.key === "ArrowLeft" && images.length > 1) step(-1);
       else if (e.key === "ArrowRight" && images.length > 1) step(1);
       else if (e.key.toLowerCase() === "z") zoom();
+      else if (e.key === "Tab") cycleFocus(e.shiftKey ? -1 : 1);
       else return;
       e.preventDefault();
       e.stopPropagation();
