@@ -1725,14 +1725,21 @@ impl Engine {
         // From here on, the series' own clock: the new series is written
         // there, as the old one was, so its days and dates mean the same.
         let zone = clock.zone(zone);
-        let from = calendar::date_in(zone, draft.start, draft.all_day);
-        // How far the user moved it, and the series' days as the user's
-        // clock has them: a Wednesday 00:30 in Tokyo is a Tuesday in
-        // California, where the new series is written.
-        let moved = recurrence::days_between(
-            &calendar::date_in(zone, before.start, before.all_day),
-            &from,
-        );
+        // The day it goes to there, and how far the user moved it. An all-day
+        // one goes by as many days from where it is on the series' clock: its
+        // date here is UTC's, a day off for a series 13 hours from it.
+        let all_day = draft.all_day && before.all_day;
+        let (from, moved) = if all_day {
+            let moved = (draft.start - before.start).div_euclid(86_400_000);
+            (recurrence::add_days(&clock.current, moved), moved)
+        } else {
+            let from = calendar::date_in(zone, draft.start, draft.all_day);
+            let moved = recurrence::days_between(
+                &calendar::date_in(zone, before.start, before.all_day),
+                &from,
+            );
+            (from, moved)
+        };
         let days = recurrence::days_between(&clock.current, &from);
         let rule = if draft.repeat != before.repeat {
             draft.repeat.as_ref()
@@ -1771,13 +1778,52 @@ impl Engine {
             .into_iter()
             .find(|c| c.id == stored.calendar_id)
             .ok_or_else(|| Error::Config("That calendar is no longer here.".into()))?;
-        let body = calendar::series_from(&master, draft, before, zone, new);
+        // An all-day one's days as the series has them.
+        let placed;
+        let draft = if all_day {
+            let start = graph::parse_iso_date(&format!("{from}T00:00:00Z")).unwrap_or(draft.start);
+            placed = EventDraft {
+                start,
+                end: start + (draft.end - draft.start),
+                ..draft.clone()
+            };
+            &placed
+        } else {
+            draft
+        };
+        let mut body = calendar::series_from(&master, draft, before, zone, new);
+        // Made once, however often it's sent: Graph knows a new series it
+        // already made by this.
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).map_err(|e| Error::Config(e.to_string()))?;
+        body["transactionId"] =
+            serde_json::json!(id.iter().map(|b| format!("{b:02x}")).collect::<String>());
         // The old series ends first, so a room it booked is free for the new
         // one's invitation; if the new one can't be made, the old one goes
         // on as it was.
         let ended = serde_json::json!({ "recurrence": recurrence::ended_before(&old, &split) });
-        graph.update_event(&series, &ended).await?;
-        let created = match graph.create_event(&calendar.remote_id, &body).await {
+        if let Err(e) = graph.update_event(&series, &ended).await {
+            // Its answer may be all that was lost: if the series ends there
+            // now, it was ended.
+            let now = graph.event_json(&series, "recurrence").await;
+            let range = &ended["recurrence"]["range"];
+            let applied = now.is_ok_and(|m| {
+                m["recurrence"]["range"]["type"] == "endDate"
+                    && m["recurrence"]["range"]["endDate"] == range["endDate"]
+            });
+            if !applied {
+                return Err(e);
+            }
+        }
+        let mut made = Err(Error::Config("The new series wasn't made.".into()));
+        for wait in [0, 10, 30] {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            made = graph.create_event(&calendar.remote_id, &body).await;
+            if made.is_ok() {
+                break;
+            }
+        }
+        let created = match made {
             Ok(created) => created,
             Err(e) => {
                 // Put back as it was, waiting out Graph's pauses a while; if

@@ -584,8 +584,44 @@ pub fn series_from(
             json!({ "contentType": "html", "content": html })
         };
     body.insert("body".into(), description);
-    body.insert("start".into(), zone.time(draft.start, draft.all_day));
-    body.insert("end".into(), zone.time(draft.end, draft.all_day));
+    // Its times: the user's where they changed them; else the series' own
+    // as Outlook has them now (they may have changed since the editor
+    // opened), on its new first day.
+    let master_time = |key: &str| {
+        let ms = master[key]["dateTime"]
+            .as_str()
+            .and_then(|t| parse_iso_date(&format!("{}Z", t.get(..19).unwrap_or(t))))?;
+        Some((ms, zone.wall_at(ms)))
+    };
+    let (start, end) = match (master_time("start"), master_time("end")) {
+        (Some((from, wall)), Some((to, _))) if !draft.all_day && !before.all_day => {
+            let start = if draft.start != before.start {
+                zone.wall_at(draft.start)
+            } else {
+                format!(
+                    "{}{}",
+                    date_in(zone, draft.start, false),
+                    wall.get(10..).unwrap_or_default()
+                )
+            };
+            let end = if draft.end != before.end {
+                zone.wall_at(draft.end)
+            } else {
+                parse_iso_date(&format!("{start}Z"))
+                    .map_or_else(|| zone.wall_at(draft.end), |t| utc_wall(t + (to - from)))
+            };
+            (
+                json!({ "dateTime": start, "timeZone": zone.name }),
+                json!({ "dateTime": end, "timeZone": zone.name }),
+            )
+        }
+        _ => (
+            zone.time(draft.start, draft.all_day),
+            zone.time(draft.end, draft.all_day),
+        ),
+    };
+    body.insert("start".into(), start);
+    body.insert("end".into(), end);
     body.insert("isAllDay".into(), json!(draft.all_day));
     body.insert("recurrence".into(), recurrence);
     body.into()
@@ -1942,6 +1978,39 @@ mod tests {
             body["body"],
             json!({ "contentType": "text", "content": "Mine" })
         );
+    }
+
+    #[test]
+    fn all_future_keeps_the_series_times_as_outlook_has_them() {
+        // 9:00 to 10:00 when the editor opened; Outlook has it to 11:00 now.
+        let master = json!({
+            "subject": "Review",
+            "start": { "dateTime": "2026-10-13T16:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-10-13T18:00:00.0000000", "timeZone": "UTC" }
+        });
+        let start = parse_iso_date("2026-11-03T16:00:00Z").unwrap();
+        let before = EventDraft {
+            title: "Review".into(),
+            start,
+            end: start + 3_600_000,
+            ..Default::default()
+        };
+        let renamed = EventDraft {
+            title: "Design review".into(),
+            ..before.clone()
+        };
+        let body = series_from(&master, &renamed, &before, PACIFIC, json!(null));
+        assert_eq!(body["start"]["dateTime"], "2026-11-03T09:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-03T11:00:00");
+        // Times the user changed are theirs.
+        let later = EventDraft {
+            start: start + 1_800_000,
+            end: start + 5_400_000,
+            ..renamed
+        };
+        let body = series_from(&master, &later, &before, PACIFIC, json!(null));
+        assert_eq!(body["start"]["dateTime"], "2026-11-03T09:30:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-03T10:30:00");
     }
 
     #[test]
