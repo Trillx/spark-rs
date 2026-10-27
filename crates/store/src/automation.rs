@@ -1084,6 +1084,9 @@ fn settings(conn: &Connection) -> Result<AutomationSettings> {
         .unwrap_or_default())
 }
 
+/// Whether the user wrote in email `id`'s conversation after it. Mail of
+/// theirs kept for a folder must be in one: a draft out of Drafts here
+/// (deleted in another app, or past the newest a listing holds) wasn't sent.
 fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
     conn.query_row(
         &format!(
@@ -1091,7 +1094,9 @@ fn answered_after(conn: &Connection, id: i64) -> Result<bool> {
              SELECT EXISTS (
                  SELECT 1 FROM members JOIN messages m ON m.id = members.id, o
                  JOIN accounts a ON a.email = m.from_address COLLATE NOCASE
-                 WHERE m.id != ?1 AND m.date > o.date AND {NOT_DRAFT})"
+                 WHERE m.id != ?1 AND m.date > o.date AND {NOT_DRAFT}
+                   AND (m.state != 'filed'
+                        OR EXISTS (SELECT 1 FROM folder_members fm WHERE fm.message_id = m.id)))"
         ),
         [id],
         |r| r.get(0),

@@ -640,6 +640,56 @@ fn an_auto_draft_deleted_in_another_app_answers_nothing() {
 }
 
 #[test]
+fn a_draft_deleted_in_another_app_wasnt_a_reply() {
+    let (mut store, account) = store();
+    with_drafts_folder(&mut store, account);
+    let drafts_only = AutomationSettings {
+        draft_accounts: [(account, NOW)].into(),
+        ..Default::default()
+    };
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
+    store.set_automation_settings(&drafts_only).unwrap();
+    store
+        .record_verdict(id, respond, &drafts_only, true, NOW)
+        .unwrap();
+    let draft = save_reply(&mut store, account, "1@example.com", "Sure.");
+    let option = [DraftOption {
+        title: String::new(),
+        body: "Sure.".into(),
+    }];
+    store.add_auto_draft(draft, id, &option, 0, NOW).unwrap();
+    assert!(!store.answered_after(id).unwrap());
+    // Deleted in Outlook: out of Drafts here once listed whole, its row left
+    // behind, unsent.
+    store
+        .conn
+        .execute_batch(&format!(
+            "DELETE FROM draft_uploads WHERE message_id = {draft};
+             DELETE FROM folder_members WHERE message_id = {draft};"
+        ))
+        .unwrap();
+    let drafts = store
+        .folders()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.role == Some(FolderRole::Drafts))
+        .unwrap()
+        .id;
+    store
+        .set_folder_synced(drafts, r#"{"complete":true}"#, NOW)
+        .unwrap();
+    assert!(store.message(draft).unwrap().is_some());
+    assert!(!store.answered_after(id).unwrap());
+    // Auto-Labels turned on: AI's To respond stands.
+    store.set_automation_settings(&on(account)).unwrap();
+    assert_eq!(store.auto_label(id).unwrap(), Some(AutoLabel::ToRespond));
+}
+
+#[test]
 fn a_users_own_reply_draft_counts_too() {
     let (mut store, account) = store();
     with_drafts_folder(&mut store, account);
