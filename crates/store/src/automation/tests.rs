@@ -301,24 +301,92 @@ fn failed_looks_are_retried_a_few_times() {
 }
 
 #[test]
-fn relabels_a_conversation_once_the_user_replies() {
+fn a_reply_sent_answers_the_conversation_before_it_syncs() {
     let (mut store, account) = store();
-    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW));
+    let settings = on(account);
+    let first = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 120_000));
+    let mut follow_up = incoming(account, 2, "a@x.com", NOW - 60_000);
+    follow_up.subject = "Re: Message 1".into();
+    follow_up.in_reply_to = Some("<1@example.com>".into());
+    let follow_up = add(&mut store, &follow_up);
+    let conversation = |id| store.message(id).unwrap().unwrap().conversation;
+    assert_eq!(conversation(first), conversation(follow_up));
+    let respond = Verdict {
+        label: Some(AutoLabel::ToRespond),
+        needs_reply: true,
+    };
     store
-        .set_auto_label(id, Some(AutoLabel::ToRespond), false)
+        .record_verdict(first, respond, &settings, true, NOW)
         .unwrap();
-    let conversation = store.message(id).unwrap().unwrap().conversation;
-    let changed = store
-        .relabel_conversation(
-            conversation,
-            account,
-            AutoLabel::ToRespond,
-            Some(AutoLabel::Actioned),
-            true,
-        )
-        .unwrap();
-    assert_eq!(changed, [id]);
-    assert_eq!(store.auto_label(id).unwrap(), Some(AutoLabel::Actioned));
+    assert_eq!(store.draft_candidates(&settings, NOW, 10).unwrap(), [first]);
+    assert_eq!(
+        ids(store.automation_candidates(&settings, NOW, 10).unwrap()),
+        [follow_up]
+    );
+    // The user's reply went out; Sent hasn't synced, so it isn't here.
+    let mut changed = store.user_replied(follow_up, &settings, true, NOW).unwrap();
+    changed.sort();
+    assert_eq!(changed, [first, follow_up]);
+    for id in [first, follow_up] {
+        assert_eq!(store.auto_label(id).unwrap(), Some(AutoLabel::Actioned));
+    }
+    assert!(
+        store
+            .automation_candidates(&settings, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!store.reply_due(first).unwrap());
+    // What AI said of the follow-up, asked before the reply went, changes nothing.
+    assert!(
+        !store
+            .record_verdict(follow_up, respond, &settings, true, NOW)
+            .unwrap()
+    );
+    assert_eq!(
+        store.auto_label(follow_up).unwrap(),
+        Some(AutoLabel::Actioned)
+    );
+    assert!(
+        store
+            .draft_candidates(&settings, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_reply_sent_with_actioned_off_leaves_no_label() {
+    let (mut store, account) = store();
+    let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
+    let mut settings = on(account);
+    // Inbox automation off for the account: nothing changes.
+    let off = AutomationSettings::default();
+    assert!(store.user_replied(id, &off, true, NOW).unwrap().is_empty());
+    assert_eq!(
+        ids(store.automation_candidates(&settings, NOW, 10).unwrap()),
+        [id]
+    );
+    settings.labels_off = vec![AutoLabel::Actioned];
+    assert!(
+        store
+            .user_replied(id, &settings, true, NOW)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.auto_label(id).unwrap(), None);
+    assert!(
+        store
+            .automation_candidates(&settings, NOW, 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn with_drafts_folder(store: &mut Store, account: i64) {
@@ -871,14 +939,16 @@ fn version_23_databases_gain_the_reply_queue() {
             .unwrap()
             .is_empty()
     );
+    // Mail looked at now queues its reply.
+    let new = add(&mut store, &incoming(account, 2, "b@x.com", NOW));
     let respond = Verdict {
         label: None,
         needs_reply: true,
     };
     store
-        .record_verdict(id, respond, &settings, false, NOW)
+        .record_verdict(new, respond, &settings, false, NOW)
         .unwrap();
-    assert_eq!(store.draft_candidates(&settings, NOW, 10).unwrap(), [id]);
+    assert_eq!(store.draft_candidates(&settings, NOW, 10).unwrap(), [new]);
     drop(store);
     // Opening it again changes nothing.
     assert_eq!(
@@ -886,8 +956,9 @@ fn version_23_databases_gain_the_reply_queue() {
             .unwrap()
             .draft_candidates(&settings, NOW, 10)
             .unwrap(),
-        [id]
+        [new]
     );
+    assert_ne!(new, id);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

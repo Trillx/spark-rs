@@ -447,6 +447,11 @@ fn save_draft(
             Wanted::Later => return Err(Failed::Later),
             Wanted::No => return Err(Failed::Unwanted),
         }
+        // No longer due: the user replied while AI was writing, before
+        // their reply is here for `wanted` to find.
+        if !store.reply_due(id).map_err(failed)? {
+            return Err(Failed::Unwanted);
+        }
     }
     let message = store
         .message(id)
@@ -620,7 +625,8 @@ fn may_clean(store: &Store, id: i64, held: bool, now: i64) -> spark_store::Resul
 }
 
 /// The user replied to email `reply_to`: its conversation's To respond
-/// label becomes Actioned, as Spark's labels follow the conversation.
+/// label becomes Actioned, as Spark's labels follow the conversation, and
+/// its mail isn't sorted or answered by AI (`Store::user_replied`).
 pub fn replied(app: &AppHandle, reply_to: i64) {
     let mailbox = app.state::<Mailbox>();
     if !mailbox.live() {
@@ -630,19 +636,11 @@ pub fn replied(app: &AppHandle, reply_to: i64) {
     let Ok(Some(m)) = engine.store().message(reply_to) else {
         return;
     };
-    let (account, conversation) = (m.account_id, m.conversation);
     let settings = engine.store().automation_settings().unwrap_or_default();
-    if !settings.labels(account) {
-        return;
-    }
-    let to = settings
-        .applies(account, AutoLabel::Actioned)
-        .then_some(AutoLabel::Actioned);
-    let push = push_labels(engine, account);
-    let changed =
-        engine
-            .store()
-            .relabel_conversation(conversation, account, AutoLabel::ToRespond, to, push);
+    let push = push_labels(engine, m.account_id);
+    let changed = engine
+        .store()
+        .user_replied(reply_to, &settings, push, now_ms());
     if changed.is_ok_and(|ids| !ids.is_empty()) {
         let _ = app.emit("mailbox-changed", ());
     }
@@ -1257,6 +1255,40 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_reply_the_user_sent_while_ai_wrote_drops_the_draft() {
+        let respond = spark_store::Verdict {
+            label: Some(AutoLabel::ToRespond),
+            needs_reply: true,
+        };
+        for replied in [false, true] {
+            let (engine, account, id) = one_email();
+            let settings = AutomationSettings {
+                draft_accounts: [(account, now_ms() - 60_000)].into(),
+                ..Default::default()
+            };
+            engine.store().set_automation_settings(&settings).unwrap();
+            engine
+                .store()
+                .record_verdict(id, respond, &settings, false, now_ms())
+                .unwrap();
+            // AI is writing when the user's own reply goes out, which Sent
+            // brings here only later.
+            if replied {
+                engine
+                    .store()
+                    .user_replied(id, &settings, false, now_ms())
+                    .unwrap();
+            }
+            let saved = save_draft(&engine, id, &options(), Asked::Worker);
+            if replied {
+                assert!(matches!(saved, Err(Failed::Unwanted)), "{saved:?}");
+            } else {
+                assert!(saved.is_ok(), "{saved:?}");
+            }
+        }
     }
 
     #[test]

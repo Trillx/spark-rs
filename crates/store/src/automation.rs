@@ -422,7 +422,8 @@ impl Store {
     }
 
     /// Records what AI said of an email, and applies its label if the
-    /// settings say so. Returns whether the label shown changed.
+    /// settings say so; one looked at already stays as it is. Returns
+    /// whether the label shown changed.
     pub fn record_verdict(
         &mut self,
         id: i64,
@@ -432,6 +433,16 @@ impl Store {
         now: i64,
     ) -> Result<bool> {
         let tx = self.conn.transaction()?;
+        // Looked at already: answered while AI was at it (`user_replied`).
+        let checked: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM automation_checked
+                            WHERE message_id = ?1 AND checked_at IS NOT NULL)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if checked {
+            return Ok(false);
+        }
         let account: Option<i64> = tx
             .query_row("SELECT account_id FROM messages WHERE id = ?1", [id], |r| {
                 r.get(0)
@@ -671,33 +682,98 @@ impl Store {
         Ok(changed)
     }
 
-    /// The emails of a conversation with `from` as their label get `to`
-    /// instead (`None` takes it off), e.g. To respond becomes Actioned once
-    /// the user replies. Returns those changed.
-    pub fn relabel_conversation(
+    /// The user sent a reply to email `id` at `at`: its conversation is
+    /// answered before a sync brings the reply here for `answered_after` to
+    /// find. To respond becomes Actioned (no label, if that's off); its mail
+    /// from before then that AI hasn't looked at yet won't be, and is
+    /// Actioned too; and no reply is due for any of it. Returns the emails
+    /// whose label changed.
+    pub fn user_replied(
         &mut self,
-        conversation: i64,
-        account_id: i64,
-        from: AutoLabel,
-        to: Option<AutoLabel>,
+        id: i64,
+        settings: &AutomationSettings,
         push: bool,
+        at: i64,
     ) -> Result<Vec<i64>> {
         let tx = self.conn.transaction()?;
-        let ids: Vec<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT l.message_id FROM auto_labels l JOIN messages m ON m.id = l.message_id
-                 WHERE l.label = ?3 AND m.account_id = ?1 AND (m.conversation = ?2 OR m.id = ?2)",
-            )?;
-            stmt.query_map(params![account_id, conversation, from.as_str()], |r| {
+        let account: Option<i64> = tx
+            .query_row("SELECT account_id FROM messages WHERE id = ?1", [id], |r| {
                 r.get(0)
-            })?
-            .collect::<Result<_>>()?
+            })
+            .optional()?;
+        // Inbox automation is off there.
+        let Some((account, since)) =
+            account.and_then(|a| settings.since().get(&a).map(|&since| (a, since)))
+        else {
+            return Ok(Vec::new());
         };
-        for &id in &ids {
-            set_label(&tx, id, to, push)?;
+        let actioned = settings
+            .applies(account, AutoLabel::Actioned)
+            .then_some(AutoLabel::Actioned);
+        let mut changed = Vec::new();
+        if settings.labels(account) {
+            let ids: Vec<i64> = tx
+                .prepare(&format!(
+                    "WITH {MEMBERS}
+                     SELECT l.message_id FROM members
+                     JOIN auto_labels l ON l.message_id = members.id WHERE l.label = ?2"
+                ))?
+                .query_map(params![id, AutoLabel::ToRespond.as_str()], |r| r.get(0))?
+                .collect::<Result<_>>()?;
+            for id in ids {
+                if set_label(&tx, id, actioned, push)? {
+                    changed.push(id);
+                }
+            }
         }
+        // What AI would look at next (`CANDIDATES`), from before the reply.
+        let unchecked: Vec<i64> = tx
+            .prepare(&format!(
+                "WITH {MEMBERS}
+                 SELECT m.id FROM members JOIN messages m ON m.id = members.id
+                 WHERE m.state = 'inbox' AND m.folder_only = 0 AND m.date >= ?2 AND m.date <= ?3
+                   AND NOT EXISTS (SELECT 1 FROM accounts a
+                                   WHERE a.email = m.from_address COLLATE NOCASE)
+                   AND NOT EXISTS (SELECT 1 FROM automation_checked c
+                                   WHERE c.message_id = m.id AND c.checked_at IS NOT NULL)
+                   AND {NOT_DRAFT}"
+            ))?
+            .query_map(params![id, since, at], |r| r.get(0))?
+            .collect::<Result<_>>()?;
+        for id in unchecked {
+            tx.execute(
+                "INSERT INTO automation_checked (message_id, checked_at) VALUES (?1, ?2)
+                 ON CONFLICT (message_id) DO UPDATE SET checked_at = excluded.checked_at,
+                     retry_at = NULL",
+                params![id, at],
+            )?;
+            if actioned.is_some() && !has_label_row(&tx, id)? && set_label(&tx, id, actioned, push)?
+            {
+                changed.push(id);
+            }
+        }
+        tx.execute(
+            &format!(
+                "WITH {MEMBERS}
+                 UPDATE automation_checked SET draft_due = NULL
+                 WHERE draft_due IS NOT NULL AND message_id IN
+                     (SELECT m.id FROM members JOIN messages m ON m.id = members.id
+                      WHERE m.date <= ?2)"
+            ),
+            params![id, at],
+        )?;
         tx.commit()?;
-        Ok(ids)
+        Ok(changed)
+    }
+
+    /// Whether a reply is still due for email `id` (`record_verdict`).
+    pub fn reply_due(&self, id: i64) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM automation_checked
+                            WHERE message_id = ?1 AND draft_due IS NOT NULL)",
+            [id],
+            |r| r.get(0),
+        )
     }
 
     /// Labels waiting to go to account `account_id`'s server.
