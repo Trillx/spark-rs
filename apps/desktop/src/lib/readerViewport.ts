@@ -65,12 +65,15 @@ export interface Places {
  * it loads (so `limit` counts every load in flight, even one scrolled past)
  * and until its place is known. Of `cards` (the expanded ones, oldest first),
  * a near one mounts if it would show from the cache, or in its turn while
- * fewer than `limit` load. When nothing changes, `mounted` itself comes back.
+ * fewer than `limit` load. A stale body on screen waiting to load again
+ * (`reloadTurns`) keeps a turn from bodies off it: what's read comes before
+ * what Find or scrolling might reach. When nothing changes, `mounted` itself
+ * comes back.
  */
 export function mountedBodies(
   cards: readonly number[],
   mounted: ReadonlySet<number>,
-  { near, visible, known, loading, cached }: Places,
+  { near, visible, known, loading, cached, stale = new Set() }: Places,
   limit = LOADING_LIMIT,
 ): ReadonlySet<number> {
   const next = new Set<number>();
@@ -79,10 +82,11 @@ export function mountedBodies(
     if (loading.has(id)) inFlight++;
     if (near.has(id) || loading.has(id) || !known.has(id)) next.add(id);
   }
+  const waiting = [...next].filter((id) => visible.has(id) && stale.has(id) && !loading.has(id)).length;
   for (const id of mountOrder(cards, visible)) {
     if (next.has(id) || !near.has(id)) continue;
     if (cached(id)) next.add(id);
-    else if (inFlight < limit) {
+    else if (inFlight + (visible.has(id) ? 0 : waiting) < limit) {
       next.add(id);
       inFlight++;
     }
@@ -112,8 +116,9 @@ export function reload(shown: Shown, version: number, turn: boolean): "waiting" 
 /**
  * Which stale bodies load their content again (see `reload`). Loading again
  * is one of the `limit` loads, as mounting is, and a body keeps its turn till
- * it's no longer stale. Bodies yet to show anything had their turns first
- * (`mountedBodies`), as a stale one shows what it had meanwhile. Then, in
+ * it's no longer stale. Bodies on screen yet to show anything had their turns
+ * first (`mountedBodies`), as a stale one shows what it had meanwhile; bodies
+ * off screen wait for stale ones on it. Then, in
  * turn, a near one that isn't loading something else gets one while fewer
  * than `limit` load. When nothing changes, `reloading` itself comes back.
  */

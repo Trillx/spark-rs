@@ -384,7 +384,7 @@ test("A body loading again keeps its turn while it's far, and lets it go as it u
   assert.equal(s.reloading.size, 0);
 });
 
-test("Bodies yet to show anything load before stale ones, and one done loading again far off unmounts", () => {
+test("Bodies on screen yet to show anything load before stale ones, and one done loading again far off unmounts", () => {
   const s = bodyScheduler(undefined, () => {}, 1, (id) => id === 1);
   const r = readers(s);
   const cards = thread(3);
@@ -393,9 +393,9 @@ test("Bodies yet to show anything load before stale ones, and one done loading a
   assert.deepEqual(sorted(s.mounted), [1, 2], "1 from the cache, 2 in the turn");
   r.show(1, "as stored");
   s.content(2, "loading");
-  // As 2 loads, a sync fills in 1's files, and 3 comes near: both wait.
+  // As 2 loads, a sync fills in 1's files, and 3 comes on screen: both wait.
   r.change([1]);
-  s.place([{ id: 3, near: true }]);
+  s.place([{ id: 3, near: true, visible: true }]);
   assert.equal(r.step(1), "waiting");
   assert.deepEqual(sorted(s.mounted), [1, 2]);
   // 3 shows nothing yet, so it goes first; 1 shows what it had meanwhile.
@@ -409,6 +409,54 @@ test("Bodies yet to show anything load before stale ones, and one done loading a
   assert.deepEqual(sorted(s.mounted), [1, 2, 3]);
   r.show(1, "filled in");
   assert.deepEqual(sorted(s.mounted), [2, 3]);
+  assert.equal(s.reloading.size, 0);
+});
+
+test("A stale body on screen loads again before a body off it mounts", () => {
+  const s = bodyScheduler(undefined, () => {}, 1, (id) => id === 1);
+  const r = readers(s);
+  const cards = thread(3);
+  s.cards(cards);
+  s.place(cards.map((id) => ({ id, near: id <= 2, visible: id <= 2 })));
+  r.show(1, "as stored");
+  s.content(2, "loading");
+  // As 2 loads, a sync fills in 1's files, and 3 comes near, off screen.
+  r.change([1]);
+  s.place([{ id: 3, near: true }]);
+  r.show(2, "as stored");
+  // 1 is being read, so it goes before 3.
+  assert.equal(r.step(1), "loading");
+  assert.deepEqual(sorted(s.mounted), [1, 2]);
+  r.show(1, "filled in");
+  assert.deepEqual(sorted(s.mounted), [1, 2, 3]);
+});
+
+test("A stale body on screen waits for one load at most while Find mounts the rest", () => {
+  // Review finding R6-1: with Find open on a long thread, bodies off screen
+  // took each turn as it came free, and the email being read waited for them all.
+  const s = bodyScheduler(undefined, () => {}, 4, (id) => id === 1);
+  const r = readers(s);
+  const cards = thread(100);
+  s.cards(cards, true);
+  s.place(cards.map((id) => ({ id, near: id <= 2, visible: id === 1 })));
+  r.show(1, "as stored");
+  // A sync fills in 1's files as the rest mount, four at a time.
+  r.change([1]);
+  let first = 0;
+  while (r.step(1) !== "loading") {
+    const fresh = [...s.mounted].filter((id) => !r.shows(id));
+    assert.ok(fresh.length > 0, "nothing loading, and 1 still waits");
+    r.show(fresh[0], "as stored");
+    first++;
+  }
+  assert.equal(first, 1, `1 waited for ${first} bodies off screen`);
+  r.show(1, "filled in");
+  // The rest still mount, all of them.
+  for (let fresh = [...s.mounted].filter((id) => !r.shows(id)); fresh.length > 0; ) {
+    for (const id of fresh) r.show(id, "as stored");
+    fresh = [...s.mounted].filter((id) => !r.shows(id));
+  }
+  assert.deepEqual(sorted(s.mounted), cards);
   assert.equal(s.reloading.size, 0);
 });
 
