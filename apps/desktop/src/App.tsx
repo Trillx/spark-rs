@@ -216,7 +216,7 @@ import {
   presetOf,
   type LaterPreset,
 } from "./lib/format";
-import { loadTheme, saveTheme, type ThemePref } from "./lib/theme";
+import { applyTheme, loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
   CARDS,
   INBOX_MODES,
@@ -292,7 +292,7 @@ import { parseMailto } from "./lib/mailto";
 import { dropPlaceholders, hasPlaceholders, htmlText, replaceText, resendHtml, textToHtml } from "./lib/richText";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import { forgetSearch, loadRecentSearches, rememberSearch, useSearchHits, useServerSearch } from "./lib/search";
-import { stepZoom } from "./lib/zoom";
+import { applyZoom, loadZoom, stepZoom } from "./lib/zoom";
 import type {
   AccountId,
   AccountView,
@@ -1114,6 +1114,11 @@ export default function App() {
       setMinimize(loadMinimize());
       setAlwaysPopOut(loadPopOut());
       setPriorityLines(loadPriorityLines());
+      // The theme and zoom are the app's, every window's.
+      const nextTheme = loadTheme();
+      setTheme(nextTheme);
+      applyTheme(nextTheme);
+      applyZoom(loadZoom());
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
