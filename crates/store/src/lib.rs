@@ -249,6 +249,11 @@ pub struct Location {
     pub uid: Option<u32>,
     pub message_id: Option<String>,
     pub remote_place: Place,
+    /// Its sender, subject and date as stored: to tell it from another
+    /// email with its Message-ID, as a changed copy sent again has.
+    pub from_address: String,
+    pub subject: String,
+    pub date: i64,
 }
 
 /// What `add_incoming` did.
@@ -1132,12 +1137,28 @@ impl Store {
 
     /// Whether message `id` is stored without its body (`Body::Missing`).
     pub fn body_missing(&self, id: i64) -> Result<bool> {
-        Ok(self
+        body_missing_in(&self.conn, id)
+    }
+
+    /// The message of account `account_id` stored without its body
+    /// (`Body::Missing`) that has Message-ID `message_id`, if it's the only
+    /// one stored with it: of several, which one an email with it is can't
+    /// be told.
+    pub fn bodyless_message_id(&self, account_id: i64, message_id: &str) -> Result<Option<i64>> {
+        let stored: Vec<(i64, bool)> = self
             .conn
-            .prepare_cached("SELECT body_missing FROM messages WHERE id = ?1")?
-            .query_row([id], |r| r.get(0))
-            .optional()?
-            .unwrap_or(false))
+            .prepare_cached(
+                "SELECT id, body_missing FROM messages WHERE account_id = ?1 AND message_id = ?2
+                 LIMIT 2",
+            )?
+            .query_map(params![account_id, message_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<Result<_>>()?;
+        Ok(match stored[..] {
+            [(id, true)] => Some(id),
+            _ => None,
+        })
     }
 
     /// The message stored with Graph id `remote_id`, if it's stored without
@@ -1335,7 +1356,8 @@ impl Store {
     pub fn location(&self, id: i64) -> Result<Option<Location>> {
         self.conn
             .query_row(
-                "SELECT account_id, remote_id, mailbox, uid, message_id, remote_place
+                "SELECT account_id, remote_id, mailbox, uid, message_id, remote_place,
+                    from_address, subject, date
                  FROM messages WHERE id = ?1",
                 [id],
                 |r| {
@@ -1346,6 +1368,9 @@ impl Store {
                         uid: r.get(3)?,
                         message_id: r.get(4)?,
                         remote_place: parse_place(&r.get::<_, String>(5)?),
+                        from_address: r.get(6)?,
+                        subject: r.get(7)?,
+                        date: r.get(8)?,
                     })
                 },
             )
@@ -2092,6 +2117,20 @@ impl Batch<'_> {
         fill_in_body_in(self.conn, id, m)
     }
 
+    /// Whether storing `m` (`add_incoming`, `add_folder_message`) would
+    /// fill in the body of the stored message it is: `m` came whole, and
+    /// that message waits for its body (`fill_in_body`), as one the
+    /// background download stored meanwhile does.
+    pub fn fills_in(&self, m: &Incoming) -> Result<bool> {
+        if m.body != Body::Whole {
+            return Ok(false);
+        }
+        match find_stored(self.conn, m)? {
+            Some(id) => body_missing_in(self.conn, id),
+            None => Ok(false),
+        }
+    }
+
     /// `Store::has_remote_id`, in the batch.
     pub fn has_remote_id(&self, account_id: i64, remote_id: &str) -> Result<bool> {
         has_remote_id_in(self.conn, account_id, remote_id)
@@ -2428,6 +2467,15 @@ fn has_remote_id_in(conn: &Connection, account_id: i64, remote_id: &str) -> Resu
         "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND remote_id = ?2)",
     )?
     .query_row(params![account_id, remote_id], |r| r.get(0))
+}
+
+/// `Store::body_missing`, in the caller's transaction.
+fn body_missing_in(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT body_missing FROM messages WHERE id = ?1")?
+        .query_row([id], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// `Store::fill_in_body`. Only a message fetched whole fills it in: not

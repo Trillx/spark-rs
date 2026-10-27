@@ -985,6 +985,11 @@ impl Engine {
                 let whole = whole.ok_or_else(|| {
                     Error::Server("The email on the server is unreadable.".into())
                 })?;
+                // What's filled in stays: not a changed copy sent again
+                // with its Message-ID, found as its UID was gone.
+                if !imap::same_email(&at, &whole) {
+                    return Err(Error::Server(imap::NOT_THE_ONE.into()));
+                }
                 let filled = self.store().fill_in_body(message_id, &whole)?;
                 // Not what was found by Message-ID in a renumbered mailbox
                 // (`imap::fetch_raw_checked`), as `download_imap` doesn't.
@@ -3877,6 +3882,46 @@ mod tests {
         }
     }
 
+    /// The header fields of `raw` named in `fields` ("FROM SUBJECT"), as
+    /// a FETCH of them answers.
+    fn header_fields(raw: &[u8], fields: &str) -> Vec<u8> {
+        let text = String::from_utf8_lossy(raw);
+        let header = text.split("\r\n\r\n").next().unwrap_or_default();
+        let mut data = String::new();
+        for line in header.split("\r\n") {
+            if let Some((name, _)) = line.split_once(':')
+                && fields
+                    .split_whitespace()
+                    .any(|f| f.eq_ignore_ascii_case(name.trim()))
+            {
+                data.push_str(line);
+                data.push_str("\r\n");
+            }
+        }
+        data.push_str("\r\n");
+        data.into_bytes()
+    }
+
+    /// The INTERNALDATE of `raw`: its Date, else the start of 1970.
+    fn internal_date_of(raw: &[u8]) -> String {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let secs = mail_parser::MessageParser::default()
+            .parse_headers(raw)
+            .and_then(|m| m.date().map(|d| d.to_timestamp()))
+            .unwrap_or(0);
+        let (y, m, d) = graph::civil_from_days(secs.div_euclid(86_400));
+        let t = secs.rem_euclid(86_400);
+        format!(
+            "{d:02}-{}-{y} {:02}:{:02}:{:02} +0000",
+            MONTHS[(m - 1) as usize],
+            t / 3600,
+            t % 3600 / 60,
+            t % 60
+        )
+    }
+
     async fn imap_session(
         socket: TcpStream,
         held: &Mutex<Held>,
@@ -3939,14 +3984,18 @@ mod tests {
                     .map(|(i, (u, raw))| (i + 1, *u, raw.clone()))
                     .collect();
                 for (seq, uid, raw) in found {
-                    // The Message-ID alone, to check a search's hits.
-                    let data = if upper.contains("HEADER.FIELDS") {
-                        let id = crate::parse::message_id(&raw)
-                            .map(|id| format!("Message-ID: <{id}>\r\n"))
-                            .unwrap_or_default();
-                        let data = format!("{id}\r\n").into_bytes();
+                    // The fields asked for, to check a search's hits, and
+                    // its arrival, as its Date says (else 1970).
+                    let data = if let Some((_, fields)) = command.split_once("HEADER.FIELDS (") {
+                        let fields = fields.split(')').next().unwrap();
+                        let data = header_fields(&raw, fields);
+                        let arrived = if upper.contains("INTERNALDATE") {
+                            format!("INTERNALDATE \"{}\" ", internal_date_of(&raw))
+                        } else {
+                            String::new()
+                        };
                         let head = format!(
-                            "* {seq} FETCH (UID {uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n",
+                            "* {seq} FETCH (UID {uid} {arrived}BODY[HEADER.FIELDS ({fields})] {{{}}}\r\n",
                             data.len()
                         );
                         write.write_all(head.as_bytes()).await?;
@@ -4327,6 +4376,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_older_mail_takes_it_and_not_a_changed_copy_sent_again() {
+        // Stored without its body at UID 42, which is gone: it was moved
+        // away and back (50), and a corrected copy with its Message-ID came
+        // after (51), as stored but for when it came and what it says.
+        let email = |date: &str, text: &str| {
+            format!(
+                "From: ana@example.com\r\nSubject: Files\r\nMessage-ID: <dup@example.com>\r\n\
+                 {date}Content-Type: text/plain\r\n\r\n{text}\r\n"
+            )
+            .into_bytes()
+        };
+        let original = email("", "The figures.");
+        let resent = email(
+            "Date: Tue, 21 Oct 2025 14:00:00 +0000\r\n",
+            "The corrected figures.",
+        );
+        let imap = ImapStandIn::start(7, vec![(50, original.clone()), (51, resent.clone())]).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        // Stored as it came, at the start of 1970 (`store_head`).
+        let id = store_head(&mut store, account.id, 42, &original);
+        let store = Arc::new(Mutex::new(store));
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+        let content = |store: &Mutex<Store>| store.lock().unwrap().content(id).unwrap().unwrap();
+
+        // Two copies alike, that came at the same time: which can't be told.
+        imap.hold(
+            imap::INBOX,
+            7,
+            vec![(50, original.clone()), (52, original.clone())],
+        );
+        let fetched = engine.fetch_body(id).await;
+        assert!(matches!(&fetched, Err(Error::Server(_))), "{fetched:?}");
+        assert!(content(&store).body_missing);
+
+        // Only the copy sent again, its subject changed: not it either.
+        let renamed = String::from_utf8(resent.clone())
+            .unwrap()
+            .replace("Subject: Files", "Subject: Files (corrected)")
+            .into_bytes();
+        imap.hold(imap::INBOX, 7, vec![(51, renamed)]);
+        let fetched = engine.fetch_body(id).await;
+        assert!(
+            matches!(&fetched, Err(Error::Server(e)) if e == imap::NOT_THE_ONE),
+            "{fetched:?}"
+        );
+        assert!(content(&store).body_missing);
+
+        // The one that came when it did.
+        imap.hold(imap::INBOX, 7, vec![(50, original), (51, resent)]);
+        assert!(engine.fetch_body(id).await.unwrap());
+        assert_eq!(content(&store).text.trim(), "The figures.");
+    }
+
+    #[tokio::test]
     async fn older_microsoft_mail_is_gone_over_after_start_and_hourly() {
         fn empty(_: &str) -> Option<serde_json::Value> {
             Some(serde_json::json!({ "value": [] }))
@@ -4425,6 +4529,101 @@ mod tests {
         }
         // Asked again, it has it.
         assert_eq!(engine.search_server(account.id, "zebra").await.unwrap(), 0);
+    }
+
+    /// `zebra` mail in full, number `n`, as `store_head` stores it.
+    fn zebra(n: u32) -> Vec<u8> {
+        format!(
+            "From: ana@example.com\r\nSubject: Files\r\nMessage-ID: <z{n}@example.com>\r\n\
+             Content-Type: text/plain\r\n\r\nThe zebra crossing, part {n}.\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// An IMAP account searched in its Archive too, with no inbox hits.
+    fn archived_search(imap: &ImapStandIn) -> (Arc<Mutex<Store>>, Account, i64) {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = imap_account(&store, &imap.server, 7);
+        let state = imap::SyncState {
+            uid_validity: Some(7),
+            floor: Some(40),
+            archive: Some("Archive".into()),
+            ..Default::default()
+        };
+        store.set_sync_state(account.id, &to_json(&state)).unwrap();
+        store
+            .replace_folders(
+                account.id,
+                &[RemoteFolder {
+                    remote_id: "Archive".into(),
+                    parent: None,
+                    name: "Archive".into(),
+                    role: Some(FolderRole::Archive),
+                    selectable: true,
+                }],
+            )
+            .unwrap();
+        let folder = store.folders().unwrap()[0].id;
+        imap.hold(imap::INBOX, 7, Vec::new());
+        (Arc::new(Mutex::new(store)), account, folder)
+    }
+
+    #[tokio::test]
+    async fn an_imap_search_brings_bodies_of_mail_archived_elsewhere() {
+        let imap = ImapStandIn::start(7, Vec::new()).await;
+        let (store, account, folder) = archived_search(&imap);
+        // Stored from the inbox without its body; archived elsewhere since,
+        // before the Archive's sync listed it there.
+        let id = store_head(&mut store.lock().unwrap(), account.id, 42, &zebra(1));
+        imap.hold("Archive", 9, vec![(7, zebra(1))]);
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+
+        assert_eq!(engine.search_server(account.id, "zebra").await.unwrap(), 1);
+        {
+            let s = store.lock().unwrap();
+            let content = s.content(id).unwrap().unwrap();
+            assert!(!content.body_missing);
+            assert_eq!(content.text.trim(), "The zebra crossing, part 1.");
+            assert_eq!(s.search("crossing").unwrap()[0].id, id);
+            assert_eq!(s.folder_uids(folder).unwrap()[&7], id, "listed there");
+        }
+        assert_eq!(engine.search_server(account.id, "zebra").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_imap_search_brings_the_rest_of_the_bodies_the_next_time() {
+        let imap = ImapStandIn::start(7, Vec::new()).await;
+        let (store, account, folder) = archived_search(&imap);
+        // 101 in the Archive, as its sync listed them, stored without bodies.
+        let mut members = Vec::new();
+        let mut archived = Vec::new();
+        for n in 1..=101 {
+            let id = store_head(&mut store.lock().unwrap(), account.id, 1000 + n, &zebra(n));
+            members.push((id, Some(n)));
+            archived.push((n, zebra(n)));
+        }
+        store
+            .lock()
+            .unwrap()
+            .set_folder_members(folder, &members)
+            .unwrap();
+        imap.hold("Archive", 9, archived);
+        let engine = Engine::new(store.clone(), Arc::new(TestSecrets));
+
+        assert_eq!(
+            engine.search_server(account.id, "zebra").await.unwrap(),
+            crate::search::SERVER_HITS
+        );
+        let bodyless = || {
+            members
+                .iter()
+                .filter(|(id, _)| store.lock().unwrap().body_missing(*id).unwrap())
+                .map(|(_, uid)| uid.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bodyless(), [1], "the newest first");
+        assert_eq!(engine.search_server(account.id, "zebra").await.unwrap(), 1);
+        assert!(bodyless().is_empty());
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@
 //! can't fetch (Gmail: "Some messages could not be FETCHed") holds back
 //! only itself, and is asked for again by later syncs.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::ops::ControlFlow;
@@ -1170,7 +1171,7 @@ pub async fn older_inbox(
             .filter(|uid| !known.contains(uid))
             .collect();
         let heads = fetch_heads(session, &new, INBOX, &mut state.heads).await?;
-        stored += store_new(store, account_id, heads, false)?.len();
+        stored += store_new(store, account_id, heads, false)?.0.len();
         // Mail a search stored brings its flags from then: the next sync
         // asks for every flag, not just the changes.
         if new.len() < batch.len() {
@@ -1478,10 +1479,11 @@ async fn fetch_reply_to(
 /// the inbox sync's) and the archive folder (Gmail: All Mail, in Gmail's
 /// own syntax). The newest `SERVER_HITS` of each that aren't stored yet are
 /// stored, inbox mail as reaching back stores it and archived mail as the
-/// archive folder's sync does. Of each, the newest `SERVER_HITS` hits
-/// stored without their bodies get them (`fill_in_found`). Returns how
-/// many were new or filled in. A place that renumbered its UIDs is left to
-/// its next sync.
+/// archive folder's sync does. The newest `SERVER_HITS` hits stored
+/// without their bodies get them, the inbox's first (`fill_in_found`),
+/// mail archived elsewhere before the archive's sync listed it too.
+/// Returns how many were new or filled in. A place that renumbered its
+/// UIDs is left to its next sync.
 pub async fn search_server(
     session: &mut Session,
     store: &Mutex<Store>,
@@ -1501,7 +1503,7 @@ pub async fn search_server(
         return Ok(0);
     };
     let mut stored = 0;
-    // Mail filled in from the inbox, which the archive needn't fill in too.
+    // Mail filled in so far, which needn't be again.
     let mut filled = HashSet::new();
 
     if let Some(floor) = state.floor
@@ -1517,16 +1519,19 @@ pub async fn search_server(
         let found = uid_search(session, &keys).await?;
         let hits = newest(found.clone(), |uid| uid < floor && !known.contains(&uid));
         for batch in hits.chunks(FETCH_BATCH) {
-            stored += fetch_new(session, store, account.id, batch, false)
-                .await?
-                .0
-                .len();
+            let (fetched, _) = fetch_messages(session, batch, INBOX).await?;
+            // Some the background download may have stored meanwhile.
+            let (new, bodies) = store_new(store, account.id, fetched, false)?;
+            stored += new.len() + bodies.len();
+            filled.extend(bodies);
         }
-        let hits: Vec<(u32, i64)> = newest(found, |uid| bodyless.contains_key(&uid))
-            .into_iter()
-            .map(|uid| (uid, bodyless[&uid]))
-            .collect();
-        let ids = fill_in_found(session, store, INBOX, &hits).await?;
+        let hits: Vec<(u32, i64)> = newest(found, |uid| {
+            bodyless.get(&uid).is_some_and(|id| !filled.contains(id))
+        })
+        .into_iter()
+        .map(|uid| (uid, bodyless[&uid]))
+        .collect();
+        let ids = fill_in_found(session, store, account.id, INBOX, &hits, None).await?;
         stored += ids.len();
         filled.extend(ids);
     }
@@ -1550,57 +1555,117 @@ pub async fn search_server(
     }
     let known = lock(store).folder_uids(folder.id)?;
     let found = uid_search(session, &keys).await?;
+    let hits = newest(found.clone(), |uid| !known.contains_key(&uid));
+    // Mail not stored yet, and mail stored from the inbox without its body
+    // that was archived elsewhere before this folder's sync listed it here.
+    let mut unknown = Vec::new();
+    let mut archived: HashMap<i64, Vec<(u32, Option<i64>)>> = HashMap::new();
+    for batch in hits.chunks(FETCH_BATCH) {
+        let (heads, _) = uid_fetch_each(
+            session,
+            &folder.remote_id,
+            batch,
+            "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await?;
+        let store = lock(store);
+        for head in &heads {
+            let Some(uid) = head.uid else {
+                continue;
+            };
+            let Some(message_id) = head.header().and_then(parse::message_id) else {
+                unknown.push(uid);
+                continue;
+            };
+            if !store.has_message_id(account.id, &message_id)? {
+                unknown.push(uid);
+            } else if let Some(id) = store.bodyless_message_id(account.id, &message_id)?
+                && !filled.contains(&id)
+            {
+                archived.entry(id).or_default().push((uid, head.arrived));
+            }
+        }
+    }
+    // Of several here with its Message-ID, the one that arrived when it
+    // did, if one alone did: a copy sent again with it doesn't.
+    let mut moved = Vec::new();
+    {
+        let store = lock(store);
+        for (id, copies) in archived {
+            let uid = match copies[..] {
+                [(uid, _)] => Some(uid),
+                _ => {
+                    let date = store.location(id)?.map_or(0, |at| at.date);
+                    let mut arrived = copies.iter().filter(|(_, arrived)| {
+                        arrived.is_some_and(|a| a.div_euclid(1000) == date.div_euclid(1000))
+                    });
+                    match (arrived.next(), arrived.next()) {
+                        (Some((uid, _)), None) => Some(*uid),
+                        _ => None,
+                    }
+                }
+            };
+            moved.extend(uid.map(|uid| (uid, id)));
+        }
+    }
+
+    // The newest stored without their bodies, as many as there's room for.
+    let room = SERVER_HITS.saturating_sub(filled.len());
     let bodyless: Vec<(u32, i64)> = {
         let store = lock(store);
+        let mut listed: Vec<(u32, i64)> = found
+            .iter()
+            .filter_map(|uid| Some((*uid, *known.get(uid)?)))
+            .collect();
+        listed.sort_unstable_by_key(|(uid, _)| Reverse(*uid));
         let mut bodyless = Vec::new();
-        for uid in newest(found.clone(), |uid| known.contains_key(&uid)) {
-            let id = known[&uid];
+        for (uid, id) in listed {
+            if bodyless.len() == room {
+                break;
+            }
             if !filled.contains(&id) && store.body_missing(id)? {
                 bodyless.push((uid, id));
             }
         }
         bodyless
     };
-    stored += fill_in_found(session, store, &folder.remote_id, &bodyless)
-        .await?
-        .len();
-    let hits = newest(found, |uid| !known.contains_key(&uid));
-    for batch in hits.chunks(FETCH_BATCH) {
-        // Mail stored from elsewhere (the inbox, another label) is left as it is.
-        let (heads, _) = uid_fetch_each(
-            session,
-            &folder.remote_id,
-            batch,
-            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-        )
-        .await?;
-        let heads: Vec<(u32, Option<String>)> = heads
-            .iter()
-            .filter_map(|f| Some((f.uid?, f.header().and_then(parse::message_id))))
-            .collect();
-        let mut unknown = Vec::new();
-        {
-            let store = lock(store);
-            for (uid, message_id) in heads {
-                let stored_already = match message_id {
-                    Some(id) => store.has_message_id(account.id, &id)?,
-                    None => false,
-                };
-                if !stored_already {
-                    unknown.push(uid);
-                }
-            }
-        }
-        let (mut fetched, _) = fetch_messages(session, &unknown, &folder.remote_id).await?;
+    moved.sort_unstable_by_key(|(uid, _)| Reverse(*uid));
+    moved.truncate(room - bodyless.len());
+    stored += fill_in_found(
+        session,
+        store,
+        account.id,
+        &folder.remote_id,
+        &bodyless,
+        None,
+    )
+    .await?
+    .len();
+    // Listed in the folder as its sync lists them, so later searches
+    // don't take them for mail stored from elsewhere.
+    stored += fill_in_found(
+        session,
+        store,
+        account.id,
+        &folder.remote_id,
+        &moved,
+        Some(folder.id),
+    )
+    .await?
+    .len();
+
+    for batch in unknown.chunks(FETCH_BATCH) {
+        let (mut fetched, _) = fetch_messages(session, batch, &folder.remote_id).await?;
         for m in &mut fetched {
             m.account_id = account.id;
         }
         stored += lock(store).batch(|b| {
             let mut new = 0;
             for m in &fetched {
-                if let Added::New(_) = b.add_folder_message(folder.id, m)? {
-                    new += 1;
-                }
+                // Some the background download may have stored meanwhile.
+                let bodies = b.fills_in(m)?;
+                let added = b.add_folder_message(folder.id, m)?;
+                new += usize::from(matches!(added, Added::New(_)) || bodies);
             }
             Ok(new)
         })?;
@@ -1609,27 +1674,54 @@ pub async fn search_server(
 }
 
 /// Downloads the messages at `found` (UID and stored message id) in the
-/// selected `mailbox`, stored without their bodies, and fills them in
-/// (`Store::fill_in_body`, which keeps what the user changed): a search
-/// found them, maybe by their bodies, which the store can't search till it
-/// has them. Returns the ids of those filled in.
+/// selected `mailbox` of account `account_id`, stored without their
+/// bodies, and fills them in (`Store::fill_in_body`, which keeps what the
+/// user changed): a search found them, maybe by their bodies, which the
+/// store can't search till it has them. Each must be the email stored
+/// (`same_email`). With `folder`, it's stored as that folder's sync stores
+/// it (`Store::add_folder_message`), and so listed there. Returns the ids
+/// of those filled in.
 async fn fill_in_found(
     session: &mut Session,
     store: &Mutex<Store>,
+    account_id: i64,
     mailbox: &str,
     found: &[(u32, i64)],
+    folder: Option<i64>,
 ) -> Result<Vec<i64>> {
     let mut filled = Vec::new();
     for batch in found.chunks(FETCH_BATCH) {
         let uids: Vec<u32> = batch.iter().map(|(uid, _)| *uid).collect();
         let ids: HashMap<u32, i64> = batch.iter().copied().collect();
-        let (fetched, _) = fetch_messages(session, &uids, mailbox).await?;
-        filled.extend(lock(store).batch(|b| {
+        let (mut fetched, _) = fetch_messages(session, &uids, mailbox).await?;
+        let mut store = lock(store);
+        let mut stored = HashMap::new();
+        for (_, id) in batch {
+            if let Some(at) = store.location(*id)? {
+                stored.insert(*id, at);
+            }
+        }
+        for m in &mut fetched {
+            m.account_id = account_id;
+        }
+        filled.extend(store.batch(|b| {
             let mut filled = Vec::new();
             for m in &fetched {
-                if let Some(&id) = m.uid.and_then(|uid| ids.get(&uid))
-                    && b.fill_in_body(id, m)?
-                {
+                let Some(&id) = m.uid.and_then(|uid| ids.get(&uid)) else {
+                    continue;
+                };
+                if !stored.get(&id).is_some_and(|at| same_email(at, m)) {
+                    continue;
+                }
+                let bodies = match folder {
+                    Some(folder) => {
+                        let bodies = b.fills_in(m)?;
+                        b.add_folder_message(folder, m)?;
+                        bodies
+                    }
+                    None => b.fill_in_body(id, m)?,
+                };
+                if bodies {
                     filled.push(id);
                 }
             }
@@ -1657,30 +1749,34 @@ async fn fetch_new(
     screen_new_senders: bool,
 ) -> Result<(Vec<i64>, usize)> {
     let (fetched, refused) = fetch_messages(session, uids, INBOX).await?;
-    let added = store_new(store, account_id, fetched, screen_new_senders)?;
+    let (added, _) = store_new(store, account_id, fetched, screen_new_senders)?;
     Ok((added, refused.len()))
 }
 
 /// Stores fetched inbox messages in one transaction; returns the ids of
-/// those that were new.
+/// those that were new, and of those stored already whose bodies they
+/// filled in (`Batch::fills_in`).
 fn store_new(
     store: &Mutex<Store>,
     account_id: i64,
     mut fetched: Vec<Incoming>,
     screen_new_senders: bool,
-) -> Result<Vec<i64>> {
+) -> Result<(Vec<i64>, Vec<i64>)> {
     for m in &mut fetched {
         m.account_id = account_id;
     }
     // All of them are stored, or (if one fails) none.
     Ok(lock(store).batch(|b| {
-        let mut added = Vec::new();
+        let (mut added, mut filled) = (Vec::new(), Vec::new());
         for m in &fetched {
-            if let Added::New(id) = b.add_incoming(m, screen_new_senders)? {
-                added.push(id);
+            let bodies = b.fills_in(m)?;
+            match b.add_incoming(m, screen_new_senders)? {
+                Added::New(id) => added.push(id),
+                Added::Known(id) if bodies => filled.push(id),
+                Added::Known(_) => {}
             }
         }
-        Ok(added)
+        Ok((added, filled))
     })?)
 }
 
@@ -2320,7 +2416,10 @@ pub async fn fetch_raw(
 /// `fetch_raw`, given the UIDVALIDITY the stored UID was given under, if
 /// it's known. When the mailbox has another now, the UID may name some
 /// other message, so it isn't fetched: the message is found by Message-ID
-/// instead, that one exactly (`find_message_id`). Whatever is fetched is
+/// instead, that one exactly (`find_message_id`). Where several have it (a
+/// changed copy sent again), the one with the stored sender, subject and
+/// arrival is taken (`the_stored_one`); if not one alone has them, none
+/// is, and it fails if nothing else is found. Whatever is fetched is
 /// checked to have the stored Message-ID, if it has one. Also says whether
 /// what was found is safe to keep: not what was found by Message-ID in a
 /// renumbered mailbox, nor at a UID that held some other message, as
@@ -2362,6 +2461,7 @@ pub async fn fetch_raw_checked(
             folders.push(mailbox);
         }
     }
+    let mut ambiguous = false;
     for mailbox in folders {
         match session.select(&mailbox).await {
             Ok(_) => {}
@@ -2369,17 +2469,78 @@ pub async fn fetch_raw_checked(
             Err(async_imap::error::Error::No(_)) => continue,
             Err(e) => return Err(e.into()),
         }
-        if let Some(uid) = find_message_id(session, message_id)
-            .await?
-            .into_iter()
-            .max()
-            && let Some(raw) = fetch_body(session, uid).await?
+        let found = find_message_id(session, message_id).await?;
+        let uid = match found[..] {
+            [] => continue,
+            [uid] => uid,
+            _ => match the_stored_one(session, &found, at).await? {
+                Some(uid) => uid,
+                None => {
+                    ambiguous = true;
+                    continue;
+                }
+            },
+        };
+        if let Some(raw) = fetch_body(session, uid).await?
             && is_it(&raw)
         {
             return Ok(Some((raw, !renumbered)));
         }
     }
+    if ambiguous {
+        return Err(Error::Server(AMBIGUOUS.into()));
+    }
     Ok(None)
+}
+
+/// Why an email found only by its Message-ID wasn't taken: the server has
+/// several with it, and not one alone is the email as stored.
+const AMBIGUOUS: &str =
+    "The server has more than one email like this one, and which is this one can't be told.";
+
+/// Why an email found by its Message-ID wasn't taken: it isn't the email
+/// as stored (`same_email`).
+pub const NOT_THE_ONE: &str =
+    "The email the server has under this one's Message-ID is a different one.";
+
+/// Of the UIDs `found` in the selected mailbox, each with the Message-ID of
+/// the email `at` describes, the one that is it: with its stored sender and
+/// subject (`same_email`), and its arrival to the second, which moving it
+/// keeps and a copy sent again doesn't. `None` unless one alone is.
+async fn the_stored_one(
+    session: &mut Session,
+    found: &[u32],
+    at: &Location,
+) -> Result<Option<u32>> {
+    let heads: Vec<Fetched> = uid_fetch(
+        session,
+        uid_set(found),
+        "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])",
+    )
+    .await?
+    .try_collect()
+    .await?;
+    let mut matching = heads
+        .iter()
+        .filter(|f| {
+            f.arrived
+                .is_some_and(|arrived| arrived.div_euclid(1000) == at.date.div_euclid(1000))
+                && f.header()
+                    .and_then(|header| parse::parse_head(header, b"", false))
+                    .is_some_and(|m| same_email(at, &m))
+        })
+        .filter_map(|f| f.uid);
+    Ok(match (matching.next(), matching.next()) {
+        (Some(uid), None) => Some(uid),
+        _ => None,
+    })
+}
+
+/// Whether `m`, fetched from the server, has the sender and subject stored
+/// of the email `at` describes: a copy of it can't change them, though a
+/// changed one sent again with its Message-ID can.
+pub fn same_email(at: &Location, m: &Incoming) -> bool {
+    m.from_address.eq_ignore_ascii_case(&at.from_address) && m.subject == at.subject
 }
 
 async fn fetch_body(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
@@ -3103,6 +3264,43 @@ mod tests {
         let m = incoming(read_fetch_response(&big)).unwrap();
         assert_eq!(m.text, "This message is too large to show here.");
         assert_eq!(m.body, Body::Partial);
+    }
+
+    #[test]
+    fn storing_whole_mail_says_whose_bodies_it_filled_in() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&spark_store::NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@example.com",
+                name: "Me",
+                label: "Test",
+                config: "{}",
+            })
+            .unwrap();
+        let head = |uid: u32, body: Body| Incoming {
+            account_id: account.id,
+            mailbox: Some(INBOX.into()),
+            uid: Some(uid),
+            message_id: Some(format!("{uid}@example.com")),
+            from_address: "ana@example.com".into(),
+            subject: "Files".into(),
+            text: "The files, in full".into(),
+            body,
+            ..Default::default()
+        };
+        // The background download stored UID 5 without its body as a
+        // search fetched it whole.
+        let Added::New(id) = store.add_incoming(&head(5, Body::Missing), false).unwrap() else {
+            panic!("stored before");
+        };
+        let store = Mutex::new(store);
+        let fetched = vec![head(5, Body::Whole), head(6, Body::Whole)];
+        let (new, filled) = store_new(&store, account.id, fetched, false).unwrap();
+        assert_eq!((new.len(), filled), (1, vec![id]));
+        let again = vec![head(5, Body::Whole)];
+        let (new, filled) = store_new(&store, account.id, again, false).unwrap();
+        assert!(new.is_empty() && filled.is_empty(), "it has it now");
     }
 
     #[test]

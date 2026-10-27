@@ -1705,7 +1705,52 @@ fn locations_say_where_the_server_keeps_a_message() {
     assert_eq!(at.account_id, account);
     assert_eq!((at.mailbox.as_deref(), at.uid), (Some("INBOX"), Some(7)));
     assert_eq!(at.remote_place, Place::Inbox);
+    // And what tells it from another with its Message-ID.
+    assert_eq!(
+        (at.from_address.as_str(), at.subject.as_str(), at.date),
+        ("a@x.com", "Message 7", 1_007)
+    );
     assert_eq!(store.location(id + 100).unwrap(), None);
+}
+
+#[test]
+fn whole_mail_says_if_it_fills_in_a_body_and_message_ids_find_one() {
+    let (mut store, account) = store_with_account();
+    let id = new_id(store.add_incoming(&head(account, 1), false).unwrap());
+    let fills = |store: &mut Store, m: &Incoming| store.batch(|b| b.fills_in(m)).unwrap();
+    assert!(fills(&mut store, &whole(account, 1)));
+    assert!(!fills(&mut store, &head(account, 1)), "not without a body");
+    assert!(!fills(&mut store, &whole(account, 2)), "nor one not stored");
+    let message_id = head(account, 1).message_id.unwrap();
+    assert_eq!(
+        store.bodyless_message_id(account, &message_id).unwrap(),
+        Some(id)
+    );
+    assert_eq!(
+        store.bodyless_message_id(account + 1, &message_id).unwrap(),
+        None
+    );
+    store.fill_in_body(id, &whole(account, 1)).unwrap();
+    assert!(!fills(&mut store, &whole(account, 1)), "filled in already");
+    assert_eq!(
+        store.bodyless_message_id(account, &message_id).unwrap(),
+        None
+    );
+    // Of two with one Message-ID, which one it is can't be told.
+    let again = Incoming {
+        mailbox: Some("Archive".into()),
+        ..head(account, 1)
+    };
+    store
+        .batch(|b| {
+            insert_message(b.conn, &again, MessageState::Done, false, Place::Archive)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        store.bodyless_message_id(account, &message_id).unwrap(),
+        None
+    );
 }
 
 #[test]

@@ -2177,6 +2177,69 @@ async fn imap_inbox_downloads_a_year_in_the_background() {
     assert_eq!(invite.summary, "Review");
     assert!(!invite.ics.is_empty());
 
+    // Moved away and back elsewhere (a new UID), and then a corrected copy
+    // with its Message-ID came: opened, it gets its own body.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    let uid_of = async |session: &mut imap::Session, mailbox: &str, id: &str| {
+        session.select(mailbox).await.unwrap();
+        let query = format!("HEADER Message-ID \"{id}\"");
+        let uids = session.uid_search(query).await.unwrap();
+        uids.into_iter().max().unwrap()
+    };
+    let take_out = async |session: &mut imap::Session, uid: u32| {
+        let _: Vec<_> = session
+            .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let _: Vec<_> = session
+            .expunge()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+    };
+    let uid = uid_of(&mut other, "INBOX", "year4@x.com").await;
+    other.uid_copy(uid.to_string(), "Projects").await.unwrap();
+    take_out(&mut other, uid).await;
+    let uid = uid_of(&mut other, "Projects", "year4@x.com").await;
+    other.uid_copy(uid.to_string(), "INBOX").await.unwrap();
+    take_out(&mut other, uid).await;
+    let corrected = raw("year4@x.com", "Year 4").replace(" body", " corrected body");
+    other.append("INBOX", None, None, corrected).await.unwrap();
+    let _ = other.logout().await;
+    let moved = find(&engine, "Year 4");
+    assert!(engine.fetch_body(moved.id).await.unwrap());
+    let content = engine.store().content(moved.id).unwrap().unwrap();
+    assert_eq!(content.text.trim(), "Year 4 body");
+
+    // Archived elsewhere before the Archive's sync listed it: a search
+    // that finds it there by its body brings that too.
+    let mut other = imap::login(&imap, &me, "pw").await.unwrap();
+    let uid = uid_of(&mut other, "INBOX", "year5@x.com").await;
+    other.uid_copy(uid.to_string(), "Archive").await.unwrap();
+    take_out(&mut other, uid).await;
+    let _ = other.logout().await;
+    assert!(found(&engine, "\"Year 5 body\"").is_empty());
+    assert_eq!(
+        engine
+            .search_server(account.id, "\"Year 5 body\"")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(found(&engine, "\"Year 5 body\""), ["Year 5"]);
+    assert_eq!(
+        engine
+            .search_server(account.id, "\"Year 5 body\"")
+            .await
+            .unwrap(),
+        0
+    );
+
     // Gone from the server: it says so, and still waits for its body.
     let mut other = imap::login(&imap, &me, "pw").await.unwrap();
     other.select("INBOX").await.unwrap();
