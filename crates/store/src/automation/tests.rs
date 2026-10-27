@@ -706,6 +706,7 @@ fn a_draft_in_trash_wasnt_a_reply_but_one_in_sent_was() {
                 folder("Drafts", FolderRole::Drafts),
                 folder("Trash", FolderRole::Trash),
                 folder("Sent", FolderRole::Sent),
+                folder("All Mail", FolderRole::Archive),
             ],
         )
         .unwrap();
@@ -722,6 +723,7 @@ fn a_draft_in_trash_wasnt_a_reply_but_one_in_sent_was() {
         role(&store, FolderRole::Trash),
         role(&store, FolderRole::Sent),
     );
+    let all_mail = role(&store, FolderRole::Archive);
     let id = add(&mut store, &incoming(account, 1, "a@x.com", NOW - 60_000));
     let draft = save_reply(&mut store, account, "1@example.com", "Sure.");
     // Out of Drafts and into Trash: Deleted Items (Microsoft) leaves it
@@ -746,6 +748,16 @@ fn a_draft_in_trash_wasnt_a_reply_but_one_in_sent_was() {
         &format!(
             "UPDATE messages SET state = 'filed' WHERE id = {draft};
              INSERT INTO folder_members (folder_id, message_id) VALUES ({trash}, {draft});"
+        ),
+    );
+    assert!(!store.answered_after(id).unwrap());
+    // Gmail's All Mail lists drafts too, and may not have been synced again
+    // since: Trash still wins.
+    moved(
+        &store,
+        &format!(
+            "INSERT INTO folder_members (folder_id, message_id) VALUES ({trash}, {draft});
+             INSERT INTO folder_members (folder_id, message_id) VALUES ({all_mail}, {draft});"
         ),
     );
     assert!(!store.answered_after(id).unwrap());
