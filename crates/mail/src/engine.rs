@@ -1336,7 +1336,10 @@ impl Engine {
         for (id, json) in due {
             let parsed = serde_json::from_str::<Draft>(&json);
             let saved_draft = parsed.as_ref().ok().and_then(|d| d.draft_id);
-            let reply_to = parsed.as_ref().ok().and_then(|d| d.reply_to);
+            let reply_to = parsed
+                .as_ref()
+                .ok()
+                .and_then(|d| self.answers(account_id, d));
             let recipients = parsed.as_ref().map(drafts::sent_to).unwrap_or_default();
             let result = match &parsed {
                 Ok(draft) => self.send_draft(account_id, id, draft).await,
@@ -1410,6 +1413,22 @@ impl Engine {
             outcomes.push(outcome);
         }
         Ok(outcomes)
+    }
+
+    /// The stored email `draft` replies to: the one it quotes, or, for one
+    /// written elsewhere with the quote in its text already, the one its
+    /// In-Reply-To names.
+    fn answers(&self, account_id: i64, draft: &Draft) -> Option<i64> {
+        if draft.reply_to.is_some() {
+            return draft.reply_to;
+        }
+        let original = draft.in_reply_to.as_deref()?;
+        let store = self.store();
+        let bare = crate::parse::bare_id(original);
+        [bare.as_str(), original]
+            .into_iter()
+            .find_map(|id| store.find_message_id(account_id, id).ok().flatten())
+            .filter(|found| Some(*found) != draft.draft_id)
     }
 
     /// Takes a scheduled send out of the queue into Drafts, exactly as it was
@@ -2985,6 +3004,47 @@ mod tests {
             subject: "Re: Lunch?".into(),
             body: "Yes.".into(),
             reply_to: Some(original),
+            ..Default::default()
+        };
+        store
+            .queue_send(account.id, &to_json(&draft), 0, &[])
+            .unwrap();
+        let engine = Engine::new(Arc::new(Mutex::new(store)), Arc::new(TestSecrets));
+        let outcomes = engine.send_due(account.id).await.unwrap();
+        assert!(matches!(outcomes[0].result, Ok(true)));
+        assert_eq!(outcomes[0].reply_to, Some(original));
+        delivery.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reply_written_elsewhere_says_what_it_answered_too() {
+        let (smtp, delivery) = smtp_delivery(250).await;
+        let mut store = Store::open_in_memory().unwrap();
+        let account = test_account(&mut store, smtp);
+        let Added::New(original) = store
+            .add_incoming(
+                &Incoming {
+                    account_id: account.id,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(1),
+                    message_id: Some("asked@example.com".into()),
+                    from_address: "recipient@example.com".into(),
+                    subject: "Lunch?".into(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        else {
+            panic!("new");
+        };
+        // Opened from Drafts with its quote in its text: it only threads.
+        let draft = Draft {
+            account: account.id,
+            to: "recipient@example.com".into(),
+            subject: "Re: Lunch?".into(),
+            body: "Yes.\n\n> Lunch?".into(),
+            in_reply_to: Some("<asked@example.com>".into()),
             ..Default::default()
         };
         store
