@@ -487,6 +487,11 @@ impl Standing {
         }
     }
 
+    /// Whether Graph asked to be left alone, for any time left.
+    pub fn is_paused(&self) -> bool {
+        lock(&self.paused_until).is_some_and(|until| until > tokio::time::Instant::now())
+    }
+
     /// Holds back requests for `pause` from now, unless they're held back
     /// longer already.
     fn pause(&self, pause: Duration) {
@@ -1056,6 +1061,30 @@ impl Graph {
         account_id: i64,
         state: &mut SyncState,
     ) -> Result<usize> {
+        self.older_inbox_pages(store, account_id, state, usize::MAX)
+            .await
+    }
+
+    /// `older_inbox` for the background download: one listing, whose
+    /// requests give up after `BACKGROUND_REQUEST_TIME`, so each step ends
+    /// soon and is kept. Mail stored already doesn't take it further on.
+    pub async fn older_inbox_step(
+        &self,
+        store: &Mutex<Store>,
+        account_id: i64,
+        state: &mut SyncState,
+    ) -> Result<usize> {
+        self.older_inbox_pages(store, account_id, state, 1).await
+    }
+
+    /// `older_inbox`, `pages` listings at most.
+    async fn older_inbox_pages(
+        &self,
+        store: &Mutex<Store>,
+        account_id: i64,
+        state: &mut SyncState,
+        mut pages: usize,
+    ) -> Result<usize> {
         if state.delta_link.is_none() {
             return Ok(0);
         }
@@ -1101,10 +1130,11 @@ impl Graph {
             {
                 state.older_than = Some(state.older_than.map_or(oldest, |o| o.min(oldest)));
             }
+            pages -= 1;
             match page.next_link {
                 // Mail already stored doesn't count: an account whose
                 // window lagged behind lists past it.
-                Some(link) if stored < OLDER_STEP => next = Some(link),
+                Some(link) if stored < OLDER_STEP && pages > 0 => next = Some(link),
                 Some(_) => {}
                 None => state.complete = true,
             }
@@ -3894,6 +3924,38 @@ pub(crate) mod tests {
         let changed = graph.sync_folder(&store, &folder, &mut state).await;
         assert_eq!(changed.unwrap(), Some(0));
         assert!(full_listings(&seen.lock().unwrap()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_background_download_lists_one_page_a_step() {
+        let (base, seen) = stand_in(mailbox).await;
+        let graph = Graph::with_base(&base, "token");
+        let (store, account_id) = microsoft_store();
+        // i50…i79 are stored already.
+        for n in 50..80 {
+            let m = Incoming {
+                account_id,
+                remote_id: Some(format!("i{n}")),
+                date: received(n),
+                ..Default::default()
+            };
+            lock(&store).add_incoming(&m, false).unwrap();
+        }
+        let mut state = SyncState {
+            delta_link: Some(format!("{base}/delta")),
+            since: Some(received(50) + 1_800_000),
+            ..Default::default()
+        };
+        // However few of it were new, and the next goes on from there.
+        let stored = graph.older_inbox_step(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 70);
+        assert_eq!(state.older_than, Some(received(149)));
+        assert_eq!(seen.lock().unwrap().drain(..).count(), 1);
+        // i149 again, as mail of its second might not have been listed.
+        let stored = graph.older_inbox_step(&store, account_id, &mut state).await;
+        assert_eq!(stored.unwrap(), 99);
+        assert_eq!(state.older_than, Some(received(248)));
+        assert_eq!(seen.lock().unwrap().drain(..).count(), 1);
     }
 
     #[tokio::test]

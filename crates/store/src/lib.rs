@@ -1557,6 +1557,15 @@ impl Store {
             .collect()
     }
 
+    /// Whether the account has local changes to push, settled or not.
+    pub fn has_pending(&self, account_id: i64) -> Result<bool> {
+        self.conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM messages WHERE account_id = ?1 AND changed_at != 0)",
+            )?
+            .query_row([account_id], |r| r.get(0))
+    }
+
     /// A message as `pending` describes it, changed or not: for finding it
     /// on the server to delete it there.
     pub fn pending_for(&self, id: i64) -> Result<Option<Pending>> {

@@ -34,6 +34,9 @@ use crate::notify;
 use crate::secrets::MailSecrets;
 
 const TICK: Duration = Duration::from_secs(2);
+/// How often the UI hears what the background download changed, while it
+/// goes on: each time, it works over the whole mailbox again.
+const BACKGROUND_TELLS: Duration = Duration::from_secs(30);
 /// How often an inbox IDLE doesn't watch is checked, as in Spark.
 const INBOX_EVERY: Duration = Duration::from_secs(30);
 /// How often the sweep runs, as in Spark: the inbox (watched or not), the
@@ -446,6 +449,7 @@ async fn work(
     };
     let mut schedule = Schedule::default();
     let mut last_sync: Option<i64> = None;
+    let mut untold = Untold::default();
     loop {
         if !matches!(engine.store().account(account_id), Ok(Some(_))) {
             break;
@@ -562,6 +566,8 @@ async fn work(
                     }
                     if report.changed() {
                         let _ = app.emit("mailbox-changed", ());
+                        // It hears what the background changed too.
+                        untold.held = false;
                     }
                     if !report.arrived.is_empty() {
                         notify::new_mail(&app, &engine, account_id, &report.arrived);
@@ -597,7 +603,22 @@ async fn work(
         }
 
         if idle(asks) && engine.backfill_due(account_id) {
-            backfill(&app, &engine, account_id).await;
+            let had_older = has_older(&engine, account_id);
+            // What the user asks for meanwhile goes first: the step stops,
+            // and may have kept some of what it did.
+            tokio::select! {
+                () = backfill(&engine, account_id, &mut untold) => {}
+                () = wake.notified() => {
+                    untold.held = true;
+                    wake.notify_one();
+                }
+            }
+            if had_older != has_older(&engine, account_id) {
+                let _ = app.emit("accounts-changed", ());
+            }
+        }
+        if untold.held && untold.due(Instant::now(), !engine.backfill_left(account_id)) {
+            let _ = app.emit("mailbox-changed", ());
         }
 
         tokio::select! {
@@ -798,19 +819,38 @@ fn idle(asks: &Asks) -> bool {
 }
 
 /// One step of the background download of older inbox mail
-/// (`Engine::backfill`), telling the UI what it brought in. A failure is
-/// only noted: the engine waits longer before the next step.
-async fn backfill(app: &AppHandle, engine: &Engine, account_id: i64) {
-    let had_older = has_older(engine, account_id);
+/// (`Engine::backfill`). What it changed the UI hears in a while
+/// (`untold`). A failure is only noted: the engine waits longer before the
+/// next step.
+async fn backfill(engine: &Engine, account_id: i64, untold: &mut Untold) {
     match engine.backfill(account_id).await {
-        Ok(report) if report.changed() => {
-            let _ = app.emit("mailbox-changed", ());
-        }
-        Ok(_) => {}
+        Ok(report) => untold.held |= report.changed(),
         Err(e) => eprintln!("spark-rs: downloading older mail for account {account_id}: {e}"),
     }
-    if had_older != has_older(engine, account_id) {
-        let _ = app.emit("accounts-changed", ());
+}
+
+/// What the background download changed that the UI hasn't heard yet
+/// (`held`), and when it last heard (`told`).
+#[derive(Default)]
+struct Untold {
+    held: bool,
+    told: Option<Instant>,
+}
+
+impl Untold {
+    /// Whether the UI is to hear what's held, at `now`: `BACKGROUND_TELLS`
+    /// after it last did, or at once once the download is `over`.
+    fn due(&mut self, now: Instant, over: bool) -> bool {
+        let due = self.held
+            && (over
+                || self
+                    .told
+                    .is_none_or(|told| now.duration_since(told) >= BACKGROUND_TELLS));
+        if due {
+            self.held = false;
+            self.told = Some(now);
+        }
+        due
     }
 }
 
@@ -1008,6 +1048,24 @@ mod tests {
             schedule.finished(at(n), &plan, ended);
         }
         assert_eq!(fetched, [40, 100, 220, 300, 600, 900]);
+    }
+
+    #[test]
+    fn the_background_download_tells_the_ui_every_so_often_and_at_its_end() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut untold = Untold::default();
+        assert!(!untold.due(at(0), true), "nothing to tell");
+        untold.held = true;
+        assert!(untold.due(at(0), false), "the first change at once");
+        for secs in [2, 4, 28] {
+            untold.held = true;
+            assert!(!untold.due(at(secs), false), "{secs}");
+        }
+        assert!(untold.due(at(30), false));
+        untold.held = true;
+        assert!(untold.due(at(32), true), "the end");
+        assert!(!untold.due(at(33), true));
     }
 
     #[test]

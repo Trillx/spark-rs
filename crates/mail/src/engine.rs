@@ -235,6 +235,9 @@ const BACKFILL_PAUSE: Duration = Duration::from_secs(2);
 /// failure in a row, up to `BACKFILL_LONGEST_WAIT`.
 const BACKFILL_RETRY: Duration = Duration::from_secs(30);
 const BACKFILL_LONGEST_WAIT: Duration = Duration::from_secs(15 * 60);
+/// The longest a background download step may take: it holds the account's
+/// turn. Its requests give up sooner; this is for the rest of it.
+const BACKFILL_STEP_TIME: Duration = Duration::from_secs(45);
 
 /// How often a pass goes over the Microsoft inbox mail stored from before
 /// the delta query's window (`graph::Graph::reconcile_inbox`), besides once
@@ -747,46 +750,60 @@ impl Engine {
     }
 
     /// Whether the account's background download has a step to take now
-    /// (`backfill`): its first sync is done, the pause since its last step
-    /// is over, nothing else waits for the account (no local change or
-    /// draft to push, nor mail to send), and its inbox isn't covered back to
+    /// (`backfill`): what's left of it (`backfill_left`), the pause since
+    /// its last step is over, Microsoft isn't asking the account to wait,
+    /// and nothing else waits for it (`work_waits`).
+    pub fn backfill_due(&self, account_id: i64) -> bool {
+        let paused = self
+            .paces_lock()
+            .get(&account_id)
+            .and_then(|pace| pace.next)
+            .is_some_and(|next| Instant::now() < next);
+        let held = self
+            .standings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&account_id)
+            .is_some_and(|standing| standing.is_paused());
+        !paused && !held && self.backfill_left(account_id) && !self.work_waits(account_id)
+    }
+
+    /// Whether the account's background download has anything left to do:
+    /// its first sync is done, and its inbox isn't covered back to
     /// `BACKFILL_DAYS` yet nor complete, or (Microsoft) a pass over the
     /// older mail it has is under way or due: every `RECONCILE_EVERY`, and
     /// once after the app starts.
-    pub fn backfill_due(&self, account_id: i64) -> bool {
-        let now = now_ms();
-        let (paused, reconcile) = {
-            let paces = self.paces_lock();
-            let pace = paces.get(&account_id);
-            (
-                pace.and_then(|pace| pace.next)
-                    .is_some_and(|next| Instant::now() < next),
-                pace.is_none_or(Pace::reconcile_due),
-            )
-        };
-        if paused {
-            return false;
-        }
-        let store = self.store();
-        let Ok(Some(account)) = store.account(account_id) else {
+    pub fn backfill_left(&self, account_id: i64) -> bool {
+        let reconcile = self
+            .paces_lock()
+            .get(&account_id)
+            .is_none_or(Pace::reconcile_due);
+        let Ok(Some(account)) = self.store().account(account_id) else {
             return false;
         };
-        let left = match config(&account) {
+        match config(&account) {
             Ok(AccountConfig::Imap { .. }) => imap::backfill_due(&from_json(&account.sync_state)),
             Ok(AccountConfig::Microsoft { .. }) => {
                 let state: graph::SyncState = from_json(&account.sync_state);
-                graph::backfill_due(&state, backfill_since(now))
+                graph::backfill_due(&state, backfill_since(now_ms()))
                     || (graph::reconcile_due(&state) && (reconcile || state.reconcile.is_some()))
             }
             Err(_) => false,
-        };
-        left && store
-            .pending(account_id, now, SETTLE_MS)
-            .is_ok_and(|p| p.is_empty())
-            && store
-                .has_draft_work(account_id, now - SETTLE_MS)
+        }
+    }
+
+    /// Whether something the user did waits for the account, which goes
+    /// before the background download: a local change or a saved draft to
+    /// push, even one still in its undo window, or mail to send.
+    fn work_waits(&self, account_id: i64) -> bool {
+        let store = self.store();
+        !store.has_pending(account_id).is_ok_and(|any| !any)
+            || !store
+                .has_draft_work(account_id, i64::MAX)
                 .is_ok_and(|work| !work)
-            && store.has_due_sends(account_id, now).is_ok_and(|due| !due)
+            || !store
+                .has_due_sends(account_id, now_ms())
+                .is_ok_and(|due| !due)
     }
 
     /// One step of the account's background download of older inbox mail:
@@ -799,14 +816,30 @@ impl Engine {
     /// Microsoft's pause. The next step waits `BACKFILL_PAUSE`, or after a
     /// failure longer each time (`backfill_due`). The report says what it
     /// brought in, as `older`, and what the pass changed, as `reconciled`.
+    ///
+    /// What the user does goes first: with the turn, if something of theirs
+    /// waits for the account (a round had the turn meanwhile), it does
+    /// nothing. A step that takes over `BACKFILL_STEP_TIME` fails.
     pub async fn backfill(&self, account_id: i64) -> Result<Report> {
         let turn = self.turn(account_id);
         let _turn = turn.lock().await;
+        if self.work_waits(account_id) {
+            return Ok(Report::default());
+        }
         let reconcile = self
             .paces_lock()
             .get(&account_id)
             .is_none_or(Pace::reconcile_due);
-        let stepped = self.backfill_step(account_id, reconcile).await;
+        let stepped = tokio::time::timeout(
+            BACKFILL_STEP_TIME,
+            self.backfill_step(account_id, reconcile),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Server(
+                "Downloading older mail took too long.".into(),
+            ))
+        });
         let mut paces = self.paces_lock();
         let pace = paces.entry(account_id).or_default();
         let wait = match &stepped {
@@ -864,12 +897,15 @@ impl Engine {
                 let older = graph::backfill_due(&state, since);
                 let reconcile =
                     graph::reconcile_due(&state) && (reconcile || state.reconcile.is_some());
-                if !older && !reconcile {
+                // Not waiting out Microsoft's pause with the account's turn.
+                if (!older && !reconcile) || self.standing(account_id).is_paused() {
                     return Ok(Default::default());
                 }
                 let graph = self.syncing_graph(account_id, &client_id, &tenant).await?;
                 if older {
-                    let older = graph.older_inbox(&self.store, account_id, &mut state).await;
+                    let older = graph
+                        .older_inbox_step(&self.store, account_id, &mut state)
+                        .await;
                     // Keep how far it got even if part of it failed.
                     graph::save_state(&self.store(), account_id, &state)?;
                     let report = Report {
@@ -4335,6 +4371,15 @@ mod tests {
             Some(Instant::now() - RECONCILE_EVERY);
         assert!(engine.backfill_due(account_id));
 
+        // Not while Microsoft asks the account to wait.
+        graph::tests::pause_until(
+            &engine.standing(account_id),
+            Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+        );
+        assert!(!engine.backfill_due(account_id));
+        graph::tests::pause_until(&engine.standing(account_id), None);
+        assert!(engine.backfill_due(account_id));
+
         // Nothing older than the delta's window: no pass.
         let state = graph::SyncState {
             delta_link: Some(format!("{base}/delta")),
@@ -4450,6 +4495,48 @@ mod tests {
             .unwrap();
         assert!(!engine.backfill_due(account.id));
         assert!(store.lock().unwrap().cancel_send(queued).unwrap());
+        assert!(engine.backfill_due(account.id));
+
+        // Even a change still in its undo window, or a draft just saved.
+        let pin = spark_store::Patch {
+            pinned: Some(true),
+            ..Default::default()
+        };
+        store.lock().unwrap().update(id, &pin, now_ms()).unwrap();
+        assert!(!engine.backfill_due(account.id));
+        // A step that comes after, once it has the account's turn, does
+        // nothing: it doesn't go to the server, which isn't there.
+        assert_eq!(
+            engine.backfill(account.id).await.unwrap(),
+            Report::default()
+        );
+        assert!(engine.paces_lock().get(&account.id).is_none());
+        store.lock().unwrap().drop_pending(id).unwrap();
+        let draft = spark_store::DraftSave {
+            account_id: account.id,
+            draft: "{}",
+            send_later: None,
+            from_name: "Me",
+            from_address: "me@example.com",
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            subject: "Plans",
+            snippet: "",
+            text: "",
+            html: None,
+            in_reply_to: None,
+            references: None,
+            attachments: &[],
+            files: &[],
+        };
+        let saved = store
+            .lock()
+            .unwrap()
+            .save_draft(None, &draft, now_ms())
+            .unwrap();
+        assert!(!engine.backfill_due(account.id));
+        store.lock().unwrap().drop_draft_upload(saved).unwrap();
         assert!(engine.backfill_due(account.id));
 
         // A step that fails waits before the next.
