@@ -9,6 +9,7 @@
 use serde::Serialize;
 use spark_mail::CalendarStatus;
 use spark_mail::calendar::{Event, EventDraft, Scope, Zone};
+use spark_mail::recurrence::Repeat;
 use spark_mail::invite::Answer;
 use tauri::{AppHandle, Emitter, State};
 
@@ -202,8 +203,9 @@ pub async fn save_event(
     Ok(())
 }
 
-/// Deletes the user's stored event `id` (`scope`: that occurrence or the
-/// whole series), then reads its account's calendar for [start, end) again.
+/// Deletes the user's stored event `id` (`scope`: that occurrence, the
+/// whole series, or the series from it on), then reads its account's
+/// calendar for [start, end) again.
 #[tauri::command]
 pub async fn delete_event(
     mailbox: State<'_, Mailbox>,
@@ -217,12 +219,27 @@ pub async fn delete_event(
     }
     let account = event_account(&mailbox, id)?;
     let engine = &mailbox.live.engine;
+    let name = zone_name();
+    let zone = Zone {
+        name: &name,
+        wall: local_wall,
+    };
     engine
-        .delete_event(id, scope.unwrap_or_default())
+        .delete_event(id, scope.unwrap_or_default(), zone)
         .await
         .map_err(text)?;
     let _ = engine.refresh_calendar(account, start, end).await;
     Ok(())
+}
+
+/// How the user's stored event `id`'s series repeats: none for an event
+/// that doesn't, or a rule the editor doesn't know.
+#[tauri::command]
+pub async fn event_repeat(mailbox: State<'_, Mailbox>, id: i64) -> Result<Option<Repeat>, String> {
+    if !mailbox.live() {
+        return Ok(None);
+    }
+    mailbox.live.engine.event_repeat(id).await.map_err(text)
 }
 
 fn event_account(mailbox: &Mailbox, id: i64) -> Result<i64, String> {

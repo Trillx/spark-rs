@@ -28,6 +28,7 @@ use crate::imap::{self, Server};
 use crate::invite::{self, Answer, Invite};
 use crate::labels;
 use crate::oauth::{self, App};
+use crate::recurrence::{self, Ends, Repeat};
 use crate::unsubscribe::{self, Unsubscribed};
 use crate::{Error, OLDER_STEP, Result, Service, search, smtp};
 
@@ -1582,12 +1583,28 @@ impl Engine {
     }
 
     /// Changes the user's stored event `event_id` to say what `draft` says:
-    /// that occurrence, or with `Scope::All` every occurrence of its series,
-    /// which move by as much as this one did. Only what changed from
+    /// that occurrence, with `Scope::All` every occurrence of its series,
+    /// which move by as much as this one did, or with `Scope::Future` this
+    /// one and those after it (`split_series`). Only what changed from
     /// `before`, the event as the editor opened it (else as stored), is
     /// sent, so what changed in Outlook meanwhile stays. Outlook sends the
     /// people invited the update.
     pub async fn update_event(
+        &self,
+        event_id: i64,
+        draft: &EventDraft,
+        before: Option<&EventDraft>,
+        scope: Scope,
+        zone: Zone<'_>,
+    ) -> Result<()> {
+        if scope == Scope::Future {
+            return self.split_series(event_id, draft, before, zone).await;
+        }
+        self.update_scoped(event_id, draft, before, scope, zone)
+            .await
+    }
+
+    async fn update_scoped(
         &self,
         event_id: i64,
         draft: &EventDraft,
@@ -1607,12 +1624,111 @@ impl Engine {
         graph.update_event(&target, &body).await
     }
 
-    /// Deletes the user's stored event `event_id`: that occurrence, or with
-    /// `Scope::All` its whole series. The people invited hear it's
-    /// canceled.
-    pub async fn delete_event(&self, event_id: i64, scope: Scope) -> Result<()> {
-        let (target, _, graph) = self.event_target(event_id, scope).await?;
-        graph.delete_event(&target).await
+    /// "All future": a new series from occurrence `event_id` on, saying
+    /// what `draft` says (`calendar::series_from`), and its old series
+    /// ending the day before. A series' first occurrence changes the whole
+    /// series instead. A series ending after so many times goes on for as
+    /// many as it had left. If the old series can't be ended, the new one
+    /// is taken back, so the occurrences aren't there twice.
+    async fn split_series(
+        &self,
+        event_id: i64,
+        draft: &EventDraft,
+        before: Option<&EventDraft>,
+        zone: Zone<'_>,
+    ) -> Result<()> {
+        let stored = self
+            .store()
+            .event(event_id)?
+            .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
+        let event = Event::from_json(&stored.data);
+        let Some(series) = event.series.clone() else {
+            return self
+                .update_scoped(event_id, draft, before, Scope::One, zone)
+                .await;
+        };
+        let opened = EventDraft::of(&event, draft.calendar);
+        let before = before.unwrap_or(&opened);
+        let graph = self.calendar_graph(stored.account_id).await?;
+        let master = graph.event_json(&series, calendar::MASTER_SELECT).await?;
+        let old = master["recurrence"].clone();
+        let first = old["range"]["startDate"].as_str().unwrap_or_default();
+        let split = calendar::date_in(zone, before.start, before.all_day);
+        if split.as_str() <= first {
+            return self
+                .update_scoped(event_id, draft, Some(before), Scope::All, zone)
+                .await;
+        }
+        let from = calendar::date_in(zone, draft.start, draft.all_day);
+        let recurrence = match &draft.repeat {
+            Some(rule) if draft.repeat != before.repeat => rule.to_graph(&from, zone.name),
+            _ => {
+                let mut rest = old.clone();
+                rest["range"]["startDate"] = serde_json::json!(from);
+                if let Some(Ends::After { times }) = Repeat::from_graph(&old).map(|r| r.ends) {
+                    let start = master["start"]["dateTime"]
+                        .as_str()
+                        .and_then(graph::parse_iso_date)
+                        .unwrap_or(before.start);
+                    let gone = graph
+                        .count_occurrences(&series, start, before.start)
+                        .await?;
+                    let left = (times as usize).saturating_sub(gone).max(1);
+                    rest["range"]["numberOfOccurrences"] = serde_json::json!(left);
+                }
+                rest
+            }
+        };
+        let calendar = self
+            .store()
+            .calendars()?
+            .into_iter()
+            .find(|c| c.id == stored.calendar_id)
+            .ok_or_else(|| Error::Config("That calendar is no longer here.".into()))?;
+        let body = calendar::series_from(&master, draft, before, zone, recurrence);
+        let created = graph.create_event(&calendar.remote_id, &body).await?;
+        let ended = serde_json::json!({ "recurrence": recurrence::ended_before(&old, &split) });
+        if let Err(e) = graph.update_event(&series, &ended).await {
+            let _ = graph.delete_event(&created).await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// How stored event `event_id`'s series repeats, if it's an occurrence
+    /// of one and the editor knows its rule.
+    pub async fn event_repeat(&self, event_id: i64) -> Result<Option<Repeat>> {
+        let stored = self
+            .store()
+            .event(event_id)?
+            .ok_or_else(|| Error::Config("That event is no longer here.".into()))?;
+        let Some(series) = Event::from_json(&stored.data).series else {
+            return Ok(None);
+        };
+        let graph = self.calendar_graph(stored.account_id).await?;
+        let master = graph.event_json(&series, "recurrence").await?;
+        Ok(Repeat::from_graph(&master["recurrence"]))
+    }
+
+    /// Deletes the user's stored event `event_id`: that occurrence, with
+    /// `Scope::All` its whole series, or with `Scope::Future` the series
+    /// from this occurrence on (it ends the day before; all of it, if this
+    /// is its first). The people invited hear it's canceled.
+    pub async fn delete_event(&self, event_id: i64, scope: Scope, zone: Zone<'_>) -> Result<()> {
+        if scope != Scope::Future {
+            let (target, _, graph) = self.event_target(event_id, scope).await?;
+            return graph.delete_event(&target).await;
+        }
+        let (series, event, graph) = self.event_target(event_id, Scope::All).await?;
+        let master = graph.event_json(&series, "recurrence").await?;
+        let old = &master["recurrence"];
+        let first = old["range"]["startDate"].as_str().unwrap_or_default();
+        let split = calendar::date_in(zone, event.start, event.all_day);
+        if event.series.is_none() || old.is_null() || split.as_str() <= first {
+            return graph.delete_event(&series).await;
+        }
+        let ended = serde_json::json!({ "recurrence": recurrence::ended_before(old, &split) });
+        graph.update_event(&series, &ended).await
     }
 
     /// What a change to stored event `event_id` goes to on the server (the

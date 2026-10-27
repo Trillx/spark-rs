@@ -79,6 +79,7 @@ export default function EventPreview({
   anchor,
   modal,
   onAnswer,
+  repeatText,
   onEdit,
   onDelete,
   onClose,
@@ -91,6 +92,8 @@ export default function EventPreview({
   modal: boolean;
   /** Rejects with a user-facing error; the answer is then undone. */
   onAnswer: (answer: InviteAnswer) => Promise<void>;
+  /** How it repeats, in words, once its series' rule is read. */
+  repeatText?: string;
   /** The user's own event: Edit and Delete show. */
   onEdit?: () => void;
   onDelete?: () => void;
@@ -220,7 +223,7 @@ export default function EventPreview({
             )}
             {e.repeats && (
               <Row Icon={Repeat}>
-                <span>Repeats</span>
+                <span>{repeatText ?? "Repeats"}</span>
               </Row>
             )}
             {e.reminder !== undefined && (

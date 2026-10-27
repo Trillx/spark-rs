@@ -11,6 +11,7 @@ import type {
   CalendarList,
   EventDraft,
   EventScope,
+  Repeat,
   Contact,
   AgentAccess,
   AgentSendingEvent,
@@ -290,7 +291,13 @@ export function saveEvent(
   return Promise.resolve();
 }
 
-/** Deletes the user's event `id` (`scope`: that occurrence or the whole series), then reads its calendar for [start, end) again. */
+/** How the user's event `id`'s series repeats; null for one that doesn't, or a rule the editor doesn't know. */
+export function eventRepeat(id: number): Promise<Repeat | null> {
+  if (isTauri()) return invoke("event_repeat", { id });
+  return Promise.resolve(null);
+}
+
+/** Deletes the user's event `id` (`scope`: that occurrence, the whole series, or it on), then reads its calendar for [start, end) again. */
 export function deleteEvent(id: number, scope: EventScope, start: number, end: number): Promise<void> {
   if (isTauri()) return invoke("delete_event", { id, scope, start, end });
   return Promise.resolve();

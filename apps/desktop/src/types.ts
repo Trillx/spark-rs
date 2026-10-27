@@ -449,10 +449,28 @@ export interface EventDraft {
   teams: boolean;
   /** Private in Outlook: people who share the calendar see only "Busy". The editor keeps it as it is. */
   private: boolean;
+  /** How it repeats; null if it doesn't. */
+  repeat: Repeat | null;
 }
 
-/** Which occurrences of a repeating event a change is for: that one, or all of them. */
-export type EventScope = "one" | "all";
+/** How an event repeats, as Microsoft 365 keeps it. Mirrors `Repeat` on the Rust side (recurrence.rs). */
+export interface Repeat {
+  every: "day" | "week" | "month" | "year";
+  /** Every this many days, weeks, months or years: 1 to 999. */
+  interval: number;
+  /** Weekly, its days (0 Sunday … 6); monthly or yearly "on the second Tuesday", that one day. */
+  weekdays: number[];
+  /** Monthly or yearly "on the …" week: 1 to 4, or 5 for the last; absent: on a day of the month. */
+  nth?: number;
+  /** Monthly or yearly on a date: its day of the month. */
+  day?: number;
+  /** Yearly: its month, 1 to 12. */
+  month?: number;
+  ends: { kind: "never" } | { kind: "after"; times: number } | { kind: "on"; date: string };
+}
+
+/** Which occurrences of a repeating event a change is for: that one, all of them, or it and those after. */
+export type EventScope = "one" | "all" | "future";
 
 /** A meeting in the pop-up (src-tauri/src/meetings.rs). */
 export interface PopupMeeting {

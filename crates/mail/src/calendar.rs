@@ -16,6 +16,7 @@ use spark_store::{RemoteCalendar, RemoteEvent};
 use crate::Result;
 use crate::graph::{Graph, Page, iso_date, parse_iso_date, path};
 use crate::invite::{Answer, Person, meeting_url, without_boilerplate};
+use crate::recurrence::Repeat;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -187,6 +188,9 @@ pub enum Scope {
     One,
     /// Every occurrence: the series.
     All,
+    /// This occurrence and those after it: a new series from here, the
+    /// old one ending the day before.
+    Future,
 }
 
 /// The user's time zone, as an event is written in it: its Windows name,
@@ -243,6 +247,9 @@ pub struct EventDraft {
     pub teams: bool,
     /// Private in Outlook: people who share the calendar see only "Busy".
     pub private: bool,
+    /// How it repeats; `None` if it doesn't (or, for an event the editor
+    /// didn't read the rule of, isn't changed).
+    pub repeat: Option<Repeat>,
 }
 
 impl EventDraft {
@@ -261,6 +268,7 @@ impl EventDraft {
             show_as: e.show_as,
             teams: e.online_meeting,
             private: e.private,
+            repeat: None,
         }
     }
 }
@@ -297,7 +305,22 @@ pub fn new_event_body(draft: &EventDraft, zone: Zone) -> serde_json::Value {
     if draft.private {
         body.insert("sensitivity".into(), json!("private"));
     }
+    if let Some(rule) = &draft.repeat {
+        let first = date_in(zone, draft.start, draft.all_day);
+        body.insert("recurrence".into(), rule.to_graph(&first, zone.name));
+    }
     body.into()
+}
+
+/// The date ("2026-10-27") of `ms` on the user's clock; an all-day event's
+/// own date.
+pub fn date_in(zone: Zone, ms: i64, all_day: bool) -> String {
+    let wall = if all_day {
+        utc_wall(ms)
+    } else {
+        (zone.wall)(ms)
+    };
+    wall.get(..10).unwrap_or_default().to_owned()
 }
 
 /// The Graph fields to change for an event the editor opened as `before`
@@ -411,8 +434,95 @@ pub fn changed_event_body(
         let sensitivity = if draft.private { "private" } else { "normal" };
         body.insert("sensitivity".into(), json!(sensitivity));
     }
+    if draft.repeat != before.repeat {
+        let recurrence = match &draft.repeat {
+            // From the series' own first day (moved by this change, if it
+            // was), or this event's.
+            Some(rule) => {
+                let first = body
+                    .get("start")
+                    .and_then(|s| s["dateTime"].as_str())
+                    .and_then(|s| s.get(..10))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        date_in(
+                            zone,
+                            if shift { details.start } else { draft.start },
+                            draft.all_day,
+                        )
+                    });
+                rule.to_graph(&first, zone.name)
+            }
+            None => serde_json::Value::Null,
+        };
+        body.insert("recurrence".into(), recurrence);
+    }
     body.into()
 }
+
+/// What the series `master` (as Graph has it, `MASTER_SELECT`) says, as a
+/// new series from occurrence `before` on, with what the user changed in
+/// `draft`: "All future", split off. The people invited are the series'
+/// with the user's additions and removals; the note is the editor's, so a
+/// Teams meeting gets joining details of its own. It repeats by
+/// `recurrence`.
+pub fn series_from(
+    master: &serde_json::Value,
+    draft: &EventDraft,
+    before: &EventDraft,
+    zone: Zone,
+    recurrence: serde_json::Value,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    for key in [
+        "subject",
+        "location",
+        "isReminderOn",
+        "reminderMinutesBeforeStart",
+        "showAs",
+        "sensitivity",
+        "isOnlineMeeting",
+        "onlineMeetingProvider",
+    ] {
+        if let Some(value) = master.get(key).filter(|v| !v.is_null()) {
+            body.insert(key.into(), value.clone());
+        }
+    }
+    let attendees: Vec<serde_json::Value> = master["attendees"]
+        .as_array()
+        .map(|all| {
+            all.iter()
+                .map(|a| json!({ "emailAddress": a["emailAddress"], "type": a["type"] }))
+                .collect()
+        })
+        .unwrap_or_default();
+    let details = EventDetails {
+        start: draft.start,
+        end: draft.end,
+        attendees: attendees.clone(),
+        body: String::new(),
+    };
+    body.insert("attendees".into(), json!(attendees));
+    let changes = changed_event_body(draft, before, &details, zone, false);
+    for (key, value) in changes.as_object().into_iter().flatten() {
+        if key != "body" && key != "recurrence" {
+            body.insert(key.clone(), value.clone());
+        }
+    }
+    body.insert(
+        "body".into(),
+        json!({ "contentType": "text", "content": draft.notes.trim() }),
+    );
+    body.insert("start".into(), zone.time(draft.start, draft.all_day));
+    body.insert("end".into(), zone.time(draft.end, draft.all_day));
+    body.insert("isAllDay".into(), json!(draft.all_day));
+    body.insert("recurrence".into(), recurrence);
+    body.into()
+}
+
+/// What `series_from` reads of a series.
+pub const MASTER_SELECT: &str = "subject,start,end,isAllDay,location,attendees,isReminderOn,\
+     reminderMinutesBeforeStart,showAs,sensitivity,isOnlineMeeting,onlineMeetingProvider,recurrence";
 
 /// `html`, an event's description, with `notes` in place of what comes
 /// before the Teams meeting Outlook put in it (found by its rule of
@@ -693,6 +803,36 @@ impl Graph {
         self.send(self.request(Method::DELETE, &format!("/me/events/{}", path(id))))
             .await?;
         Ok(())
+    }
+
+    /// Event `id` as Graph has it: the fields `select` names, times in UTC.
+    pub async fn event_json(&self, id: &str, select: &str) -> Result<serde_json::Value> {
+        self.json(
+            self.request(
+                Method::GET,
+                &format!("/me/events/{}?$select={select}", path(id)),
+            )
+            .header("Prefer", "outlook.timezone=\"UTC\""),
+        )
+        .await
+    }
+
+    /// How many occurrences series `id` has from `start` to before `end`
+    /// (Unix ms).
+    pub async fn count_occurrences(&self, id: &str, start: i64, end: i64) -> Result<usize> {
+        let mut next = Some(format!(
+            "/me/events/{}/instances?startDateTime={}&endDateTime={}&$select=id&$top={EVENT_PAGE}",
+            path(id),
+            iso_date(start),
+            iso_date(end)
+        ));
+        let mut count = 0;
+        while let Some(url) = next.take() {
+            let page: Page<serde_json::Value> = self.json(self.request(Method::GET, &url)).await?;
+            count += page.value.len();
+            next = page.next_link;
+        }
+        Ok(count)
     }
 
     /// Event `id`'s times, people and description as Graph has them now.
@@ -1357,6 +1497,153 @@ mod tests {
         assert_eq!(body["end"]["dateTime"], "2026-10-28T00:00:00");
     }
 
+    fn weekly_rule() -> crate::recurrence::Repeat {
+        use crate::recurrence::{Ends, Every, Repeat};
+        Repeat {
+            every: Every::Week,
+            interval: 1,
+            weekdays: vec![2],
+            nth: None,
+            day: None,
+            month: None,
+            ends: Ends::Never,
+        }
+    }
+
+    #[test]
+    fn repeat_rules_go_with_new_and_changed_events() {
+        // Tuesday 9:30 in a zone 7 hours behind UTC.
+        let start = parse_iso_date("2026-10-27T16:30:00Z").unwrap();
+        let draft = EventDraft {
+            title: "Standup".into(),
+            start,
+            end: start + 900_000,
+            repeat: Some(weekly_rule()),
+            ..Default::default()
+        };
+        let body = new_event_body(&draft, PACIFIC);
+        assert_eq!(
+            body["recurrence"]["pattern"]["daysOfWeek"],
+            json!(["tuesday"])
+        );
+        assert_eq!(
+            body["recurrence"]["range"],
+            json!({ "type": "noEnd", "startDate": "2026-10-27", "recurrenceTimeZone": "Pacific Standard Time" })
+        );
+
+        let single = EventDraft {
+            repeat: None,
+            ..draft.clone()
+        };
+        let details = EventDetails {
+            start,
+            end: start + 900_000,
+            ..Default::default()
+        };
+        assert!(
+            changed_event_body(&single, &single, &details, PACIFIC, false)
+                .get("recurrence")
+                .is_none()
+        );
+        // Made to repeat: from its own day.
+        let body = changed_event_body(&draft, &single, &details, PACIFIC, false);
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-10-27");
+        // A series' rule changed from an occurrence: from the series' first day.
+        let series = EventDetails {
+            start: start - 14 * DAY_MS,
+            ..details.clone()
+        };
+        let every_two = EventDraft {
+            repeat: Some(crate::recurrence::Repeat {
+                interval: 2,
+                ..weekly_rule()
+            }),
+            ..draft.clone()
+        };
+        let body = changed_event_body(&every_two, &draft, &series, PACIFIC, true);
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-10-13");
+        assert_eq!(body["recurrence"]["pattern"]["interval"], 2);
+        // No longer repeating.
+        let body = changed_event_body(&single, &draft, &series, PACIFIC, true);
+        assert_eq!(body["recurrence"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn all_future_starts_a_series_of_its_own() {
+        let start = parse_iso_date("2026-11-03T16:30:00Z").unwrap();
+        let master = json!({
+            "subject": "Standup",
+            "location": { "displayName": "Room 4" },
+            "attendees": [
+                { "type": "required", "status": { "response": "accepted" }, "emailAddress": { "address": "sam@contoso.com" } },
+                { "type": "resource", "emailAddress": { "address": "room4@contoso.com" } }
+            ],
+            "isReminderOn": true,
+            "reminderMinutesBeforeStart": 15,
+            "showAs": "busy",
+            "sensitivity": "normal",
+            "isOnlineMeeting": true,
+            "onlineMeetingProvider": "teamsForBusiness",
+            "recurrence": null
+        });
+        let before = EventDraft {
+            title: "Standup".into(),
+            start,
+            end: start + 900_000,
+            location: "Room 4".into(),
+            notes: "Agenda".into(),
+            attendees: vec![person("Sam", "sam@contoso.com")],
+            reminder: Some(15),
+            teams: true,
+            ..Default::default()
+        };
+        // From here on: half an hour later, with Alex too.
+        let draft = EventDraft {
+            start: start + 1_800_000,
+            end: start + 2_700_000,
+            attendees: vec![
+                person("Sam", "sam@contoso.com"),
+                person("Alex", "alex@contoso.com"),
+            ],
+            ..before.clone()
+        };
+        let rule = weekly_rule().to_graph("2026-11-03", "Pacific Standard Time");
+        let body = series_from(&master, &draft, &before, PACIFIC, rule.clone());
+        assert_eq!(body["subject"], "Standup");
+        assert_eq!(body["location"]["displayName"], "Room 4");
+        assert_eq!(body["start"]["dateTime"], "2026-11-03T10:00:00");
+        assert_eq!(body["end"]["dateTime"], "2026-11-03T10:15:00");
+        assert_eq!(body["isOnlineMeeting"], true);
+        assert_eq!(
+            body["body"],
+            json!({ "contentType": "text", "content": "Agenda" })
+        );
+        assert_eq!(body["recurrence"], rule);
+        let invited: Vec<(&str, &str)> = body["attendees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                (
+                    a["emailAddress"]["address"].as_str().unwrap(),
+                    a["type"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            invited,
+            [
+                ("sam@contoso.com", "required"),
+                ("room4@contoso.com", "resource"),
+                ("alex@contoso.com", "required")
+            ]
+        );
+        assert!(
+            body["attendees"][0].get("status").is_none(),
+            "answers aren't copied"
+        );
+    }
+
     #[test]
     fn notes_wrapped_with_the_meeting_are_replaced_not_kept() {
         let meeting = format!(
@@ -1460,6 +1747,7 @@ mod tests {
             .await
             .unwrap();
         graph.delete_event("ev1").await.unwrap();
+        graph.event_json("ser1", "recurrence").await.unwrap();
         let asked: Vec<(String, String, String)> = seen
             .take()
             .into_iter()
@@ -1485,6 +1773,31 @@ mod tests {
             (asked[3].0.as_str(), asked[3].1.as_str()),
             ("DELETE", "/me/events/ev1")
         );
+        assert_eq!(asked[4].1, "/me/events/ser1?$select=recurrence");
+    }
+
+    #[tokio::test]
+    async fn a_series_occurrences_are_counted_page_by_page() {
+        fn reply(path: &str) -> Option<serde_json::Value> {
+            Some(match path {
+                p if p.starts_with("/me/events/ser1/instances?startDateTime=2026-10-06T16:30:00Z&endDateTime=2026-11-03T16:30:00Z&") => {
+                    json!({ "value": [{ "id": "a" }, { "id": "b" }], "@odata.nextLink": "/me/events/ser1/instances?page=2" })
+                }
+                "/me/events/ser1/instances?page=2" => json!({ "value": [{ "id": "c" }] }),
+                _ => return None,
+            })
+        }
+        let (base, _) = crate::graph::tests::stand_in(reply).await;
+        let graph = Graph::with_base(&base, "token");
+        let count = graph
+            .count_occurrences(
+                "ser1",
+                parse_iso_date("2026-10-06T16:30:00Z").unwrap(),
+                parse_iso_date("2026-11-03T16:30:00Z").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
     }
 
     #[test]

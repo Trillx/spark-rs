@@ -1,5 +1,6 @@
-import type { CalendarEvent, CalendarInfo, CalendarList, EventDraft, EventScope, InviteAnswer, InvitePerson } from "../types";
+import type { CalendarEvent, CalendarInfo, CalendarList, EventDraft, EventScope, InviteAnswer, InvitePerson, Repeat } from "../types";
 import { DAY_MS, addDays, startOfDay, utcDate } from "./calendar";
+import { atMinutes, dateValue, fromUtcDate, minutesOf, toUtcDate } from "./eventDraft";
 
 // The demo accounts' calendars. They live here rather than on the Rust side
 // because only the UI knows the local time zone the events are placed in:
@@ -29,6 +30,11 @@ const MEET = "https://meet.google.com/abc-defg-hij";
 const answers = new Map<number, InviteAnswer>();
 /** Events made, changed and deleted in the demo. */
 const made: CalendarEvent[] = [];
+/** How the demo's series repeat, by series. */
+const rules = new Map<string, Repeat>([
+  ["standup", { every: "week", interval: 1, weekdays: [1, 2, 3, 4, 5], ends: { kind: "never" } }],
+  ["planning", { every: "week", interval: 1, weekdays: [1], ends: { kind: "never" } }],
+]);
 const changes = new Map<number, Partial<CalendarEvent>>();
 const deleted = new Set<number>();
 
@@ -204,12 +210,47 @@ export function demoListEvents(start: number, end: number): CalendarEvent[] {
     .filter((e) => e.start < end && e.end > start);
 }
 
-/** The demo's events that a change with `scope` to `id` is for: it, or its whole series. */
+/** The demo's events that a change with `scope` to `id` is for: it, its whole series, or those of it from it on. */
 function scoped(id: number, scope: EventScope) {
   const all = demoListEvents(-Infinity, Infinity);
   const e = all.find((x) => x.id === id);
   if (!e) return [];
-  return scope === "all" && e.series ? all.filter((x) => x.series === e.series) : [e];
+  if (!e.series || scope === "one") return [e];
+  return all.filter((x) => x.series === e.series && (scope === "all" || x.start >= e.start));
+}
+
+/** How the demo event `id`'s series repeats. */
+export function demoRepeat(id: number): Repeat | null {
+  const e = demoListEvents(-Infinity, Infinity).find((x) => x.id === id);
+  return (e?.series && rules.get(e.series)) || null;
+}
+
+/** The days (local midnights) `rule` puts an event on from `first`, up to a year and a bit. */
+function ruleDays(rule: Repeat, first: number) {
+  const days: number[] = [];
+  const start = new Date(first);
+  const until = rule.ends.kind === "on" ? dateValue(rule.ends.date) : first + 400 * DAY_MS;
+  const most = rule.ends.kind === "after" ? rule.ends.times : 200;
+  for (let i = 0; i < 800 && days.length < most; i++) {
+    const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+    if (d.getTime() > until) break;
+    const months = (d.getFullYear() - start.getFullYear()) * 12 + d.getMonth() - start.getMonth();
+    const last = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 7).getMonth() !== d.getMonth();
+    const onDay =
+      rule.nth === undefined
+        ? d.getDate() === rule.day
+        : rule.weekdays.includes(d.getDay()) && (rule.nth === 5 ? last : Math.ceil(d.getDate() / 7) === rule.nth);
+    const hit =
+      rule.every === "day"
+        ? i % rule.interval === 0
+        : rule.every === "week"
+          ? rule.weekdays.includes(d.getDay()) && Math.floor((i + start.getDay()) / 7) % rule.interval === 0
+          : rule.every === "month"
+            ? months % rule.interval === 0 && onDay
+            : (d.getFullYear() - start.getFullYear()) % rule.interval === 0 && d.getMonth() + 1 === (rule.month ?? 1) && onDay;
+    if (hit) days.push(d.getTime());
+  }
+  return days;
 }
 
 /** As `saveEvent`, in the demo: made or changed here, the series moving by as much as the occurrence did. */
@@ -227,17 +268,35 @@ export function demoSaveEvent(id: number | null, draft: EventDraft, scope: Event
     callLink: draft.teams ? TEAMS : undefined,
     private: draft.private,
   };
-  if (id === null) {
+  const make = (start: number, series?: string) =>
     made.push({
       ...fields,
       id: 10_000 + made.length,
       account: CALENDARS.find((c) => c.id === draft.calendar)!.account,
-      start: draft.start,
-      end: draft.end,
+      start,
+      end: start + (draft.end - draft.start),
       response: "organizer",
       canceled: false,
-      repeats: false,
+      repeats: series !== undefined,
+      series,
     });
+  /** A series by `rule` from the draft's own day, named `series`. */
+  const makeSeries = (rule: Repeat, series: string) => {
+    rules.set(series, rule);
+    const first = draft.allDay ? fromUtcDate(draft.start) : startOfDay(draft.start);
+    for (const day of ruleDays(rule, first)) make(draft.allDay ? toUtcDate(day) : atMinutes(day, minutesOf(draft.start)), series);
+  };
+  const before = id === null ? undefined : scoped(id, "one")[0];
+  const oldRule = before?.series ? (rules.get(before.series) ?? null) : null;
+  const ruleChanged = before !== undefined && JSON.stringify(draft.repeat) !== JSON.stringify(oldRule) && scope !== "one";
+  if (id === null || !before) {
+    if (draft.repeat) makeSeries(draft.repeat, `made-${made.length}`);
+    else make(draft.start);
+  } else if (ruleChanged || (!before.repeats && draft.repeat)) {
+    // The occurrences it's for give way to the new rule's, from this one's day on.
+    for (const e of before.repeats ? scoped(id, scope) : [before]) deleted.add(e.id);
+    if (draft.repeat) makeSeries(draft.repeat, scope === "all" && before.series ? before.series : `made-${made.length}`);
+    else make(draft.start);
   } else {
     const before = scoped(id, "one")[0];
     for (const e of scoped(id, scope)) {

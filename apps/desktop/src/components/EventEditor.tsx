@@ -9,7 +9,16 @@ import {
   atMinutes,
   attendeesChanged,
   composing,
+  dateText,
+  dateValue,
   dayOf,
+  followStart,
+  fromUtcDate,
+  nthOf,
+  presetRule,
+  repeatKind,
+  repeatText,
+  type RepeatKind,
   draftChanged,
   minutesOf,
   parseTime,
@@ -20,7 +29,7 @@ import {
   withStart,
   type NewEventDefaults,
 } from "../lib/eventDraft";
-import type { AccountView, CalendarEvent, CalendarInfo, EventDraft } from "../types";
+import type { AccountView, CalendarEvent, CalendarInfo, EventDraft, Repeat } from "../types";
 import Avatar from "./Avatar";
 import { ChoiceDialog } from "./Dialog";
 import { Popover } from "./Dropdown";
@@ -207,6 +216,19 @@ export default function EventEditor({
       return withAllDay(d, on, defaults, timed.current);
     });
 
+  // A preset repeat rule goes with the first day ("every week" on its weekday) as it moves.
+  const lastStart = useRef({ start: draft.start, allDay: draft.allDay });
+  useEffect(() => {
+    const was = lastStart.current;
+    lastStart.current = { start: draft.start, allDay: draft.allDay };
+    if (was.allDay === draft.allDay && dayOf(was.start) === dayOf(draft.start)) return;
+    setDraft((d) => ({ ...d, repeat: followStart(d.repeat, was, d) }));
+  }, [draft.start, draft.allDay]);
+  const [customizing, setCustomizing] = useState(false);
+  const kind = repeatKind(draft.repeat, draft);
+  /** An occurrence of a series whose rule this can't show: it's left as it is. */
+  const unknownRule = event?.repeats === true && initial.repeat === null;
+
   const inviting = event ? attendeesChanged(draft, initial) : draft.attendees.length > 0;
   const label = inviting ? "Send Invitation" : event ? "Update" : "Create";
   const days = draft.allDay ? allDayDays(draft) : null;
@@ -327,7 +349,40 @@ export default function EventEditor({
 
           <hr className="my-3 border-hairline" />
 
-          <div className="space-y-1.5">
+          <div className="relative space-y-1.5">
+            <Row label="Repeat:">
+              <select
+                aria-label="Repeat frequency"
+                className="select select-sm h-8 min-h-8 flex-1 rounded-lg border-hairline text-[13px]"
+                value={unknownRule ? "unknown" : kind}
+                disabled={unknownRule}
+                onChange={(e) => {
+                  const chosen = e.target.value as RepeatKind;
+                  if (chosen === "custom") setCustomizing(true);
+                  else set({ repeat: presetRule(chosen, draft) });
+                }}
+              >
+                {unknownRule && <option value="unknown">Repeats (change it in Outlook)</option>}
+                <option value="none">None</option>
+                <option value="day">Every day</option>
+                <option value="week">Every week</option>
+                <option value="month">Every month</option>
+                <option value="year">Every year</option>
+                <option value="custom">{kind === "custom" && draft.repeat ? repeatText({ ...draft.repeat, ends: { kind: "never" } }) : "Custom…"}</option>
+              </select>
+            </Row>
+            {draft.repeat && <Ends rule={draft.repeat} onChange={(repeat) => set({ repeat })} />}
+            {customizing && (
+              <RepeatDialog
+                rule={draft.repeat ?? presetRule("week", draft)!}
+                draft={draft}
+                onSave={(repeat) => {
+                  set({ repeat });
+                  setCustomizing(false);
+                }}
+                onClose={() => setCustomizing(false)}
+              />
+            )}
             <Row label="Alert:">
               <select
                 aria-label="Notification alert"
@@ -433,6 +488,235 @@ export default function EventEditor({
         />
       )}
     </>
+  );
+}
+
+/** When a rule stops: never, after so many times, or on a date. */
+function Ends({ rule, onChange }: { rule: Repeat; onChange: (rule: Repeat) => void }) {
+  const ends = rule.ends;
+  const [times, setTimes] = useState(ends.kind === "after" ? String(ends.times) : "1");
+  return (
+    <Row label="Ends:">
+      <select
+        aria-label="Repeat ends"
+        className="select select-sm h-8 min-h-8 w-28 rounded-lg border-hairline text-[13px]"
+        value={ends.kind}
+        onChange={(e) => {
+          const kind = e.target.value;
+          if (kind === "never") onChange({ ...rule, ends: { kind } });
+          else if (kind === "after") onChange({ ...rule, ends: { kind, times: 1 } });
+          else onChange({ ...rule, ends: { kind: "on", date: dateText(dayOf(Date.now())) } });
+          setTimes("1");
+        }}
+      >
+        <option value="never">Never</option>
+        <option value="after">After</option>
+        <option value="on">On the date</option>
+      </select>
+      {ends.kind === "after" && (
+        <>
+          <input
+            aria-label="Number of times to repeat event"
+            inputMode="numeric"
+            className="h-8 w-14 rounded-lg border border-hairline bg-base-100 px-2 outline-none focus:border-primary"
+            value={times}
+            onChange={(e) => {
+              const text = e.target.value.replace(/\D/g, "").slice(0, 3);
+              setTimes(text);
+              if (Number(text) >= 1) onChange({ ...rule, ends: { kind: "after", times: Number(text) } });
+            }}
+            // Empty, it's once.
+            onBlur={() => !(Number(times) >= 1) && (setTimes("1"), onChange({ ...rule, ends: { kind: "after", times: 1 } }))}
+          />
+          <span className="text-text-2">time(s)</span>
+        </>
+      )}
+      {ends.kind === "on" && (
+        <DateField
+          label="Repeat end date"
+          day={dateValue(ends.date)}
+          onPick={(day) => onChange({ ...rule, ends: { kind: "on", date: dateText(day) } })}
+        />
+      )}
+    </Row>
+  );
+}
+
+const weekdayShort = (day: number) => new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(new Date(2023, 0, 1 + day));
+const monthLong = (month: number) => new Intl.DateTimeFormat(undefined, { month: "long" }).format(new Date(2023, month - 1, 1));
+
+/**
+ * Spark's Custom repeat: how often (daily, weekly, monthly, yearly) and every how many; weekly, its
+ * days; monthly or yearly, on a day of the month or "on the second Tuesday"; yearly, its month.
+ * A day of the month and a month each, as Microsoft 365 keeps them.
+ */
+function RepeatDialog({
+  rule,
+  draft,
+  onSave,
+  onClose,
+}: {
+  rule: Repeat;
+  draft: EventDraft;
+  onSave: (rule: Repeat) => void;
+  onClose: () => void;
+}) {
+  const [r, setR] = useState<Repeat>(rule);
+  const first = new Date(draft.allDay ? fromUtcDate(draft.start) : draft.start);
+  const [count, setCount] = useState(String(rule.interval));
+  useEffect(() => {
+    // Capture, so Esc closes this and not the editor.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.isComposing) return;
+      e.stopPropagation();
+      e.preventDefault();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+  const units = { day: "day(s)", week: "week(s)", month: "month(s)", year: "year(s)" };
+  const byDay = r.nth === undefined;
+  const onThe = () => ({ nth: nthOf(first.getTime()), weekdays: [first.getDay()], day: undefined });
+  const onDate = () => ({ nth: undefined, weekdays: [], day: first.getDate() });
+  return (
+    <div
+      role="dialog"
+      aria-label="Custom repeat"
+      className="absolute left-0 right-0 top-9 z-40 rounded-xl border border-hairline bg-popover p-3 shadow-popup"
+    >
+      <div className="flex items-center gap-2">
+        <span className="w-20 text-text-2">Frequency:</span>
+        <select
+          aria-label="Frequency"
+          className="select select-sm h-8 min-h-8 flex-1 rounded-lg border-hairline text-[13px]"
+          value={r.every}
+          onChange={(e) => {
+            const every = e.target.value as Repeat["every"];
+            setR({ ...presetRule(every, draft)!, interval: r.interval, ends: r.ends });
+          }}
+        >
+          <option value="day">Daily</option>
+          <option value="week">Weekly</option>
+          <option value="month">Monthly</option>
+          <option value="year">Yearly</option>
+        </select>
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <span className="w-20 text-text-2">Every</span>
+        <input
+          aria-label="Interval"
+          inputMode="numeric"
+          className="h-8 w-14 rounded-lg border border-hairline bg-base-100 px-2 outline-none focus:border-primary"
+          value={count}
+          onChange={(e) => {
+            const text = e.target.value.replace(/\D/g, "").slice(0, 3);
+            setCount(text);
+            if (Number(text) >= 1) setR((x) => ({ ...x, interval: Number(text) }));
+          }}
+          onBlur={() => !(Number(count) >= 1) && (setCount("1"), setR((x) => ({ ...x, interval: 1 })))}
+        />
+        <span className="text-text-2">{units[r.every]}</span>
+      </div>
+      {r.every === "week" && (
+        <div className="mt-2 flex gap-1" role="group" aria-label="On">
+          {[0, 1, 2, 3, 4, 5, 6].map((d) => {
+            const on = r.weekdays.includes(d);
+            return (
+              <button
+                key={d}
+                aria-pressed={on}
+                className={`h-7 flex-1 rounded-md text-xs ${on ? "bg-primary text-primary-content" : "bg-base-content/[0.07] hover:bg-base-content/[0.12]"}`}
+                // The last day on stays on.
+                onClick={() =>
+                  setR((x) => ({
+                    ...x,
+                    weekdays: on ? (x.weekdays.length > 1 ? x.weekdays.filter((w) => w !== d) : x.weekdays) : [...x.weekdays, d].sort(),
+                  }))
+                }
+              >
+                {weekdayShort(d)}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {r.every === "year" && (
+        <div className="mt-2 flex items-center gap-2">
+          <span className="w-20 text-text-2">In</span>
+          <select
+            aria-label="Month"
+            className="select select-sm h-8 min-h-8 flex-1 rounded-lg border-hairline text-[13px]"
+            value={r.month ?? first.getMonth() + 1}
+            onChange={(e) => setR((x) => ({ ...x, month: Number(e.target.value) }))}
+          >
+            {Array.from({ length: 12 }, (_, i) => (
+              <option key={i} value={i + 1}>
+                {monthLong(i + 1)}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      {(r.every === "month" || r.every === "year") && (
+        <div className="mt-2 space-y-1.5">
+          <label className="flex cursor-pointer items-center gap-2">
+            <input type="radio" className="radio radio-xs" checked={byDay} onChange={() => setR((x) => ({ ...x, ...onDate() }))} />
+            <span>On day</span>
+            <input
+              aria-label="Day of the month"
+              inputMode="numeric"
+              disabled={!byDay}
+              className="h-7 w-12 rounded-lg border border-hairline bg-base-100 px-2 outline-none focus:border-primary disabled:opacity-50"
+              value={byDay ? (r.day ?? first.getDate()) : first.getDate()}
+              onChange={(e) => {
+                const day = Number(e.target.value.replace(/\D/g, "").slice(0, 2));
+                if (day >= 1 && day <= 31) setR((x) => ({ ...x, day }));
+              }}
+            />
+          </label>
+          <label className="flex cursor-pointer items-center gap-2">
+            <input type="radio" className="radio radio-xs" checked={!byDay} onChange={() => setR((x) => ({ ...x, ...onThe() }))} />
+            <span>On the</span>
+            <select
+              aria-label="Week of the month"
+              disabled={byDay}
+              className="select select-xs h-7 min-h-7 rounded-lg border-hairline text-[13px]"
+              value={r.nth ?? nthOf(first.getTime())}
+              onChange={(e) => setR((x) => ({ ...x, nth: Number(e.target.value) }))}
+            >
+              {["first", "second", "third", "fourth", "last"].map((w, i) => (
+                <option key={w} value={i + 1}>
+                  {w}
+                </option>
+              ))}
+            </select>
+            <select
+              aria-label="Weekday"
+              disabled={byDay}
+              className="select select-xs h-7 min-h-7 rounded-lg border-hairline text-[13px]"
+              value={r.weekdays[0] ?? first.getDay()}
+              onChange={(e) => setR((x) => ({ ...x, weekdays: [Number(e.target.value)] }))}
+            >
+              {[0, 1, 2, 3, 4, 5, 6].map((d) => (
+                <option key={d} value={d}>
+                  {new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(new Date(2023, 0, 1 + d))}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+      <p className="mt-3 text-xs text-text-2">This event will repeat {repeatText({ ...r, ends: { kind: "never" } }).replace(/^Every/, "every")}.</p>
+      <div className="mt-3 flex justify-end gap-2">
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>
+          Cancel
+        </button>
+        <button className="btn btn-primary btn-sm" disabled={!(Number(count) >= 1)} onClick={() => onSave(r)}>
+          Save
+        </button>
+      </div>
+    </div>
   );
 }
 

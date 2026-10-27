@@ -323,10 +323,11 @@ open it, every five minutes while it's open, and as you move to other weeks;
 what was read stays on this computer, so it opens at once.
 
 New event (Ctrl+E) opens Spark's editor: the calendar, title, all day or
-the times, an alert, free or busy, a Teams call, the people to invite, the
-place and a note. An event of your own shows Edit and Delete in its details;
-for a repeating event they ask whether to change only that occurrence or all
-of them. Saving writes to your Microsoft 365 calendar at once, and Outlook
+the times, how it repeats (every day, week, month or year, or a custom rule,
+ending never, after some times or on a date), an alert, free or busy, a
+Teams call, the people to invite, the place and a note. An event of your own
+shows Edit and Delete in its details; for a repeating event they ask whether
+to change only that occurrence, all of them, or it and those after it. Saving writes to your Microsoft 365 calendar at once, and Outlook
 mails the invitations and updates. Settings → Calendar has the length and
 alerts new events start with.
 
@@ -335,8 +336,7 @@ there; drag your own events to move them, by their top or bottom edge to
 change their length, or into the all-day row and out of it. In Month view
 they move to another day. Right-click an event for Edit, Duplicate, Copy,
 Delete, your answer to an invitation and Show only this calendar, and
-empty time for New Event and Paste Event. Repeat rules and Gmail calendars
-aren't there yet.
+empty time for New Event and Paste Event. Gmail calendars aren't there yet.
 
 Microsoft 365 accounts added before the calendar arrived signed in without
 the calendar permission: add `Calendars.ReadWrite` to the app registration

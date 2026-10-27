@@ -1,4 +1,4 @@
-import type { CalendarEvent, EventDraft } from "../types";
+import type { CalendarEvent, EventDraft, Repeat } from "../types";
 
 // The event editor's draft: what a new event starts as, an event as the editor
 // shows it, and the rules Spark's editor keeps as its times change. Timed
@@ -69,6 +69,8 @@ export function draftOf(e: CalendarEvent): EventDraft {
     showAs: e.showAs,
     teams: e.onlineMeeting,
     private: e.private,
+    // Read from its series as the editor opens (`eventRepeat`).
+    repeat: null,
   };
 }
 
@@ -109,6 +111,7 @@ export function newDraft(calendar: number, start: number, allDay: boolean, defau
     showAs: allDay ? "free" : "busy",
     teams: false,
     private: false,
+    repeat: null,
   };
 }
 
@@ -216,7 +219,8 @@ export function draftChanged(d: EventDraft, before: EventDraft) {
     people(d) !== people(before) ||
     d.reminder !== before.reminder ||
     d.showAs !== before.showAs ||
-    d.teams !== before.teams
+    d.teams !== before.teams ||
+    JSON.stringify(d.repeat) !== JSON.stringify(before.repeat)
   );
 }
 
@@ -372,4 +376,109 @@ export function gestureOutcome(g: GridGesture, p: GridPoint, days: number[]): Dr
       return { start: atMinutes(day(p.col), clampDay(floorQuarter(p.minutes))), end: null, allDay: false };
     }
   }
+}
+
+// ---- repeat rules ----
+
+/** The repeat presets Spark's editor lists, and Custom. */
+export type RepeatKind = "none" | "day" | "week" | "month" | "year" | "custom";
+
+/** The local day an event starts on: an all-day one's date. */
+function firstDay(d: { start: number; allDay: boolean }) {
+  return new Date(d.allDay ? fromUtcDate(d.start) : d.start);
+}
+
+/** Spark's "Every day / week / month / year", from the event's own first day; null for none. */
+export function presetRule(kind: Exclude<RepeatKind, "custom">, d: { start: number; allDay: boolean }): Repeat | null {
+  const day = firstDay(d);
+  const never = { kind: "never" } as const;
+  switch (kind) {
+    case "none":
+      return null;
+    case "day":
+      return { every: "day", interval: 1, weekdays: [], ends: never };
+    case "week":
+      return { every: "week", interval: 1, weekdays: [day.getDay()], ends: never };
+    case "month":
+      return { every: "month", interval: 1, weekdays: [], day: day.getDate(), ends: never };
+    case "year":
+      return { every: "year", interval: 1, weekdays: [], day: day.getDate(), month: day.getMonth() + 1, ends: never };
+  }
+}
+
+/** Which preset `rule` is for an event starting as `d` does (its end aside), else custom. */
+export function repeatKind(rule: Repeat | null, d: { start: number; allDay: boolean }): RepeatKind {
+  if (!rule) return "none";
+  for (const kind of ["day", "week", "month", "year"] as const) {
+    const preset = presetRule(kind, d)!;
+    if (JSON.stringify({ ...preset, ends: rule.ends }) === JSON.stringify(rule)) return kind;
+  }
+  return "custom";
+}
+
+/** A rule that went with its event's first day (a preset) follows it to `next`; a custom one stays. */
+export function followStart(rule: Repeat | null, was: { start: number; allDay: boolean }, next: { start: number; allDay: boolean }) {
+  const kind = repeatKind(rule, was);
+  if (!rule || kind === "custom" || kind === "none") return rule;
+  return { ...presetRule(kind, next)!, ends: rule.ends };
+}
+
+const weekdayName = (day: number, style: "short" | "long") =>
+  new Intl.DateTimeFormat(undefined, { weekday: style }).format(new Date(2023, 0, 1 + day));
+const monthName = (month: number) => new Intl.DateTimeFormat(undefined, { month: "long" }).format(new Date(2023, month - 1, 1));
+const NTH_WORDS = ["", "first", "second", "third", "fourth", "last"];
+const untilFormat = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" });
+
+/** "2026-12-31" as a local midnight, and back. */
+export function dateValue(date: string) {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
+export function dateText(day: number) {
+  const d = new Date(day);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * A rule in words: "Every day", "Every 2 weeks on Mon, Wed", "Every weekday", "Every month on day
+ * 15", "Every month on the last Friday", "Every year on October 27", with how it ends: ", 10 times",
+ * ", until Dec 31, 2026".
+ */
+export function repeatText(rule: Repeat) {
+  const n = rule.interval;
+  const unit = (one: string) => (n === 1 ? `Every ${one}` : `Every ${n} ${one}s`);
+  const on = rule.nth ? ` on the ${NTH_WORDS[rule.nth]} ${weekdayName(rule.weekdays[0] ?? 0, "long")}` : "";
+  let text: string;
+  switch (rule.every) {
+    case "day":
+      text = unit("day");
+      break;
+    case "week": {
+      const days = [...rule.weekdays].sort();
+      text =
+        n === 1 && days.join() === "1,2,3,4,5"
+          ? "Every weekday"
+          : `${unit("week")} on ${days.map((d) => weekdayName(d, "short")).join(", ")}`;
+      break;
+    }
+    case "month":
+      text = `${unit("month")}${rule.nth ? on : ` on day ${rule.day ?? 1}`}`;
+      break;
+    case "year":
+      text = rule.nth
+        ? `${unit("year")}${on} of ${monthName(rule.month ?? 1)}`
+        : `${unit("year")} on ${monthName(rule.month ?? 1)} ${rule.day ?? 1}`;
+      break;
+  }
+  if (rule.ends.kind === "after") text += `, ${rule.ends.times} ${rule.ends.times === 1 ? "time" : "times"}`;
+  if (rule.ends.kind === "on") text += `, until ${untilFormat.format(dateValue(rule.ends.date))}`;
+  return text;
+}
+
+/** Which week of its month `day` is in, Spark's "on the …": 1 to 4, or 5 when it's the month's last. */
+export function nthOf(day: number) {
+  const d = new Date(day);
+  const next = new Date(day);
+  next.setDate(d.getDate() + 7);
+  return next.getMonth() !== d.getMonth() ? 5 : Math.min(4, Math.ceil(d.getDate() / 7));
 }

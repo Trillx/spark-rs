@@ -62,7 +62,7 @@ Last full check: 2026-10-26.
 |---|:-:|---|
 | Unlimited Calendar Connections | ✅ | Every calendar of every Microsoft 365 account you add |
 | Multi-Provider Support | 🟡 | Microsoft 365 only; Gmail calendars need Google sign-in, which spark-rs doesn't have yet |
-| Create Events | 🟡 | New Event (Ctrl+E), dragging on the grid, Edit, Delete, Duplicate and Copy/Paste in Microsoft 365 calendars, with people to invite, an alert and a Teams call; events move and resize by dragging; repeat rules aren't there yet |
+| Create Events | 🟡 | New Event (Ctrl+E), dragging on the grid, Edit, Delete, Duplicate and Copy/Paste in Microsoft 365 calendars, with people to invite, an alert, a Teams call and repeat rules (presets and Custom, with All Future); events move and resize by dragging; not yet tried with a real Microsoft 365 account |
 | Zoom Integration | 🟡 | Join from the calendar and the meeting pop-up; adding a Zoom call to an event needs a Zoom sign-in spark-rs doesn't have |
 | Google Meet Integration | 🟡 | Join from the calendar and the meeting pop-up; adding a Meet call needs a Google calendar |
 | Microsoft Teams Integration | 🟡 | Join from the calendar and the meeting pop-up, and add a Teams call to events in Microsoft 365 calendars |

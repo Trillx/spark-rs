@@ -14,6 +14,7 @@ pub mod invite;
 pub mod labels;
 pub mod oauth;
 pub mod parse;
+pub mod recurrence;
 pub mod search;
 pub mod signature;
 pub mod smtp;

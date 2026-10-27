@@ -348,3 +348,32 @@ test("a copy keeps a Zoom link in its note; a Teams meeting is made anew", async
   assert.equal(composing({ nativeEvent: {}, keyCode: 229 }), true);
   assert.equal(composing({ nativeEvent: { isComposing: false }, keyCode: 13 }), false);
 });
+
+test("repeat presets come from the first day, and rules read as Spark words them", async () => {
+  const { presetRule, repeatKind, followStart, repeatText, nthOf } = await import("./eventDraft.ts");
+  // Tuesday, October 27, 2026.
+  const tuesday = { start: atMinutes(dayOf(new Date(2026, 9, 27).getTime()), 9 * 60), allDay: false };
+  const weekly = presetRule("week", tuesday)!;
+  assert.deepEqual(weekly.weekdays, [2]);
+  assert.equal(repeatKind(weekly, tuesday), "week");
+  assert.equal(repeatKind({ ...weekly, ends: { kind: "after", times: 5 } }, tuesday), "week", "its end aside");
+  assert.equal(repeatKind({ ...weekly, interval: 2 }, tuesday), "custom");
+  const thursday = { ...tuesday, start: tuesday.start + 2 * DAY };
+  assert.deepEqual(followStart(weekly, tuesday, thursday)!.weekdays, [4], "a preset follows the day");
+  const custom = { ...weekly, interval: 2 };
+  assert.equal(followStart(custom, tuesday, thursday), custom, "a custom rule stays");
+  assert.equal(presetRule("month", tuesday)!.day, 27);
+  assert.deepEqual([presetRule("year", tuesday)!.month, presetRule("year", tuesday)!.day], [10, 27]);
+
+  assert.equal(repeatText(presetRule("day", tuesday)!), "Every day");
+  assert.match(repeatText({ ...weekly, interval: 2, weekdays: [3, 1] }), /^Every 2 weeks on Mon, Wed$/);
+  assert.equal(repeatText({ ...weekly, weekdays: [1, 2, 3, 4, 5] }), "Every weekday");
+  assert.equal(repeatText({ ...presetRule("month", tuesday)!, ends: { kind: "after", times: 10 } }), "Every month on day 27, 10 times");
+  assert.match(
+    repeatText({ every: "month", interval: 1, weekdays: [5], nth: 5, ends: { kind: "on", date: "2027-06-30" } }),
+    /^Every month on the last Friday, until Jun 30, 2027$/,
+  );
+  assert.equal(repeatText(presetRule("year", tuesday)!), "Every year on October 27");
+  assert.equal(nthOf(new Date(2026, 9, 27).getTime()), 5, "the last Tuesday of October");
+  assert.equal(nthOf(new Date(2026, 9, 13).getTime()), 2);
+});

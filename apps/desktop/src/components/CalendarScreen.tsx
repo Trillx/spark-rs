@@ -4,6 +4,7 @@ import {
   answerEvent,
   cancelSignIn,
   deleteEvent,
+  eventRepeat,
   getPrefs,
   listCalendars,
   listEvents,
@@ -34,7 +35,7 @@ import {
   viewDays,
   type CalendarKind,
 } from "../lib/calendar";
-import { demoAnswer, demoCalendars, demoDeleteEvent, demoListEvents, demoSaveEvent } from "../lib/demoCalendar";
+import { demoAnswer, demoCalendars, demoDeleteEvent, demoListEvents, demoRepeat, demoSaveEvent } from "../lib/demoCalendar";
 import {
   atMinutes,
   copyOf,
@@ -44,6 +45,7 @@ import {
   minutesOf,
   newDraft,
   newEventStart,
+  repeatText,
   toUtcDate,
   type DragOutcome,
   type NewEventDefaults,
@@ -58,6 +60,7 @@ import type {
   EventDraft,
   EventScope,
   InviteAnswer,
+  Repeat,
 } from "../types";
 import AccountMark from "./AccountMark";
 import { MonthGrid, WeekGrid, type GridMenuTarget } from "./CalendarGrid";
@@ -97,6 +100,8 @@ interface Source {
     end: number,
   ) => Promise<void>;
   remove: (id: number, scope: EventScope, start: number, end: number) => Promise<void>;
+  /** How an event's series repeats. */
+  repeat: (id: number) => Promise<Repeat | null>;
 }
 
 const LIVE: Source = {
@@ -106,6 +111,7 @@ const LIVE: Source = {
   answer: answerEvent,
   save: saveEvent,
   remove: deleteEvent,
+  repeat: eventRepeat,
 };
 const DEMO: Source = {
   calendars: () => Promise.resolve(demoCalendars()),
@@ -114,6 +120,7 @@ const DEMO: Source = {
   answer: demoAnswer,
   save: (id, draft, _before, scope) => demoSaveEvent(id, draft, scope),
   remove: (id, scope) => demoDeleteEvent(id, scope),
+  repeat: (id) => Promise.resolve(demoRepeat(id)),
 };
 
 /** Settings → Calendar's length and alerts for new events; the defaults if they can't be read. */
@@ -363,6 +370,20 @@ export default function CalendarScreen({
     [events, hidden, calendars],
   );
   const open = preview ? events.find((e) => e.id === preview.id) : undefined;
+  /** The open event's repeat rule in words, read from its series. */
+  const [rule, setRule] = useState<{ id: number; text: string } | null>(null);
+  useEffect(() => {
+    if (!open?.repeats) return;
+    let current = true;
+    const id = open.id;
+    source.repeat(id).then(
+      (r) => current && setRule(r ? { id, text: repeatText(r) } : null),
+      () => {},
+    );
+    return () => {
+      current = false;
+    };
+  }, [open?.id, open?.repeats, source]);
 
   useEffect(() => {
     const id = wanted.current;
@@ -555,27 +576,57 @@ export default function CalendarScreen({
     return items;
   };
 
+  /** An event in the editor; a repeating one with its series' rule. */
   const editEvent = async (e: CalendarEvent, anchor: DOMRect) => {
-    const defaults = await newEventDefaults();
+    const [defaults, repeat] = await Promise.all([
+      newEventDefaults(),
+      e.repeats ? source.repeat(e.id).catch(() => null) : Promise.resolve(null),
+    ]);
     setPreview(null);
-    setEditor({ event: e, initial: draftOf(e), defaults, anchor, modal: kind === "day" });
+    setEditor({ event: e, initial: { ...draftOf(e), repeat }, defaults, anchor, modal: kind === "day" });
   };
 
-  /** Saves the editor's draft; a repeating event asks which occurrences first. False to go on editing. */
-  /** `before` is the event as the editor opened it: only what changed from it is saved. */
+  /**
+   * Saves the editor's draft (`before`: the event as the editor opened it; only what changed from it
+   * is saved). A repeating event asks which occurrences first, as Spark does: a changed rule is for
+   * all of them or those from here on, none at all for all of them. False to go on editing.
+   */
   const saveDraft = async (event: CalendarEvent | undefined, draft: EventDraft, before: EventDraft | null) => {
     let scope: EventScope = "one";
     if (event?.repeats) {
-      const choice = await ask({
-        title: "You're changing a repeating event.",
-        message: "Do you want to change only this occurrence of the event, or all occurrences?",
-        choices: [
-          { label: "Back to edit", value: "back" },
-          { label: "All", value: "all" },
-          { label: "Only This Event", value: "one", primary: true },
-        ],
-      });
-      if (choice !== "one" && choice !== "all") return false;
+      const ruleChanged = before !== null && JSON.stringify(draft.repeat) !== JSON.stringify(before.repeat);
+      const choice = await ask(
+        !ruleChanged
+          ? {
+              title: "You're changing a repeating event.",
+              message: "Do you want to change only this occurrence of the event, or all occurrences?",
+              choices: [
+                { label: "Back to edit", value: "back" },
+                { label: "All", value: "all" },
+                { label: "All Future", value: "future" },
+                { label: "Only This Event", value: "one", primary: true },
+              ],
+            }
+          : draft.repeat === null
+            ? {
+                title: "You're changing a repeating event.",
+                message: "Do you want to change all occurrences?",
+                choices: [
+                  { label: "Cancel", value: "back" },
+                  { label: "All", value: "all", primary: true },
+                ],
+              }
+            : {
+                title: "You're changing a repeating event.",
+                message: "Do you want to change all occurrences or only future?",
+                choices: [
+                  { label: "Back to edit", value: "back" },
+                  { label: "All", value: "all" },
+                  { label: "All Future", value: "future", primary: true },
+                ],
+              },
+      );
+      if (choice !== "one" && choice !== "all" && choice !== "future") return false;
       scope = choice;
     }
     await source.save(event?.id ?? null, draft, before, scope, start - DAY_MS, end + DAY_MS);
@@ -598,19 +649,22 @@ export default function CalendarScreen({
     if (e.repeats) {
       const choice = await ask({
         title: "Delete an event",
-        message: "Do you want to delete all occurrences or only this event?",
+        message: "Do you want to delete this and all future occurrences or only this event?",
         choices: [
           { label: "Cancel", value: "cancel" },
           { label: "All", value: "all" },
+          { label: "All Future", value: "future" },
           { label: "Only This Event", value: "one", primary: true },
         ],
       });
-      if (choice !== "one" && choice !== "all") return;
+      if (choice !== "one" && choice !== "all" && choice !== "future") return;
       scope = choice;
     }
     setPreview(null);
     setFailed(null);
-    const gone = (x: CalendarEvent) => x.id === e.id || (scope === "all" && e.series !== undefined && x.series === e.series);
+    const series = (x: CalendarEvent) => e.series !== undefined && x.series === e.series;
+    const gone = (x: CalendarEvent) =>
+      x.id === e.id || (scope === "all" && series(x)) || (scope === "future" && series(x) && x.start >= e.start);
     setEvents((all) => all.filter((x) => !gone(x)));
     try {
       await source.remove(e.id, scope, start - DAY_MS, end + DAY_MS);
@@ -792,6 +846,7 @@ export default function CalendarScreen({
           anchor={preview.anchor}
           modal={kind === "day"}
           onAnswer={(a) => answer(open, a)}
+          repeatText={rule?.id === open.id ? rule.text : undefined}
           onEdit={editable(open) ? () => void editEvent(open, preview.anchor) : undefined}
           onDelete={editable(open) ? () => void removeEvent(open) : undefined}
           onClose={() => setPreview(null)}
