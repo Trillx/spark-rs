@@ -317,9 +317,12 @@ spark-cli event rsvp 1114 maybe             # an invitation email
   user, then `event update e… --add …` to invite.
 - `--alerts 600s` reminds the user ten minutes before. `--video-conference
   teams` adds a Teams call; spark-rs can't add Zoom or Meet calls.
-- `--show-as free` keeps an event from blocking the user's time (a flight
-  reminder, a hotel stay); also `busy` (the default), `tentative`, `oof`,
-  `working-elsewhere`.
+- `--show-as free` keeps an event from blocking the user's time; also
+  `busy`, `tentative`, `oof`, `working-elsewhere`. Timed events are busy
+  unless told otherwise; all-day events are free, as the app makes them.
+- An all-day event takes dates: `--start 2026-07-01 --end 2026-07-03`
+  covers the 1st to the 3rd. In `events` its `.start` and `.end` are those
+  dates, the end being the last day it covers.
 - `rsvp` takes `accept`, `decline` or `maybe`, and an event ID or the ID of
   the invitation email (many invitations are in the Inbox but not yet in the
   calendar). The organizer hears back.

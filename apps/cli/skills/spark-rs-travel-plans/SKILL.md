@@ -90,10 +90,10 @@ Berlin, an hour ahead of Lisbon:
 spark-cli event create --title "Flight TP 547 Berlin to Lisbon" --start 2026-11-16T14:10 --end 2026-11-16T17:45 --location "BER Terminal 1" --description "Booking ABC123, seat 14C. Lands 16:45 Lisbon time."
 ```
 
-Without `--add` nobody is invited or emailed. New events show as busy,
-which is right for each leg. A hotel stay as an all-day event would block
-those days in `availability`, so give it `--show-as free` (or
-`--show-as oof` if the user is away from work):
+Without `--add` nobody is invited or emailed. Timed events show as busy,
+which is right for each leg. An all-day event, such as a hotel stay, shows
+as free, so it doesn't block those days in `availability`; give it
+`--show-as oof` if the user is away from work:
 
 ```bash
 spark-cli event create --title "Hotel Baixa, Lisbon" --start 2026-11-16 --end 2026-11-18 --all-day --show-as free --description "Booking 55821, Rua Augusta 12."

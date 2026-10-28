@@ -417,7 +417,8 @@ fn mute(env: &Env, named: &[&Message], accounts: &[i64], muted: bool) -> Done {
         let mut undo = Vec::new();
         let mut done = HashSet::new();
         for m in named {
-            if done.insert(m.conversation) {
+            // One already so changes nothing, and has nothing to undo.
+            if done.insert(m.conversation) && m.muted != muted {
                 store.set_muted(m.conversation, muted).map_err(db)?;
                 undo.push(Step::Muted {
                     conversation: m.conversation,
@@ -574,6 +575,8 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
                             id,
                             from: r.remind_at,
                             to: at,
+                            account: r.account_id,
+                            subject: r.subject,
                         });
                     }
                 }
@@ -591,7 +594,12 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
                             if_no_reply: true,
                         })
                         .map_err(db)?;
-                    undo.push(Step::Reminder { id, at: Some(at) });
+                    undo.push(Step::Reminder {
+                        id,
+                        at: Some(at),
+                        account: m.account_id,
+                        subject: m.subject.clone(),
+                    });
                 }
                 None => {
                     for id in existing {

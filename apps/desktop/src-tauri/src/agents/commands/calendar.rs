@@ -3,7 +3,7 @@
 //! first, so what it lists is current. Event IDs are `e` and a number
 //! (`e42`), so `event rsvp` can tell them from an invitation email's ID.
 
-use chrono::{Datelike, Duration, Local, NaiveTime, TimeZone, Weekday};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Weekday};
 use serde_json::{Value, json};
 use spark_mail::calendar::{Event, EventDraft, Scope, ShowAs, Zone};
 use spark_mail::invite::{Answer, Person};
@@ -23,6 +23,60 @@ const WORK_START: u32 = 8;
 const WORK_END: u32 = 20;
 /// Shorter gaps aren't offered as free time.
 const MIN_SLOT: i64 = 15 * 60_000;
+
+/// An all-day date as the calendar keeps it: midnight UTC on that date
+/// (`2026-11-05`, `05/11/2026` or `2026/11/05`; a time's own date).
+fn utc_day(text: &str) -> Result<i64, Fail> {
+    let text = text.trim();
+    let date = ["%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"]
+        .iter()
+        .find_map(|f| NaiveDate::parse_from_str(text, f).ok())
+        .or_else(|| {
+            Local
+                .timestamp_millis_opt(parse_time(text, false).ok()?)
+                .single()
+                .map(|t| t.date_naive())
+        })
+        .ok_or_else(|| Fail::Error(format!("{text} isn't a date. Write yyyy-MM-dd.")))?;
+    Ok(date.and_time(NaiveTime::MIN).and_utc().timestamp_millis())
+}
+
+/// The UTC date of an all-day boundary.
+fn utc_date(ms: i64) -> NaiveDate {
+    DateTime::from_timestamp_millis(ms)
+        .map(|t| t.date_naive())
+        .unwrap_or_default()
+}
+
+/// When an event begins and ends on this computer's clock. All-day events
+/// are kept as UTC midnights of their dates, which are local midnights here.
+fn span(e: &Event) -> (i64, i64) {
+    if !e.all_day {
+        return (e.start, e.end);
+    }
+    let local = |ms: i64| {
+        let day = utc_date(ms).and_time(NaiveTime::MIN);
+        Local
+            .from_local_datetime(&day)
+            .earliest()
+            .map_or(ms, |t| t.timestamp_millis())
+    };
+    (local(e.start), local(e.end))
+}
+
+/// An event's start and end for JSON: times, or for an all-day event the
+/// first and the last day it covers.
+fn bounds(start: i64, end: i64, all_day: bool) -> (String, String) {
+    if all_day {
+        let first = utc_date(start);
+        (
+            first.to_string(),
+            utc_date(end - DAY).max(first).to_string(),
+        )
+    } else {
+        (iso(start), iso(end))
+    }
+}
 
 /// How the history names a range.
 fn range_name(a: &Args, start: i64, end: i64) -> String {
@@ -124,8 +178,8 @@ fn event_json(e: &StoredEvent, event: &Event, calendar: &str, account: &str) -> 
     let mut v = json!({
         "id": format!("e{}", e.id),
         "title": event.title,
-        "start": iso(event.start),
-        "end": iso(event.end),
+        "start": bounds(event.start, event.end, event.all_day).0,
+        "end": bounds(event.start, event.end, event.all_day).1,
         "all_day": event.all_day,
         "calendar": calendar,
         "account": account,
@@ -201,13 +255,28 @@ pub async fn events(env: &Env<'_>, a: &Args<'_>) -> Done {
             "There's no calendar {w}. accounts lists them."
         )));
     }
-    let mut stored = env.store().events_between(start, end).map_err(db)?;
-    stored.sort_by_key(|e| (e.start, e.id));
-    let list: Vec<Value> = stored
+    // A day either side: all-day events are kept in UTC days.
+    let stored = env
+        .store()
+        .events_between(start - DAY, end + DAY)
+        .map_err(db)?;
+    let mut found: Vec<(i64, &StoredEvent, Event)> = stored
         .iter()
-        .filter_map(|e| {
+        .map(|e| {
+            let event = Event::from_json(&e.data);
+            (span(&event).0, e, event)
+        })
+        .filter(|(_, _, event)| {
+            let (s, e) = span(event);
+            s < end && e > start
+        })
+        .collect();
+    found.sort_by_key(|(at, e, _)| (*at, e.id));
+    let list: Vec<Value> = found
+        .iter()
+        .filter_map(|(_, e, event)| {
             let (c, email, _) = picked.iter().find(|(c, _, _)| c.id == e.calendar_id)?;
-            Some(event_json(e, &Event::from_json(&e.data), &c.name, email))
+            Some(event_json(e, event, &c.name, email))
         })
         .collect();
     let value =
@@ -300,21 +369,39 @@ fn apply_fields(a: &Args, draft: &mut EventDraft, creating: bool) -> Result<(), 
     }
     let all_day = a.flag("all_day") || a.str("start").is_some_and(is_date);
     let length = (draft.end - draft.start).max(0);
+    let was_all_day = draft.all_day;
     if let Some(s) = a.str("start") {
-        draft.start = parse_time(s, false)?;
         draft.all_day = all_day;
-        draft.end = if draft.all_day {
-            draft.start + DAY
-        } else if creating || length == 0 {
-            draft.start + 30 * 60_000
+        if all_day {
+            // All-day dates are UTC midnights, as the calendar keeps them.
+            draft.start = utc_day(s)?;
+            let days = if was_all_day {
+                (length / DAY).max(1)
+            } else {
+                1
+            };
+            draft.end = draft.start + days * DAY;
         } else {
-            draft.start + length
-        };
-    } else if a.flag("all_day") {
+            draft.start = parse_time(s, false)?;
+            draft.end = if creating || length == 0 || was_all_day {
+                draft.start + 30 * 60_000
+            } else {
+                draft.start + length
+            };
+        }
+    } else if a.flag("all_day") && !was_all_day {
+        // A timed event made all-day covers its own date.
         draft.all_day = true;
+        draft.start = utc_day(&super::when(draft.start))?;
+        draft.end = draft.start + DAY;
     }
     if let Some(e) = a.str("end") {
-        draft.end = parse_time(e, draft.all_day)?;
+        // An all-day end is the last day it covers.
+        draft.end = if draft.all_day {
+            utc_day(e)? + DAY
+        } else {
+            parse_time(e, false)?
+        };
     }
     if draft.end <= draft.start {
         return Err("end must come after start.".into());
@@ -324,7 +411,20 @@ fn apply_fields(a: &Args, draft: &mut EventDraft, creating: bool) -> Result<(), 
         draft.reminder = Some(
             match first.strip_suffix('s').and_then(|n| n.parse::<i64>().ok()) {
                 Some(seconds) => seconds / 60,
-                None => ((draft.start - parse_time(first, false)?) / 60_000).max(0),
+                None => {
+                    let starts = if draft.all_day {
+                        span(&Event {
+                            start: draft.start,
+                            end: draft.end,
+                            all_day: true,
+                            ..Event::default()
+                        })
+                        .0
+                    } else {
+                        draft.start
+                    };
+                    ((starts - parse_time(first, false)?) / 60_000).max(0)
+                }
             },
         );
     }
@@ -388,6 +488,10 @@ async fn create(env: &Env<'_>, a: &Args<'_>) -> Done {
         ..EventDraft::default()
     };
     apply_fields(a, &mut draft, true)?;
+    // As the app's editor makes them: an all-day event doesn't block the day.
+    if draft.all_day && a.str("show_as").is_none() {
+        draft.show_as = ShowAs::Free;
+    }
     let (name, wall) = zone();
     let zone = Zone {
         name: &name,
@@ -413,12 +517,14 @@ async fn create(env: &Env<'_>, a: &Args<'_>) -> Done {
         .filter(|e| e.calendar_id == calendar.id && e.start == draft.start)
         .find(|e| Event::from_json(&e.data).title == draft.title);
     let invited = draft.attendees.len();
-    let mut out = format!(
-        "Event \"{}\" made in {}:{}, {}.",
-        draft.title,
-        account.email,
-        calendar.name,
+    let starts = if draft.all_day {
+        format!("{}, all day", utc_date(draft.start))
+    } else {
         when(draft.start)
+    };
+    let mut out = format!(
+        "Event \"{}\" made in {}:{}, {starts}.",
+        draft.title, account.email, calendar.name
     );
     if let Some(e) = &made {
         out.push_str(&format!("\nID: e{}", e.id));
@@ -440,8 +546,8 @@ async fn create(env: &Env<'_>, a: &Args<'_>) -> Done {
                 "id": made.map(|e| format!("e{}", e.id)),
                 "title": draft.title,
                 "calendar": format!("{}:{}", account.email, calendar.name),
-                "start": iso(draft.start),
-                "end": iso(draft.end),
+                "start": bounds(draft.start, draft.end, draft.all_day).0,
+                "end": bounds(draft.start, draft.end, draft.all_day).1,
                 "all_day": draft.all_day,
                 "invited": invited,
             }),
@@ -530,7 +636,7 @@ async fn update(env: &Env<'_>, a: &Args<'_>) -> Done {
             summary: format!("changed the event \"{}\"", draft.title),
         }),
         ..Reply::new(
-            json!({ "id": format!("e{}", stored.id), "title": draft.title, "start": iso(draft.start), "end": iso(draft.end), "attendees": told }),
+            json!({ "id": format!("e{}", stored.id), "title": draft.title, "start": bounds(draft.start, draft.end, draft.all_day).0, "end": bounds(draft.start, draft.end, draft.all_day).1, "attendees": told }),
             out,
         )
     })
@@ -693,7 +799,7 @@ pub async fn availability(env: &Env<'_>, a: &Args<'_>) -> Done {
             let free = event.canceled
                 || event.show_as == spark_mail::calendar::ShowAs::Free
                 || event.response == spark_mail::calendar::Response::Declined;
-            (!free).then_some((event.start, event.end))
+            (!free).then_some(span(&event))
         })
         .collect();
     busy.sort();
@@ -770,6 +876,55 @@ pub async fn availability(env: &Env<'_>, a: &Args<'_>) -> Done {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_day_dates_are_utc_midnights_and_local_days() {
+        let mut draft = EventDraft::default();
+        let args = serde_json::json!({ "start": "2026-11-05", "end": "2026-11-06" });
+        apply_fields(&Args(&args), &mut draft, true).unwrap();
+        let midnight = NaiveDate::from_ymd_opt(2026, 11, 5)
+            .unwrap()
+            .and_time(NaiveTime::MIN)
+            .and_utc()
+            .timestamp_millis();
+        assert!(draft.all_day);
+        assert_eq!(draft.start, midnight);
+        assert_eq!(
+            draft.end,
+            midnight + 2 * DAY,
+            "the end date is the last day"
+        );
+        assert_eq!(
+            bounds(draft.start, draft.end, true),
+            ("2026-11-05".into(), "2026-11-06".into())
+        );
+        // On this computer's clock the event is the local days.
+        let event = Event {
+            start: draft.start,
+            end: draft.end,
+            all_day: true,
+            ..Event::default()
+        };
+        let local = Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 11, 5)
+                    .unwrap()
+                    .and_time(NaiveTime::MIN),
+            )
+            .earliest()
+            .unwrap();
+        assert_eq!(span(&event).0, local.timestamp_millis());
+        // A timed start stays local.
+        let mut timed = EventDraft::default();
+        apply_fields(
+            &Args(&serde_json::json!({ "start": "2026-11-05T09:00" })),
+            &mut timed,
+            true,
+        )
+        .unwrap();
+        assert!(!timed.all_day);
+        assert_eq!(timed.end - timed.start, 30 * 60_000);
+    }
 
     #[test]
     fn event_ids_take_an_e() {

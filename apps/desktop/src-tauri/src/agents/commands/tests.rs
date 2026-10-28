@@ -1016,3 +1016,71 @@ fn undo_keeps_a_draft_whose_cc_changed() {
         "the edited draft stays: {out}"
     );
 }
+
+#[test]
+fn undoing_a_mute_that_changed_nothing_does_nothing() {
+    let f = Fixture::new("mute-noop");
+    f.allow(f.work, Access::Triage);
+    let deals = f.id("Weekly deals");
+    let conversation = f
+        .engine
+        .store()
+        .message(deals)
+        .unwrap()
+        .unwrap()
+        .conversation;
+    f.engine.store().set_muted(conversation, true).unwrap();
+    f.ok(
+        "action",
+        json!({ "action_name": "mute", "message_ids": [deals] }),
+    );
+    let entry = &f.ok("history", json!({}))["entries"][0];
+    assert_eq!(entry["can_undo"], false, "{entry}");
+}
+
+#[test]
+fn undo_leaves_a_reminder_that_reused_the_id() {
+    let f = Fixture::new("reminder-id-reuse");
+    f.allow(f.work, Access::Triage);
+    let a = add(
+        &f,
+        f.work,
+        50,
+        "Me Myself",
+        "me@work.com",
+        "First offer",
+        90,
+    );
+    let b = add(
+        &f,
+        f.work,
+        51,
+        "Me Myself",
+        "me@work.com",
+        "Second offer",
+        80,
+    );
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [a], "date": "2099-02-01" }),
+    );
+    let set_a = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    f.ok(
+        "action",
+        json!({ "action_name": "clearReminder", "message_ids": [a] }),
+    );
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [b], "date": "2099-02-01" }),
+    );
+    let b_reminders = f.engine.store().reminders_on(b).unwrap();
+    assert_eq!(b_reminders.len(), 1);
+    let out = f.ok("history", json!({ "undo": set_a.to_string() }));
+    assert_eq!(
+        f.engine.store().reminders_on(b).unwrap(),
+        b_reminders,
+        "B's reminder stays: {out}"
+    );
+}

@@ -114,11 +114,16 @@ pub enum Step {
         #[serde(default)]
         print: u64,
     },
-    /// A reminder the agent set, for `at`.
+    /// A reminder the agent set, for `at`. Its account and subject tell
+    /// it from a later reminder that got its id.
     Reminder {
         id: i64,
         #[serde(default)]
         at: Option<i64>,
+        #[serde(default)]
+        account: i64,
+        #[serde(default)]
+        subject: String,
     },
     /// A reminder the agent cleared, all of it.
     ReminderCleared {
@@ -129,6 +134,8 @@ pub enum Step {
         id: i64,
         from: i64,
         to: i64,
+        account: i64,
+        subject: String,
     },
 }
 
@@ -710,8 +717,16 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
             // Deleted by the caller, as Discard does, with the store let go.
             return Ok(None);
         }
-        Step::Reminder { id, at } => match store.reminder(*id)? {
+        Step::Reminder {
+            id,
+            at,
+            account,
+            subject,
+        } => match store.reminder(*id)? {
             None => return Ok(Some(format!("reminder {id} is gone"))),
+            Some(r) if r.account_id != *account || r.subject != *subject => {
+                return Ok(Some(format!("reminder {id} is gone")));
+            }
             Some(r) if r.due || at.is_some_and(|at| r.remind_at != at) => {
                 return Ok(Some(format!("reminder {id} changed since")));
             }
@@ -722,8 +737,17 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
                 return Ok(Some(format!("reminder {} couldn't come back", reminder.id)));
             }
         }
-        Step::ReminderMoved { id, from, to } => match store.reminder(*id)? {
+        Step::ReminderMoved {
+            id,
+            from,
+            to,
+            account,
+            subject,
+        } => match store.reminder(*id)? {
             None => return Ok(Some(format!("reminder {id} is gone"))),
+            Some(r) if r.account_id != *account || r.subject != *subject => {
+                return Ok(Some(format!("reminder {id} is gone")));
+            }
             Some(r) if r.due || r.remind_at != *to => {
                 return Ok(Some(format!("reminder {id} changed since")));
             }
