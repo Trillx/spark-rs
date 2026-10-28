@@ -36,7 +36,7 @@ The first gives the top senders over 30 days by emails, the second how many
 of each went unread, the third how many notification conversations sit in
 the Inbox now. Rows are conversations, and a bot can thread many alerts
 into one, so count `.messages // 1`, not rows, and take unread from the
-second search, not a row's `.unread`. A sender
+second search, not a row's `.unread`; a sender missing from the second search has none unread. A sender
 with a high count and nearly all unread is the first to look at.
 
 ## 2. Refile the misfiled

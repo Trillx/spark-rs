@@ -33,15 +33,15 @@ spark-cli search --filter "category:priority is:unread newer_than:28d" --page-si
 For each sender, note how many emails they sent and how many the user left
 unread. Rows are conversations, so count `.messages // 1`, and take unread
 from the second search rather than a row's `.unread`, which is only its
-newest email's. Candidates to take off: automated senders, newsletters, people the
+newest email's; a sender missing from it has nothing unread. Candidates to take off: automated senders, newsletters, people the
 user no longer works with, and senders whose mail mostly stays unread.
 
 ## 2. Who's missing
 
 ```bash
 spark-cli contacts --limit 30
-spark-cli emails Sent --filter "to:bo@example.com newer_than:60d" --page-size 1000 --json | jq '[.emails[] | .messages // 1] | add'
-spark-cli search --filter "from:bo@example.com is:unreplied newer_than:60d" --page-size 1000 --json | jq '[.emails[] | .messages // 1] | add'
+spark-cli emails Sent --filter "to:bo@example.com newer_than:60d" --page-size 1000 --json | jq '[.emails[] | .messages // 1] | add // 0'
+spark-cli search --filter "from:bo@example.com is:unreplied newer_than:60d" --page-size 1000 --json | jq '[.emails[] | .messages // 1] | add // 0'
 ```
 
 `contacts` with no query lists the people the user writes to most. For the

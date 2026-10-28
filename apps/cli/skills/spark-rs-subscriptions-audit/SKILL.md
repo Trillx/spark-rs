@@ -42,7 +42,7 @@ Rows are conversations, and a list that threads its issues can put many
 emails in one, so count emails with `.messages // 1`, not rows. Mail per
 30 days is the 90-day email count divided by three; the unread share is
 the second search's count over the first's, not the representative row's
-`.unread` flag.
+`.unread` flag; a sender missing from the second search has none unread.
 
 ## 2. Leave out transactional mail
 
