@@ -34,6 +34,10 @@ spark-cli search --filter "unsubscribe -category:newsletter newer_than:90d" --pa
 `search --filter` looks in the Inbox, Done, New Senders and the other
 folders (not Trash, Spam or Blocked). The third line catches marketing
 filed as People or Notifications: most of it says "unsubscribe" somewhere.
+A row's `.unsubscribe` is `true` when the email's header gives a way to
+leave the list, `false` when it has none; it's missing where spark-rs
+doesn't know (Microsoft 365 mail, and mail stored before it looked). A
+`true` there is a list even if it doesn't look like one.
 Rows are conversations, and a list that threads its issues can put many
 emails in one, so count emails with `.messages // 1`, not rows. Mail per
 30 days is the 90-day email count divided by three; the unread share is

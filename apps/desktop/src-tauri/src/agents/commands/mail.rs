@@ -433,6 +433,10 @@ pub fn summary(view: &View, m: &Message) -> Value {
     if let Some(kind) = &m.invite_kind {
         row["invite"] = json!(kind);
     }
+    // Whether its List-Unsubscribe header gives a way to leave, when known.
+    if let Some(unsubscribe) = m.unsubscribe {
+        row["unsubscribe"] = json!(unsubscribe);
+    }
     row
 }
 
