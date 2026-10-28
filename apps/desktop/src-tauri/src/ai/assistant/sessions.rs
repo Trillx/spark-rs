@@ -190,23 +190,45 @@ impl Session {
     /// Ends an answer that was cut short (stopped, or the app quit): tool
     /// calls left without results get results saying so, since the model
     /// can't go on without them, and cards still waiting count as skipped.
+    /// Results already in hand stay as they are.
     pub fn seal(&mut self) {
-        if let Some(last) = self.turns.last()
-            && last.role == Role::Assistant
-        {
-            let parts: Vec<Part> = last
+        if let Some(i) = self.turns.iter().rposition(|t| t.role == Role::Assistant) {
+            let answered: Vec<&str> = match self.turns.get(i + 1) {
+                Some(next) => next
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Part::ToolResult { id, .. } => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            let missing: Vec<Part> = self.turns[i]
                 .tool_calls()
+                .filter(|(id, _, _)| !answered.contains(id))
                 .map(|(id, _, _)| Part::ToolResult {
                     id: id.to_owned(),
                     content: "The user stopped the assistant before this ran.".into(),
                     is_error: true,
                 })
                 .collect();
-            if !parts.is_empty() {
-                self.turns.push(Turn {
-                    role: Role::User,
-                    parts,
-                });
+            if !missing.is_empty() {
+                match self.turns.get_mut(i + 1) {
+                    // Results go before any text in a turn.
+                    Some(next) => {
+                        let at = next
+                            .parts
+                            .iter()
+                            .take_while(|p| matches!(p, Part::ToolResult { .. }))
+                            .count();
+                        next.parts.splice(at..at, missing);
+                    }
+                    None => self.turns.push(Turn {
+                        role: Role::User,
+                        parts: missing,
+                    }),
+                }
             }
         }
         if let Some(Entry::Assistant { answer }) = self.entries.last_mut()
@@ -380,6 +402,58 @@ mod tests {
         let turns = s.turns.len();
         s.seal();
         assert_eq!(s.turns.len(), turns);
+    }
+
+    #[test]
+    fn sealing_keeps_the_results_already_in() {
+        let mut s = Session::new("a4".into(), String::new(), "Archive both", 1);
+        s.turns.push(Turn::user("Archive both"));
+        s.turns.push(Turn {
+            role: Role::Assistant,
+            parts: vec![
+                Part::ToolCall {
+                    id: "t1".into(),
+                    name: "update_emails".into(),
+                    input: json!({ "ids": [1], "action": "done" }),
+                },
+                Part::ToolCall {
+                    id: "t2".into(),
+                    name: "update_emails".into(),
+                    input: json!({ "ids": [2], "action": "done" }),
+                },
+            ],
+        });
+        s.turns.push(Turn {
+            role: Role::User,
+            parts: vec![Part::ToolResult {
+                id: "t1".into(),
+                content: "updated".into(),
+                is_error: false,
+            }],
+        });
+        s.seal();
+        assert_eq!(s.turns.len(), 3);
+        assert_eq!(
+            s.turns[2].parts,
+            vec![
+                Part::ToolResult {
+                    id: "t1".into(),
+                    content: "updated".into(),
+                    is_error: false
+                },
+                Part::ToolResult {
+                    id: "t2".into(),
+                    content: "The user stopped the assistant before this ran.".into(),
+                    is_error: true,
+                },
+            ]
+        );
+
+        // A results turn begun but empty (the app quit mid-way) is filled in.
+        s.turns[2].parts.clear();
+        s.seal();
+        assert_eq!(s.turns[2].parts.len(), 2);
+        assert_eq!(s.turns.len(), 3);
     }
 
     #[test]

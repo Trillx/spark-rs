@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, NaiveDate, SecondsFormat, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spark_ai::Tool;
-use spark_mail::calendar::Event;
+use spark_mail::calendar::{Event, Response, ShowAs};
 use spark_store::{Store, domain_of};
 
 use crate::agents::Access;
@@ -194,7 +194,7 @@ pub fn catalog() -> Vec<Tool> {
         ),
         tool(
             "list_events",
-            "Events on the user's calendars between two times, for questions about their schedule, meetings or free time.",
+            "Events on the user's calendars between two times, fetched from the server as you ask, for questions about their schedule, meetings or free time. All-day events give their first and last dates. Canceled events and ones the user declined are listed too, marked so; show_as says whether an event makes them busy.",
             json!({ "type": "object", "properties": {
                 "start": { "type": "string", "description": "A date such as 2026-10-28 (its start, in the user's time zone) or an RFC 3339 time. Default: today." },
                 "end": { "type": "string", "description": "Same forms; a date means its end. Default: a day after start." },
@@ -243,7 +243,11 @@ pub fn prepare(store: &mut Store, id: &str, name: &str, input: &Value, now: i64)
         "search_email" => Prepared::Ran(run_agent(store, "search_messages", input, now)),
         "list_emails" => Prepared::Ran(run_agent(store, "list_messages", input, now)),
         "read_email" => Prepared::Ran(run_agent(store, "read_message", input, now)),
-        "list_events" => Prepared::Ran(events(store, input).unwrap_or_else(Outcome::error)),
+        "list_events" => Prepared::Ran(
+            event_span(input)
+                .and_then(|span| events(store, &span))
+                .unwrap_or_else(Outcome::error),
+        ),
         "update_emails" => confirm_update(store, id, input, now),
         "decide_senders" => confirm_senders(id, input),
         "draft_email" => draft(store, id, input),
@@ -498,6 +502,63 @@ fn draft(store: &Store, id: &str, input: &Value) -> Prepared {
     }
 }
 
+/// What a calendar question covers: the instants [start, end) and the
+/// user's local days from `first` to `last`.
+#[derive(Debug, PartialEq)]
+pub struct Span {
+    start: i64,
+    end: i64,
+    first: NaiveDate,
+    last: NaiveDate,
+}
+
+impl Span {
+    /// What to fetch and read: a day more each side, since an all-day event
+    /// is stored from its date's UTC midnight, which can fall outside the
+    /// user's own day.
+    pub fn fetch(&self) -> (i64, i64) {
+        (self.start - DAY_MS, self.end + DAY_MS)
+    }
+
+    fn covers(&self, stored: &spark_store::StoredEvent, all_day: bool) -> bool {
+        if all_day {
+            let (first, last) = all_day_dates(stored);
+            first <= self.last && last >= self.first
+        } else {
+            stored.start < self.end && stored.end > self.start
+        }
+    }
+}
+
+/// The span a `list_events` call asks about.
+pub fn event_span(input: &Value) -> Result<Span, String> {
+    let today = Local::now().date_naive();
+    let start = match time(&input["start"], false)? {
+        Some(start) => start,
+        None => local_midnight(today)?,
+    };
+    let end = time(&input["end"], true)?.unwrap_or(start + DAY_MS);
+    if end <= start {
+        return Err("end must be after start.".into());
+    }
+    if end - start > MAX_EVENT_DAYS * DAY_MS {
+        return Err(format!("Ask for at most {MAX_EVENT_DAYS} days at a time."));
+    }
+    let day = |ms: i64| {
+        Local
+            .timestamp_millis_opt(ms)
+            .single()
+            .map(|t| t.date_naive())
+            .ok_or_else(|| "That time isn't on the calendar.".to_owned())
+    };
+    Ok(Span {
+        start,
+        end,
+        first: day(start)?,
+        last: day(end - 1)?,
+    })
+}
+
 /// `value` as a time: a date is its start, or its end when `end` (both in
 /// the user's time zone).
 fn time(value: &Value, end: bool) -> Result<Option<i64>, String> {
@@ -514,12 +575,33 @@ fn time(value: &Value, end: bool) -> Result<Option<i64>, String> {
     } else {
         date
     };
+    local_midnight(date).map(Some)
+}
+
+fn local_midnight(date: NaiveDate) -> Result<i64, String> {
     let midnight = date.and_hms_opt(0, 0, 0).expect("midnight exists");
     Local
         .from_local_datetime(&midnight)
         .earliest()
-        .map(|t| Some(t.timestamp_millis()))
-        .ok_or_else(|| format!("{text} has no midnight in this time zone."))
+        .map(|t| t.timestamp_millis())
+        .ok_or_else(|| format!("{date} has no midnight in this time zone."))
+}
+
+/// An all-day event's first and last dates: it's stored from its first
+/// date's UTC midnight to the one after its last.
+fn all_day_dates(stored: &spark_store::StoredEvent) -> (NaiveDate, NaiveDate) {
+    let date = |ms: i64| {
+        DateTime::from_timestamp_millis(ms)
+            .unwrap_or_default()
+            .date_naive()
+    };
+    let first = date(stored.start);
+    let last = if stored.end > stored.start {
+        date(stored.end - 1)
+    } else {
+        first
+    };
+    (first, last)
 }
 
 fn local(ms: i64) -> String {
@@ -530,16 +612,7 @@ fn local(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-fn events(store: &Store, input: &Value) -> Result<Outcome, String> {
-    let today = time(&json!(Local::now().format("%Y-%m-%d").to_string()), false)?.unwrap_or(0);
-    let start = time(&input["start"], false)?.unwrap_or(today);
-    let end = time(&input["end"], true)?.unwrap_or(start + DAY_MS);
-    if end <= start {
-        return Err("end must be after start.".into());
-    }
-    if end - start > MAX_EVENT_DAYS * DAY_MS {
-        return Err(format!("Ask for at most {MAX_EVENT_DAYS} days at a time."));
-    }
+fn events(store: &Store, span: &Span) -> Result<Outcome, String> {
     let db = |e: spark_store::Error| format!("spark-rs couldn't read its calendar: {e}");
     let names: HashMap<i64, String> = store
         .calendars()
@@ -547,14 +620,29 @@ fn events(store: &Store, input: &Value) -> Result<Outcome, String> {
         .into_iter()
         .map(|c| (c.id, c.name))
         .collect();
-    let mut stored = store.events_between(start, end).map_err(db)?;
-    stored.sort_by_key(|e| e.start);
-    let total = stored.len();
-    let events: Vec<Value> = stored
+    let (from, to) = span.fetch();
+    let mut found: Vec<(spark_store::StoredEvent, Event)> = store
+        .events_between(from, to)
+        .map_err(db)?
         .into_iter()
-        .take(MAX_EVENTS)
         .map(|stored| {
             let event = Event::from_json(&stored.data);
+            (stored, event)
+        })
+        .filter(|(stored, event)| span.covers(stored, event.all_day))
+        .collect();
+    found.sort_by_key(|(stored, _)| stored.start);
+    let total = found.len();
+    let events: Vec<Value> = found
+        .into_iter()
+        .take(MAX_EVENTS)
+        .map(|(stored, event)| {
+            let (start, end) = if event.all_day {
+                let (first, last) = all_day_dates(&stored);
+                (first.to_string(), last.to_string())
+            } else {
+                (local(stored.start), local(stored.end))
+            };
             let notes = event.notes.as_deref().map(|n| {
                 let n = n.trim();
                 match n.char_indices().nth(NOTES_CHARS) {
@@ -564,9 +652,25 @@ fn events(store: &Store, input: &Value) -> Result<Outcome, String> {
             });
             json!({
                 "title": event.title,
-                "start": local(stored.start),
-                "end": local(stored.end),
+                "start": start,
+                "end": end,
                 "all_day": event.all_day,
+                "canceled": event.canceled,
+                "response": match event.response {
+                    Response::Organizer => "organizer",
+                    Response::Accepted => "accepted",
+                    Response::Tentative => "tentative",
+                    Response::Declined => "declined",
+                    Response::None => "not_answered",
+                },
+                "show_as": match event.show_as {
+                    ShowAs::Free => "free",
+                    ShowAs::Tentative => "tentative",
+                    ShowAs::Busy => "busy",
+                    ShowAs::Oof => "out_of_office",
+                    ShowAs::WorkingElsewhere => "working_elsewhere",
+                    ShowAs::Unknown => "unknown",
+                },
                 "location": event.location,
                 "call_link": event.call_link,
                 "calendar": names.get(&stored.calendar_id),
@@ -578,6 +682,19 @@ fn events(store: &Store, input: &Value) -> Result<Outcome, String> {
         text: json!({ "total": total, "events": events }).to_string(),
         ..Outcome::default()
     })
+}
+
+/// `outcome` (a list_events result) saying which accounts' calendars
+/// couldn't be fetched just now, so it may be out of date for them.
+pub fn note_stale(mut outcome: Outcome, stale: &[String]) -> Outcome {
+    if stale.is_empty() || outcome.is_error {
+        return outcome;
+    }
+    if let Ok(mut value) = serde_json::from_str::<Value>(&outcome.text) {
+        value["not_up_to_date"] = json!(stale);
+        outcome.text = value.to_string();
+    }
+    outcome
 }
 
 fn emails(n: usize) -> String {
@@ -762,9 +879,12 @@ mod tests {
 
     #[test]
     fn dates_mean_whole_local_days() {
-        let start = time(&json!("2026-10-28"), false).unwrap().unwrap();
-        let end = time(&json!("2026-10-28"), true).unwrap().unwrap();
-        assert!(end - start >= 23 * 3_600_000 && end - start <= 25 * 3_600_000);
+        let span = event_span(&json!({ "start": "2026-10-28" })).unwrap();
+        assert!(span.end - span.start >= 23 * 3_600_000 && span.end - span.start <= 25 * 3_600_000);
+        assert_eq!(span.first, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        assert_eq!(span.last, span.first);
+        let week = event_span(&json!({ "start": "2026-10-26", "end": "2026-11-01" })).unwrap();
+        assert_eq!(week.last, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
         assert_eq!(
             time(&json!("2026-10-28T09:00:00Z"), false).unwrap(),
             Some(
@@ -775,19 +895,129 @@ mod tests {
         );
         assert!(time(&json!("next week"), false).is_err());
         assert_eq!(time(&Value::Null, false).unwrap(), None);
+        assert!(event_span(&json!({ "start": "2026-01-01", "end": "2026-12-31" })).is_err());
+        assert!(event_span(&json!({ "start": "2026-10-28", "end": "2026-10-27" })).is_err());
+    }
 
-        let (store, _, _) = mailbox();
-        let outcome = events(&store, &json!({ "start": "2026-10-28" })).unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&outcome.text).unwrap()["total"],
-            0
-        );
-        assert!(
-            events(
-                &store,
-                &json!({ "start": "2026-01-01", "end": "2026-12-31" })
+    /// One calendar with an all-day event on October 29 (stored from that
+    /// date's UTC midnight, as Graph gives it), and a declined and a
+    /// canceled meeting on the 28th.
+    fn calendar(store: &mut Store, account: i64) {
+        store
+            .replace_calendars(
+                account,
+                &[spark_store::RemoteCalendar {
+                    remote_id: "cal".into(),
+                    name: "Work".into(),
+                    color: None,
+                    is_default: true,
+                    own: true,
+                }],
             )
-            .is_err()
-        );
+            .unwrap();
+        let id = store.calendars().unwrap()[0].id;
+        let utc = |d: u32| {
+            DateTime::parse_from_rfc3339(&format!("2026-10-{d:02}T00:00:00Z"))
+                .unwrap()
+                .timestamp_millis()
+        };
+        let local_at = |d: u32, h: i64| {
+            local_midnight(NaiveDate::from_ymd_opt(2026, 10, d).unwrap()).unwrap() + h * 3_600_000
+        };
+        let event = |remote: &str, start: i64, end: i64, data: Event| spark_store::RemoteEvent {
+            remote_id: remote.into(),
+            start,
+            end,
+            data: data.to_json(),
+        };
+        store
+            .replace_events(
+                id,
+                utc(20),
+                utc(31),
+                &[
+                    event(
+                        "offsite",
+                        utc(29),
+                        utc(30),
+                        Event {
+                            title: "Offsite".into(),
+                            all_day: true,
+                            ..Event::default()
+                        },
+                    ),
+                    event(
+                        "sync",
+                        local_at(28, 10),
+                        local_at(28, 11),
+                        Event {
+                            title: "Sync".into(),
+                            response: Response::Declined,
+                            ..Event::default()
+                        },
+                    ),
+                    event(
+                        "lunch",
+                        local_at(28, 12),
+                        local_at(28, 13),
+                        Event {
+                            title: "Lunch".into(),
+                            canceled: true,
+                            show_as: ShowAs::Free,
+                            ..Event::default()
+                        },
+                    ),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn titles(outcome: &Outcome) -> Vec<String> {
+        let value: Value = serde_json::from_str(&outcome.text).unwrap();
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["title"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn all_day_events_fall_on_their_own_dates() {
+        let (mut store, account, _) = mailbox();
+        calendar(&mut store, account);
+        let day = |d: &str| events(&store, &event_span(&json!({ "start": d })).unwrap()).unwrap();
+        assert_eq!(titles(&day("2026-10-28")), ["Sync", "Lunch"]);
+        let offsite = day("2026-10-29");
+        assert_eq!(titles(&offsite), ["Offsite"]);
+        let value: Value = serde_json::from_str(&offsite.text).unwrap();
+        assert_eq!(value["events"][0]["start"], "2026-10-29");
+        assert_eq!(value["events"][0]["end"], "2026-10-29");
+        assert_eq!(value["events"][0]["all_day"], true);
+        assert!(titles(&day("2026-10-30")).is_empty());
+    }
+
+    #[test]
+    fn events_say_whether_they_happen_and_make_the_user_busy() {
+        let (mut store, account, _) = mailbox();
+        calendar(&mut store, account);
+        let outcome = events(
+            &store,
+            &event_span(&json!({ "start": "2026-10-28" })).unwrap(),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&outcome.text).unwrap();
+        let sync = &value["events"][0];
+        assert_eq!(sync["response"], "declined");
+        assert_eq!(sync["canceled"], false);
+        assert_eq!(sync["show_as"], "busy");
+        let lunch = &value["events"][1];
+        assert_eq!(lunch["canceled"], true);
+        assert_eq!(lunch["show_as"], "free");
+
+        let stale = note_stale(outcome, &["me@work.example: sign in again".into()]);
+        let value: Value = serde_json::from_str(&stale.text).unwrap();
+        assert_eq!(value["not_up_to_date"][0], "me@work.example: sign in again");
+        assert_eq!(value["total"], 2);
     }
 }

@@ -162,6 +162,9 @@ fn turn_messages(turn: &Turn) -> Vec<Value> {
 #[derive(Debug, Default)]
 pub(crate) struct Decoder {
     text: String,
+    /// The model declined in words of its own (`delta.refusal`), which
+    /// can end in an ordinary "stop".
+    refused: bool,
     finish_reason: Option<String>,
     usage: Usage,
     model: Option<String>,
@@ -190,6 +193,12 @@ impl Decoder {
             };
         }
         let choice = &v["choices"][0];
+        if choice["delta"]["refusal"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty())
+        {
+            self.refused = true;
+        }
         if let Some(reason) = choice["finish_reason"].as_str() {
             self.finish_reason = Some(reason.to_owned());
         }
@@ -207,6 +216,7 @@ impl Decoder {
             .finish_reason
             .ok_or_else(|| AiError::Protocol("stream ended without a finish reason".into()))?;
         let stop_reason = match reason.as_str() {
+            _ if self.refused => StopReason::Refusal { category: None },
             "stop" => StopReason::EndTurn,
             "length" => StopReason::MaxTokens,
             "tool_calls" | "function_call" => StopReason::ToolUse,
@@ -513,5 +523,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_refusal_in_words_is_a_refusal() {
+        let mut parser = sse::Parser::default();
+        let mut decoder = TurnDecoder::default();
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"refusal\":\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\"I can't help with that.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        for event in parser.push(stream.as_bytes()) {
+            assert_eq!(decoder.handle(&event).unwrap(), None);
+        }
+        let reply = decoder.finish().unwrap();
+        assert_eq!(reply.stop_reason, StopReason::Refusal { category: None });
+        assert!(reply.turn.parts.is_empty());
     }
 }

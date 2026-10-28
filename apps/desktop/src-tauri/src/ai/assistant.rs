@@ -11,7 +11,7 @@ mod tools;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,9 @@ struct Live {
     /// task ends at its next wait, but in the meantime it must not touch
     /// the chat, which is sealed and saved as it was.
     stopped: AtomicBool,
+    /// The text of the model turn streaming now, which the model's own
+    /// record of the chat doesn't have until the turn is whole.
+    pending: Mutex<String>,
 }
 
 impl Live {
@@ -63,7 +66,40 @@ impl Live {
             session: Mutex::new(session),
             waiting: Mutex::default(),
             stopped: AtomicBool::new(false),
+            pending: Mutex::default(),
         }
+    }
+
+    /// Text as it streams in, for the answer and in case it's stopped.
+    fn streamed(&self, text: &str) {
+        self.answer(|a| a.push_text(text));
+        if !self.stopped.load(Ordering::Relaxed) {
+            self.pending.lock().unwrap().push_str(text);
+        }
+    }
+
+    /// The model turn is whole (or gone): its text is no longer pending.
+    fn turn_ended(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+
+    /// Stops the answer where it is. What it was writing stays in the
+    /// model's record, so a follow-up can refer to it; tool calls without
+    /// results get ones saying so; nothing the task does later counts.
+    fn stop(&self) -> MutexGuard<'_, Session> {
+        let mut session = self.session.lock().unwrap();
+        self.stopped.store(true, Ordering::Relaxed);
+        self.waiting.lock().unwrap().clear();
+        let partial = std::mem::take(&mut *self.pending.lock().unwrap());
+        if !partial.trim().is_empty() && session.turns.last().is_some_and(|t| t.role == Role::User)
+        {
+            session.turns.push(Turn {
+                role: Role::Assistant,
+                parts: vec![Part::text(partial)],
+            });
+        }
+        session.seal();
+        session
     }
 
     fn answer<T>(&self, f: impl FnOnce(&mut Answer) -> T) -> T {
@@ -78,6 +114,17 @@ impl Live {
         let mut session = self.session.lock().unwrap();
         if !self.stopped.load(Ordering::Relaxed) {
             session.turns.push(turn);
+        }
+    }
+
+    /// Adds a tool's result to the results turn being filled, so results
+    /// in hand count even if the rest of the calls never run.
+    fn push_result(&self, part: Part) {
+        let mut session = self.session.lock().unwrap();
+        if !self.stopped.load(Ordering::Relaxed)
+            && let Some(turn) = session.turns.last_mut()
+        {
+            turn.parts.push(part);
         }
     }
 }
@@ -152,10 +199,7 @@ impl AssistantState {
     fn stop(&self, id: &str) -> Option<Answer> {
         let run = self.runs.lock().unwrap().remove(id)?;
         run.task.abort();
-        let mut session = run.live.session.lock().unwrap();
-        run.live.stopped.store(true, Ordering::Relaxed);
-        run.live.waiting.lock().unwrap().clear();
-        session.seal();
+        let mut session = run.live.stop();
         session.updated = now_ms();
         let _ = self.sessions.save(&session);
         Some(session.answer().clone())
@@ -357,6 +401,9 @@ impl Model for AiClient {
 /// What writing an answer needs from the app, which tests stand in for.
 trait Host {
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T;
+    /// Fetches every account's calendar for [start, end); returns the
+    /// accounts that couldn't be, with why.
+    async fn refresh_calendar(&self, start: i64, end: i64) -> Vec<String>;
     /// Mail changed, so the lists reload.
     fn mail_changed(&self);
     fn save(&self, live: &Live);
@@ -367,6 +414,19 @@ struct AppHost<'a>(&'a AppHandle);
 impl Host for AppHost<'_> {
     fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
         f(&mut self.0.state::<Mailbox>().live.engine.store())
+    }
+
+    async fn refresh_calendar(&self, start: i64, end: i64) -> Vec<String> {
+        let mailbox = self.0.state::<Mailbox>();
+        let engine = &mailbox.live.engine;
+        let accounts = engine.store().accounts().unwrap_or_default();
+        let mut failed = Vec::new();
+        for account in accounts {
+            if let Err(e) = engine.refresh_calendar(account.id, start, end).await {
+                failed.push(format!("{}: {e}", account.email));
+            }
+        }
+        failed
     }
 
     fn mail_changed(&self) {
@@ -401,10 +461,11 @@ async fn answer(
         let mark = live.answer(|a| a.mark());
         let reply = model
             .converse(&request, |text| {
-                live.answer(|a| a.push_text(text));
+                live.streamed(text);
                 emit(AssistantEvent::Text { text: text.into() });
             })
             .await;
+        live.turn_ended();
         let reply = match reply {
             Ok(reply) => reply,
             Err(e) => {
@@ -429,15 +490,15 @@ async fn answer(
                     .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
                     .collect();
                 live.push_turn(reply.turn);
-                let mut results = Vec::with_capacity(calls.len());
-                for (id, name, input) in calls {
-                    results.push(run_tool(host, live, emit, &id, &name, &input).await);
-                }
                 live.push_turn(Turn {
                     role: Role::User,
-                    parts: results,
+                    parts: Vec::new(),
                 });
-                host.save(live);
+                for (id, name, input) in calls {
+                    let result = run_tool(host, live, emit, &id, &name, &input).await;
+                    live.push_result(result);
+                    host.save(live);
+                }
             }
             StopReason::MaxTokens => {
                 // Cut-off tool calls can't run, and would need results.
@@ -478,9 +539,21 @@ async fn run_tool(
     if let Some(invalid) = Part::invalid_input(id, input) {
         return invalid;
     }
+    // Calendar questions get the days fetched from the server first: the
+    // stored events cover only what the calendar has shown lately.
+    let stale = match name {
+        "list_events" => match tools::event_span(input) {
+            Ok(span) => {
+                let (start, end) = span.fetch();
+                host.refresh_calendar(start, end).await
+            }
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
     let prepared = host.with_store(|store| tools::prepare(store, id, name, input, now_ms()));
     let outcome = match prepared {
-        Prepared::Ran(outcome) => outcome,
+        Prepared::Ran(outcome) => tools::note_stale(outcome, &stale),
         Prepared::Draft { card, result } => {
             show_card(live, emit, card, true);
             return result_part(id, result, false);
@@ -664,11 +737,19 @@ mod tests {
         store: Mutex<Store>,
         changed: AtomicUsize,
         saves: AtomicUsize,
+        /// The calendar ranges fetched, and the accounts that "fail".
+        refreshed: Mutex<Vec<(i64, i64)>>,
+        stale: Vec<String>,
     }
 
     impl Host for TestHost {
         fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
             f(&mut self.store.lock().unwrap())
+        }
+
+        async fn refresh_calendar(&self, start: i64, end: i64) -> Vec<String> {
+            self.refreshed.lock().unwrap().push((start, end));
+            self.stale.clone()
         }
 
         fn mail_changed(&self) {
@@ -715,6 +796,8 @@ mod tests {
             store: Mutex::new(store),
             changed: AtomicUsize::new(0),
             saves: AtomicUsize::new(0),
+            refreshed: Mutex::default(),
+            stale: Vec::new(),
         };
         (host, id)
     }
@@ -935,6 +1018,140 @@ mod tests {
         ));
         drop(session);
         assert_eq!(text_of(&live), "");
+    }
+
+    #[test]
+    fn stopping_between_two_approvals_keeps_the_first_result() {
+        let (host, id) = host();
+        let model = Script::new(vec![
+            (
+                vec!["Archiving both."],
+                reply(
+                    StopReason::ToolUse,
+                    vec![
+                        Part::text("Archiving both."),
+                        call(
+                            "t1",
+                            "update_emails",
+                            json!({ "ids": [id], "action": "done" }),
+                        ),
+                        call(
+                            "t2",
+                            "update_emails",
+                            json!({ "ids": [id], "action": "pin" }),
+                        ),
+                    ],
+                ),
+            ),
+            // The task would have been ended by now; here it runs on, ignored.
+            (
+                vec!["Late"],
+                reply(StopReason::EndTurn, vec![Part::text("Late")]),
+            ),
+        ]);
+        let live = live("Archive and pin it");
+        let shared = &live;
+        let decider = async {
+            let wait = |card: &'static str| async move {
+                loop {
+                    if shared.waiting.lock().unwrap().contains_key(card) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            wait("t1").await;
+            let approve = shared.waiting.lock().unwrap().remove("t1").unwrap();
+            approve.send(true).unwrap();
+            wait("t2").await;
+            drop(shared.stop());
+        };
+        let emit = |_| {};
+        tauri::async_runtime::block_on(async {
+            futures_util::join!(answer(&model, &host, &live, &emit), decider)
+        });
+
+        let state = host
+            .store
+            .lock()
+            .unwrap()
+            .message(id)
+            .unwrap()
+            .unwrap()
+            .state;
+        assert_eq!(state, MessageState::Done, "the approved change happened");
+        let session = live.session.lock().unwrap();
+        assert_eq!(session.turns.len(), 3);
+        let [first, second] = &session.turns[2].parts[..] else {
+            panic!("one result each: {:?}", session.turns[2].parts);
+        };
+        assert!(
+            matches!(first, Part::ToolResult { id, is_error: false, content } if id == "t1" && content.contains("updated"))
+        );
+        assert!(matches!(second, Part::ToolResult { id, is_error: true, .. } if id == "t2"));
+    }
+
+    #[test]
+    fn a_stopped_answer_keeps_its_text_for_the_model() {
+        let story = live("Write me a long story");
+        story.streamed("Once upon ");
+        story.streamed("a time");
+        let session = story.stop();
+        assert_eq!(session.turns.len(), 2);
+        assert_eq!(session.turns[1].role, Role::Assistant);
+        assert_eq!(session.turns[1].text(), "Once upon a time");
+        drop(session);
+        story.streamed("more");
+        assert_eq!(
+            story.session.lock().unwrap().turns[1].text(),
+            "Once upon a time"
+        );
+
+        // A whole turn is already in the record: nothing is added twice.
+        let hello = live("Hi");
+        hello.streamed("Hello");
+        hello.turn_ended();
+        hello.push_turn(Turn {
+            role: Role::Assistant,
+            parts: vec![Part::text("Hello")],
+        });
+        assert_eq!(hello.stop().turns.len(), 2);
+    }
+
+    #[test]
+    fn calendar_questions_fetch_those_days_first() {
+        let (mut host, _) = host();
+        host.stale = vec!["me@work.example: sign in again".into()];
+        let input = json!({ "start": "2026-10-28" });
+        let model = Script::new(vec![
+            (
+                vec![],
+                reply(
+                    StopReason::ToolUse,
+                    vec![call("t1", "list_events", input.clone())],
+                ),
+            ),
+            (
+                vec!["Free all day."],
+                reply(StopReason::EndTurn, vec![Part::text("Free all day.")]),
+            ),
+        ]);
+        let live = live("Am I free on the 28th?");
+        let (ended, _) = run(&model, &host, &live);
+        assert_eq!(ended.0, Status::Done);
+        assert_eq!(
+            *host.refreshed.lock().unwrap(),
+            [tools::event_span(&input).unwrap().fetch()]
+        );
+        let session = live.session.lock().unwrap();
+        let Part::ToolResult {
+            content, is_error, ..
+        } = &session.turns[2].parts[0]
+        else {
+            panic!("a result");
+        };
+        assert!(!is_error);
+        assert!(content.contains("not_up_to_date"), "{content}");
     }
 
     #[test]
