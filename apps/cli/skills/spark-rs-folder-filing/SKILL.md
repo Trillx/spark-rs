@@ -54,12 +54,15 @@ today's reply by an older email.
 ## 3. See where each sender's mail went before
 
 ```bash
-spark-cli search --filter "from:ana@example.com" --page-size 200 --json | jq '.emails | group_by(.folder) | map({folder: .[0].folder, count: length})'
-spark-cli search --filter "from:example.org" --page-size 200 --json | jq '.emails | group_by(.folder) | map({folder: .[0].folder, count: length})'
+spark-cli search --filter "from:ana@example.com" --page-size 1000 --json | jq '[.emails[] | (.folders // {(.folder): (.messages // 1)}) | to_entries[]] | group_by(.key) | map({folder: .[0].key, emails: (map(.value) | add)}) | sort_by(-.emails)'
+spark-cli search --filter "from:example.org" --page-size 1000 --json | jq '[.emails[] | (.folders // {(.folder): (.messages // 1)}) | to_entries[]] | group_by(.key) | map({folder: .[0].key, emails: (map(.value) | add)}) | sort_by(-.emails)'
 spark-cli thread 1114
 ```
 
-The `.folder` of a sender's past mail shows the habit: if most of Ana's
+A row is a conversation, and `.folder` is only its newest match's; when a
+conversation's matches sit in several folders, `.folders` gives how many
+in each, which the jq counts. Where the sender's past mail went shows the
+habit: if most of Ana's
 mail is in `Projects/Atlas`, her new mail probably goes there too. A domain
 (`from:example.org`) works for a whole client. `thread` shows `Labels:`,
 the user's folders a conversation is in. When a sender's mail is spread

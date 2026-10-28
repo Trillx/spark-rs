@@ -40,13 +40,14 @@ user no longer works with, and senders whose mail mostly stays unread.
 
 ```bash
 spark-cli contacts --limit 30
-spark-cli emails Sent --filter "to:bo@example.com newer_than:60d" --json | jq '.total'
-spark-cli search --filter "from:bo@example.com is:unreplied newer_than:60d" --json | jq '.total'
+spark-cli emails Sent --filter "to:bo@example.com newer_than:60d" --page-size 1000 --json | jq '[.emails[] | .messages // 1] | add'
+spark-cli search --filter "from:bo@example.com is:unreplied newer_than:60d" --page-size 1000 --json | jq '[.emails[] | .messages // 1] | add'
 ```
 
 `contacts` with no query lists the people the user writes to most. For the
-top ones, count how often the user wrote to them and how much of their mail
-is still unanswered: someone the user writes to often and leaves little
+top ones, count how many emails the user wrote to them and how many of
+theirs are still unanswered (rows are conversations, so add up
+`.messages // 1`, not `.total`): someone the user writes to often and leaves little
 unanswered is a good candidate. Read one or two threads with them
 (`spark-cli thread 1114`) to see how fast the user usually answers. Leave
 out the user's own addresses, mailing lists and shared inboxes like

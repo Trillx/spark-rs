@@ -352,17 +352,21 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
     drop(store);
     // One row a conversation: its newest match, counting the rest and
     // keeping when the first was.
-    let mut rows: BTreeMap<i64, (&Message, usize, i64)> = BTreeMap::new();
+    type Row<'m> = (&'m Message, usize, i64, BTreeMap<String, usize>);
+    let mut rows: BTreeMap<i64, Row> = BTreeMap::new();
     for m in hits {
-        let row = rows.entry(m.conversation).or_insert((m, 0, m.date));
+        let row = rows
+            .entry(m.conversation)
+            .or_insert((m, 0, m.date, BTreeMap::new()));
         row.1 += 1;
         row.2 = row.2.min(m.date);
+        *row.3.entry(view.folder_name(m)).or_default() += 1;
         if (m.date, m.id) > (row.0.date, row.0.id) {
             row.0 = m;
         }
     }
-    let mut rows: Vec<(&Message, usize, i64)> = rows.into_values().collect();
-    rows.sort_by_key(|(m, _, _)| (m.date, m.id));
+    let mut rows: Vec<Row> = rows.into_values().collect();
+    rows.sort_by_key(|(m, _, _, _)| (m.date, m.id));
     if !ascending {
         rows.reverse();
     }
@@ -371,11 +375,15 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
         .iter()
         .skip((page - 1) * size)
         .take(size)
-        .map(|(m, n, first)| {
+        .map(|(m, n, first, folders)| {
             let mut row = summary(view, m);
             if *n > 1 {
                 row["messages"] = json!(n);
                 row["first_date"] = json!(iso(*first));
+            }
+            // Matches in several folders: how many in each.
+            if folders.len() > 1 {
+                row["folders"] = json!(folders);
             }
             if let Some((latest, unread, emails)) = whole.get(&m.conversation) {
                 row["latest_date"] = json!(iso(*latest));

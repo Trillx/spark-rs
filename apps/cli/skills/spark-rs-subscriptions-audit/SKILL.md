@@ -95,7 +95,15 @@ Unsubscribing can't be undone from the history.
 
 Lists can take a few days to stop. A sender still mailing a week or two
 later can be blocked, with a yes. If the user wants the old mail gone too,
-archive it with the IDs from step 1, after showing how many.
+list it in the Inbox with the whole-conversation fields, and archive only
+rows that are all the list's mail; a conversation where a person also
+wrote goes to the user to decide:
+
+```bash
+spark-cli emails --filter "from:news@deals.example.net" --page-size 200 --json | jq '[.emails[] | select((.messages // 1) == .email_count) | .id]'
+```
+
+Show how many and archive after a yes.
 
 ## Report
 

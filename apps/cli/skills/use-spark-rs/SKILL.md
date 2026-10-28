@@ -176,7 +176,9 @@ row also describes the whole conversation in that folder, whatever the
 filter matched: `.latest_date` (its newest email), `.unread_count` and
 `.email_count`. Before archiving or moving a row, check those: act on
 settled conversations, or on rows whose matches are all of it
-(`(.messages // 1) == .email_count`).
+(`(.messages // 1) == .email_count`). When a conversation's matches sit in
+several folders, `.folders` says how many are in each; `.folder` is only
+the newest match's.
 
 `is:unreplied` is email someone sent the user that the user hasn't answered.
 `is:waiting` is the other way round: email the user sent that nobody has

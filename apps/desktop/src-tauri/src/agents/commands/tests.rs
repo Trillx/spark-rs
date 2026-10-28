@@ -281,6 +281,18 @@ fn emails_list_conversations_newest_first_with_filters() {
     assert!(row["latest_date"].as_str().unwrap() > row["date"].as_str().unwrap());
     assert_eq!(row["unread_count"], 2);
     assert_eq!(row["email_count"], 2, "one matched, two in the Inbox");
+    // A conversation spread over folders says how many matches are in each.
+    let quote = f.id("Bracket quote");
+    let done = spark_store::Patch {
+        state: Some(MessageState::Done),
+        ..Default::default()
+    };
+    f.engine.store().update(quote, &done, now_ms()).unwrap();
+    let spread = f.ok("search", json!({ "filter": "from:ana" }));
+    assert_eq!(
+        spread["emails"][0]["folders"],
+        json!({ "Done": 1, "Inbox": 1 })
+    );
     let news = f.ok(
         "emails",
         json!({ "filter": "category:newsletter is:unread" }),
