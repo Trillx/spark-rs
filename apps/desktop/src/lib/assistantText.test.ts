@@ -41,8 +41,17 @@ test("Only web and mail links become links", () => {
     { kind: "link", href: "https://example.com", children: [{ kind: "text", text: "site" }] },
     { kind: "text", text: " and " },
     { kind: "text", text: "x" },
-    { kind: "text", text: ")" },
   ]);
+});
+
+test("Link addresses can hold parentheses", () => {
+  const rust = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+  assert.deepEqual(inline(`See [Rust](${rust}).`), [
+    { kind: "text", text: "See " },
+    { kind: "link", href: rust, children: [{ kind: "text", text: "Rust" }] },
+    { kind: "text", text: "." },
+  ]);
+  assert.equal(plainAnswer(`See [Rust](${rust}).`, []), `See Rust (${rust}).`);
 });
 
 test("Unclosed marks and HTML stay text", () => {

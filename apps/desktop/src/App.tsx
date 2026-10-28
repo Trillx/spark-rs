@@ -4405,6 +4405,8 @@ export default function App() {
   const showList = twoColumns || !openMessage;
   const showReader = twoColumns || openMessage !== null;
   const readerLeft = THREAD_WINDOW !== null ? 0 : sidebarSpace + (twoColumns && !homeShown ? listWidthUsed : 0);
+  /** The full-pane composer beside the assistant's panel, or over it when the pane would be too narrow. */
+  const fullComposerRight = windowWidth - readerLeft - assistantSpace >= COMPOSER_MIN_BESIDE ? assistantSpace : 0;
 
   return (
     <AccountsContext value={accounts}>
@@ -4462,6 +4464,8 @@ export default function App() {
             <div
               // Under the composer (z-50), so Reply and Forward write over it.
               className="absolute inset-0 z-40 flex justify-center bg-black/30 px-6 pb-6 pt-10"
+              // Clear of the assistant's panel, which stays usable beside it.
+              style={assistantSpace ? { right: assistantSpace } : undefined}
               onClick={() => setOpenId(null)}
             >
               <section
@@ -4628,7 +4632,7 @@ export default function App() {
             draft={draft}
             saved={draftSaved === draftKey(draft)}
             full={composerFull}
-            fullStyle={{ left: readerLeft, right: assistantSpace }}
+            fullStyle={{ left: readerLeft, right: fullComposerRight }}
             floatStyle={composerBesideAssistant}
             onChange={(patch) =>
               setDraft(

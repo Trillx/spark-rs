@@ -24,6 +24,9 @@ const BULLET = /^(\s*)[-*•+]\s+(.*)$/;
 const NUMBERED = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
 /** Every citation in a text. Only for `matchAll` and `replace`, which don't leave state behind. */
 const CITE = /\[\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\]/g;
+/** A Markdown link, whose address may hold a pair of parentheses, as Wikipedia's often do. */
+const LINK = /\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g;
+const LINK_HERE = new RegExp(`^${LINK.source}`);
 /** A citation where the text continues. */
 const CITE_HERE = /^\[\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\]/;
 
@@ -157,7 +160,7 @@ export function inline(text: string): Inline[] {
       i += em[0].length;
       continue;
     }
-    const link = /^\[([^\]]+)\]\(([^)\s]+)\)/.exec(rest);
+    const link = LINK_HERE.exec(rest);
     if (link) {
       flush();
       const href = safeHref(link[2]);
@@ -205,7 +208,7 @@ export function plainAnswer(text: string, order: number[]): string {
     })
     .replace(/(\*\*|__)(.+?)\1/g, "$2")
     .replace(/`([^`]+)`/g, "$1")
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, "$1 ($2)")
+    .replace(LINK, "$1 ($2)")
     .trim();
 }
 

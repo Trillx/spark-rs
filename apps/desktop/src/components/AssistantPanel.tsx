@@ -176,7 +176,9 @@ export default function AssistantPanel({
   async function stop() {
     const id = chatId.current;
     if (!id) return;
-    const token = run.current;
+    // Events the stopped answer sent before it stopped can still be on their way: they mustn't
+    // land on the answer as saved.
+    const token = ++run.current;
     const answer = await assistantStop(id);
     if (answer) updateAnswer(token, () => answer);
     else updateAnswer(token, (a) => (a.status === "working" ? { ...a, status: "stopped" } : a));
