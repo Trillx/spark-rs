@@ -167,6 +167,12 @@ them; `contact-action acceptContact` or `blockContact` decides.
 A `-` before an operator leaves out what it matches (`-category:newsletter`).
 Other words must appear in the email, as in `search`.
 
+Filters match single emails, then rows group them by conversation. So
+`older_than:7d` still lists a conversation that got a reply today, by its
+older email, and archiving or moving that row takes today's reply along.
+To act on settled conversations, list without the age filter and keep the
+rows whose `.date` (their newest email) is old enough.
+
 `is:unreplied` is email someone sent the user that the user hasn't answered.
 `is:waiting` is the other way round: email the user sent that nobody has
 answered since, the list to chase. Both look at the whole conversation, so

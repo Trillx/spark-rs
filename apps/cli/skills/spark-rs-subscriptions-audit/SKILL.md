@@ -26,15 +26,19 @@ blocking and archiving need triage.
 ## 1. Gather the senders
 
 ```bash
-spark-cli search --filter "category:newsletter newer_than:90d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, name: .[0].from_name, count: length, unread: (map(select(.unread)) | length), ids: map(.id)}) | sort_by(-.count)'
+spark-cli search --filter "category:newsletter newer_than:90d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, name: .[0].from_name, emails: (map(.messages // 1) | add), ids: map(.id)}) | sort_by(-.emails)'
+spark-cli search --filter "category:newsletter is:unread newer_than:90d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, unread: (map(.messages // 1) | add)})'
 spark-cli search --filter "unsubscribe -category:newsletter newer_than:90d" --page-size 1000 --json
 ```
 
 `search --filter` looks in the Inbox, Done, New Senders and the other
-folders (not Trash, Spam or Blocked). The second line catches marketing
+folders (not Trash, Spam or Blocked). The third line catches marketing
 filed as People or Notifications: most of it says "unsubscribe" somewhere.
-For each sender, work out mail per 30 days (the 90-day count of rows,
-which are conversations, divided by three) and the share left unread.
+Rows are conversations, and a list that threads its issues can put many
+emails in one, so count emails with `.messages // 1`, not rows. Mail per
+30 days is the 90-day email count divided by three; the unread share is
+the second search's count over the first's, not the representative row's
+`.unread` flag.
 
 ## 2. Leave out transactional mail
 

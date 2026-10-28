@@ -57,9 +57,16 @@ passed, a delivered parcel, an expired code, an old status report) can go
 in bulk. Read one or two to be sure, then list them per sender:
 
 ```bash
-spark-cli emails --filter "category:notification from:alerts@ci.example.com older_than:2d" --page-size 200 --json | jq '[.emails[].id]'
+spark-cli emails --filter "category:notification from:alerts@ci.example.com" --page-size 200 --json | jq '[.emails[] | {id, date, unread}]'
 spark-cli action archive 1201 1202 1203 1204 1205 1206 1207
 ```
+
+Each row is a conversation dated by its newest email, and archiving takes
+the whole conversation. So pick by the row's `.date` (older than a couple
+of days, worked out from now) and leave out unread rows: a conversation
+with a fresh alert in it shows that alert's date and stays. Don't put
+`older_than:` in the filter, or a conversation with today's failure would
+come back by its old alert and be archived with it.
 
 Keep alerts that still ask for something: a failed payment, a security
 warning, an expiring certificate. Archive only after the user says yes to

@@ -38,11 +38,16 @@ account's folders.
 ## 2. Pick what to file
 
 Take what the user names. Otherwise offer the Inbox's settled
-conversations, such as mail from people older than a week:
+conversations, such as mail from people with nothing new for a week:
 
 ```bash
-spark-cli emails --filter "category:personal older_than:7d" --json
+spark-cli emails --filter "category:personal" --page-size 200 --json | jq '[.emails[] | {id, date, subject, unread}]'
 ```
+
+Each row is a conversation dated by its newest email, and a move takes the
+whole conversation. Keep the rows whose `.date` is over a week old (worked
+out from now) and that aren't unread; an `older_than:` filter would bring
+back a conversation with today's reply by its older email.
 
 ## 3. See where each sender's mail went before
 
