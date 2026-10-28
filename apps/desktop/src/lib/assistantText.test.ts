@@ -64,6 +64,13 @@ test("Citations number the sources in first-cited order", () => {
   ]);
 });
 
+test("Reading an answer doesn't change how its citations are counted", () => {
+  // The panel reads each line, then counts the citations in the whole text.
+  inline("Yes [[123]]");
+  assert.deepEqual(citedIds("Yes [[123]]"), [123]);
+  assert.equal(plainAnswer("Yes [[123]]", [123]), "Yes [1]");
+});
+
 test("Text appears at an even pace without half a citation", () => {
   const text = "See [[1234]] now";
   assert.equal(revealTo(text, 0, 3, false), 3);

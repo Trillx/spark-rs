@@ -20,6 +20,7 @@ import {
 } from "../assistant";
 import { citedIds, parseAnswer, plainAnswer, revealTo, type Inline, type TextBlock } from "../lib/assistantText";
 import { formatAgo, formatListDate } from "../lib/format";
+import { openLink } from "../lib/links";
 import Avatar from "./Avatar";
 
 /** The panel's 364px and the margin around it: what the mail beside it gives up. */
@@ -580,7 +581,16 @@ function AnswerText({
           );
         case "link":
           return (
-            <a key={i} href={x.href} target="_blank" rel="noreferrer" className="text-secondary underline">
+            <a
+              key={i}
+              href={x.href}
+              className="text-secondary underline"
+              onClick={(e) => {
+                // The app opens links the way it opens them from emails: the browser, or a new email.
+                e.preventDefault();
+                openLink(x.href);
+              }}
+            >
               {inline(x.children)}
             </a>
           );

@@ -22,7 +22,10 @@ export type TextBlock =
 
 const BULLET = /^(\s*)[-*•+]\s+(.*)$/;
 const NUMBERED = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
+/** Every citation in a text. Only for `matchAll` and `replace`, which don't leave state behind. */
 const CITE = /\[\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\]/g;
+/** A citation where the text continues. */
+const CITE_HERE = /^\[\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\]/;
 
 export function parseAnswer(text: string): TextBlock[] {
   return blocks(text.replace(/\r\n?/g, "\n").split("\n"));
@@ -124,9 +127,8 @@ export function inline(text: string): Inline[] {
   let i = 0;
   while (i < text.length) {
     const rest = text.slice(i);
-    CITE.lastIndex = 0;
-    const cite = rest.startsWith("[[") ? CITE.exec(rest) : null;
-    if (cite && cite.index === 0) {
+    const cite = CITE_HERE.exec(rest);
+    if (cite) {
       flush();
       for (const id of cite[1].split(",")) out.push({ kind: "cite", id: Number(id.trim()) });
       i += cite[0].length;

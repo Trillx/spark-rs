@@ -323,6 +323,8 @@ export default function CalendarScreen({
       // A drag on the grid takes Esc for itself.
       if (document.documentElement.hasAttribute("data-calendar-drag")) return;
       if (isTypingTarget(e.target) || isInsideOverlay(e.target) || document.querySelector("[data-composer]")) return;
+      // The AI Assistant's panel beside the calendar keeps its keys.
+      if (e.target instanceof Element && e.target.closest("[data-assistant]")) return;
       const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
       const handled = () => {
         e.preventDefault();

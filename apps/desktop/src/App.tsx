@@ -3605,9 +3605,11 @@ export default function App() {
         e.preventDefault();
         return run(zooming);
       }
-      if (palette || settingsPage || isInsideOverlay(e.target)) return;
-      // The assistant's panel is like a text field: its buttons don't take mail shortcuts.
-      const typing = isTypingTarget(e.target) || (e.target instanceof Element && e.target.closest("[data-assistant]") !== null);
+      // The assistant's panel (its past-chats list too) is like a text field: its buttons don't
+      // take mail shortcuts, but Ctrl+K and the like still work there.
+      const inAssistant = e.target instanceof Element && e.target.closest("[data-assistant]") !== null;
+      if (palette || settingsPage || (isInsideOverlay(e.target) && !inAssistant)) return;
+      const typing = isTypingTarget(e.target) || inAssistant;
       if (isModShortcut(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "z") {
         if (!typing && toast?.undo && !toast.actionLabel) {
           e.preventDefault();
