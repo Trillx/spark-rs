@@ -387,6 +387,7 @@ pub fn summary(view: &View, m: &Message) -> Value {
         "from_name": m.from_name,
         "from_address": m.from_address,
         "subject": m.subject,
+        "to": m.to,
         "snippet": m.snippet,
         "unread": m.unread,
         "pinned": m.pinned,
@@ -497,6 +498,12 @@ pub async fn thread(env: &Env<'_>, a: &Args<'_>) -> Done {
         if !elsewhere.is_empty() {
             message["reply_to"] = json!(content.reply_to);
         }
+        if let Some(invite) = invite(
+            &content,
+            view.account(x.account_id).map_or("", |a| a.email.as_str()),
+        ) {
+            message["invitation"] = invite;
+        }
         message["text"] = json!(cut(content.text, MAX_TEXT));
         if content.body_missing {
             message["body_missing"] = json!(true);
@@ -517,6 +524,62 @@ pub async fn thread(env: &Env<'_>, a: &Args<'_>) -> Done {
         value["subject"].as_str().unwrap_or_default()
     );
     Ok(Reply::new(value.clone(), text::thread(&value)).said(summary))
+}
+
+/// The calendar invitation (or answer, cancellation, new time) an email
+/// carries, for the account `me`: what, when, and the user's answer.
+fn invite(content: &spark_store::Content, me: &str) -> Option<Value> {
+    use spark_mail::invite::{Answer, Invite};
+    let invite = content.invite.as_deref().and_then(Invite::from_json)?;
+    if invite.ics.is_empty() {
+        return None;
+    }
+    let card = invite.card(me, content.rsvp.as_deref().and_then(Answer::parse));
+    // All-day and floating times are as written, read as UTC.
+    let time = |ms: i64| {
+        if card.all_day || card.floating {
+            chrono::DateTime::from_timestamp_millis(ms)
+                .map(|t| {
+                    t.naive_utc()
+                        .format(if card.all_day {
+                            "%Y-%m-%d"
+                        } else {
+                            "%Y-%m-%dT%H:%M"
+                        })
+                        .to_string()
+                })
+                .unwrap_or_default()
+        } else {
+            iso(ms)
+        }
+    };
+    let mut v = json!({
+        "kind": card.kind,
+        "title": card.summary,
+        "start": time(card.start),
+        "all_day": card.all_day,
+        "canceled": card.canceled,
+        "can_answer": card.can_answer,
+    });
+    if let Some(end) = card.end {
+        v["end"] = json!(time(end));
+    }
+    if let Some(answer) = card.answer {
+        v["answer"] = json!(answer.as_str());
+    }
+    if let Some(l) = card.location {
+        v["location"] = json!(l);
+    }
+    if let Some(l) = card.call_link {
+        v["call_link"] = json!(l);
+    }
+    if let Some(o) = card.organizer {
+        v["organizer"] = json!(o.address);
+    }
+    if card.repeats {
+        v["repeats"] = json!(true);
+    }
+    Some(v)
 }
 
 /// Where `attachment` leaves message `id`'s file `index`.

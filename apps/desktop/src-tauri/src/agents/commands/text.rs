@@ -388,6 +388,40 @@ pub fn thread(value: &Value) -> String {
         if !f.is_empty() {
             out.push_str(&format!("Flags: {f}\n"));
         }
+        if let Some(i) = m["invitation"].as_object() {
+            let when = match (
+                i.get("start").and_then(Value::as_str),
+                i.get("end").and_then(Value::as_str),
+            ) {
+                (Some(start), Some(end)) => format!("{} – {}", short_time(start), short_time(end)),
+                (Some(start), None) => short_time(start),
+                _ => String::new(),
+            };
+            let kind = i
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("invitation");
+            out.push_str(&format!(
+                "Calendar {kind}: {}, {when}{}{}\n",
+                i.get("title").and_then(Value::as_str).unwrap_or_default(),
+                i.get("location")
+                    .and_then(Value::as_str)
+                    .map(|l| format!(", {l}"))
+                    .unwrap_or_default(),
+                if i.get("canceled") == Some(&Value::Bool(true)) {
+                    ", canceled"
+                } else {
+                    ""
+                },
+            ));
+            match i.get("answer").and_then(Value::as_str) {
+                Some(a) => out.push_str(&format!("Your answer: {a}\n")),
+                None if i.get("can_answer") == Some(&Value::Bool(true)) => out.push_str(
+                    "Your answer: none yet (event rsvp <this email's ID> accept|decline|maybe)\n",
+                ),
+                None => {}
+            }
+        }
         let files = m["attachments"].as_array().cloned().unwrap_or_default();
         if !files.is_empty() {
             out.push_str("Attachments:\n");

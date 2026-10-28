@@ -5,7 +5,7 @@
 
 use chrono::{Datelike, Duration, Local, NaiveTime, TimeZone, Weekday};
 use serde_json::{Value, json};
-use spark_mail::calendar::{Event, EventDraft, Scope, Zone};
+use spark_mail::calendar::{Event, EventDraft, Scope, ShowAs, Zone};
 use spark_mail::invite::{Answer, Person};
 use spark_store::{Calendar, StoredEvent, now_ms};
 
@@ -164,10 +164,14 @@ fn event_json(e: &StoredEvent, event: &Event, calendar: &str, account: &str) -> 
 }
 
 fn person(p: &Person) -> String {
-    if p.name.is_empty() || p.name.eq_ignore_ascii_case(&p.address) {
+    let who = if p.name.is_empty() || p.name.eq_ignore_ascii_case(&p.address) {
         p.address.clone()
     } else {
         format!("{} <{}>", p.name, p.address)
+    };
+    match p.answer {
+        Some(answer) => format!("{who} ({})", answer.as_str()),
+        None => who,
     }
 }
 
@@ -321,6 +325,20 @@ fn apply_fields(a: &Args, draft: &mut EventDraft, creating: bool) -> Result<(), 
                 None => ((draft.start - parse_time(first, false)?) / 60_000).max(0),
             },
         );
+    }
+    if let Some(show) = a.str("show_as") {
+        draft.show_as = match show.to_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "free" => ShowAs::Free,
+            "busy" => ShowAs::Busy,
+            "tentative" => ShowAs::Tentative,
+            "oof" | "away" | "outofoffice" => ShowAs::Oof,
+            "workingelsewhere" => ShowAs::WorkingElsewhere,
+            other => {
+                return Err(Fail::Error(format!(
+                    "show_as is free, busy, tentative, oof or working-elsewhere, not {other}."
+                )));
+            }
+        };
     }
     match a.str("video_conference") {
         None => {}

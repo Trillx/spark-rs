@@ -593,3 +593,50 @@ fn folders_and_contacts_list_what_is_there() {
     assert_eq!(top["match"], "top");
     assert!(top["contacts"].as_array().unwrap().len() <= 2);
 }
+
+#[test]
+fn waiting_finds_sent_email_nobody_answered() {
+    let f = Fixture::new("waiting");
+    f.allow(f.work, Access::Read);
+    let now = now_ms();
+    let mut store = f.engine.store();
+    for (uid, from, subject, id, reply, minutes) in [
+        (10, "me@work.com", "Invoice 12", "<s1@work.com>", None, 90),
+        (11, "me@work.com", "Proposal", "<s2@work.com>", None, 80),
+        (
+            12,
+            "ana@parts.com",
+            "Re: Proposal",
+            "<r2@parts.com>",
+            Some("<s2@work.com>"),
+            70,
+        ),
+    ] {
+        store
+            .add_incoming(
+                &Incoming {
+                    account_id: f.work,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(uid),
+                    message_id: Some(id.into()),
+                    in_reply_to: reply.map(str::to_owned),
+                    references: reply.map(str::to_owned),
+                    from_name: "Someone".into(),
+                    from_address: from.into(),
+                    to: vec!["Ana Ruiz <ana@parts.com>".into()],
+                    subject: subject.into(),
+                    text: subject.into(),
+                    date: now - 60_000 * minutes,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+    }
+    drop(store);
+    let waiting = f.ok("search", json!({ "filter": "is:waiting" }));
+    assert_eq!(subjects(&waiting), ["Invoice 12"]);
+    // Ana's reply to the proposal is hers to answer, not the user's wait.
+    let unreplied = f.ok("search", json!({ "filter": "is:unreplied from:ana" }));
+    assert!(subjects(&unreplied).contains(&"Re: Proposal".to_owned()));
+}

@@ -533,9 +533,13 @@ spark-cli history
 ```
 
 Add `--json` to any command for JSON. Agents can also run it as an MCP
-server (`spark-cli mcp`), where each command is a tool, and
-`spark-cli skill --install <folder>` writes a skill that teaches an agent
-the commands. Agents see nothing until you choose what they may do in each
+server (`spark-cli mcp`), where each command is a tool. spark-cli also
+carries skills for agents: one that teaches the commands, recipes for jobs
+such as a morning briefing, inbox triage, chasing replies, meeting prep, a
+person brief or a receipts roundup, and roles (assistant, founder,
+freelancer, sales, project lead). `spark-cli skill --list` shows them and
+`spark-cli skill --install <folder> --all` installs them into an agent's
+skills folder. Agents see nothing until you choose what they may do in each
 account under Settings → Agents:
 
 - **Read**: list, search and read mail and attachments, and see the

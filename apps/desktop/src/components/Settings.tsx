@@ -1181,9 +1181,9 @@ function AgentsPage({ onAddAccount }: { onAddAccount: () => void }) {
             <CommandRow label="Hermes" command={`hermes mcp add spark-rs --command ${cli} --args mcp`} />
             <CommandRow label="Other agents" description="Their MCP server command." command={`${cli} mcp`} />
             <CommandRow
-              label="Skill for Claude Code"
-              description="Teaches it spark-cli's commands, for when it works in a terminal. Other agents: spark-cli skill prints it."
-              command={`${cli} skill --install "%USERPROFILE%\\.claude\\skills"`}
+              label="Skills for Claude Code"
+              description="Teach it spark-cli's commands and recipes for jobs like a morning briefing, inbox triage or meeting prep. Other agents: spark-cli skill --list."
+              command={`${cli} skill --install "%USERPROFILE%\\.claude\\skills" --all`}
             />
           </>
         ) : (

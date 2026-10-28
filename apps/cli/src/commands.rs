@@ -11,11 +11,44 @@ use serde_json::{Map, Value, json};
 
 use crate::agent::Link;
 
-/// The skill agents read to use spark-cli, its version spark-cli's.
-const SKILL: &str = include_str!("../SKILL.md");
+/// Every skill, by name, from `skills/<name>/SKILL.md` (see `build.rs`).
+const SKILLS: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/skills.rs"));
+/// The skill the others build on: the commands.
+const BASE: &str = "use-spark-rs";
+/// The others' names start with this.
+const PREFIX: &str = "spark-rs-";
 
-fn skill_text() -> String {
-    SKILL.replace("{{version}}", env!("CARGO_PKG_VERSION"))
+/// A skill's text by name (`inbox-triage` or `spark-rs-inbox-triage`), its
+/// version spark-cli's.
+fn skill_text(name: &str) -> Option<(&'static str, String)> {
+    let name = name.trim();
+    SKILLS
+        .iter()
+        .find(|(n, _)| *n == name || n.strip_prefix(PREFIX) == Some(name))
+        .map(|(n, text)| (*n, text.replace("{{version}}", env!("CARGO_PKG_VERSION"))))
+}
+
+/// The frontmatter's `description`, on one line.
+fn description(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in text.lines().skip(1) {
+        if line == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("description:") {
+            inside = true;
+            let rest = rest.trim().trim_start_matches(">-").trim();
+            if !rest.is_empty() {
+                out.push(rest.to_owned());
+            }
+        } else if inside && line.starts_with("  ") {
+            out.push(line.trim().to_owned());
+        } else if inside {
+            break;
+        }
+    }
+    out.join(" ")
 }
 
 #[derive(Args, Default)]
@@ -223,6 +256,9 @@ pub enum Mail {
         /// teams (or auto).
         #[arg(long)]
         video_conference: Option<String>,
+        /// busy (the default), free, tentative, oof or working-elsewhere.
+        #[arg(long)]
+        show_as: Option<String>,
         /// user@example.com or user@example.com:Calendar, for create.
         #[arg(long)]
         calendar: Option<String>,
@@ -488,6 +524,7 @@ pub async fn run(mail: Mail, json: bool) -> Result<()> {
             alerts,
             location,
             video_conference,
+            show_as,
             calendar,
             add,
             remove,
@@ -504,6 +541,7 @@ pub async fn run(mail: Mail, json: bool) -> Result<()> {
                 .str("alerts", alerts)
                 .str("location", location)
                 .str("video_conference", video_conference)
+                .str("show_as", show_as)
                 .str("calendar", calendar)
                 .list("add", add)
                 .list("remove", remove),
@@ -650,17 +688,49 @@ fn read_stdin_file(name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// `spark-cli skill`: prints the skill, or installs it under `dir`.
-pub fn skill(install: Option<PathBuf>) -> Result<()> {
+/// `spark-cli skill`: prints a skill (the base one unless named), lists
+/// them, or installs one or all of them as `<dir>/<name>/SKILL.md`.
+pub fn skill(name: Option<String>, install: Option<PathBuf>, all: bool, list: bool) -> Result<()> {
+    if list {
+        for (n, text) in SKILLS {
+            println!("{n}\n    {}\n", description(text));
+        }
+        println!(
+            "spark-cli skill <name> prints one; spark-cli skill --install <folder> --all installs them all."
+        );
+        return Ok(());
+    }
+    let wanted: Vec<&str> = match (&name, all) {
+        (Some(_), true) => bail!("Pass a skill's name or --all, not both."),
+        (_, true) => SKILLS.iter().map(|(n, _)| *n).collect(),
+        (Some(n), false) => vec![n.as_str()],
+        (None, false) => vec![BASE],
+    };
+    let mut skills = Vec::new();
+    for n in wanted {
+        let found = skill_text(n)
+            .with_context(|| format!("There's no skill {n}. spark-cli skill --list lists them."))?;
+        skills.push(found);
+    }
     let Some(dir) = install else {
-        print!("{}", skill_text());
+        for (_, text) in &skills {
+            print!("{text}");
+        }
         return Ok(());
     };
-    let folder = dir.join("use-spark-rs");
-    std::fs::create_dir_all(&folder).with_context(|| format!("making {}", folder.display()))?;
-    let path = folder.join("SKILL.md");
-    std::fs::write(&path, skill_text()).with_context(|| format!("writing {}", path.display()))?;
-    println!("Installed the skill to {}", path.display());
+    for (n, text) in &skills {
+        let folder = dir.join(n);
+        std::fs::create_dir_all(&folder).with_context(|| format!("making {}", folder.display()))?;
+        let path = folder.join("SKILL.md");
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        println!("Installed {}", path.display());
+    }
+    if !skills.iter().any(|(n, _)| *n == BASE) && !dir.join(BASE).join("SKILL.md").is_file() {
+        println!(
+            "The others build on {BASE}: spark-cli skill --install {} installs it.",
+            dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -669,8 +739,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_skill_names_its_version_and_commands() {
-        let skill = skill_text();
+    fn the_base_skill_names_its_version_and_commands() {
+        let (_, skill) = skill_text(BASE).unwrap();
         assert!(skill.starts_with("---\nname: use-spark-rs\n"));
         assert!(skill.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))));
         for command in [
@@ -683,6 +753,133 @@ mod tests {
         ] {
             assert!(skill.contains(&format!("spark-cli {command}")), "{command}");
         }
+    }
+
+    #[test]
+    fn every_skill_is_named_for_its_folder_and_builds_on_the_base() {
+        assert!(SKILLS.len() > 1);
+        for (name, text) in SKILLS {
+            assert!(
+                text.starts_with(&format!("---\nname: {name}\n")),
+                "{name}: name"
+            );
+            assert!(!description(text).is_empty(), "{name}: description");
+            assert!(text.contains("version: {{version}}"), "{name}: version");
+            if *name != BASE {
+                assert!(name.starts_with(PREFIX), "{name}: prefix");
+                assert!(text.contains("      - use-spark-rs\n"), "{name}: requires");
+            }
+        }
+        assert_eq!(
+            skill_text("inbox-triage").map(|(n, _)| n),
+            Some("spark-rs-inbox-triage")
+        );
+    }
+
+    /// Splits a shell command line into words: quotes, `$'…'` with its
+    /// escapes, and backslashes; stops at a pipe, redirect or comment.
+    fn words(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '|' | '>' | ';' | '&' => break,
+                '#' if word.is_none() => break,
+                c if c.is_whitespace() => out.extend(word.take()),
+                '\'' => {
+                    let w = word.get_or_insert_with(String::new);
+                    for c in chars.by_ref() {
+                        if c == '\'' {
+                            break;
+                        }
+                        w.push(c);
+                    }
+                }
+                '"' => {
+                    let w = word.get_or_insert_with(String::new);
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '"' => break,
+                            '\\' => w.extend(chars.next()),
+                            c => w.push(c),
+                        }
+                    }
+                }
+                '$' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    let w = word.get_or_insert_with(String::new);
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '\'' => break,
+                            '\\' => match chars.next() {
+                                Some('n') => w.push('\n'),
+                                Some('t') => w.push('\t'),
+                                Some(other) => w.push(other),
+                                None => {}
+                            },
+                            c => w.push(c),
+                        }
+                    }
+                }
+                '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+                c => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        out.extend(word);
+        out
+    }
+
+    #[test]
+    fn shell_words_split_like_bash() {
+        assert_eq!(
+            words(r#"spark-cli draft --body $'Hi,\n\nThanks.' --to "Ana <a@x.com>" | jq . # note"#),
+            [
+                "spark-cli",
+                "draft",
+                "--body",
+                "Hi,\n\nThanks.",
+                "--to",
+                "Ana <a@x.com>"
+            ]
+        );
+        assert_eq!(
+            words("spark-cli emails 'Set Aside' --json"),
+            ["spark-cli", "emails", "Set Aside", "--json"]
+        );
+    }
+
+    /// Every `spark-cli` line in the skills' bash examples parses as a
+    /// command, so a skill can't teach a flag that doesn't exist.
+    #[test]
+    fn every_example_in_the_skills_is_a_real_command() {
+        let mut checked = 0;
+        let mut bad = Vec::new();
+        for (name, text) in SKILLS {
+            let mut in_bash = false;
+            for (n, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") {
+                    in_bash = trimmed == "```bash";
+                    continue;
+                }
+                let Some(at) = line.find("spark-cli ").filter(|_| in_bash) else {
+                    continue;
+                };
+                let args = words(&line[at..]);
+                checked += 1;
+                if let Err(e) = <crate::Cli as clap::Parser>::try_parse_from(&args) {
+                    let first = e.to_string().lines().next().unwrap_or_default().to_owned();
+                    bad.push(format!("{name}:{}: {}\n    {first}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(checked > 50, "only {checked} examples found");
+        assert!(
+            bad.is_empty(),
+            "examples that don't parse:\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]

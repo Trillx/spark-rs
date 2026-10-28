@@ -619,7 +619,16 @@ async fn unsubscribe(env: &Env<'_>, ids: &[String]) -> Done {
                 results.push(json!({ "id": id, "result": "unsubscribed" }));
             }
             Unsubscribed::Email { to, subject, body } => {
-                // The list asks for an email, which goes from the account.
+                // The list asks for an email, which goes from the account:
+                // that's sending, so it needs send.
+                if env.access(m.account_id) < Access::Send {
+                    lines.push(format!(
+                        "Email {id}: the list unsubscribes by an email to {to}, and sending needs send access in {}. The user can click Unsubscribe on the email in spark-rs.",
+                        account.email
+                    ));
+                    results.push(json!({ "id": id, "result": "needs_send", "to": to }));
+                    continue;
+                }
                 let draft = spark_mail::draft::Draft {
                     account: m.account_id,
                     to: to.clone(),
@@ -629,11 +638,16 @@ async fn unsubscribe(env: &Env<'_>, ids: &[String]) -> Done {
                     ..Default::default()
                 };
                 let json = serde_json::to_string(&draft).map_err(|e| Fail::Error(e.to_string()))?;
-                env.guarded(&[m.account_id], Access::Triage, "unsubscribe", |store| {
-                    store
-                        .queue_send(m.account_id, &json, draft.send_at, &[])
-                        .map_err(db)
-                })?;
+                env.guarded(
+                    &[m.account_id],
+                    Access::Send,
+                    "send the unsubscribe email",
+                    |store| {
+                        store
+                            .queue_send(m.account_id, &json, draft.send_at, &[])
+                            .map_err(db)
+                    },
+                )?;
                 (env.nudge)(m.account_id);
                 lines.push(format!(
                     "Email {id}: sent the list's unsubscribe email to {to}."

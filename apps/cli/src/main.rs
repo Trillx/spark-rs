@@ -38,11 +38,20 @@ struct Cli {
 enum Command {
     #[command(flatten)]
     Mail(Box<Mail>),
-    /// Print the skill that teaches agents spark-cli, or install it as
-    /// <dir>/use-spark-rs/SKILL.md.
+    /// Print the skill that teaches agents spark-cli, or another skill
+    /// (`--list` shows them), or install them as <DIR>/<name>/SKILL.md.
     Skill {
+        /// A skill's name, e.g. inbox-triage; use-spark-rs if omitted.
+        name: Option<String>,
+        /// Install into this folder (an agent's skills folder) instead of printing.
         #[arg(long, value_name = "DIR")]
         install: Option<PathBuf>,
+        /// Every skill, not one.
+        #[arg(long)]
+        all: bool,
+        /// List the skills and what each is for.
+        #[arg(long, conflicts_with_all = ["name", "install", "all"])]
+        list: bool,
     },
     /// Serve spark-rs's commands as MCP tools on stdin/stdout, for agents
     /// such as Claude Code and Codex. Starts spark-rs if it isn't running.
@@ -119,7 +128,12 @@ fn main() {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Mail(mail) => commands::run(*mail, cli.json).await,
-        Command::Skill { install } => commands::skill(install),
+        Command::Skill {
+            name,
+            install,
+            all,
+            list,
+        } => commands::skill(name, install, all, list),
         Command::Mcp => agent::mcp().await,
         Command::Tools => agent::tools().await,
         Command::Call { tool, arguments } => agent::call_tool(&tool, arguments.as_deref()).await,

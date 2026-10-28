@@ -352,6 +352,8 @@ enum Is {
     Read,
     Pinned,
     Unreplied,
+    /// Sent by the user, and nobody has written back since.
+    Waiting,
     Priority,
     Muted,
     Snoozed,
@@ -414,6 +416,7 @@ impl Filter {
                     "read" => Is::Read,
                     "pinned" | "starred" => Is::Pinned,
                     "unreplied" => Is::Unreplied,
+                    "waiting" | "awaiting_reply" => Is::Waiting,
                     "priority" | "important" => Is::Priority,
                     "muted" => Is::Muted,
                     "snoozed" => Is::Snoozed,
@@ -479,15 +482,26 @@ impl Filter {
             .iter()
             .map(|a| a.email.to_lowercase())
             .collect();
-        let replied = if self
-            .terms
-            .iter()
-            .any(|(t, _)| *t == Term::Is(Is::Unreplied))
-        {
-            replied(mailbox, &own)
-        } else {
-            HashSet::new()
-        };
+        let needs = |is: Is| self.terms.iter().any(|(t, _)| *t == Term::Is(is));
+        let mut answers = Answers::default();
+        if needs(Is::Unreplied) || needs(Is::Waiting) {
+            answers.drafts = mailbox
+                .messages
+                .iter()
+                .filter(|m| mailbox.is_in(m, List::Drafts))
+                .map(|m| m.id)
+                .collect();
+        }
+        if needs(Is::Unreplied) {
+            // A reply still in Drafts hasn't answered anyone.
+            answers.by_you = answered(mailbox, |m| {
+                own.contains(&m.from_address.to_lowercase()) && !answers.drafts.contains(&m.id)
+            });
+        }
+        if needs(Is::Waiting) {
+            answers.by_others =
+                answered(mailbox, |m| !own.contains(&m.from_address.to_lowercase()));
+        }
         let mut out = Vec::new();
         for m in candidates {
             let mut content = None;
@@ -503,7 +517,7 @@ impl Filter {
                         }
                         content_matches(term, content.as_ref())
                     }
-                    _ => matches(term, m, &replied, &own, now),
+                    _ => matches(term, m, &answers, &own, now),
                 };
                 if hit == *negated {
                     matched = false;
@@ -590,13 +604,18 @@ fn tokens(text: &str) -> Vec<String> {
     out
 }
 
-fn matches(
-    term: &Term,
-    m: &Message,
-    replied: &HashSet<i64>,
-    own: &HashSet<String>,
-    now: i64,
-) -> bool {
+/// Which emails were answered, for `is:unreplied` and `is:waiting`.
+#[derive(Default)]
+struct Answers {
+    /// Answered from one of the user's accounts.
+    by_you: HashSet<i64>,
+    /// Answered by someone else.
+    by_others: HashSet<i64>,
+    /// Drafts, which are the user's but not sent.
+    drafts: HashSet<i64>,
+}
+
+fn matches(term: &Term, m: &Message, answers: &Answers, own: &HashSet<String>, now: i64) -> bool {
     match term {
         Term::From(x) => format!("{} {}", m.from_name, m.from_address)
             .to_lowercase()
@@ -616,7 +635,12 @@ fn matches(
             m.state == MessageState::Snoozed && m.snoozed_until.is_some_and(|t| t > now)
         }
         Term::Is(Is::Unreplied) => {
-            !own.contains(&m.from_address.to_lowercase()) && !replied.contains(&m.id)
+            !own.contains(&m.from_address.to_lowercase()) && !answers.by_you.contains(&m.id)
+        }
+        Term::Is(Is::Waiting) => {
+            own.contains(&m.from_address.to_lowercase())
+                && !answers.by_others.contains(&m.id)
+                && !answers.drafts.contains(&m.id)
         }
         Term::Category(kind) => match kind {
             Kind::Priority => m.priority,
@@ -671,20 +695,18 @@ fn ends(name: &str, extensions: &[&str]) -> bool {
     extensions.iter().any(|e| name.ends_with(e))
 }
 
-/// Messages someone answered from one of the user's accounts: a later
-/// message of theirs in the same conversation.
-fn replied(mailbox: &View, own: &HashSet<String>) -> HashSet<i64> {
-    let mut last_own: HashMap<i64, i64> = HashMap::new();
-    for m in &mailbox.messages {
-        if own.contains(&m.from_address.to_lowercase()) {
-            let at = last_own.entry(m.conversation).or_insert(m.date);
-            *at = (*at).max(m.date);
-        }
+/// Messages answered by someone `by` picks: a later message of theirs in
+/// the same conversation.
+fn answered(mailbox: &View, by: impl Fn(&Message) -> bool) -> HashSet<i64> {
+    let mut last: HashMap<i64, i64> = HashMap::new();
+    for m in mailbox.messages.iter().filter(|m| by(m)) {
+        let at = last.entry(m.conversation).or_insert(m.date);
+        *at = (*at).max(m.date);
     }
     mailbox
         .messages
         .iter()
-        .filter(|m| last_own.get(&m.conversation).is_some_and(|&at| at > m.date))
+        .filter(|m| last.get(&m.conversation).is_some_and(|&at| at > m.date))
         .map(|m| m.id)
         .collect()
 }

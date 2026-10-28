@@ -3,7 +3,7 @@
 
 use serde_json::{Map, Value, json};
 
-const FILTER: &str = "Gmail-style filter, operators combined in one string: from:<name or address>, to:, cc:, subject:<text> or subject:\"two words\", before:yyyy/MM/dd, after:yyyy/MM/dd, newer_than:7d (d/w/m/y), older_than:, has:attachment (also document, spreadsheet, presentation, reminder), is:unread (also read, pinned, starred, unreplied, priority, muted, snoozed), category:priority (also personal, notification, newsletter, invitation, invitation_response), filename:<name>. A - before an operator leaves out what it matches; other words are searched for.";
+const FILTER: &str = "Gmail-style filter, operators combined in one string: from:<name or address>, to:, cc:, subject:<text> or subject:\"two words\", before:yyyy/MM/dd, after:yyyy/MM/dd, newer_than:7d (d/w/m/y), older_than:, has:attachment (also document, spreadsheet, presentation, reminder), is:unread (also read, pinned, starred, unreplied: received and not answered by the user; waiting: sent by the user and not answered since; priority, muted, snoozed), category:priority (also personal, notification, newsletter, invitation, invitation_response), filename:<name>. A - before an operator leaves out what it matches; other words are searched for.";
 const MESSAGE_ID: &str = "An email ID, from emails, search or thread.";
 
 /// A parameter: its name, JSON type and description.
@@ -230,6 +230,7 @@ pub fn catalog() -> Value {
             param("location", "string", "Where."),
             param("alerts", "string", "When to remind: 300s for five minutes before, or a time."),
             param("video_conference", "string", "teams (or auto) adds a Teams call."),
+            param("show_as", "string", "How it shows on the user's schedule: busy (the default), free, tentative, oof or working-elsewhere. Free time isn't blocked by it."),
             param("calendar", "string", "For create: user@example.com (its default calendar) or user@example.com:Name."),
             param("add", "array", "People to invite."),
             param("remove", "array", "People to uninvite (update)."),
