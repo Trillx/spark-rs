@@ -26,11 +26,14 @@ triage in every account, because it counts for all of them.
 ## 1. Who's Priority now
 
 ```bash
-spark-cli search --filter "category:priority newer_than:28d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, name: .[0].from_name, count: length, unread: (map(select(.unread)) | length)}) | sort_by(-.count)'
+spark-cli search --filter "category:priority newer_than:28d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, name: .[0].from_name, emails: (map(.messages // 1) | add)}) | sort_by(-.emails)'
+spark-cli search --filter "category:priority is:unread newer_than:28d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, unread: (map(.messages // 1) | add)})'
 ```
 
-For each sender, note how much they sent and how much the user left
-unread. Candidates to take off: automated senders, newsletters, people the
+For each sender, note how many emails they sent and how many the user left
+unread. Rows are conversations, so count `.messages // 1`, and take unread
+from the second search rather than a row's `.unread`, which is only its
+newest email's. Candidates to take off: automated senders, newsletters, people the
 user no longer works with, and senders whose mail mostly stays unread.
 
 ## 2. Who's missing

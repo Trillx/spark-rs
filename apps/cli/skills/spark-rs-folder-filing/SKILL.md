@@ -41,13 +41,15 @@ Take what the user names. Otherwise offer the Inbox's settled
 conversations, such as mail from people with nothing new for a week:
 
 ```bash
-spark-cli emails --filter "category:personal" --page-size 200 --json | jq '[.emails[] | {id, date, subject, unread}]'
+spark-cli emails --filter "category:personal" --page-size 200 --json | jq '[.emails[] | {id, subject, latest_date, unread_count}]'
 ```
 
-Each row is a conversation dated by its newest email, and a move takes the
-whole conversation. Keep the rows whose `.date` is over a week old (worked
-out from now) and that aren't unread; an `older_than:` filter would bring
-back a conversation with today's reply by its older email.
+Each row is a conversation, and a move takes all of it in the Inbox,
+including emails the filter didn't match. Keep the rows whose
+`.latest_date` (the conversation's newest email there) is over a week old,
+worked out from now, and whose `.unread_count` is 0. An `older_than:`
+filter, or judging by `.date`, would bring back a conversation with
+today's reply by an older email.
 
 ## 3. See where each sender's mail went before
 

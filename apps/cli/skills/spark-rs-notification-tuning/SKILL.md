@@ -27,12 +27,16 @@ muting need triage, and refiling a sender needs triage in every account.
 ## 1. Find the noisy senders
 
 ```bash
-spark-cli search --filter "category:notification newer_than:30d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, count: length, unread: (map(select(.unread)) | length)}) | sort_by(-.count) | .[:15]'
+spark-cli search --filter "category:notification newer_than:30d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, emails: (map(.messages // 1) | add)}) | sort_by(-.emails) | .[:15]'
+spark-cli search --filter "category:notification is:unread newer_than:30d" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, unread: (map(.messages // 1) | add)})'
 spark-cli emails --filter "category:notification" --json | jq '.total'
 ```
 
-The first gives the top senders over 30 days with how many went unread; the
-second, how many notification conversations sit in the Inbox now. A sender
+The first gives the top senders over 30 days by emails, the second how many
+of each went unread, the third how many notification conversations sit in
+the Inbox now. Rows are conversations, and a bot can thread many alerts
+into one, so count `.messages // 1`, not rows, and take unread from the
+second search, not a row's `.unread`. A sender
 with a high count and nearly all unread is the first to look at.
 
 ## 2. Refile the misfiled
@@ -57,16 +61,16 @@ passed, a delivered parcel, an expired code, an old status report) can go
 in bulk. Read one or two to be sure, then list them per sender:
 
 ```bash
-spark-cli emails --filter "category:notification from:alerts@ci.example.com" --page-size 200 --json | jq '[.emails[] | {id, date, unread}]'
+spark-cli emails --filter "category:notification from:alerts@ci.example.com" --page-size 200 --json | jq '[.emails[] | {id, latest_date, unread_count}]'
 spark-cli action archive 1201 1202 1203 1204 1205 1206 1207
 ```
 
-Each row is a conversation dated by its newest email, and archiving takes
-the whole conversation. So pick by the row's `.date` (older than a couple
-of days, worked out from now) and leave out unread rows: a conversation
-with a fresh alert in it shows that alert's date and stays. Don't put
-`older_than:` in the filter, or a conversation with today's failure would
-come back by its old alert and be archived with it.
+Each row is a conversation, and archiving takes all of it in the Inbox,
+including mail the filter didn't match, such as a colleague's reply to an
+alert. So pick by `.latest_date` (the conversation's newest email, older
+than a couple of days, worked out from now) and leave out rows whose
+`.unread_count` isn't 0. Don't decide by `.date`, which is only the newest
+alert, and don't put `older_than:` in the filter.
 
 Keep alerts that still ask for something: a failed payment, a security
 warning, an expiring certificate. Archive only after the user says yes to

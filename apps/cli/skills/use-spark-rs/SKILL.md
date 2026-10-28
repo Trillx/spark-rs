@@ -167,11 +167,16 @@ them; `contact-action acceptContact` or `blockContact` decides.
 A `-` before an operator leaves out what it matches (`-category:newsletter`).
 Other words must appear in the email, as in `search`.
 
-Filters match single emails, then rows group them by conversation. So
-`older_than:7d` still lists a conversation that got a reply today, by its
-older email, and archiving or moving that row takes today's reply along.
-To act on settled conversations, list without the age filter and keep the
-rows whose `.date` (their newest email) is old enough.
+Filters match single emails, then rows group them by conversation, and a
+row's `.date` and `.unread` are its newest *matching* email's. Archiving
+or moving a row takes the whole conversation in that folder, matching or
+not: `older_than:7d` or `from:alerts@…` can list a conversation that got
+someone's reply today, and acting on it takes the reply along. Each JSON
+row also describes the whole conversation in that folder, whatever the
+filter matched: `.latest_date` (its newest email), `.unread_count` and
+`.email_count`. Before archiving or moving a row, check those: act on
+settled conversations, or on rows whose matches are all of it
+(`(.messages // 1) == .email_count`).
 
 `is:unreplied` is email someone sent the user that the user hasn't answered.
 `is:waiting` is the other way round: email the user sent that nobody has

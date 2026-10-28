@@ -271,6 +271,16 @@ fn emails_list_conversations_newest_first_with_filters() {
         json!({ "folder": "me@work.com", "filter": "from:ana -category:newsletter" }),
     );
     assert_eq!(subjects(&work), ["Re: Bracket quote"]);
+    // The conversation as a whole, whatever the filter matched.
+    let first = f.ok(
+        "emails",
+        json!({ "filter": "subject:\"Bracket quote\" -subject:Re" }),
+    );
+    assert_eq!(subjects(&first), ["Bracket quote"]);
+    let row = &first["emails"][0];
+    assert!(row["latest_date"].as_str().unwrap() > row["date"].as_str().unwrap());
+    assert_eq!(row["unread_count"], 2);
+    assert_eq!(row["email_count"], 2, "one matched, two in the Inbox");
     let news = f.ok(
         "emails",
         json!({ "filter": "category:newsletter is:unread" }),

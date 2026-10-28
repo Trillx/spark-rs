@@ -71,12 +71,15 @@ need the user's decision; events they haven't answered show `.response`
 ## 5. Notifications and newsletters in bulk
 
 ```bash
-spark-cli emails --filter "category:notification after:2026/10/19" --page-size 1000 --json | jq '.emails | group_by(.from_address) | map({sender: .[0].from_address, count: length, ids: map(.id)}) | sort_by(-.count)'
+spark-cli emails --filter "category:notification after:2026/10/19" --page-size 1000 --json | jq '.emails | map(select((.messages // 1) == .email_count)) | group_by(.from_address) | map({sender: .[0].from_address, emails: (map(.messages // 1) | add), ids: map(.id)}) | sort_by(-.emails)'
 spark-cli action archive 1201 1202 1203 1204 1205 1206 1207
 ```
 
-Run the first for `category:newsletter` too. Pull out anything that still
-needs action (a failed payment, a security alert, an expiring account, a
+Run the first for `category:newsletter` too. Archiving a row takes its
+whole conversation in the Inbox, so the jq keeps only rows made entirely
+of matching mail; a conversation where a person also wrote stays out of
+the batch and goes through step 3. Pull out anything that still needs
+action (a failed payment, a security alert, an expiring account, a
 delivery problem), show the rest grouped by sender with counts, and
 archive only after a yes. A few new senders (`emails --new-senders`) can
 be decided here; a long queue is `spark-rs-new-senders`.

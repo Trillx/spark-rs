@@ -334,6 +334,15 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
         .iter()
         .filter(|m| scopes.iter().any(|s| view.in_scope(m, s)))
         .collect();
+    // Each conversation as a whole in the folder, whatever the filter: an
+    // action on a row takes all of it.
+    let mut whole: HashMap<i64, (i64, usize, usize)> = HashMap::new();
+    for m in &candidates {
+        let entry = whole.entry(m.conversation).or_insert((m.date, 0, 0));
+        entry.0 = entry.0.max(m.date);
+        entry.1 += usize::from(m.unread);
+        entry.2 += 1;
+    }
     let store = env.store();
     let found: Option<HashSet<i64>> = match filter.words() {
         Some(words) => Some(store.search_ids(words).map_err(db)?.into_iter().collect()),
@@ -367,6 +376,11 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
             if *n > 1 {
                 row["messages"] = json!(n);
                 row["first_date"] = json!(iso(*first));
+            }
+            if let Some((latest, unread, emails)) = whole.get(&m.conversation) {
+                row["latest_date"] = json!(iso(*latest));
+                row["unread_count"] = json!(unread);
+                row["email_count"] = json!(emails);
             }
             row
         })
