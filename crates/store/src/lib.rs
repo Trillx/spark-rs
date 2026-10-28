@@ -193,6 +193,9 @@ pub struct Incoming {
     pub flagged: bool,
     /// The calendar invite it carries, JSON owned by the mail crate.
     pub invite: Option<String>,
+    /// Whether its `List-Unsubscribe` header gives a way to leave the list;
+    /// `None` when the fetch didn't read that header.
+    pub unsubscribe: Option<bool>,
     /// How much of the message the fetch brought: only a whole one fills in
     /// the body of one stored without it.
     pub body: Body,
@@ -325,6 +328,9 @@ pub struct Message {
     /// server couldn't give then (`Store::fill_in_remote`). A body read
     /// before, or what a search found in it, is out of date when it moves.
     pub content_rev: i64,
+    /// Whether it can be unsubscribed from (`Incoming::unsubscribe`);
+    /// `None` for mail whose headers weren't read for it.
+    pub unsubscribe: Option<bool>,
 }
 
 /// A reminder in the Inbox, on the email it came back as.
@@ -739,7 +745,7 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      json_extract(invite, '$.kind'), \
      (SELECT label FROM auto_labels WHERE message_id = messages.id), \
      (SELECT draft_id FROM auto_drafts WHERE message_id = messages.id ORDER BY created_at DESC, draft_id DESC LIMIT 1), \
-     content_rev";
+     content_rev, unsubscribe";
 
 /// The messages the list shows: all but drafts waiting in the outbox to be sent.
 const LISTED: &str = "id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)";
@@ -956,6 +962,16 @@ impl Store {
             tx.pragma_update(None, "user_version", 28)?;
             tx.commit()?;
             conn.pragma_update(None, "foreign_keys", true)?;
+        }
+        if version < 29 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "-- Whether its List-Unsubscribe header gives a way to leave the
+                 -- list (`Message::unsubscribe`); NULL for mail stored before.
+                 ALTER TABLE messages ADD COLUMN unsubscribe INTEGER;",
+            )?;
+            tx.pragma_update(None, "user_version", 29)?;
+            tx.commit()?;
         }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
         conn.execute_batch(&changes::WATCH_MESSAGES)?;
@@ -2344,6 +2360,7 @@ fn set_sync_state_in(conn: &Connection, id: i64, sync_state: &str) -> Result<()>
 fn add_incoming_in(conn: &Connection, m: &Incoming, screen_new_senders: bool) -> Result<Added> {
     if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
+        refresh_unsubscribe(conn, id, m)?;
         if m.body == Body::Whole {
             fill_in_body_in(conn, id, m)?;
         }
@@ -2428,6 +2445,7 @@ fn add_folder_message_in(conn: &Connection, folder_id: i64, m: &Incoming) -> Res
     let home = (place == Place::Folder).then_some(folder_id);
     let added = if let Some(id) = find_stored(conn, m)? {
         refresh_reply_to(conn, id, m)?;
+        refresh_unsubscribe(conn, id, m)?;
         if m.body == Body::Whole {
             fill_in_body_in(conn, id, m)?;
         }
@@ -2745,6 +2763,18 @@ fn refresh_reply_to(conn: &Connection, id: i64, m: &Incoming) -> Result<bool> {
         > 0)
 }
 
+/// Fetches that read `List-Unsubscribe` refresh whether the message can be
+/// unsubscribed from, as it may have been stored before that was kept.
+fn refresh_unsubscribe(conn: &Connection, id: i64, m: &Incoming) -> Result<()> {
+    if let Some(unsubscribe) = m.unsubscribe {
+        conn.prepare_cached(
+            "UPDATE messages SET unsubscribe = ?2 WHERE id = ?1 AND unsubscribe IS NOT ?2",
+        )?
+        .execute(params![id, unsubscribe])?;
+    }
+    Ok(())
+}
+
 fn insert_message(
     conn: &Connection,
     m: &Incoming,
@@ -2758,12 +2788,12 @@ fn insert_message(
             from_name, from_address, to_list, cc_list, subject, snippet, date,
             text_body, html_body, attachments, category, state, unread, pinned, screening,
             remote_place, remote_unread, remote_pinned, bcc_list, invite, reply_to_list,
-            auto_category, body_missing)
+            auto_category, body_missing, unsubscribe)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  ?16, ?17, ?18,
                  -- The sender's category if the user chose one, else what its headers say.
                  COALESCE((SELECT category FROM sender_categories WHERE address = ?10), ?19),
-                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19, ?28)",
+                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19, ?28, ?29)",
     )?
     .execute(params![
         m.account_id,
@@ -2794,6 +2824,7 @@ fn insert_message(
         m.invite,
         json(m.reply_to.as_deref().unwrap_or_default()),
         m.body == Body::Missing,
+        m.unsubscribe,
     ])?;
     let id = conn.last_insert_rowid();
     let threading = conversations::Threading {
@@ -2965,6 +2996,7 @@ fn message_row(r: &Row) -> Result<Message> {
             .and_then(AutoLabel::parse),
         auto_draft: r.get(26)?,
         content_rev: r.get(27)?,
+        unsubscribe: r.get(28)?,
     })
 }
 

@@ -6,6 +6,7 @@ use spark_store::{Body, Category, Incoming};
 
 use crate::attachment;
 use crate::invite::Invite;
+use crate::unsubscribe;
 
 pub use mail_parser::decoders::html::html_to_text;
 
@@ -63,6 +64,10 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         html,
         attachments,
         invite: Invite::find(&m).map(|i| i.to_json()),
+        unsubscribe: Some(
+            m.header_raw("List-Unsubscribe")
+                .is_some_and(unsubscribe::offered),
+        ),
         body: Body::Whole,
         ..Default::default()
     })
@@ -334,6 +339,38 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert_eq!(m.snippet, "Hello readers, this week: phones.");
         assert!(m.html.as_deref().unwrap().contains("<b>readers</b>"));
         assert_eq!(m.category, Category::Newsletters);
+        assert_eq!(m.unsubscribe, Some(true));
+    }
+
+    #[test]
+    fn unsubscribing_is_known_from_the_header_alone() {
+        // A receipt from a no-reply sender is a notification, but its list
+        // can still be left.
+        let receipt = "From: Shop <noreply@shop.com>\r\n\
+Subject: Deals\r\n\
+List-Unsubscribe: <https://shop.com/u/1>\r\n\
+\r\n\
+Hi\r\n";
+        let m = parse_message(receipt.as_bytes()).unwrap();
+        assert_eq!(m.category, Category::Notifications);
+        assert_eq!(m.unsubscribe, Some(true));
+        let unusable = "From: news@x.com\r\nList-Unsubscribe: <mailto:nobody>\r\n\r\nHi\r\n";
+        assert_eq!(
+            parse_message(unusable.as_bytes()).unwrap().unsubscribe,
+            Some(false)
+        );
+        let plain = "From: ana@x.com\r\nSubject: Hi\r\n\r\nHi\r\n";
+        assert_eq!(
+            parse_message(plain.as_bytes()).unwrap().unsubscribe,
+            Some(false)
+        );
+        let head = parse_head(
+            b"From: news@x.com\r\nList-Unsubscribe: <mailto:u@x.com>\r\n",
+            b"Hi",
+            false,
+        )
+        .unwrap();
+        assert_eq!(head.unsubscribe, Some(true));
     }
 
     #[test]

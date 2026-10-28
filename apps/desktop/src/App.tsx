@@ -194,6 +194,7 @@ import {
   saveMinimize,
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
+import { andMore, canUnsubscribe, settleEach, unsubscribeTargets } from "./lib/unsubscribe";
 import { draftLeft, goneNotice, markTrying, stuckNotice } from "./lib/outbox";
 import {
   activate as activateHome,
@@ -504,6 +505,8 @@ const LIST_KEYS = new Set<ActionId>([
 
 /** Failures stay up longer than undo toasts. */
 const ERROR_TOAST_MS = 10_000;
+/** How many lists a batch Unsubscribe asks at once: each asks the mail server for its email's headers first. */
+const UNSUBSCRIBE_AT_ONCE = 3;
 /** The composer saves its draft after this long without typing. */
 const AUTOSAVE_MS = 4_000;
 
@@ -1981,6 +1984,8 @@ export default function App() {
   const together = (m: Message) => movesWith(threadOf(m), m);
   /** `m` as stored, not a row's copy with the conversation's flags, so undo puts back its own. */
   const own = (m: Message) => messages.find((x) => x.id === m.id) ?? m;
+  /** Sent from one of your accounts. */
+  const fromYou = (m: Message) => isFromYou(m, accounts.find((a) => a.id === m.account));
 
   /** Pin and Priority mark the conversation: off for every email that has it, on for `m`. */
   function flag(m: Message, key: "pinned" | "priority", on: string, off: string, icon: ToastIcon) {
@@ -2217,6 +2222,7 @@ export default function App() {
     allSnoozed: pickedMessages.every((m) => m.state === "snoozed"),
     allSpam: pickedMessages.every(inSpam),
     allDeleted: pickedMessages.every((m) => m.state === "deleted"),
+    anyUnsubscribe: pickedMessages.some((m) => threadOf(m).some((x) => canUnsubscribe(x) && !fromYou(x))),
   };
 
   const bulk: BulkActions = {
@@ -2287,6 +2293,7 @@ export default function App() {
       ),
     spam: () => batch(spam),
     move: () => openMove(batchRows),
+    unsubscribe: () => unsubscribeAll(batchRows),
     clear: clearPicked,
   };
 
@@ -2766,6 +2773,56 @@ export default function App() {
     });
   }
 
+  /**
+   * Unsubscribes from the lists the conversations `rows` came from, after asking: each sender once, a few at a time,
+   * then one toast for them all, as Spark does. Pages a list wants finishing on open in the browser.
+   */
+  function unsubscribeAll(rows: Message[]) {
+    const targets = unsubscribeTargets(rows.map(threadOf), fromYou);
+    if (targets.length <= 1) return targets.length ? unsubscribeFrom(targets[0]) : undefined;
+    const name = (m: Message) => m.from.trim() || m.address;
+    setConfirm({
+      title: "Unsubscribe",
+      message: `Stop getting emails like these from ${andMore(targets.map(name))}? spark-rs asks each mailing list to take you off it.`,
+      confirmLabel: "Unsubscribe",
+      danger: false,
+      run: async () => {
+        const results = await settleEach(targets, UNSUBSCRIBE_AT_ONCE, (m) => unsubscribe(m.id));
+        const left: string[] = [];
+        const pages: string[] = [];
+        const failed: string[] = [];
+        let error: unknown;
+        results.forEach((r, i) => {
+          if (r.status === "rejected") {
+            failed.push(name(targets[i]));
+            error ??= r.reason;
+          } else if (r.value.kind === "page") pages.push(r.value.url);
+          else left.push(name(targets[i]));
+        });
+        // Nothing went: the dialog stays up with why.
+        if (failed.length === targets.length) throw `Couldn't unsubscribe from ${andMore(failed)}: ${String(error)}`;
+        for (const url of pages) await openExternal(url);
+        // What went wrong comes first: a long toast is cut short.
+        const parts = failed.length
+          ? [`Couldn't unsubscribe from ${andMore(failed)}`]
+          : left.length
+            ? [`Unsubscribed from ${andMore(left)}`]
+            : [];
+        if (failed.length && left.length) parts.push(`unsubscribed from ${plural(left.length, "other")}`);
+        if (pages.length === 1) parts.push("finish 1 on its page");
+        else if (pages.length) {
+          parts.push(parts.length ? `finish ${pages.length} on their pages` : `Finish unsubscribing on ${pages.length} lists' pages`);
+        }
+        showToast(
+          parts.join("; "),
+          undefined,
+          failed.length ? ICONS.error : ICONS.unsubscribe,
+          failed.length || pages.length ? { duration: ERROR_TOAST_MS } : {},
+        );
+      },
+    });
+  }
+
   /** Opens a search for `query`, keeping the thread open; it counts as a recent search. */
   /** A search a conversation's own window asked for: shown here, over whatever covered the list. */
   function searchFromWindow(query: string) {
@@ -3045,8 +3102,6 @@ export default function App() {
   }
 
   const replySubject = (m: Message) => (/^re:/i.test(m.subject) ? m.subject : `Re: ${m.subject}`);
-
-  const fromYou = (m: Message) => isFromYou(m, accounts.find((a) => a.id === m.account));
 
   /** To Reply-To (or From); on sent mail, follow up with its recipients. */
   function reply(m: Message) {
@@ -3824,7 +3879,7 @@ export default function App() {
             Icon: m.muted ? Bell : BellOff,
             run: () => actions.mute(m),
           },
-          ...(m.category === "newsletters"
+          ...(canUnsubscribe(m)
             ? [{ id: "unsubscribe", label: "Unsubscribe", keywords: "newsletter list stop", Icon: MailX, run: () => actions.unsubscribe(m) }]
             : []),
           ...(fromYou(m) && !isDraft(m, folders)
@@ -3954,8 +4009,8 @@ export default function App() {
       : [];
     const pickedSenders = pickedMessages.filter((x) => senderPriority(x) !== null).map((x) => x.address);
     const allPrioritySenders = pickedSenders.every((a) => prioritySet.has(a.toLowerCase()));
-    const selectionCommands: Command[] =
-      pickedMessages.length > 1 && pickedSenders.length
+    const selectionCommands: Command[] = [
+      ...(pickedMessages.length > 1 && pickedSenders.length
         ? [
             {
               id: "priority-senders",
@@ -3965,7 +4020,19 @@ export default function App() {
               run: () => prioritize(pickedSenders, !allPrioritySenders),
             },
           ]
-        : [];
+        : []),
+      ...(pickedMessages.length > 1 && selection.anyUnsubscribe
+        ? [
+            {
+              id: "unsubscribe-senders",
+              label: "Unsubscribe from selected senders",
+              keywords: "newsletters mailing lists stop",
+              Icon: MailX,
+              run: () => unsubscribeAll(pickedMessages),
+            },
+          ]
+        : []),
+    ];
     // A conversation's own window acts on that conversation only: it has no list.
     if (THREAD_WINDOW !== null) return [...messageCommands, ...(m ? gatekeeperCommands(m) : [])];
     const waiting = waitingInList();

@@ -56,6 +56,7 @@ import { readingStart } from "../lib/conversation";
 import { decidableDomain, domainOf } from "../lib/gatekeeper";
 import { shownFromCache, useInlineImages, useMessageContent, type ContentState } from "../lib/content";
 import { allowRemoteImages, useRemoteImagesAllowed } from "../lib/remoteImages";
+import { canUnsubscribe } from "../lib/unsubscribe";
 import {
   laterPresets,
   formatFullDate,
@@ -400,7 +401,7 @@ export default function ThreadView({
           </Pill>
         )}
         {label && <AutoLabelPill label={label} onChange={(l) => actions.setAutoLabel(conversation, l)} />}
-        {m.category === "newsletters" && !scrolled && (
+        {canUnsubscribe(m) && !scrolled && (
           <button
             className="ml-auto shrink-0 text-xs font-medium text-primary hover:underline"
             onClick={() => actions.unsubscribe(m)}
@@ -1007,7 +1008,7 @@ function MessageMenuItems({
           onSelect={() => actions.mute(m)}
         />
       )}
-      {m.category === "newsletters" && (
+      {canUnsubscribe(m) && (
         <MenuItem label="Unsubscribe" icon={<MailX size={15} />} onSelect={() => actions.unsubscribe(m)} />
       )}
       <li role="none" className="my-0.5 h-px bg-hairline" />

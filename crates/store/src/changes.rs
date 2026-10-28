@@ -80,6 +80,7 @@ pub(crate) static WATCH_MESSAGES: LazyLock<String> = LazyLock::new(|| {
         "returned_at",
         "invite",
         "content_rev",
+        "unsubscribe",
     ];
     let changed = listed
         .iter()

@@ -5,6 +5,7 @@ import {
   Clock,
   FolderInput,
   Inbox,
+  MailX,
   Pin,
   ShieldAlert,
   ShieldCheck,
@@ -30,6 +31,8 @@ export interface Selection {
   allSnoozed: boolean;
   allSpam: boolean;
   allDeleted: boolean;
+  /** Some of them came from a mailing list that can be left. */
+  anyUnsubscribe: boolean;
 }
 
 export interface BulkActions {
@@ -46,6 +49,8 @@ export interface BulkActions {
   spam: () => void;
   /** Opens Move to folder. */
   move: () => void;
+  /** Unsubscribes from the lists they came from, once per sender. */
+  unsubscribe: () => void;
   clear: () => void;
 }
 
@@ -150,6 +155,7 @@ function Buttons({ selection: s, actions }: { selection: Selection; actions: Bul
             onClick={actions.aside}
           />
           <Action tip={hint("Move to Folder…", "move")} Icon={FolderInput} onClick={actions.move} />
+          {s.anyUnsubscribe && <Action tip="Unsubscribe" Icon={MailX} onClick={actions.unsubscribe} />}
           <Action
             tip={s.allSpam ? "Not Spam" : "Move to Spam"}
             Icon={s.allSpam ? ShieldCheck : ShieldAlert}

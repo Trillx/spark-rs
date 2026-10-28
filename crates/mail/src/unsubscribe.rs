@@ -63,6 +63,13 @@ pub fn options(list_unsubscribe: &str, post: Option<&str>) -> Options {
     found
 }
 
+/// Whether a `List-Unsubscribe` header gives a way to leave that
+/// `unsubscribe` can take: a web link, or a mailto with an address.
+pub fn offered(list_unsubscribe: &str) -> bool {
+    let found = options(list_unsubscribe, None);
+    found.web.is_some() || found.mailto.as_deref().and_then(email).is_some()
+}
+
 /// Unsubscribes the best way `options` offers. A one-click link that fails
 /// falls back to the others.
 pub async fn unsubscribe(options: Options) -> Result<Unsubscribed> {
@@ -274,6 +281,18 @@ mod tests {
             })
         );
         assert_eq!(email("mailto:nobody"), None);
+    }
+
+    #[test]
+    fn offered_needs_a_link_it_can_use() {
+        assert!(offered("<https://list.example/u/1>"));
+        assert!(offered("<http://list.example/u/1>"));
+        assert!(offered("<mailto:leave@list.example>"));
+        assert!(offered("<mailto:nobody>, <https://list.example/u>"));
+        assert!(!offered("<mailto:nobody>"));
+        assert!(!offered("<ftp://list.example/u>"));
+        assert!(!offered("https://list.example/u"));
+        assert!(!offered(""));
     }
 
     #[test]

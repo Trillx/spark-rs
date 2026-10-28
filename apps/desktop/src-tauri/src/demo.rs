@@ -573,6 +573,7 @@ impl DemoMailbox {
             auto_label: None,
             auto_draft: None,
             content_rev: 0,
+            unsubscribe: None,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -755,6 +756,7 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             auto_label: e.auto_label,
             auto_draft: e.auto_draft,
             content_rev: 0,
+            unsubscribe: None,
         })
         .collect()
 }

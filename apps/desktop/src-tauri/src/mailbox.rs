@@ -99,6 +99,11 @@ pub struct Message {
     /// searches found, are out of date when it moves.
     #[serde(skip_serializing_if = "is_zero")]
     pub content_rev: i64,
+    /// Whether its `List-Unsubscribe` header gives a way to leave the list;
+    /// absent when that isn't known (mail stored before it was kept, or
+    /// from Microsoft 365, whose listings leave headers out).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsubscribe: Option<bool>,
 }
 
 fn is_zero(n: &i64) -> bool {
@@ -412,6 +417,7 @@ fn from_store(m: spark_store::Message) -> Message {
         auto_label: m.auto_label,
         auto_draft: m.auto_draft,
         content_rev: m.content_rev,
+        unsubscribe: m.unsubscribe,
     }
 }
 
@@ -3051,6 +3057,7 @@ mod tests {
             auto_label: None,
             auto_draft: None,
             content_rev: 0,
+            unsubscribe: None,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["muted"], true);

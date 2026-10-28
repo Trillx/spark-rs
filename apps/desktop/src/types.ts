@@ -127,6 +127,11 @@ export interface Message {
    * it moves. None is 0.
    */
   contentRev?: number;
+  /**
+   * Whether its List-Unsubscribe header gives a way to leave the list; absent when that isn't known (mail stored
+   * before it was kept, or from Microsoft 365). See `canUnsubscribe`.
+   */
+  unsubscribe?: boolean;
 }
 
 /** Spark's Auto-Labels (AutoLabel in the store's automation.rs). */

@@ -1418,6 +1418,8 @@ fn version_27_databases_keep_their_queue_and_give_no_outbox_id_twice() {
                      draft_message INTEGER REFERENCES messages(id) ON DELETE SET NULL
                  );
                  PRAGMA foreign_keys = ON;
+                 DROP TRIGGER temp.log_message_changed;
+                 ALTER TABLE messages DROP COLUMN unsubscribe;
                  PRAGMA user_version = 27;",
             )
             .unwrap();
@@ -1443,7 +1445,7 @@ fn version_27_databases_keep_their_queue_and_give_no_outbox_id_twice() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 29);
     let queued: Vec<_> = store
         .outbox_sends()
         .unwrap()
@@ -4311,6 +4313,7 @@ fn version_21_databases_index_pending_and_snoozed_mail() {
              -- This opening's change log watches it.
              DROP TRIGGER temp.log_message_changed;
              ALTER TABLE messages DROP COLUMN content_rev;
+             ALTER TABLE messages DROP COLUMN unsubscribe;
              PRAGMA user_version = 21;",
         )
         .unwrap();
@@ -4367,6 +4370,7 @@ fn version_25_databases_have_every_body() {
                 "ALTER TABLE messages DROP COLUMN body_missing;
                  DROP TRIGGER temp.log_message_changed;
                  ALTER TABLE messages DROP COLUMN content_rev;
+                 ALTER TABLE messages DROP COLUMN unsubscribe;
                  PRAGMA user_version = 25;",
             )
             .unwrap();
@@ -4837,4 +4841,36 @@ fn graph_mail_keyed_anew_is_stored_once() {
     assert!(!store.rekey_remote(account_id, busy, None).unwrap());
     assert!(store.message(busy).unwrap().is_some());
     assert!(store.has_remote_id(account_id, "rest-4").unwrap());
+}
+
+#[test]
+fn unsubscribing_is_kept_as_fetches_read_it() {
+    let (mut store, account) = store_with_account();
+    let newsletter = || incoming(account, 1, "news@x.com");
+    // Stored before it was kept: not known.
+    let id = new_id(store.add_incoming(&newsletter(), false).unwrap());
+    assert_eq!(store.message(id).unwrap().unwrap().unsubscribe, None);
+    let (_, mark) = store.messages_marked().unwrap();
+    // A fetch that read its header says, and the list hears of it.
+    let read = Incoming {
+        unsubscribe: Some(true),
+        ..newsletter()
+    };
+    store.add_incoming(&read, false).unwrap();
+    assert_eq!(store.message(id).unwrap().unwrap().unsubscribe, Some(true));
+    let changes = store.message_changes(&mark.unwrap()).unwrap().unwrap();
+    assert_eq!(changes.messages.len(), 1);
+    assert_eq!(changes.messages[0].unsubscribe, Some(true));
+    // One that didn't read it (flags only) leaves it be.
+    store.add_incoming(&newsletter(), false).unwrap();
+    assert_eq!(store.message(id).unwrap().unwrap().unsubscribe, Some(true));
+    let plain = Incoming {
+        unsubscribe: Some(false),
+        ..incoming(account, 2, "ana@x.com")
+    };
+    let other = new_id(store.add_incoming(&plain, false).unwrap());
+    assert_eq!(
+        store.message(other).unwrap().unwrap().unsubscribe,
+        Some(false)
+    );
 }

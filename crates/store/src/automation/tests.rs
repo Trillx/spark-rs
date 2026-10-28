@@ -1193,6 +1193,7 @@ fn version_23_databases_gain_the_reply_queue() {
                  ALTER TABLE messages DROP COLUMN body_missing;
                  DROP TRIGGER temp.log_message_changed;
                  ALTER TABLE messages DROP COLUMN content_rev;
+                 ALTER TABLE messages DROP COLUMN unsubscribe;
                  PRAGMA user_version = 23;",
             )
             .unwrap();
@@ -1340,6 +1341,7 @@ fn version_24_databases_gain_server_versions() {
              ALTER TABLE messages DROP COLUMN body_missing;
              DROP TRIGGER temp.log_message_changed;
              ALTER TABLE messages DROP COLUMN content_rev;
+             ALTER TABLE messages DROP COLUMN unsubscribe;
              PRAGMA user_version = 24;",
         )
         .unwrap();

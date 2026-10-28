@@ -92,6 +92,7 @@ pub mod tests {
             auto_label: None,
             auto_draft: None,
             content_rev: 0,
+            unsubscribe: None,
         }
     }
 
