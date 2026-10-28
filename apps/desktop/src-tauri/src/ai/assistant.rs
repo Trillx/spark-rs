@@ -43,6 +43,9 @@ struct Run {
     run: u64,
     task: JoinHandle<()>,
     live: Arc<Live>,
+    /// A Stop has it: its own end mustn't free the chat before the Stop
+    /// has saved it.
+    stopping: bool,
 }
 
 /// What a running answer shares with the commands that stop it or decide
@@ -58,6 +61,10 @@ struct Live {
     /// The text of the model turn streaming now, which the model's own
     /// record of the chat doesn't have until the turn is whole.
     pending: Mutex<String>,
+    /// The answer as the first Stop saved it. Held while that Stop saves,
+    /// so another Stop waits for it and doesn't save again (by then the
+    /// chat may have a follow-up, or be deleted).
+    stopped_as: Mutex<Option<Answer>>,
 }
 
 impl Live {
@@ -67,6 +74,7 @@ impl Live {
             waiting: Mutex::default(),
             stopped: AtomicBool::new(false),
             pending: Mutex::default(),
+            stopped_as: Mutex::default(),
         }
     }
 
@@ -196,30 +204,48 @@ impl AssistantState {
     }
 
     /// Stops the answer being written in chat `id`, keeping what it did so far.
-    /// The run stays registered until the chat is sealed and saved, so a
-    /// second Stop waits for the same lock (and changes nothing), and a
-    /// follow-up isn't taken while the chat is still being written.
+    /// Stops the answer being written in chat `id`, keeping what it did so
+    /// far. The chat stays busy until it's sealed and saved, so a follow-up
+    /// isn't taken while it's still being written.
     fn stop(&self, id: &str) -> Option<Answer> {
-        let (run, live) = {
-            let runs = self.runs.lock().unwrap();
-            let run = runs.get(id)?;
-            run.task.abort();
-            (run.run, run.live.clone())
-        };
+        let (run, live) = self.claim(id)?;
+        Some(self.stop_claimed(id, run, &live))
+    }
+
+    /// Marks the run as stopping and ends its task.
+    fn claim(&self, id: &str) -> Option<(u64, Arc<Live>)> {
+        let mut runs = self.runs.lock().unwrap();
+        let run = runs.get_mut(id)?;
+        run.stopping = true;
+        run.task.abort();
+        Some((run.run, run.live.clone()))
+    }
+
+    /// Seals and saves the chat (only the first Stop does), then frees it.
+    fn stop_claimed(&self, id: &str, run: u64, live: &Live) -> Answer {
+        let mut stopped_as = live.stopped_as.lock().unwrap();
+        if let Some(answer) = &*stopped_as {
+            return answer.clone();
+        }
         let answer = {
             let mut session = live.stop();
             session.updated = now_ms();
             let _ = self.sessions.save(&session);
             session.answer().clone()
         };
-        self.finished(id, run);
-        Some(answer)
-    }
-
-    /// Drops a finished run, unless a newer one replaced it.
-    fn finished(&self, id: &str, run: u64) {
+        *stopped_as = Some(answer.clone());
         let mut runs = self.runs.lock().unwrap();
         if runs.get(id).is_some_and(|r| r.run == run) {
+            runs.remove(id);
+        }
+        answer
+    }
+
+    /// Drops a run that ended on its own, unless a newer one replaced it
+    /// or a Stop is still saving it.
+    fn finished(&self, id: &str, run: u64) {
+        let mut runs = self.runs.lock().unwrap();
+        if runs.get(id).is_some_and(|r| r.run == run && !r.stopping) {
             runs.remove(id);
         }
     }
@@ -324,7 +350,15 @@ pub async fn assistant_send(
             }
         }
     });
-    runs.insert(id.clone(), Run { run, task, live });
+    runs.insert(
+        id.clone(),
+        Run {
+            run,
+            task,
+            live,
+            stopping: false,
+        },
+    );
     Ok(Some(id))
 }
 
@@ -1185,18 +1219,7 @@ mod tests {
 
     #[test]
     fn a_chat_stays_running_until_its_stop_has_saved_it() {
-        let dir = std::env::temp_dir().join(format!("spark-assistant-stop-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = AssistantState::new(dir.clone());
-        let live = Arc::new(live("Archive it"));
-        state.runs.lock().unwrap().insert(
-            "c1".into(),
-            Run {
-                run: 7,
-                task: tauri::async_runtime::spawn(async {}),
-                live: live.clone(),
-            },
-        );
+        let (state, live, dir) = running_chat("stop");
         // An approved change holds the chat's lock while the mail store is busy.
         let busy = live.session.lock().unwrap();
         std::thread::scope(|s| {
@@ -1216,6 +1239,63 @@ mod tests {
             state.sessions.load("c1").unwrap().answer().status,
             Status::Stopped
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A state with chat c1 running as run 7.
+    fn running_chat(name: &str) -> (AssistantState, Arc<Live>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("spark-assistant-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = AssistantState::new(dir.clone());
+        let live = Arc::new(live("Archive it"));
+        state.runs.lock().unwrap().insert(
+            "c1".into(),
+            Run {
+                run: 7,
+                task: tauri::async_runtime::spawn(async {}),
+                live: live.clone(),
+                stopping: false,
+            },
+        );
+        (state, live, dir)
+    }
+
+    #[test]
+    fn a_late_second_stop_leaves_a_follow_up_alone() {
+        let (state, live, dir) = running_chat("late-stop");
+        // Two Stops get the chat; the second is held up until after a follow-up.
+        let (run, claimed) = state.claim("c1").unwrap();
+        assert!(state.stop("c1").is_some());
+        assert!(state.running("c1").is_none());
+        let mut follow_up = state.sessions.load("c1").unwrap();
+        follow_up.entries.push(Entry::User {
+            text: "And the other one?".into(),
+        });
+        state.sessions.save(&follow_up).unwrap();
+        let answer = state.stop_claimed("c1", run, &claimed);
+        assert_eq!(answer.status, Status::Stopped);
+        assert_eq!(
+            state.sessions.load("c1").unwrap().entries,
+            follow_up.entries
+        );
+        drop(live);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_answer_ending_as_it_is_stopped_keeps_the_chat_busy_until_saved() {
+        let (state, live, dir) = running_chat("end-on-stop");
+        let (run, claimed) = state.claim("c1").unwrap();
+        // The task was past its last wait: it ends on its own.
+        state.finished("c1", run);
+        assert!(
+            state.running("c1").is_some(),
+            "a follow-up must wait for the stop"
+        );
+        state.stop_claimed("c1", run, &claimed);
+        assert!(state.running("c1").is_none());
+        drop(live);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
