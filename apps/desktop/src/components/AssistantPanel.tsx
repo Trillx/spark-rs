@@ -238,7 +238,8 @@ export default function AssistantPanel({
       aria-label="AI Assistant"
       data-assistant
       hidden={!open}
-      className={`${open ? "flex" : "hidden"} assistant-in absolute bottom-2 right-2 top-8 z-30 w-[364px] flex-col overflow-hidden rounded-[20px] border border-hairline bg-base-100 shadow-popup`}
+      // Over the Home Screen's email (z-40) when it floats over the mail, under the composer (z-50).
+      className={`${open ? "flex" : "hidden"} assistant-in absolute bottom-2 right-2 top-8 z-[45] w-[364px] flex-col overflow-hidden rounded-[20px] border border-hairline bg-base-100 shadow-popup`}
       onKeyDown={(e) => {
         if (e.key !== "Escape") return;
         e.stopPropagation();

@@ -658,8 +658,11 @@ export default function App() {
   const windowWidth = useWindowWidth();
   const sidebarWidth = layout.width;
   const sidebarSpace = sidebarMode === "locked" ? sidebarWidth : SIDEBAR_RAIL;
-  // The assistant's panel takes its room from the mail beside it.
-  const assistantSpace = assistantOpen && THREAD_WINDOW === null ? ASSISTANT_SPACE : 0;
+  // The assistant's panel takes its room from the mail beside it when that leaves the mail as much
+  // room as a reader needs, as in Spark; in a narrower window it floats over the mail instead.
+  const assistantDocked =
+    assistantOpen && THREAD_WINDOW === null && windowWidth - sidebarSpace - ASSISTANT_SPACE >= READER_MIN;
+  const assistantSpace = assistantDocked ? ASSISTANT_SPACE : 0;
   const container = windowWidth - sidebarSpace - assistantSpace;
   const listWidthUsed = effectiveListWidth(listWidth, container);
   const wide = useTwoColumns(container, listWidthUsed);
