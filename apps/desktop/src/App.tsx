@@ -481,6 +481,8 @@ const HOME_TICK_MS = 15_000;
 /** Spark waits this long after a window loses focus before calling spark-rs inactive. */
 const BLUR_SETTLE_MS = 150;
 /** On the Home Screen, with no email open over it, only these shortcuts act. */
+/** The floating composer goes beside the assistant's panel only if it can be this wide there. */
+const COMPOSER_MIN_BESIDE = 440;
 const HOME_KEYS = new Set<ActionId>(["compose", "search", "sidebar", "command", "settings", "close", "assistant"]);
 /** Shortcuts that move around the list, which the Home Screen hides. */
 const LIST_KEYS = new Set<ActionId>([
@@ -1936,13 +1938,17 @@ export default function App() {
 
   const closeSearch = () => changeView({ search: null }, true);
 
-  /** Esc: the folder picker and sidebar overlay, then the selection, then the thread, then a sub-list, then search. */
+  /**
+   * Esc: the folder picker and sidebar overlay, then the selection, then the thread, then a sub-list, then
+   * search, then the assistant's panel.
+   */
   function closeTopmost() {
     if (pickerOpen || sidebarMode === "overlay") closeSidebar();
     else if (pickedRows.length) clearPicked();
     else if (openId !== null) setOpenId(null);
     else if (view.sub) changeView({ sub: null });
     else if (searching) closeSearch();
+    else if (assistantOpen) setAssistantOpen(false);
   }
 
   function onSearchKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
@@ -3600,7 +3606,8 @@ export default function App() {
         return run(zooming);
       }
       if (palette || settingsPage || isInsideOverlay(e.target)) return;
-      const typing = isTypingTarget(e.target);
+      // The assistant's panel is like a text field: its buttons don't take mail shortcuts.
+      const typing = isTypingTarget(e.target) || (e.target instanceof Element && e.target.closest("[data-assistant]") !== null);
       if (isModShortcut(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "z") {
         if (!typing && toast?.undo && !toast.actionLabel) {
           e.preventDefault();
@@ -4319,6 +4326,16 @@ export default function App() {
     );
   }
 
+  /**
+   * The floating composer moves left of the assistant's panel when there's room for it there, and
+   * goes over the panel when there isn't.
+   */
+  const besideAssistant = windowWidth - assistantSpace - 32;
+  const composerBesideAssistant =
+    assistantSpace && besideAssistant >= COMPOSER_MIN_BESIDE
+      ? { right: assistantSpace + 16, maxWidth: besideAssistant }
+      : undefined;
+
   /** Opens the assistant's panel, asking `question` if there is one. */
   function openAssistant(question?: string) {
     setAssistantOpen(true);
@@ -4610,7 +4627,7 @@ export default function App() {
             saved={draftSaved === draftKey(draft)}
             full={composerFull}
             fullStyle={{ left: readerLeft, right: assistantSpace }}
-            floatStyle={assistantSpace ? { right: assistantSpace + 16 } : undefined}
+            floatStyle={composerBesideAssistant}
             onChange={(patch) =>
               setDraft(
                 (d) =>

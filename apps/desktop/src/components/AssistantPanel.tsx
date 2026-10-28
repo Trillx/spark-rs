@@ -191,7 +191,9 @@ export default function AssistantPanel({
 
   async function restore(id: string) {
     setHistoryOpen(false);
-    if (working && chat.id !== id) await stop();
+    // The chat on screen is already here, with its answer still arriving.
+    if (id === chat.id) return inputRef.current?.focus();
+    if (working) await stop();
     const token = ++run.current;
     try {
       const view = await assistantSession(id);
@@ -231,6 +233,7 @@ export default function AssistantPanel({
   return (
     <aside
       aria-label="AI Assistant"
+      data-assistant
       hidden={!open}
       className={`${open ? "flex" : "hidden"} assistant-in absolute bottom-2 right-2 top-8 z-30 w-[364px] flex-col overflow-hidden rounded-[20px] border border-hairline bg-base-100 shadow-popup`}
       onKeyDown={(e) => {
@@ -476,18 +479,22 @@ function AnswerView({
 }) {
   const text = answer.blocks.map((b) => (b.type === "text" ? b.text : "")).join("");
   const complete = answer.status !== "working";
-  const [shown, setShown] = useState(animate ? 0 : text.length);
+  const [shown, setShown] = useState(0);
   // A refusal takes back what streamed.
-  const visible = Math.min(shown, text.length);
+  const visible = animate ? Math.min(shown, text.length) : text.length;
+  const done = complete && visible >= text.length;
+  // A steady tick that reads the latest text, so text arriving faster than
+  // the tick can't keep putting it off.
+  const latest = useRef({ text, complete });
+  latest.current = { text, complete };
   useEffect(() => {
-    if (!animate) {
-      setShown(text.length);
-      return;
-    }
-    if (visible >= text.length) return;
-    const timer = window.setTimeout(() => setShown(revealTo(text, visible, PACE_CHARS, complete)), PACE_MS);
-    return () => window.clearTimeout(timer);
-  }, [animate, text, visible, complete]);
+    if (!animate || done) return;
+    const timer = window.setInterval(() => {
+      const { text, complete } = latest.current;
+      setShown((n) => (n >= text.length ? n : revealTo(text, n, PACE_CHARS, complete)));
+    }, PACE_MS);
+    return () => window.clearInterval(timer);
+  }, [animate, done]);
   useLayoutEffect(onGrow, [visible, answer.blocks.length, answer.status]);
   const [quiet, setQuiet] = useState(true);
   useEffect(() => {
@@ -694,7 +701,7 @@ function Footer({
       data-tip="Copy"
       aria-label="Copy"
       className="grid size-6 place-items-center rounded-md text-secondary/70 hover:bg-secondary/10 hover:text-secondary"
-      onClick={() => void navigator.clipboard.writeText(plainAnswer(text)).then(onCopied)}
+      onClick={() => void navigator.clipboard.writeText(plainAnswer(text, sources.map((s) => s.id))).then(onCopied)}
     >
       <Copy size={14} />
     </button>

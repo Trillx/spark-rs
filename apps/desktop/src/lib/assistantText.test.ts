@@ -54,7 +54,10 @@ test("Unclosed marks and HTML stay text", () => {
 test("Citations number the sources in first-cited order", () => {
   const text = "Due Friday [[7]]. Also [[3, 7]] and [[3]].";
   assert.deepEqual(citedIds(text), [7, 3]);
-  assert.equal(plainAnswer("**Due** Friday [[7]]. Also [[3,7]]."), "Due Friday [1]. Also [2][1].");
+  assert.equal(plainAnswer("**Due** Friday [[7]]. Also [[3,7]].", [7, 3]), "Due Friday [1]. Also [2][1].");
+  // Numbered as the chips are: an email the panel doesn't know has no chip and no number.
+  assert.equal(plainAnswer("Unknown [[999]], real [[1]].", [1]), "Unknown, real [1].");
+  assert.equal(plainAnswer("Bonjour ! Prêt [[1]] ?", [1]), "Bonjour ! Prêt [1] ?");
   assert.deepEqual(inline("[[3, 7]]"), [
     { kind: "cite", id: 3 },
     { kind: "cite", id: 7 },

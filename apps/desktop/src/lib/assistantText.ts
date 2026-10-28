@@ -185,16 +185,22 @@ export function citedIds(text: string): number[] {
   return ids;
 }
 
-/** Plain text for the clipboard: Markdown marks gone, citations as [n]. */
-export function plainAnswer(text: string): string {
-  const order = citedIds(text);
+/**
+ * Plain text for the clipboard: Markdown marks gone, citations numbered as the chips are, by
+ * `order` (the cited emails the panel knows), and ones it doesn't know left out.
+ */
+export function plainAnswer(text: string, order: number[]): string {
   return text
-    .replace(CITE, (_, ids: string) =>
-      ids
+    .replace(/(\s*)\[\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]\]/g, (_, space: string, ids: string) => {
+      const numbers = ids
         .split(",")
-        .map((id) => `[${order.indexOf(Number(id.trim())) + 1}]`)
-        .join(""),
-    )
+        .map((id) => order.indexOf(Number(id.trim())) + 1)
+        .filter((n) => n > 0)
+        .map((n) => `[${n}]`)
+        .join("");
+      // A citation left out takes the space before it along.
+      return numbers ? space + numbers : "";
+    })
     .replace(/(\*\*|__)(.+?)\1/g, "$2")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, "$1 ($2)")
