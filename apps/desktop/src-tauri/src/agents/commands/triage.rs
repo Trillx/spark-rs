@@ -546,11 +546,37 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
             m.id
         )));
     }
-    let accounts: Vec<i64> = named.iter().map(|m| m.account_id).collect();
+    // A reminder can belong to another account than the email it's on
+    // (a reply sent from one account to another's email): it needs triage
+    // in its own account too.
+    let mut accounts: Vec<i64> = named.iter().map(|m| m.account_id).collect();
+    {
+        let store = env.store();
+        for m in named {
+            for id in store.reminders_on(m.id).map_err(db)? {
+                accounts.extend(store.reminder(id).map_err(db)?.map(|r| r.account_id));
+            }
+        }
+    }
     let undo = env.guarded(&accounts, Access::Triage, "set reminders", |store| {
         let mut undo = Vec::new();
         for m in named {
+            let existing = store.reminders_on(m.id).map_err(db)?;
             match at {
+                // One already on it moves to the new time.
+                Some(at) if !existing.is_empty() => {
+                    for id in existing {
+                        let Some(r) = store.reminder(id).map_err(db)? else {
+                            continue;
+                        };
+                        store.set_reminder(id, Some(at)).map_err(db)?;
+                        undo.push(Step::ReminderMoved {
+                            id,
+                            from: r.remind_at,
+                            to: at,
+                        });
+                    }
+                }
                 Some(at) => {
                     let header = store.headers(m.id).map_err(db)?.and_then(|h| h.message_id);
                     let id = store
@@ -568,7 +594,7 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
                     undo.push(Step::Reminder { id, at: Some(at) });
                 }
                 None => {
-                    for id in store.reminders_on(m.id).map_err(db)? {
+                    for id in existing {
                         if let Some(reminder) = store.remove_reminder(id).map_err(db)? {
                             undo.push(Step::ReminderCleared { reminder });
                         }
@@ -795,7 +821,8 @@ async fn sendable(env: &Env<'_>, id: i64, at: Option<i64>) -> Result<Sending, Fa
         )));
     }
     draft.draft_id = Some(id);
-    draft.send_at = at.unwrap_or_else(|| now_ms() + SEND_DELAY_MS);
+    // A send now gets its undo window when it's queued (`send`).
+    draft.send_at = at.unwrap_or_default();
     draft.send_later = at.map(|at| SendLater {
         key: "custom".into(),
         at,
@@ -879,8 +906,12 @@ async fn send(env: &Env<'_>, a: &Args<'_>, ids: &[String]) -> Done {
             Sending::Draft {
                 id: draft_id,
                 account,
-                draft,
+                mut draft,
             } => {
+                // The undo window starts now, after every draft was checked.
+                if at.is_none() {
+                    draft.send_at = now_ms() + SEND_DELAY_MS;
+                }
                 let queued = env.prefs.with_agent_access(|grants| {
                     refuse(env.agent, grants, &account, Access::Send, "send mail")?;
                     mailbox::queue_live(env.engine, &draft).map_err(Fail::Error)
@@ -1022,13 +1053,18 @@ async fn unschedule(env: &Env<'_>, ids: &[String]) -> Done {
 fn visible_people(env: &Env) -> Result<HashSet<String>, Fail> {
     let readable: HashSet<i64> = env.readable()?.iter().map(|(a, _)| a.id).collect();
     let mut people = HashSet::new();
-    for m in env.store().messages().map_err(db)? {
+    let store = env.store();
+    for m in store.messages().map_err(db)? {
         if readable.contains(&m.account_id) {
             people.insert(m.from_address.to_lowercase());
             for to in &m.to {
                 people.insert(super::compose::address_of(to).to_lowercase());
             }
         }
+    }
+    let accounts: Vec<i64> = readable.into_iter().collect();
+    for copied in store.copied_in(&accounts).map_err(db)? {
+        people.insert(super::compose::address_of(&copied).to_lowercase());
     }
     Ok(people)
 }

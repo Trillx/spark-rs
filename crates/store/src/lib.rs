@@ -1329,6 +1329,26 @@ impl Store {
             .optional()
     }
 
+    /// The Cc and Bcc entries of the email in `accounts`, as stored
+    /// (display strings): the people copied on it.
+    pub fn copied_in(&self, accounts: &[i64]) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT account_id, cc_list, bcc_list FROM messages")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (account, cc, bcc) = row?;
+            if accounts.contains(&account) {
+                out.extend(from_json(&cc));
+                out.extend(from_json(&bcc));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn content(&self, id: i64) -> Result<Option<Content>> {
         self.conn
             .query_row(

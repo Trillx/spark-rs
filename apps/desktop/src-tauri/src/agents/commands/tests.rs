@@ -262,7 +262,10 @@ fn emails_list_conversations_newest_first_with_filters() {
     );
     assert_eq!(inbox["emails"][2]["messages"], 2);
     // The conversation's row is its newest email, with when the first came.
-    assert!(inbox["emails"][2]["first_date"].as_str().unwrap() < inbox["emails"][2]["date"].as_str().unwrap());
+    assert!(
+        inbox["emails"][2]["first_date"].as_str().unwrap()
+            < inbox["emails"][2]["date"].as_str().unwrap()
+    );
     let work = f.ok(
         "emails",
         json!({ "folder": "me@work.com", "filter": "from:ana -category:newsletter" }),
@@ -928,4 +931,88 @@ fn a_draft_the_server_took_can_still_be_undone() {
     let out = f.ok("history", json!({ "undo": entry.to_string() }));
     assert_eq!(out["left_alone"], json!([]), "{out}");
     assert!(!f.engine.store().is_draft(draft).unwrap());
+}
+
+#[test]
+fn a_second_change_reminder_moves_the_first_and_undo_moves_it_back() {
+    let f = Fixture::new("reminder-move");
+    f.allow(f.work, Access::Triage);
+    let sent = add(&f, f.work, 40, "Me Myself", "me@work.com", "Offer", 60);
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [sent], "date": "2099-01-05" }),
+    );
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [sent], "date": "2099-01-12" }),
+    );
+    let store = f.engine.store();
+    let ids = store.reminders_on(sent).unwrap();
+    assert_eq!(ids.len(), 1, "moved, not added");
+    let first = store.reminder(ids[0]).unwrap().unwrap().remind_at;
+    drop(store);
+    assert_eq!(first, super::parse_time("2099-01-12", false).unwrap());
+    let moved = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    f.ok("history", json!({ "undo": moved.to_string() }));
+    let back = f
+        .engine
+        .store()
+        .reminder(ids[0])
+        .unwrap()
+        .unwrap()
+        .remind_at;
+    assert_eq!(back, super::parse_time("2099-01-05", false).unwrap());
+}
+
+#[test]
+fn people_only_copied_are_contacts_too() {
+    let f = Fixture::new("contacts-cc");
+    f.allow(f.work, Access::Read);
+    f.engine
+        .store()
+        .add_incoming(
+            &Incoming {
+                account_id: f.work,
+                mailbox: Some("INBOX".into()),
+                uid: Some(41),
+                from_name: "Ana Ruiz".into(),
+                from_address: "ana@parts.com".into(),
+                to: vec!["Me Myself <me@work.com>".into()],
+                cc: vec!["Carol Diaz <carol@parts.com>".into()],
+                subject: "Copied".into(),
+                date: now_ms() - 60_000,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    f.ok("contact", json!({ "email": "carol@parts.com" }));
+}
+
+#[test]
+fn undo_keeps_a_draft_whose_cc_changed() {
+    let f = Fixture::new("draft-cc-undo");
+    f.allow(f.work, Access::Triage);
+    let draft = f.ok(
+        "draft",
+        json!({ "to": ["bo@example.com"], "subject": "Hi", "body": "Hello" }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    let wrote = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let edited = f.ok(
+        "draft",
+        json!({ "edit": draft.to_string(), "cc": ["carol@example.com"] }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    let out = f.ok("history", json!({ "undo": wrote.to_string() }));
+    assert!(
+        f.engine.store().is_draft(edited).unwrap(),
+        "the edited draft stays: {out}"
+    );
 }

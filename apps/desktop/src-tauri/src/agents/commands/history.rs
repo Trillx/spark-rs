@@ -124,18 +124,28 @@ pub enum Step {
     ReminderCleared {
         reminder: RemovedReminder,
     },
+    /// A reminder the agent moved from one time to another.
+    ReminderMoved {
+        id: i64,
+        from: i64,
+        to: i64,
+    },
 }
 
 /// What a draft says, as a number that changes when it does: its subject,
-/// recipients and text (FNV-1a, which stays the same across builds).
+/// To, Cc, Bcc and text (FNV-1a, which stays the same across builds).
 pub fn draft_print(store: &Store, id: i64) -> spark_store::Result<u64> {
     let subject = store.message(id)?.map(|m| m.subject).unwrap_or_default();
-    let (to, text) = match store.content(id)? {
-        Some(c) => (c.to.join(","), c.text),
-        None => (String::new(), String::new()),
+    let fields = match store.content(id)? {
+        Some(c) => [c.to.join(","), c.cc.join(","), c.bcc.join(","), c.text],
+        None => Default::default(),
     };
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in [subject, to, text].join("\u{0}").bytes() {
+    for byte in [vec![subject], fields.to_vec()]
+        .concat()
+        .join("\u{0}")
+        .bytes()
+    {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -572,7 +582,7 @@ fn step_accounts(store: &Store, step: &Step) -> spark_store::Result<Vec<i64>> {
             .map(|m| m.account_id)
             .into_iter()
             .collect(),
-        Step::Reminder { id, .. } => store
+        Step::Reminder { id, .. } | Step::ReminderMoved { id, .. } => store
             .reminder(*id)?
             .map(|r| r.account_id)
             .into_iter()
@@ -712,6 +722,13 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
                 return Ok(Some(format!("reminder {} couldn't come back", reminder.id)));
             }
         }
+        Step::ReminderMoved { id, from, to } => match store.reminder(*id)? {
+            None => return Ok(Some(format!("reminder {id} is gone"))),
+            Some(r) if r.due || r.remind_at != *to => {
+                return Ok(Some(format!("reminder {id} changed since")));
+            }
+            Some(_) => store.set_reminder(*id, Some(*from))?,
+        },
     }
     Ok(None)
 }
