@@ -6,6 +6,10 @@
 
 Issues live on git.cafe (`michael/spark-rs`) and are managed with the `cafe` CLI. See `docs/agents/issue-tracker.md`.
 
+### Milestones
+
+The roadmap is git.cafe's milestones, M1 onward (`cafe milestone list`). Work toward one names it: a `Milestone: M7` line in commit bodies and issue bodies. See `docs/agents/issue-tracker.md`.
+
 ### Triage labels
 
 The five default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.

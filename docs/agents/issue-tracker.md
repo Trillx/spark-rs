@@ -15,6 +15,16 @@ On Windows, run `cafe` from PowerShell: its shim fails under Git Bash and other 
 
 git.cafe issues also have a workflow state (`triage`, `backlog`, `unstarted`, `started`, `completed`, `canceled`). Triage roles are tracked with the labels in `triage-labels.md`; leave the workflow state at its default except when closing.
 
+## Milestones
+
+The roadmap lives as git.cafe milestones, titled `M<n>: <name>` (M3b sits between M3 and M4; "Later" holds what's blocked or put off). Each one's description lists what it holds. Read them with `cafe milestone list` and `cafe milestone view <number>`; the milestone number isn't the M number past M9.
+
+- **Tag work**: a `Milestone: M7` line at the end of a commit body, before its trailers, and at the top of an issue body. `cafe issue create` has no milestone flag, so that line is the link.
+- **Plan**: new roadmap work goes into the milestone it belongs to (`cafe milestone edit <number> --description ...`), or into a new milestone created with `cafe milestone create "M10: <name>" --description ...`.
+- **Ship**: when a milestone's work is on main, put "Shipped in <commits>." at the top of its description, end it with what's not done, then `cafe milestone close <number>`.
+
+The repo is public: milestone descriptions name features, never Spark research.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
