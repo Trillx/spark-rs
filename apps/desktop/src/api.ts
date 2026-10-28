@@ -14,6 +14,7 @@ import type {
   Repeat,
   Contact,
   AgentAccess,
+  AgentActivity,
   AgentSendingEvent,
   AgentsView,
   AccountView,
@@ -1145,6 +1146,18 @@ export function getAgents(): Promise<AgentsView> {
 
 export function setAgentAccess(account: AccountId, access: AgentAccess): Promise<AgentsView> {
   if (isTauri()) return invoke("set_agent_access", { account, access });
+  return Promise.reject(DESKTOP_ONLY);
+}
+
+/** What agents did lately, newest first: what they changed, or with `reads` everything. */
+export function getAgentActivity(reads: boolean): Promise<AgentActivity[]> {
+  if (isTauri()) return invoke("agent_activity", { reads });
+  return Promise.resolve([]);
+}
+
+/** Puts back what an agent changed; resolves to what was left alone because it changed since. */
+export function undoAgentActivity(id: number): Promise<string[]> {
+  if (isTauri()) return invoke("undo_agent_activity", { id });
   return Promise.reject(DESKTOP_ONLY);
 }
 

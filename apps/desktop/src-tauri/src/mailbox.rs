@@ -1615,7 +1615,7 @@ pub async fn send_message(mailbox: State<'_, Mailbox>, draft: Draft) -> Result<i
 }
 
 /// Queues a real account's draft, its files read from this computer.
-fn queue_live(engine: &spark_mail::Engine, draft: &Draft) -> Result<i64, String> {
+pub(crate) fn queue_live(engine: &spark_mail::Engine, draft: &Draft) -> Result<i64, String> {
     queue_reading(engine, draft, |path| std::fs::read(path))
 }
 
@@ -2162,7 +2162,12 @@ pub fn discard_draft(mailbox: State<'_, Mailbox>, id: i64) -> Result<(), String>
         mailbox.demo.discard_draft(id);
         return Ok(());
     }
-    discard_live(&mailbox.live.engine, id)?;
+    discard_saved_draft(&mailbox.live.engine, id)
+}
+
+/// Deletes a real account's saved draft, as Discard does.
+pub(crate) fn discard_saved_draft(engine: &spark_mail::Engine, id: i64) -> Result<(), String> {
+    discard_live(engine, id)?;
     SAVED_FILES.forget(id);
     Ok(())
 }

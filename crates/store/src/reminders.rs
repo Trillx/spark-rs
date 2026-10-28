@@ -137,6 +137,19 @@ impl Store {
         Ok(())
     }
 
+    /// The reminders to come or waiting on stored email `message`: one set
+    /// on it when it was sent, or the one it came back as.
+    pub fn reminders_on(&self, message: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT r.id FROM reminders r JOIN messages m ON m.id = ?1
+             WHERE r.state IN ('pending', 'due')
+               AND (r.message_row = m.id
+                    OR (r.account_id = m.account_id AND m.message_id IS NOT NULL
+                        AND trim(r.message_id, '<>') = trim(m.message_id, '<>')))",
+        )?;
+        stmt.query_map([message], |r| r.get(0))?.collect()
+    }
+
     /// Done on a reminder in the Inbox, or (`false`) its undo.
     pub fn finish_reminder(&self, id: i64, done: bool) -> Result<()> {
         self.conn.execute(

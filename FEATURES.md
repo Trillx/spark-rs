@@ -54,7 +54,7 @@ Last full check: 2026-10-26.
 | Home Screen | ✅ | Opens at launch and after 15 minutes in the background (adjustable), with what came in while you were away, a Priority, People or All preview, and Email Focus times with reminders. Wallpapers are gradients, not photos |
 | CRM Integrations | ❌ | |
 | Link Sharing | ➖ | Needs a server to host the shared email |
-| Spark CLI (Agent access) | ✅ | `spark-cli` is an MCP server for Claude Code, Codex and other agents, allowed to Read, Triage or Send per account |
+| Spark CLI (Agent access) | 🟡 | `spark-cli` has the Spark CLI's commands and flags, as a command line and an MCP server, with Read, Triage or Send per account, a skill, and an activity log with Undo. Spark's team, shared-inbox and meeting-notes commands have nothing behind them; agents can't add a label without moving the email or see other people's free time. Not yet tried with a real account |
 
 ## Calendars and Meetings
 

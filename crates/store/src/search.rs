@@ -129,6 +129,22 @@ impl Store {
     }
 }
 
+impl Store {
+    /// The ids of the messages `search` finds, best match first by FTS5's
+    /// bm25, where words in the subject and the sender count most.
+    pub fn search_ranked(&self, text: &str) -> Result<Vec<i64>> {
+        let Some(query) = fts_query(text) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1
+               AND rowid NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)
+             ORDER BY bm25(messages_fts, 4.0, 4.0, 2.0, 1.0, 6.0, 1.0)",
+        )?;
+        stmt.query_map([query], |r| r.get(0))?.collect()
+    }
+}
+
 /// `Store::search_ids` for the FTS query `?1`: what `search` asks, but only
 /// the ids, unsorted.
 pub(crate) const SEARCH_IDS: &str = "SELECT id FROM messages

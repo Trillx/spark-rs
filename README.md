@@ -70,8 +70,10 @@ Created in [T3 Code](https://t3.codes).
   meetings, with Join for Teams, Zoom and Meet calls.
 - **Search.** A full-text index on your computer answers as you type, and the
   servers are searched too, for mail that isn't downloaded yet.
-- **Agents.** Claude Code, Codex and other MCP clients can read, triage or
-  send your mail through `spark-cli`, as far as you allow for each account.
+- **Agents.** Claude Code, Codex and other agents can read, triage, draft
+  and send your mail and use your calendar through `spark-cli`, with the
+  Spark CLI's commands, as far as you allow for each account, and you can
+  undo what they changed.
 - **Native on Windows.** Builds for ARM and x64, about 12 MB to download, with
   the tray, notifications, and drafts that save offline. Passwords and keys
   stay in Windows Credential Manager.
@@ -517,25 +519,45 @@ policy before using AI on work mail.
 ## AI agents
 
 Agents on this computer, such as Claude Code, Codex and Hermes, can work
-with your mail through `spark-cli`, which they run as an MCP server
-(`spark-cli mcp`). They see nothing until you choose what they may do in each
+with your mail through `spark-cli`. Its commands follow the Spark CLI's
+names and flags, so agents and skills written for Spark find their way:
+
+```bash
+spark-cli emails --filter "category:priority is:unread"
+spark-cli search "bracket price"
+spark-cli thread 1114
+spark-cli draft --reply-to 1114 --body "Thanks, that works."
+spark-cli action archive 1114 1120
+spark-cli events --week
+spark-cli history
+```
+
+Add `--json` to any command for JSON. Agents can also run it as an MCP
+server (`spark-cli mcp`), where each command is a tool, and
+`spark-cli skill --install <folder>` writes a skill that teaches an agent
+the commands. Agents see nothing until you choose what they may do in each
 account under Settings → Agents:
 
-- **Read**: list, search and read mail.
-- **Triage**: also mark mail Done, read, pinned, set aside, snoozed or deleted.
-  Changes reach the server after the usual undo window. With triage in every
-  account, agents can also accept or block senders and domains.
-- **Send**: also send email as you. spark-rs holds each one for 30 seconds
-  and shows it with Undo (or a notification while the window is hidden).
+- **Read**: list, search and read mail and attachments, and see the
+  calendar, contacts and templates.
+- **Triage**: also write drafts, archive, pin, snooze, move or delete mail,
+  change a sender's category or Priority, and (with triage in every
+  account) accept or block senders and domains. Changes reach the server
+  after the usual undo window.
+- **Send**: also send drafts as you, schedule them, and make, change or
+  answer calendar events. spark-rs holds each email for 30 seconds and
+  shows it with Undo (or a notification while the window is hidden).
 
-The same page has the command that connects each agent, for example
+Settings → Agents also lists what agents did, kept on your computer for 30
+days, with Undo for what they changed (`spark-cli history undo <id>` does
+the same). The page has the command that connects each agent, for example
 `claude mcp add --scope user spark-rs -- "<path>\spark-cli.exe" mcp`.
 `spark-cli` reaches the running app over a loopback port with a token that
 only your Windows account can read, and starts spark-rs in the background if
-it isn't running. From a shell, `spark-cli status`, `spark-cli tools` and
-`spark-cli call <tool> '<json>'` do the same. Emails are written by other
-people and can contain text aimed at agents, so allow sending only if you
-trust the agents you use.
+it isn't running. `spark-cli status` says what agents may do. Spark's team,
+shared-inbox and meeting-notes commands have nothing behind them here.
+Emails are written by other people and can contain text aimed at agents, so
+allow sending only if you trust the agents you use.
 
 ## Layout
 
@@ -544,7 +566,7 @@ crates/store              SQLite storage: accounts, messages, folders, outbox, d
 crates/mail               IMAP/SMTP and Microsoft Graph: sync, sending, Microsoft sign-in
 crates/ai                 bring-your-own-key AI client (Anthropic, OpenAI-compatible)
 crates/agent              how spark-cli reaches the running app (loopback port + token)
-apps/cli                  spark-cli: MCP server for AI agents, plus headless dev checks
+apps/cli                  spark-cli: the command line and MCP server for AI agents, plus headless dev checks
 apps/desktop              desktop app UI: React + Tailwind + daisyUI (Vite)
 apps/desktop/src-tauri    desktop app shell (Tauri 2): accounts, sync workers, demo mailbox
 tools/cross               Docker image for building Windows binaries on Linux

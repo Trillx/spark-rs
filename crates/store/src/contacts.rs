@@ -130,6 +130,17 @@ impl Store {
         self.with_people(|people| people.suggest(&words, &turned_down, now, limit))
     }
 
+    /// The people the user writes to most, then the people who write to
+    /// them, best first: `suggest_contacts` with nothing typed yet.
+    pub fn top_contacts(&self, now: i64, limit: usize) -> Result<Vec<Contact>> {
+        let turned_down: HashSet<String> = self
+            .conn
+            .prepare_cached("SELECT lower(address) FROM contact_exceptions")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_>>()?;
+        self.with_people(|people| people.suggest(&[], &turned_down, now, limit))
+    }
+
     /// Stops suggesting `address`.
     pub fn never_suggest(&self, address: &str) -> Result<()> {
         self.conn.execute(

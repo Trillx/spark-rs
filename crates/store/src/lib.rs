@@ -1635,6 +1635,20 @@ impl Store {
         Ok(before.as_deref().map(parse_category))
     }
 
+    /// The category the user filed a sender's mail under (`set_sender_category`),
+    /// if they did.
+    pub fn sender_category(&self, address: &str) -> Result<Option<Category>> {
+        let category: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT category FROM sender_categories WHERE address = ?1",
+                [address],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(category.as_deref().map(parse_category))
+    }
+
     /// Mutes or unmutes a conversation (`Message::conversation`).
     pub fn set_muted(&self, conversation: i64, muted: bool) -> Result<()> {
         let sql = if muted {

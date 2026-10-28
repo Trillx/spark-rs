@@ -257,7 +257,7 @@ fn event_account(mailbox: &Mailbox, id: i64) -> Result<i64, String> {
 
 /// The user's time zone by Windows' name for it, which Graph takes; UTC
 /// where that isn't known.
-fn zone_name() -> String {
+pub(crate) fn zone_name() -> String {
     #[cfg(windows)]
     {
         let key = windows_registry::LOCAL_MACHINE
@@ -274,7 +274,7 @@ fn zone_name() -> String {
 }
 
 /// `ms` on the user's clock, without the zone: "2026-10-27T09:30:00".
-fn local_wall(ms: i64) -> String {
+pub(crate) fn local_wall(ms: i64) -> String {
     #[cfg(windows)]
     {
         use chrono::TimeZone;

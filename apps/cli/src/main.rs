@@ -1,4 +1,5 @@
 mod agent;
+mod commands;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -14,26 +15,42 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use commands::Mail;
+
 #[derive(Parser)]
 #[command(
     name = "spark-cli",
     version,
-    about = "Connects AI agents to spark-rs, and checks this machine"
+    about = "spark-rs for AI agents: read, triage and send your mail in the running spark-rs, \
+             within the access you give each account in Settings > Agents.",
+    after_help = "Agents: run `spark-cli skill` for how to use it, or `spark-cli mcp` as an MCP server."
 )]
 struct Cli {
+    /// Print the result as JSON instead of text. A failure prints
+    /// {"error": {"message": …}} and exits with 1.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve spark-rs's mail tools over MCP on stdin/stdout, for agents
+    #[command(flatten)]
+    Mail(Box<Mail>),
+    /// Print the skill that teaches agents spark-cli, or install it as
+    /// <dir>/use-spark-rs/SKILL.md.
+    Skill {
+        #[arg(long, value_name = "DIR")]
+        install: Option<PathBuf>,
+    },
+    /// Serve spark-rs's commands as MCP tools on stdin/stdout, for agents
     /// such as Claude Code and Codex. Starts spark-rs if it isn't running.
     Mcp,
-    /// List the tools agents get.
+    /// Print the MCP tool definitions as JSON.
     Tools,
-    /// Run one tool and print its result, e.g.
-    /// `spark-cli call list_messages '{"unread_only": true}'`.
+    /// Run one MCP tool and print its result, e.g.
+    /// `spark-cli call emails '{"filter": "is:unread"}'`.
     Call {
         tool: String,
         /// The tool's arguments as a JSON object.
@@ -78,9 +95,31 @@ enum AiProvider {
     Openai,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    match Cli::parse().command {
+fn main() {
+    let cli = Cli::parse();
+    let json = cli.json;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let result = runtime.block_on(run(cli));
+    if let Err(e) = result {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "error": { "message": format!("{e:#}") } })
+            );
+        } else {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Mail(mail) => commands::run(*mail, cli.json).await,
+        Command::Skill { install } => commands::skill(install),
         Command::Mcp => agent::mcp().await,
         Command::Tools => agent::tools().await,
         Command::Call { tool, arguments } => agent::call_tool(&tool, arguments.as_deref()).await,

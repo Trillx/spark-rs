@@ -70,8 +70,11 @@ import {
   cancelSignIn,
   deleteSignature,
   failureOf,
+  getAgentActivity,
   getAgents,
   getPrefs,
+  onAgentActivity,
+  onAgentSending,
   onSettingsChanged,
   mailApp,
   makeDefaultMailApp,
@@ -84,6 +87,7 @@ import {
   saveSignature,
   setAgentAccess,
   setDefaultSignature,
+  undoAgentActivity,
   testNotification,
   trustCertificate,
   type TrustedCerts,
@@ -108,6 +112,7 @@ import { signatureLabel } from "../lib/signatures";
 import type {
   AccountView,
   AgentAccess,
+  AgentActivity,
   AgentsView,
   BadgeCount,
   DefaultSignature,
@@ -1093,17 +1098,23 @@ function LabelRow({
 
 const ACCESS: { key: AgentAccess; label: string; detail: string; Icon: LucideIcon }[] = [
   { key: "none", label: "No access", detail: "Agents can't see this account.", Icon: CircleX },
-  { key: "read", label: "Read", detail: "Agents can list, search and read mail.", Icon: Eye },
+  {
+    key: "read",
+    label: "Read",
+    detail: "Agents can list, search and read mail, and see the calendar, contacts and templates.",
+    Icon: Eye,
+  },
   {
     key: "triage",
     label: "Triage",
-    detail: "Agents can also mark mail Done, read, pinned, set aside, snoozed or deleted.",
+    detail: "Agents can also write drafts, archive, pin, snooze, move or delete mail, and accept or block senders.",
     Icon: Inbox,
   },
   {
     key: "send",
     label: "Send",
-    detail: "Agents can also send email as you. Each one waits 30 seconds so you can undo it.",
+    detail:
+      "Agents can also send drafts as you and change calendar events. Each email waits 30 seconds so you can undo it.",
     Icon: Send,
   },
 ];
@@ -1169,6 +1180,11 @@ function AgentsPage({ onAddAccount }: { onAddAccount: () => void }) {
             <CommandRow label="Codex" command={`codex mcp add spark-rs -- ${cli} mcp`} />
             <CommandRow label="Hermes" command={`hermes mcp add spark-rs --command ${cli} --args mcp`} />
             <CommandRow label="Other agents" description="Their MCP server command." command={`${cli} mcp`} />
+            <CommandRow
+              label="Skill for Claude Code"
+              description="Teaches it spark-cli's commands, for when it works in a terminal. Other agents: spark-cli skill prints it."
+              command={`${cli} skill --install "%USERPROFILE%\\.claude\\skills"`}
+            />
           </>
         ) : (
           <Row
@@ -1178,6 +1194,105 @@ function AgentsPage({ onAddAccount }: { onAddAccount: () => void }) {
         )}
       </Group>
 
+      <AgentActivityGroup />
+
+      <StatusLine status={status} />
+    </>
+  );
+}
+
+/** What agents did, newest first, as spark-rs records it; what they changed can be undone here. */
+function AgentActivityGroup() {
+  const [reads, setReads] = useState(false);
+  const [rows, setRows] = useState<AgentActivity[] | null>(null);
+  const [status, setStatus] = useState<Status>({ kind: "idle" });
+
+  useEffect(() => {
+    let live = true;
+    const load = () =>
+      void getAgentActivity(reads).then(
+        (list) => live && setRows(list),
+        (error) => live && setStatus({ kind: "error", text: String(error) }),
+      );
+    load();
+    const stops = [onAgentActivity(load), onAgentSending(load)];
+    return () => {
+      live = false;
+      for (const stop of stops) stop();
+    };
+  }, [reads]);
+
+  async function undo(row: AgentActivity) {
+    try {
+      const left = await undoAgentActivity(row.id);
+      setRows(await getAgentActivity(reads));
+      setStatus(
+        left.length
+          ? { kind: "ok", text: `Undone, except what changed since: ${left.join("; ")}.` }
+          : { kind: "idle" },
+      );
+    } catch (error) {
+      setStatus({ kind: "error", text: String(error) });
+    }
+  }
+
+  return (
+    <>
+      <div className="mb-2 flex items-center justify-between px-1">
+        <h3 className="text-[13px] font-semibold text-text-2">Agent activity</h3>
+        <div role="radiogroup" aria-label="Show" className="flex rounded-full border border-hairline bg-base-200 p-0.5 text-xs">
+          {[
+            { key: false, label: "Changes" },
+            { key: true, label: "All activity" },
+          ].map((choice) => (
+            <button
+              key={choice.label}
+              role="radio"
+              aria-checked={reads === choice.key}
+              onClick={() => setReads(choice.key)}
+              className={`h-6 rounded-full px-2.5 ${
+                reads === choice.key ? "bg-base-100 text-primary shadow-sm" : "text-text-2 hover:text-base-content"
+              }`}
+            >
+              {choice.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <Group note="Kept on this computer for 30 days. Sends and calendar changes can't be undone here.">
+        {rows === null ? null : rows.length === 0 ? (
+          <Row
+            label={reads ? "No agent activity yet" : "No changes by agents yet"}
+            description="What agents connected through spark-cli do shows here."
+          />
+        ) : (
+          rows.map((row) => (
+            <div key={row.id} className="flex min-h-[44px] items-center gap-3 px-4 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] leading-5">
+                  <span className="font-medium">{row.agent}</span> {row.summary}
+                </div>
+                <div className="text-xs leading-[18px] text-text-2">
+                  {formatAgo(row.at)}
+                  {row.result === "blocked" && " · Not allowed"}
+                  {row.result === "error" && " · Failed"}
+                  {row.undone && " · Undone"}
+                  {row.result !== "success" && row.detail && (
+                    <span className="block truncate" title={row.detail}>
+                      {row.detail}
+                    </span>
+                  )}
+                </div>
+              </div>
+              {row.canUndo && (
+                <button className="btn btn-ghost btn-sm h-8 rounded-lg text-text-2" onClick={() => void undo(row)}>
+                  Undo
+                </button>
+              )}
+            </div>
+          ))
+        )}
+      </Group>
       <StatusLine status={status} />
     </>
   );

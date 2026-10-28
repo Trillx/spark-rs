@@ -1,13 +1,16 @@
 //! AI agents on this computer (Claude Code, Codex, …) using the user's mail.
 //! Agents run `spark-cli`, which reaches this app over a loopback connection
-//! (the protocol is in the `spark-agent` crate). The app runs the tools in
-//! `tools.rs` against the access the user chose per account in Settings →
-//! Agents, and tells the UI what agents did.
+//! (the protocol is in the `spark-agent` crate). The app runs the commands
+//! in `commands/` (Spark's CLI commands) and the older tools in `tools.rs`
+//! against the access the user chose per account in Settings → Agents, and
+//! tells the UI what agents did.
 
+pub(crate) mod commands;
 pub(crate) mod tools;
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,6 +67,13 @@ impl Access {
     }
 }
 
+/// What the commands keep while the app runs.
+struct AgentState {
+    log: commands::Log,
+    /// Where `attachment` leaves copies of files for spark-cli.
+    files: PathBuf,
+}
+
 /// Listens for `spark-cli` and writes where to find this app to
 /// `agent-endpoint.json` in the local data folder.
 pub fn start(app: &AppHandle) -> Result<(), String> {
@@ -78,11 +88,15 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
         .map(|a| a.id)
         .collect();
     app.state::<PrefsState>().retain_agent_accounts(&accounts)?;
-    let path = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| e.to_string())?
-        .join(ENDPOINT_FILE);
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    let path = dir.join(ENDPOINT_FILE);
+    // Copies handed to agents last time aren't needed any more.
+    let files = std::env::temp_dir().join("spark-rs").join("agent-files");
+    let _ = std::fs::remove_dir_all(&files);
+    app.manage(AgentState {
+        log: commands::Log::new(dir.join(commands::HISTORY_FILE)),
+        files,
+    });
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -96,7 +110,7 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
             Ok((listener, token)) => {
                 spark_agent::serve(listener, token, move |request| {
                     let app = app.clone();
-                    async move { handle(&app, request) }
+                    async move { handle(&app, request).await }
                 })
                 .await
             }
@@ -118,20 +132,30 @@ pub fn stopped(app: &AppHandle) {
     }
 }
 
-fn handle(app: &AppHandle, request: Request) -> Response {
+async fn handle(app: &AppHandle, request: Request) -> Response {
     match request.method.as_str() {
         "ping" => Response::Result(json!({
             "app": "spark-rs",
             "version": app.package_info().version.to_string(),
         })),
-        "tools/list" => Response::Result(tools::catalog()),
+        "tools/list" => Response::Result(commands::catalog()),
         "tools/call" => {
             let name = request.params["name"].as_str().unwrap_or_default();
             let args = match &request.params["arguments"] {
                 Value::Null => json!({}),
                 args => args.clone(),
             };
-            let outcome = run(app, &agent_name(&request.client), name, &args);
+            let agent = agent_name(&request.client);
+            if commands::knows(name) {
+                let outcome = command(app, &agent, name, &args).await;
+                return Response::Result(json!({
+                    "content": [{ "type": "text", "text": outcome.text }],
+                    "structuredContent": outcome.value,
+                    "isError": outcome.is_error,
+                }));
+            }
+            // The older tools, still there for agents set up with them.
+            let outcome = run(app, &agent, name, &args);
             Response::Result(json!({
                 "content": [{ "type": "text", "text": outcome.text }],
                 "isError": outcome.is_error,
@@ -139,6 +163,24 @@ fn handle(app: &AppHandle, request: Request) -> Response {
         }
         other => Response::Error(format!("spark-rs doesn't know {other}.")),
     }
+}
+
+async fn command(app: &AppHandle, agent: &str, name: &str, args: &Value) -> commands::Outcome {
+    let prefs = app.state::<PrefsState>();
+    let mailbox = app.state::<Mailbox>();
+    let state = app.state::<AgentState>();
+    let nudge = |account: i64| mailbox.live.nudge(account);
+    let env = commands::Env {
+        engine: &mailbox.live.engine,
+        prefs: &prefs,
+        agent,
+        files: &state.files,
+        log: &state.log,
+        nudge: &nudge,
+    };
+    let outcome = commands::run(&env, name, args).await;
+    tell(app, agent, &outcome.effect);
+    outcome
 }
 
 #[derive(Clone, Serialize)]
@@ -170,7 +212,13 @@ fn run(app: &AppHandle, agent: &str, name: &str, args: &Value) -> tools::Outcome
         };
         tools::call(&mut cx, name, args)
     });
-    match &outcome.effect {
+    tell(app, agent, &outcome.effect);
+    outcome
+}
+
+/// Tells the UI what an agent did.
+fn tell(app: &AppHandle, agent: &str, effect: &Option<Effect>) {
+    match effect {
         Some(Effect::Changed { summary }) => {
             let _ = app.emit("mailbox-changed", ());
             let _ = app.emit(
@@ -200,7 +248,6 @@ fn run(app: &AppHandle, agent: &str, name: &str, args: &Value) -> tools::Outcome
         }
         None => {}
     }
-    outcome
 }
 
 /// A readable name from MCP's `clientInfo.name`.
@@ -212,6 +259,8 @@ fn agent_name(client: &str) -> String {
         "Codex"
     } else if lower.contains("hermes") {
         "Hermes"
+    } else if lower.contains("gemini") {
+        "Gemini CLI"
     } else if lower.contains("claude") {
         "Claude"
     } else if lower.is_empty() || lower == "spark-cli" {
@@ -272,6 +321,69 @@ fn view(mailbox: &Mailbox, access: &BTreeMap<i64, Access>) -> Result<AgentsView,
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "This computer".into()),
     })
+}
+
+/// A row of Settings → Agents → Agent activity.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityRow {
+    id: u64,
+    at: i64,
+    agent: String,
+    /// What it did, e.g. "archived “Quote”"; for a failure, what it tried.
+    summary: String,
+    /// Why it failed or was refused.
+    detail: Option<String>,
+    /// "success", "error" or "blocked".
+    result: String,
+    can_undo: bool,
+    undone: bool,
+}
+
+/// What agents did lately, newest first: what they changed, or with
+/// `reads` everything.
+#[tauri::command]
+pub fn agent_activity(app: AppHandle, reads: bool) -> Vec<ActivityRow> {
+    let Some(state) = app.try_state::<AgentState>() else {
+        return Vec::new();
+    };
+    commands::recent(&state.log, reads, 200)
+        .into_iter()
+        .map(|e| {
+            let result = serde_json::to_value(e.result)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let success = result == "success";
+            ActivityRow {
+                id: e.id,
+                at: e.at,
+                summary: if e.summary.is_empty() {
+                    format!("ran spark-cli {}", e.command)
+                } else {
+                    e.summary
+                },
+                agent: e.agent,
+                detail: e.detail,
+                can_undo: success && !e.undo.is_empty() && !e.undone,
+                undone: e.undone,
+                result,
+            }
+        })
+        .collect()
+}
+
+/// The user's Undo on an activity row. Says what was left alone because it
+/// changed since.
+#[tauri::command]
+pub fn undo_agent_activity(app: AppHandle, id: u64) -> Result<Vec<String>, String> {
+    let state = app
+        .try_state::<AgentState>()
+        .ok_or("Agents aren't connected to spark-rs.")?;
+    let mailbox = app.state::<Mailbox>();
+    let (_, skipped) = commands::undo_for_user(&mailbox.live.engine, &state.log, id)?;
+    let _ = app.emit("mailbox-changed", ());
+    Ok(skipped)
 }
 
 #[tauri::command]

@@ -318,6 +318,21 @@ export interface AgentsView {
   computer: string;
 }
 
+/** Something an agent did, from spark-rs's record of them (Settings → Agents → Agent activity). */
+export interface AgentActivity {
+  id: number;
+  /** Unix ms. */
+  at: number;
+  agent: string;
+  /** What it did, e.g. "archived “Quote”"; for a failure, what it tried. */
+  summary: string;
+  /** Why it failed or wasn't allowed. */
+  detail: string | null;
+  result: "success" | "error" | "blocked";
+  canUndo: boolean;
+  undone: boolean;
+}
+
 /** An agent's email waits in the outbox until `sendAt` (Unix ms). */
 export interface AgentSendingEvent {
   id: number;

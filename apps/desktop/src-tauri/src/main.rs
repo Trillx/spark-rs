@@ -208,6 +208,8 @@ fn main() {
             background::set_badge,
             agents::get_agents,
             agents::set_agent_access,
+            agents::agent_activity,
+            agents::undo_agent_activity,
             updates::get_updates,
             updates::check_for_updates,
             updates::install_update,
