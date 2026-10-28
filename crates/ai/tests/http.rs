@@ -1,7 +1,10 @@
 //! Drives `AiClient` against a one-shot local HTTP server that replays a
 //! canned response, checking the request it sent.
 
-use spark_ai::{AiClient, AiError, ChatRequest, Message, ProviderConfig, StopReason};
+use spark_ai::{
+    AiClient, AiError, ChatRequest, ConversationRequest, Message, Part, ProviderConfig, StopReason,
+    Tool, Turn,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -136,4 +139,48 @@ async fn http_errors_carry_the_provider_message() {
         }
         other => panic!("expected an HTTP error, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn anthropic_conversation_with_a_tool_call() {
+    let (url, server) = serve_once(
+        "200 OK",
+        "text/event-stream",
+        concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":30}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"search_email\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"ana\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":12}}\n\n",
+        ),
+    )
+    .await;
+    let config = ProviderConfig {
+        base_url: url,
+        ..ProviderConfig::anthropic()
+    };
+    let client = AiClient::new(config, Some("test-key".into())).unwrap();
+    let request = ConversationRequest {
+        system: Some("Help.".into()),
+        turns: vec![Turn::user("Mail from Ana?")],
+        tools: vec![Tool {
+            name: "search_email".into(),
+            description: "Searches mail.".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }],
+        max_tokens: 1000,
+    };
+    let reply = client.converse(&request, |_| {}).await.unwrap();
+    assert_eq!(reply.stop_reason, StopReason::ToolUse);
+    assert_eq!(
+        reply.turn.parts,
+        vec![Part::ToolCall {
+            id: "toolu_1".into(),
+            name: "search_email".into(),
+            input: serde_json::json!({ "query": "ana" }),
+        }]
+    );
+    let sent = server.await.unwrap();
+    assert!(sent.contains("\"tools\":[{"), "{sent}");
+    assert!(sent.contains("\"input_schema\""), "{sent}");
 }

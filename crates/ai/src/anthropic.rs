@@ -2,7 +2,10 @@
 
 use serde_json::{Value, json};
 
-use crate::{AiError, ChatRequest, Completion, ProviderConfig, StopReason, Usage, sse};
+use crate::{
+    AiError, ChatRequest, Completion, ConversationRequest, Part, ProviderConfig, ProviderKind,
+    Reply, Role, StopReason, Turn, Usage, sse,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
@@ -32,6 +35,28 @@ pub(crate) fn request(
         .post(format!("{base}/v1/messages"))
         .header("anthropic-version", API_VERSION)
         .json(&body(config, request, fallback));
+    if let Some(key) = api_key {
+        builder = builder.header("x-api-key", key);
+    }
+    if fallback {
+        builder = builder.header("anthropic-beta", FALLBACK_BETA);
+    }
+    builder
+}
+
+pub(crate) fn conversation_request(
+    http: &reqwest::Client,
+    config: &ProviderConfig,
+    api_key: Option<&str>,
+    request: &ConversationRequest,
+) -> reqwest::RequestBuilder {
+    let base = config.base_url.trim_end_matches('/');
+    let official = base == DEFAULT_BASE_URL;
+    let fallback = official && supports_default_fallback(&config.model);
+    let mut builder = http
+        .post(format!("{base}/v1/messages"))
+        .header("anthropic-version", API_VERSION)
+        .json(&conversation_body(config, request, official, fallback));
     if let Some(key) = api_key {
         builder = builder.header("x-api-key", key);
     }
@@ -77,6 +102,75 @@ fn body(config: &ProviderConfig, request: &ChatRequest, fallback: bool) -> Value
     body
 }
 
+/// `official`: the request goes to Anthropic's own API, which takes
+/// `eager_input_streaming`; proxies may reject it.
+fn conversation_body(
+    config: &ProviderConfig,
+    request: &ConversationRequest,
+    official: bool,
+    fallback: bool,
+) -> Value {
+    let chat = ChatRequest {
+        system: request.system.clone(),
+        messages: Vec::new(),
+        max_tokens: request.max_tokens,
+    };
+    let mut body = body(config, &chat, fallback);
+    body["messages"] = request.turns.iter().map(turn).collect();
+    if !request.tools.is_empty() {
+        body["tools"] = request
+            .tools
+            .iter()
+            .map(|t| {
+                let mut tool = json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                });
+                if official {
+                    tool["eager_input_streaming"] = json!(true);
+                }
+                tool
+            })
+            .collect();
+    }
+    body
+}
+
+fn turn(turn: &Turn) -> Value {
+    let content: Vec<Value> = turn
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            // The API rejects empty text blocks.
+            Part::Text { text } if text.is_empty() => None,
+            Part::Text { text } => Some(json!({ "type": "text", "text": text })),
+            Part::ToolCall { id, name, input } => Some(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": if input.is_object() { input.clone() } else { json!({}) },
+            })),
+            Part::ToolResult {
+                id,
+                content,
+                is_error,
+            } => Some(json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": content,
+                "is_error": is_error,
+            })),
+            Part::Opaque {
+                provider: ProviderKind::Anthropic,
+                block,
+            } => Some(block.clone()),
+            Part::Opaque { .. } => None,
+        })
+        .collect();
+    json!({ "role": turn.role, "content": content })
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Decoder {
     text: String,
@@ -89,8 +183,10 @@ impl Decoder {
     /// Returns the text this event added, if any. Thinking blocks, pings and
     /// fallback markers carry no answer text and are skipped.
     pub fn handle(&mut self, event: &sse::Event) -> Result<Option<String>, AiError> {
-        let v: Value = serde_json::from_str(&event.data)
-            .map_err(|e| AiError::Protocol(format!("bad event from Anthropic: {e}")))?;
+        self.apply(&parse(event)?)
+    }
+
+    fn apply(&mut self, v: &Value) -> Result<Option<String>, AiError> {
         match v["type"].as_str() {
             Some("message_start") => {
                 self.model = v["message"]["model"].as_str().map(str::to_owned);
@@ -138,10 +234,121 @@ impl Decoder {
     }
 }
 
+/// Collects a whole turn: its text, tool calls and the blocks that have to
+/// go back unchanged (thinking).
+#[derive(Debug, Default)]
+pub(crate) struct TurnDecoder {
+    meta: Decoder,
+    /// By index: the block as it started, with deltas applied, and a
+    /// tool call's input JSON so far.
+    blocks: Vec<Option<(Value, String)>>,
+}
+
+impl TurnDecoder {
+    /// Returns the text this event added, if any.
+    pub fn handle(&mut self, event: &sse::Event) -> Result<Option<String>, AiError> {
+        let v = parse(event)?;
+        let index = v["index"].as_u64().map(|i| i as usize);
+        match (v["type"].as_str(), index) {
+            (Some("content_block_start"), Some(i)) => {
+                if self.blocks.len() <= i {
+                    self.blocks.resize(i + 1, None);
+                }
+                self.blocks[i] = Some((v["content_block"].clone(), String::new()));
+            }
+            (Some("content_block_delta"), Some(i)) => {
+                if let Some(Some((block, input))) = self.blocks.get_mut(i) {
+                    let delta = &v["delta"];
+                    let append = |block: &mut Value, field: &str, key: &str| {
+                        let more = delta[key].as_str().unwrap_or_default();
+                        let so_far = block[field].as_str().unwrap_or_default();
+                        block[field] = json!(format!("{so_far}{more}"));
+                    };
+                    match delta["type"].as_str() {
+                        Some("text_delta") => append(block, "text", "text"),
+                        Some("thinking_delta") => append(block, "thinking", "thinking"),
+                        Some("signature_delta") => block["signature"] = delta["signature"].clone(),
+                        Some("input_json_delta") => {
+                            input.push_str(delta["partial_json"].as_str().unwrap_or_default())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.meta.apply(&v)
+    }
+
+    pub fn finish(self) -> Result<Reply, AiError> {
+        let done = self.meta.finish()?;
+        let refused = matches!(done.stop_reason, StopReason::Refusal { .. });
+        let blocks: Vec<(Value, String)> = self.blocks.into_iter().flatten().collect();
+        // After a fallback mid-answer, what the declined model started other
+        // than text doesn't go back: its thinking and unfinished tool calls.
+        let boundary = blocks.iter().rposition(|(b, _)| b["type"] == "fallback");
+        let parts = if refused {
+            Vec::new()
+        } else {
+            blocks
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, (block, input))| {
+                    let kind = block["type"].as_str().unwrap_or_default().to_owned();
+                    if boundary.is_some_and(|b| i <= b) && kind != "text" {
+                        return None;
+                    }
+                    match kind.as_str() {
+                        "text" => Some(Part::Text {
+                            text: block["text"].as_str().unwrap_or_default().to_owned(),
+                        }),
+                        "tool_use" => Some(Part::ToolCall {
+                            id: block["id"].as_str().unwrap_or_default().to_owned(),
+                            name: block["name"].as_str().unwrap_or_default().to_owned(),
+                            input: tool_input(&input),
+                        }),
+                        _ => Some(Part::Opaque {
+                            provider: ProviderKind::Anthropic,
+                            block,
+                        }),
+                    }
+                })
+                .collect()
+        };
+        Ok(Reply {
+            turn: Turn {
+                role: Role::Assistant,
+                parts,
+            },
+            stop_reason: done.stop_reason,
+            usage: done.usage,
+            model: done.model,
+        })
+    }
+}
+
+fn parse(event: &sse::Event) -> Result<Value, AiError> {
+    serde_json::from_str(&event.data)
+        .map_err(|e| AiError::Protocol(format!("bad event from Anthropic: {e}")))
+}
+
+/// A tool call's streamed input: no input is `{}`, and input that isn't a
+/// JSON object stays the text it was, to be reported back.
+fn tool_input(raw: &str) -> Value {
+    if raw.trim().is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) if value.is_object() => value,
+        _ => Value::String(raw.to_owned()),
+    }
+}
+
 fn stop_reason(reason: &str, details: &Value) -> StopReason {
     match reason {
         "end_turn" | "stop_sequence" => StopReason::EndTurn,
         "max_tokens" => StopReason::MaxTokens,
+        "tool_use" => StopReason::ToolUse,
         "refusal" => StopReason::Refusal {
             category: details["category"].as_str().map(str::to_owned),
         },
@@ -152,7 +359,7 @@ fn stop_reason(reason: &str, details: &Value) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Effort, Message, ProviderKind};
+    use crate::{Effort, Message};
 
     fn config(base_url: &str, model: &str) -> ProviderConfig {
         ProviderConfig {
@@ -243,5 +450,215 @@ mod tests {
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
         );
         assert!(matches!(result, Err(AiError::Stream(m)) if m == "Overloaded"));
+    }
+
+    fn conversation() -> ConversationRequest {
+        let thinking = json!({ "type": "thinking", "thinking": "", "signature": "sig" });
+        ConversationRequest {
+            system: Some("Help with mail.".into()),
+            turns: vec![
+                Turn::user("Any mail from Ana?"),
+                Turn {
+                    role: Role::Assistant,
+                    parts: vec![
+                        Part::Opaque {
+                            provider: ProviderKind::Anthropic,
+                            block: thinking.clone(),
+                        },
+                        Part::Opaque {
+                            provider: ProviderKind::OpenAiCompatible,
+                            block: json!({ "x": 1 }),
+                        },
+                        Part::text(""),
+                        Part::ToolCall {
+                            id: "toolu_1".into(),
+                            name: "search_email".into(),
+                            input: json!({ "query": "from:ana" }),
+                        },
+                    ],
+                },
+                Turn {
+                    role: Role::User,
+                    parts: vec![Part::ToolResult {
+                        id: "toolu_1".into(),
+                        content: "[]".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![crate::Tool {
+                name: "search_email".into(),
+                description: "Searches mail.".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }],
+            max_tokens: 16000,
+        }
+    }
+
+    #[test]
+    fn conversation_passes_thinking_back_and_streams_tool_input_only_on_the_api() {
+        let request = conversation();
+        let official = conversation_body(
+            &config(DEFAULT_BASE_URL, "claude-opus-5-5"),
+            &request,
+            true,
+            true,
+        );
+        let assistant = &official["messages"][1]["content"];
+        assert_eq!(
+            assistant,
+            &json!([
+                { "type": "thinking", "thinking": "", "signature": "sig" },
+                { "type": "tool_use", "id": "toolu_1", "name": "search_email", "input": { "query": "from:ana" } },
+            ])
+        );
+        assert_eq!(
+            official["messages"][2]["content"][0],
+            json!({ "type": "tool_result", "tool_use_id": "toolu_1", "content": "[]", "is_error": false })
+        );
+        assert_eq!(official["tools"][0]["eager_input_streaming"], true);
+        assert_eq!(official["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(official["fallbacks"], "default");
+        assert_eq!(official["system"], "Help with mail.");
+
+        let proxy = conversation_body(
+            &config("https://gateway.example", "claude-opus-5-5"),
+            &request,
+            false,
+            false,
+        );
+        assert!(proxy["tools"][0].get("eager_input_streaming").is_none());
+        assert!(proxy.get("fallbacks").is_none());
+    }
+
+    fn decode_turn(stream: &str) -> (String, Reply) {
+        let mut parser = sse::Parser::default();
+        let mut decoder = TurnDecoder::default();
+        let mut streamed = String::new();
+        for event in parser.push(stream.as_bytes()) {
+            if let Some(text) = decoder.handle(&event).unwrap() {
+                streamed.push_str(&text);
+            }
+        }
+        (streamed, decoder.finish().unwrap())
+    }
+
+    fn event(data: Value) -> String {
+        format!("data: {data}\n\n")
+    }
+
+    #[test]
+    fn decodes_thinking_text_and_tool_calls_into_a_turn() {
+        let stream = [
+            json!({ "type": "message_start", "message": { "model": "claude-opus-5-5", "usage": { "input_tokens": 900 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "Search " } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "first." } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "abc" } }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+            json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": "Let me look." } }),
+            json!({ "type": "content_block_start", "index": 2, "content_block": { "type": "tool_use", "id": "toolu_9", "name": "search_email", "input": {} } }),
+            json!({ "type": "content_block_delta", "index": 2, "delta": { "type": "input_json_delta", "partial_json": "{\"query\": " } }),
+            json!({ "type": "content_block_delta", "index": 2, "delta": { "type": "input_json_delta", "partial_json": "\"invoice\"}" } }),
+            json!({ "type": "content_block_start", "index": 3, "content_block": { "type": "tool_use", "id": "toolu_10", "name": "list_accounts", "input": {} } }),
+            json!({ "type": "content_block_start", "index": 4, "content_block": { "type": "tool_use", "id": "toolu_11", "name": "read_email", "input": {} } }),
+            json!({ "type": "content_block_delta", "index": 4, "delta": { "type": "input_json_delta", "partial_json": "{\"id\": 4" } }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 80 } }),
+        ]
+        .map(event)
+        .concat();
+        let (streamed, reply) = decode_turn(&stream);
+        assert_eq!(streamed, "Let me look.");
+        assert_eq!(reply.stop_reason, StopReason::ToolUse);
+        assert_eq!(reply.usage.input_tokens, 900);
+        assert_eq!(
+            reply.turn.parts,
+            vec![
+                Part::Opaque {
+                    provider: ProviderKind::Anthropic,
+                    block: json!({ "type": "thinking", "thinking": "Search first.", "signature": "abc" }),
+                },
+                Part::text("Let me look."),
+                Part::ToolCall {
+                    id: "toolu_9".into(),
+                    name: "search_email".into(),
+                    input: json!({ "query": "invoice" })
+                },
+                Part::ToolCall {
+                    id: "toolu_10".into(),
+                    name: "list_accounts".into(),
+                    input: json!({})
+                },
+                // Cut off: reported back rather than run.
+                Part::ToolCall {
+                    id: "toolu_11".into(),
+                    name: "read_email".into(),
+                    input: json!("{\"id\": 4")
+                },
+            ]
+        );
+        let bad: Vec<_> = reply
+            .turn
+            .tool_calls()
+            .filter_map(|(id, _, input)| Part::invalid_input(id, input))
+            .collect();
+        assert_eq!(
+            bad,
+            vec![Part::ToolResult {
+                id: "toolu_11".into(),
+                content: json!({ "INVALID_JSON": "{\"id\": 4" }).to_string(),
+                is_error: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn after_a_fallback_only_text_from_before_it_goes_back() {
+        let stream = [
+            json!({ "type": "message_start", "message": { "model": "claude-opus-5-5", "usage": { "input_tokens": 5 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "", "signature": "s1" } }),
+            json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text", "text": "Part" } }),
+            json!({ "type": "content_block_start", "index": 2, "content_block": { "type": "tool_use", "id": "toolu_1", "name": "search_email", "input": {} } }),
+            json!({ "type": "content_block_start", "index": 3, "content_block": { "type": "fallback", "from": { "model": "claude-opus-5-5" }, "to": { "model": "claude-opus-5" } } }),
+            json!({ "type": "content_block_start", "index": 4, "content_block": { "type": "thinking", "thinking": "", "signature": "s2" } }),
+            json!({ "type": "content_block_start", "index": 5, "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 5, "delta": { "type": "text_delta", "text": "ial answer." } }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 9 } }),
+        ]
+        .map(event)
+        .concat();
+        let (_, reply) = decode_turn(&stream);
+        assert_eq!(
+            reply.turn.parts,
+            vec![
+                Part::text("Part"),
+                Part::Opaque {
+                    provider: ProviderKind::Anthropic,
+                    block: json!({ "type": "thinking", "thinking": "", "signature": "s2" }),
+                },
+                Part::text("ial answer."),
+            ]
+        );
+        assert_eq!(reply.turn.text(), "Partial answer.");
+    }
+
+    #[test]
+    fn a_refused_turn_has_no_parts() {
+        let stream = [
+            json!({ "type": "message_start", "message": { "model": "claude-opus-5-5", "usage": { "input_tokens": 5 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "toolu_1", "name": "search_email", "input": {} } }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "refusal", "stop_details": { "category": "cyber" } }, "usage": { "output_tokens": 1 } }),
+        ]
+        .map(event)
+        .concat();
+        let (_, reply) = decode_turn(&stream);
+        assert!(reply.turn.parts.is_empty());
+        assert_eq!(
+            reply.stop_reason,
+            StopReason::Refusal {
+                category: Some("cyber".into())
+            }
+        );
     }
 }
