@@ -1,8 +1,9 @@
 //! Bring-your-own-key AI: the provider settings, the API key in the OS
-//! credential store, +AI Summary and the composer's +AI (Quick +AI Replies
-//! included). The key stays on this side; the UI only learns whether one is
-//! stored.
+//! credential store, +AI Summary, the composer's +AI (Quick +AI Replies
+//! included) and the AI Assistant. The key stays on this side; the UI only
+//! learns whether one is stored.
 
+pub(crate) mod assistant;
 pub(crate) mod compose;
 pub(crate) mod email;
 pub(crate) mod keys;

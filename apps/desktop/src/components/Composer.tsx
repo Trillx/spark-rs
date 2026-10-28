@@ -108,6 +108,7 @@ export default function Composer({
   saved = false,
   full,
   fullStyle,
+  floatStyle,
   onChange,
   onToggleFull,
   onClose,
@@ -125,6 +126,8 @@ export default function Composer({
   full: boolean;
   /** Where the full-pane composer sits (the reading pane's box). */
   fullStyle: CSSProperties;
+  /** Moves the floating composer, e.g. clear of the AI Assistant's panel. */
+  floatStyle?: CSSProperties;
   onChange: (patch: Partial<Draft>) => void;
   onToggleFull: () => void;
   /** Closing keeps it in Drafts. */
@@ -392,7 +395,7 @@ export default function Composer({
       role="dialog"
       aria-label={draft.title}
       onKeyDown={onKeyDown}
-      style={full ? fullStyle : undefined}
+      style={full ? fullStyle : floatStyle}
       className={`z-50 flex flex-col overflow-hidden border bg-base-100 transition-colors ${dropping ? "border-primary" : "border-hairline"} ${
         full
           ? "fixed bottom-0 top-8 rounded-tl-xl"

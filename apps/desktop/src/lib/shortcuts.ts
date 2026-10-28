@@ -48,7 +48,8 @@ export type ActionId =
   | "zoomReset"
   | "move"
   | "findInThread"
-  | "openInNewWindow";
+  | "openInNewWindow"
+  | "assistant";
 
 interface Binding {
   /** `KeyboardEvent.key`, lowercased for letters. */
@@ -117,6 +118,8 @@ const SHORTCUTS: Record<ActionId, Binding[]> = {
   findInThread: [{ key: "f", mod: true, shift: true }],
   /** Spark's "Open Thread in a new Window". */
   openInNewWindow: [{ code: "KeyN", mod: true, alt: true }],
+  /** The AI Assistant's panel: Spark's own on macOS. */
+  assistant: [{ key: "c", mod: true, shift: true }],
 };
 
 function bindingMatches(b: Binding, e: KeyboardEvent) {

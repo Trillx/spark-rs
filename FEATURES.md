@@ -76,7 +76,7 @@ Last full check: 2026-10-26.
 | Quick Replies | ✅ | Interested, Not interested and Thanks, written by AI |
 | Email Summaries | 🟡 | Short, detailed or action-point summaries of one email, not of a whole conversation |
 | Translations | ❌ | |
-| AI Assistant | ❌ | Meanwhile, agents such as Claude Code can search and read your mail through `spark-cli` |
+| AI Assistant | 🟡 | A chat beside your mail that searches and reads your email and calendar on your own AI provider, cites the emails it used, proposes changes for you to approve, drafts emails to open in the composer, and keeps past chats. No memories, web search, attachment reading or meeting notes yet, and it hasn't been tried with a real account |
 | Meeting Notes | ❌ | |
 | Autopilot | ❌ | |
 | Auto-Drafts | 🟡 | New mail that needs an answer gets a reply waiting in Drafts and in the conversation, written with your own AI provider: up to three options to pick from, your custom instructions, senders to leave out, and cleanup of drafts you didn't use. Auto-Labels sort new mail into To respond, FYI and Spark's other labels, kept on Gmail and in Outlook too. Drafts don't learn your writing style yet |

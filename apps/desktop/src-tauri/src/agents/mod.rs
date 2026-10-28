@@ -4,7 +4,7 @@
 //! `tools.rs` against the access the user chose per account in Settings →
 //! Agents, and tells the UI what agents did.
 
-mod tools;
+pub(crate) mod tools;
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;

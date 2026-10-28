@@ -61,9 +61,10 @@ Created in [T3 Code](https://t3.codes).
   before the server sees it.
 - **+AI on your own key.** Summaries, quick replies, and writing and rewriting
   in the composer, through Anthropic, OpenAI, or an OpenAI-compatible server
-  such as Ollama on your own computer. Turn on Auto-Labels and Auto-Drafts and
-  new mail is sorted under To respond, FYI and the like, with replies waiting
-  in Drafts for the mail that needs one.
+  such as Ollama on your own computer. The AI Assistant answers questions
+  about your mail and calendar and tidies the inbox when you ask. Turn on
+  Auto-Labels and Auto-Drafts and new mail is sorted under To respond, FYI
+  and the like, with replies waiting in Drafts for the mail that needs one.
 - **Calendar.** Microsoft 365 calendars by day, week or month, invitations you
   answer from the email, event alerts with Snooze, and a pop-up before
   meetings, with Join for Teams, Zoom and Meet calls.
@@ -454,6 +455,25 @@ kept in Windows Credential Manager, not in a settings file.
   shortens, expands or proofreads what you've written, changes its tone, or
   changes it the way you describe.
 
+### AI Assistant
+
+**Ask me anything...** at the bottom right of the mail (or `Ctrl+Shift+C`, or
+AI Assistant in `Ctrl+K`) opens a chat beside your mail. Hover over the button
+for a few questions to start with. The assistant searches and reads your
+email and looks at your calendar to answer. Each email it relies on is a
+small number in the answer, listed under Sources, and clicking one opens
+that email. "This email" means the one open in the reader.
+
+Ask it to tidy up and it proposes the change on a card: mark emails Done,
+snooze, pin, set aside or delete them, or accept or block senders. Nothing
+changes until you click Approve. When it writes an email or a reply, it
+shows a draft with **Open Draft**, which opens it in the composer for you to
+edit and send. The assistant can't send email itself.
+
+Stop ends an answer early. **Start new chat** clears the panel, and **View
+past chats** brings back an earlier chat, which you can continue or delete.
+Chats are saved on your computer; the 50 most recent are kept.
+
 ### Auto-Labels and Auto-Drafts
 
 Settings → Inbox Automation turns these on for each account. Both are off
@@ -483,6 +503,11 @@ Your provider gets only what you use AI on, under its terms. A summary sends
 the email's sender, date, subject and text. The composer sends what you ask
 for, the draft or the part you selected, the email you're replying to or
 forwarding, and, when no signature follows, your name for the sign-off.
+The AI Assistant sends your question, the date and time, the subject and
+sender of the email open in the reader, and what its tools find while it
+answers: the sender, subject, date and snippet of emails it searches or lists,
+the full text of emails it reads, and your calendar events for the days it
+checks. The rest of a chat goes too when you continue it.
 Nothing is sent in the background unless you turn on Inbox Automation: then
 each new Inbox email in those accounts is sent (sender, recipients, date,
 subject and text, a few at a time), and for a draft, the earlier emails of

@@ -172,6 +172,14 @@ import { reduceSummary, startSummary, type SummaryState } from "./components/Sum
 import ThreadView, { type ThreadActions } from "./components/ThreadView";
 import UndoToast, { TOAST_MS, type ToastData, type ToastIcon } from "./components/UndoToast";
 import { CaptionButtons, DragStrip } from "./components/WindowChrome";
+import AssistantPanel, {
+  ASSISTANT_MIN_WIDTH,
+  ASSISTANT_SPACE,
+  AssistantPill,
+  assistantSuggestions,
+  type Ask,
+} from "./components/AssistantPanel";
+import type { DraftCard, EmailRef } from "./assistant";
 import { AccountsContext, isDemoMode, isFromYou } from "./lib/accounts";
 import { joinAddresses, parseEntry, replyRecipients, splitAddresses } from "./lib/addresses";
 import { badgeIcon } from "./lib/badge";
@@ -471,7 +479,7 @@ const HOME_TICK_MS = 15_000;
 /** Spark waits this long after a window loses focus before calling spark-rs inactive. */
 const BLUR_SETTLE_MS = 150;
 /** On the Home Screen, with no email open over it, only these shortcuts act. */
-const HOME_KEYS = new Set<ActionId>(["compose", "search", "sidebar", "command", "settings", "close"]);
+const HOME_KEYS = new Set<ActionId>(["compose", "search", "sidebar", "command", "settings", "close", "assistant"]);
 /** Shortcuts that move around the list, which the Home Screen hides. */
 const LIST_KEYS = new Set<ActionId>([
   "next",
@@ -554,6 +562,9 @@ export default function App() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [composerKey, setComposerKey] = useState(0);
   const [composerFull, setComposerFull] = useState(false);
+  /** The AI Assistant's panel at the right, and a question for it from the pill. */
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantAsk, setAssistantAsk] = useState<Ask | null>(null);
   /** `draftKey` of the composer's draft as it is in Drafts (opened or saved), if it is. */
   const [draftSaved, setDraftSaved] = useState<string | null>(null);
   /** The saved draft each composer session (by `composerKey`) saved to. */
@@ -643,7 +654,9 @@ export default function App() {
   const windowWidth = useWindowWidth();
   const sidebarWidth = layout.width;
   const sidebarSpace = sidebarMode === "locked" ? sidebarWidth : SIDEBAR_RAIL;
-  const container = windowWidth - sidebarSpace;
+  // The assistant's panel takes its room from the mail beside it.
+  const assistantSpace = assistantOpen && THREAD_WINDOW === null ? ASSISTANT_SPACE : 0;
+  const container = windowWidth - sidebarSpace - assistantSpace;
   const listWidthUsed = effectiveListWidth(listWidth, container);
   const wide = useTwoColumns(container, listWidthUsed);
   // A conversation's own window has no list beside it: finishing one closes it rather than
@@ -3392,6 +3405,9 @@ export default function App() {
         return toggleSidebar();
       case "command":
         return setPalette({ kind: "actions" });
+      case "assistant":
+        if (THREAD_WINDOW === null) setAssistantOpen((o) => !o);
+        return;
       case "findInThread":
         if (openMessage) setFindRequest((n) => n + 1);
         return;
@@ -3510,7 +3526,7 @@ export default function App() {
       // The Home Screen hides the list: only its own keys, or the open email's, act.
       if (homeShown && (openId === null ? !HOME_KEYS.has(action) : LIST_KEYS.has(action))) return;
       // Cmd/Ctrl+K, +F and +, also work from the search field; single keys never fire while typing.
-      if (typing && action !== "command" && action !== "search" && action !== "settings") return;
+      if (typing && action !== "command" && action !== "search" && action !== "settings" && action !== "assistant") return;
       // Let Enter activate a focused button instead of opening the selected row.
       if (action === "open" && e.target instanceof Element && e.target.closest("button, a, [role='menuitem']")) return;
       e.preventDefault();
@@ -4004,6 +4020,18 @@ export default function App() {
         Icon: Bot,
         run: () => openSettings("agents"),
       },
+      ...(THREAD_WINDOW === null
+        ? [
+            {
+              id: "assistant",
+              label: "AI Assistant",
+              keywords: "ask ai chat question",
+              Icon: Sparkles,
+              shortcut: shortcutLabel("assistant"),
+              run: () => openAssistant(),
+            },
+          ]
+        : []),
       {
         id: "ai-settings",
         label: "AI settings",
@@ -4204,6 +4232,34 @@ export default function App() {
     );
   }
 
+  /** Opens the assistant's panel, asking `question` if there is one. */
+  function openAssistant(question?: string) {
+    setAssistantOpen(true);
+    if (question) setAssistantAsk({ text: question, nonce: Date.now() });
+  }
+
+  /** An email the assistant cited: in the reader if it's here, else in a window of its own. */
+  function openAssistantEmail(email: EmailRef) {
+    setCalendarOpen(false);
+    if (messages.some((m) => m.id === email.id)) openConversation(email.id);
+    else void openThreadWindow(email.id, email.subject || "No subject").catch(fileError);
+  }
+
+  /** A draft the assistant wrote, in the composer to edit and send. */
+  function openAssistantDraft(d: DraftCard) {
+    compose({
+      title: d.replyTo === undefined ? "New message" : "Reply",
+      to: d.to,
+      cc: d.cc,
+      showCc: d.cc !== "",
+      subject: d.subject,
+      body: d.body,
+      from: d.account,
+      replyTo: d.replyTo,
+      doneAfter: d.replyTo !== undefined && appPrefs.sendAndDone,
+    });
+  }
+
   function fileError(error: unknown) {
     showToast(String(error), undefined, ICONS.error, { duration: ERROR_TOAST_MS });
   }
@@ -4266,7 +4322,10 @@ export default function App() {
           actions={sidebarActions}
         />
 
-        <main className="relative flex min-w-0 flex-1">
+        <main
+          className="relative flex min-w-0 flex-1"
+          style={assistantSpace ? { paddingRight: assistantSpace } : undefined}
+        >
           <DragStrip />
           <CaptionButtons />
           {calendarOpen && (
@@ -4407,6 +4466,21 @@ export default function App() {
               )}
             </section>
           )}
+          {!assistantOpen && !draft && !homeShown && !calendarOpen && !pickedRows.length && windowWidth >= ASSISTANT_MIN_WIDTH && (
+            <AssistantPill suggestions={assistantSuggestions(openMessage)} onAsk={openAssistant} />
+          )}
+          <AssistantPanel
+            open={assistantOpen}
+            ask={assistantAsk}
+            screen={{ openEmail: openMessage?.id }}
+            name={(accounts.find((a) => !a.demo)?.name ?? accounts[0]?.name ?? "").split(/\s+/)[0]}
+            suggestions={assistantSuggestions(openMessage)}
+            onClose={() => setAssistantOpen(false)}
+            onOpenEmail={openAssistantEmail}
+            onOpenDraft={openAssistantDraft}
+            onOpenSettings={() => openSettings("ai")}
+            onCopied={() => showToast("Copied", undefined, ICONS.copy)}
+          />
         </main>
           </>
         ) : (
@@ -4448,7 +4522,8 @@ export default function App() {
             draft={draft}
             saved={draftSaved === draftKey(draft)}
             full={composerFull}
-            fullStyle={{ left: readerLeft, right: 0 }}
+            fullStyle={{ left: readerLeft, right: assistantSpace }}
+            floatStyle={assistantSpace ? { right: assistantSpace + 16 } : undefined}
             onChange={(patch) =>
               setDraft(
                 (d) =>

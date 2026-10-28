@@ -61,6 +61,9 @@ fn main() {
             app.manage(meetings::Meetings::default());
             app.manage(alerts::Alerts::default());
             app.manage(ai::AiState::new(config_dir.clone(), ai::Keys::platform()));
+            app.manage(ai::assistant::AssistantState::new(
+                app.path().app_local_data_dir()?.join("assistant"),
+            ));
             app.manage(automation::Automation::new());
             notify::register(app.handle());
             let live = live::Live::open(&app.path().app_local_data_dir()?)?;
@@ -183,6 +186,12 @@ fn main() {
             ai::cancel_summary,
             ai::compose_with_ai,
             ai::cancel_compose,
+            ai::assistant::assistant_send,
+            ai::assistant::assistant_stop,
+            ai::assistant::assistant_decide,
+            ai::assistant::assistant_sessions,
+            ai::assistant::assistant_session,
+            ai::assistant::assistant_delete_session,
             automation::get_inbox_automation,
             automation::save_inbox_automation,
             automation::set_auto_label,
