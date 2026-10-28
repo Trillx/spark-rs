@@ -481,6 +481,8 @@ const HOME_TICK_MS = 15_000;
 /** Spark waits this long after a window loses focus before calling spark-rs inactive. */
 const BLUR_SETTLE_MS = 150;
 /** On the Home Screen, with no email open over it, only these shortcuts act. */
+/** The calendar's header needs this much width for all its controls; the assistant docks beside it only then. */
+const CALENDAR_MIN = 680;
 /** The floating composer goes beside the assistant's panel only if it can be this wide there. */
 const COMPOSER_MIN_BESIDE = 440;
 const HOME_KEYS = new Set<ActionId>(["compose", "search", "sidebar", "command", "settings", "close", "assistant"]);
@@ -661,7 +663,9 @@ export default function App() {
   // The assistant's panel takes its room from the mail beside it when that leaves the mail as much
   // room as a reader needs, as in Spark; in a narrower window it floats over the mail instead.
   const assistantDocked =
-    assistantOpen && THREAD_WINDOW === null && windowWidth - sidebarSpace - ASSISTANT_SPACE >= READER_MIN;
+    assistantOpen &&
+    THREAD_WINDOW === null &&
+    windowWidth - sidebarSpace - ASSISTANT_SPACE >= (calendarOpen ? CALENDAR_MIN : READER_MIN);
   const assistantSpace = assistantDocked ? ASSISTANT_SPACE : 0;
   const container = windowWidth - sidebarSpace - assistantSpace;
   const listWidthUsed = effectiveListWidth(listWidth, container);
