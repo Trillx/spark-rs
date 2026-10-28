@@ -27,8 +27,8 @@ spark-cli <command> [arguments] [--json]
 **Text or JSON.** Commands print text to read. Add `--json` for the same
 result as JSON with full values, snake_case keys and ISO 8601 dates, to
 process it (`spark-cli emails --json | jq '.emails[].id'`). A failure prints
-`{"error": {"message": "…"}}` with `--json`, or `Error: …` on stderr, and
-exits with 1.
+`{"error": {"message": "…"}}` with `--json`, or an error on stderr, and
+exits non-zero.
 
 ## Working safely
 

@@ -601,18 +601,65 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
     })
 }
 
-async fn unsubscribe(env: &Env<'_>, ids: &[String]) -> Done {
-    let mut results = Vec::new();
-    let mut lines = Vec::new();
+/// IDs as given, each once, in order.
+fn once(ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     for id in ids {
-        let id = message_id(id)?;
+        let id = id.trim().to_owned();
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// How a command over several targets went once each was tried. Every
+/// target was checked first, so what fails here failed on its own (the
+/// network, the server), and the others still ran.
+fn finish(
+    results: Vec<Value>,
+    lines: Vec<String>,
+    failed: usize,
+    done: String,
+    effect: Option<Effect>,
+    targets: Vec<String>,
+) -> Done {
+    if failed == results.len() {
+        return Err(Fail::Error(lines.join("\n")));
+    }
+    Ok(Reply {
+        targets,
+        summary: done,
+        effect,
+        ..Reply::new(
+            json!({ "results": results, "failed": failed }),
+            lines.join("\n"),
+        )
+    })
+}
+
+async fn unsubscribe(env: &Env<'_>, ids: &[String]) -> Done {
+    // Every email first, so one that can't be done stops them all.
+    let mut targets = Vec::new();
+    for id in once(ids) {
+        let id = message_id(&id)?;
         let (m, account) = env.message(id)?;
         env.need(&account, Access::Triage, "unsubscribe")?;
-        let result = env
-            .engine
-            .unsubscribe(id)
-            .await
-            .map_err(|e| Fail::Error(format!("Email {id}: {e}")))?;
+        targets.push((id, m, account));
+    }
+    let mut results = Vec::new();
+    let mut lines = Vec::new();
+    let mut failed = 0;
+    for (id, m, account) in targets {
+        let result = match env.engine.unsubscribe(id).await {
+            Ok(result) => result,
+            Err(e) => {
+                failed += 1;
+                lines.push(format!("Email {id}: couldn't unsubscribe: {e}"));
+                results.push(json!({ "id": id, "result": "failed", "error": e.to_string() }));
+                continue;
+            }
+        };
         match result {
             Unsubscribed::Done => {
                 lines.push(format!("Email {id}: unsubscribed from {}.", m.from_address));
@@ -662,11 +709,16 @@ async fn unsubscribe(env: &Env<'_>, ids: &[String]) -> Done {
             }
         }
     }
-    Ok(Reply {
-        targets: ids.to_vec(),
-        summary: format!("unsubscribed from {}", count(ids.len(), "list", "lists")),
-        ..Reply::new(json!({ "results": results }), lines.join("\n"))
-    })
+    let tried = results.len() - failed;
+    let ids: Vec<String> = results.iter().map(|r| r["id"].to_string()).collect();
+    finish(
+        results,
+        lines,
+        failed,
+        format!("unsubscribed from {}", count(tried, "list", "lists")),
+        None,
+        ids,
+    )
 }
 
 /// A queued send an id names: `s12` for outbox 12, or the saved draft a
@@ -689,9 +741,73 @@ fn waiting(env: &Env, id: &str) -> Result<Option<spark_mail::engine::WaitingSend
     Ok(sends.into_iter().find(|w| w.draft.draft_id == Some(draft)))
 }
 
+/// What `action send` does with one ID, once it's checked.
+enum Sending {
+    /// Something already queued: moved, or sent now.
+    Queued(Box<spark_mail::engine::WaitingSend>),
+    /// A saved draft, ready to queue.
+    Draft {
+        id: i64,
+        account: spark_store::Account,
+        draft: Box<spark_mail::draft::Draft>,
+    },
+}
+
+/// Checks that draft `id` can go: the account allows sending, and it has
+/// recipients, a subject, no template placeholders left and fits.
+async fn sendable(env: &Env<'_>, id: i64, at: Option<i64>) -> Result<Sending, Fail> {
+    let (_, account) = env.message(id)?;
+    if !env.store().is_draft(id).map_err(db)? {
+        return Err(Fail::Error(format!(
+            "Email {id} isn't a draft. draft writes one; action send sends it."
+        )));
+    }
+    env.need(&account, Access::Send, "send mail")?;
+    let mut draft = mailbox::open_live(env.engine, id)
+        .await
+        .map_err(Fail::Error)?;
+    if draft.to.trim().is_empty() && draft.cc.trim().is_empty() && draft.bcc.trim().is_empty() {
+        return Err(Fail::Error(format!(
+            "Draft {id} has no recipients: draft --edit {id} --to … adds them."
+        )));
+    }
+    if draft.subject.trim().is_empty() {
+        return Err(Fail::Error(format!(
+            "Draft {id} has no subject: draft --edit {id} --subject … adds one."
+        )));
+    }
+    for field in [&draft.to, &draft.cc, &draft.bcc] {
+        spark_mail::draft::recipients(field)
+            .map_err(|e| Fail::Error(format!("Draft {id}: {e}")))?;
+    }
+    draft
+        .check_size()
+        .map_err(|e| Fail::Error(format!("Draft {id}: {e}")))?;
+    if draft
+        .body_html
+        .as_deref()
+        .is_some_and(|h| h.contains("data-placeholder="))
+    {
+        return Err(Fail::Error(format!(
+            "Draft {id} still has template placeholders to fill. Edit its body, or let the user fill them in spark-rs."
+        )));
+    }
+    draft.draft_id = Some(id);
+    draft.send_at = at.unwrap_or_else(|| now_ms() + SEND_DELAY_MS);
+    draft.send_later = at.map(|at| SendLater {
+        key: "custom".into(),
+        at,
+    });
+    Ok(Sending::Draft {
+        id,
+        account,
+        draft: Box::new(draft),
+    })
+}
+
 /// `action send`: sends saved drafts (after the usual 30 seconds the user
 /// can undo in), schedules them with `date`, or moves or sends now what's
-/// scheduled.
+/// scheduled. Every ID is checked before any goes.
 async fn send(env: &Env<'_>, a: &Args<'_>, ids: &[String]) -> Done {
     let at = match a.str("date") {
         Some(date) => {
@@ -705,167 +821,168 @@ async fn send(env: &Env<'_>, a: &Args<'_>, ids: &[String]) -> Done {
         }
         None => None,
     };
+    let mut plan = Vec::new();
+    for id in once(ids) {
+        let item = match waiting(env, &id)? {
+            Some(w) => {
+                let account = env.account(w.account_id)?;
+                env.need(&account, Access::Send, "send mail")?;
+                Sending::Queued(Box::new(w))
+            }
+            None => sendable(env, message_id(&id)?, at).await?,
+        };
+        plan.push((id, item));
+    }
     let mut lines = Vec::new();
     let mut results = Vec::new();
     let mut effect = None;
-    for id in ids {
-        if let Some(w) = waiting(env, id)? {
-            let account = env.account(w.account_id)?;
-            env.need(&account, Access::Send, "send mail")?;
-            let moved = env
-                .engine
-                .reschedule(w.id, at)
-                .await
-                .map_err(|e| Fail::Error(e.to_string()))?;
-            if at.is_none() && moved == QueuedChange::Moved {
-                (env.nudge)(w.account_id);
-            }
-            let line = match (moved, at) {
-                (QueuedChange::Moved, Some(at)) => {
-                    format!("{id} rescheduled to send on {}.", when(at))
+    let mut failed = 0;
+    for (id, item) in plan {
+        match item {
+            Sending::Queued(w) => {
+                let moved = match env.engine.reschedule(w.id, at).await {
+                    Ok(moved) => moved,
+                    Err(e) => {
+                        failed += 1;
+                        lines.push(format!("{id} couldn't be changed: {e}"));
+                        results
+                            .push(json!({ "id": id, "result": "failed", "error": e.to_string() }));
+                        continue;
+                    }
+                };
+                if at.is_none() && moved == QueuedChange::Moved {
+                    (env.nudge)(w.account_id);
                 }
-                (QueuedChange::Moved, None) => format!("{id} is sending now."),
-                (QueuedChange::Sent, _) => format!("{id} was already sent."),
-                (QueuedChange::Failed { draft_id }, _) => format!(
-                    "{id} couldn't be sent and is back in Drafts{}.",
-                    draft_id
-                        .map(|d| format!(" as draft {d}"))
-                        .unwrap_or_default()
-                ),
-                (QueuedChange::TakenBack { draft_id }, _) => {
-                    format!("{id} is back in Drafts as draft {draft_id}.")
+                lines.push(match (moved, at) {
+                    (QueuedChange::Moved, Some(at)) => {
+                        format!("{id} rescheduled to send on {}.", when(at))
+                    }
+                    (QueuedChange::Moved, None) => format!("{id} is sending now."),
+                    (QueuedChange::Sent, _) => format!("{id} was already sent."),
+                    (QueuedChange::Failed { draft_id }, _) => format!(
+                        "{id} couldn't be sent and is back in Drafts{}.",
+                        draft_id
+                            .map(|d| format!(" as draft {d}"))
+                            .unwrap_or_default()
+                    ),
+                    (QueuedChange::TakenBack { draft_id }, _) => {
+                        format!("{id} is back in Drafts as draft {draft_id}.")
+                    }
+                    (QueuedChange::Gone, _) => format!("{id} is no longer waiting to send."),
+                });
+                results.push(
+                    json!({ "id": id, "result": serde_json::to_value(moved).unwrap_or_default() }),
+                );
+            }
+            Sending::Draft {
+                id: draft_id,
+                account,
+                draft,
+            } => {
+                let queued = env.prefs.with_agent_access(|grants| {
+                    refuse(env.agent, grants, &account, Access::Send, "send mail")?;
+                    mailbox::queue_live(env.engine, &draft).map_err(Fail::Error)
+                });
+                let queued = match queued {
+                    Ok(queued) => queued,
+                    Err(Fail::Blocked(m)) => return Err(Fail::Blocked(m)),
+                    Err(Fail::Error(e)) => {
+                        failed += 1;
+                        lines.push(format!("Draft {draft_id} didn't go: {e}"));
+                        results.push(json!({ "id": draft_id, "result": "failed", "error": e }));
+                        continue;
+                    }
+                };
+                if let Some(signature) = draft
+                    .signature_id
+                    .filter(|_| draft.clean_signature().is_some())
+                {
+                    env.store()
+                        .use_signature(&account.email, signature, now_ms())
+                        .map_err(db)?;
                 }
-                (QueuedChange::Gone, _) => format!("{id} is no longer waiting to send."),
-            };
-            results.push(
-                json!({ "id": id, "result": serde_json::to_value(moved).unwrap_or_default() }),
-            );
-            lines.push(line);
-            continue;
-        }
-        let draft_id = message_id(id)?;
-        let (m, account) = env.message(draft_id)?;
-        if !env.store().is_draft(draft_id).map_err(db)? {
-            return Err(Fail::Error(format!(
-                "Email {draft_id} isn't a draft. draft writes one; action send sends it."
-            )));
-        }
-        env.need(&account, Access::Send, "send mail")?;
-        let mut draft = mailbox::open_live(env.engine, draft_id)
-            .await
-            .map_err(Fail::Error)?;
-        if draft.to.trim().is_empty() && draft.cc.trim().is_empty() && draft.bcc.trim().is_empty() {
-            return Err(Fail::Error(format!(
-                "Draft {draft_id} has no recipients: draft edit={draft_id} to=… adds them."
-            )));
-        }
-        if draft.subject.trim().is_empty() {
-            return Err(Fail::Error(format!(
-                "Draft {draft_id} has no subject: draft edit={draft_id} subject=… adds one."
-            )));
-        }
-        for field in [&draft.to, &draft.cc, &draft.bcc] {
-            spark_mail::draft::recipients(field)
-                .map_err(|e| Fail::Error(format!("Draft {draft_id}: {e}")))?;
-        }
-        draft
-            .check_size()
-            .map_err(|e| Fail::Error(format!("Draft {draft_id}: {e}")))?;
-        if draft
-            .body_html
-            .as_deref()
-            .is_some_and(|h| h.contains("data-placeholder="))
-        {
-            return Err(Fail::Error(format!(
-                "Draft {draft_id} still has template placeholders to fill. Edit its body, or let the user fill them in spark-rs."
-            )));
-        }
-        draft.draft_id = Some(draft_id);
-        draft.send_at = at.unwrap_or_else(|| now_ms() + SEND_DELAY_MS);
-        draft.send_later = at.map(|at| SendLater {
-            key: "custom".into(),
-            at,
-        });
-        let queued = env.prefs.with_agent_access(|grants| {
-            refuse(env.agent, grants, &account, Access::Send, "send mail")?;
-            mailbox::queue_live(env.engine, &draft).map_err(Fail::Error)
-        })?;
-        if let Some(signature) = draft
-            .signature_id
-            .filter(|_| draft.clean_signature().is_some())
-        {
-            env.store()
-                .use_signature(&account.email, signature, now_ms())
-                .map_err(db)?;
-        }
-        let to = if draft.to.is_empty() {
-            draft.cc.clone()
-        } else {
-            draft.to.clone()
-        };
-        match at {
-            Some(at) => {
-                lines.push(format!(
-                    "Draft {draft_id} scheduled to send on {}. Scheduled ID: s{queued}.",
-                    when(at)
-                ));
-                effect = Some(Effect::Changed {
-                    summary: format!("scheduled an email to {to}"),
-                });
-            }
-            None => {
-                lines.push(format!(
-                    "Draft {draft_id} sends in {} seconds unless the user undoes it in spark-rs. Scheduled ID: s{queued}.",
-                    SEND_DELAY_MS / 1000
-                ));
-                effect = Some(Effect::Sending {
-                    id: queued,
-                    to: to.clone(),
-                    subject: draft.subject.clone(),
-                    send_at: draft.send_at,
-                });
+                let to = if draft.to.is_empty() {
+                    draft.cc.clone()
+                } else {
+                    draft.to.clone()
+                };
+                match at {
+                    Some(at) => {
+                        lines.push(format!(
+                            "Draft {draft_id} scheduled to send on {}. Scheduled ID: s{queued}.",
+                            when(at)
+                        ));
+                        effect = Some(Effect::Changed {
+                            summary: format!("scheduled an email to {to}"),
+                        });
+                    }
+                    None => {
+                        lines.push(format!(
+                            "Draft {draft_id} sends in {} seconds unless the user undoes it in spark-rs. Scheduled ID: s{queued}.",
+                            SEND_DELAY_MS / 1000
+                        ));
+                        effect = Some(Effect::Sending {
+                            id: queued,
+                            to: to.clone(),
+                            subject: draft.subject.clone(),
+                            send_at: draft.send_at,
+                        });
+                    }
+                }
+                results.push(json!({
+                    "id": draft_id,
+                    "result": if at.is_some() { "scheduled" } else { "sending" },
+                    "scheduled_id": format!("s{queued}"),
+                    "account": account.email,
+                    "to": to,
+                    "subject": draft.subject,
+                    "sends_at": iso(draft.send_at),
+                }));
             }
         }
-        results.push(json!({
-            "id": draft_id,
-            "scheduled_id": format!("s{queued}"),
-            "account": account.email,
-            "to": to,
-            "subject": m.subject,
-            "sends_at": iso(draft.send_at),
-        }));
     }
-    Ok(Reply {
-        targets: ids.to_vec(),
-        summary: match at {
-            Some(at) => format!(
-                "scheduled {} for {}",
-                count(ids.len(), "email", "emails"),
-                when(at)
-            ),
-            None => format!("sent {}", count(ids.len(), "email", "emails")),
-        },
-        effect,
-        ..Reply::new(json!({ "results": results }), lines.join("\n"))
-    })
+    let went = results.len() - failed;
+    let done = match at {
+        Some(at) => format!(
+            "scheduled {} for {}",
+            count(went, "email", "emails"),
+            when(at)
+        ),
+        None => format!("sent {}", count(went, "email", "emails")),
+    };
+    let targets = results
+        .iter()
+        .map(|r| r["id"].to_string().trim_matches('"').to_owned())
+        .collect();
+    finish(results, lines, failed, done, effect, targets)
 }
 
 async fn unschedule(env: &Env<'_>, ids: &[String]) -> Done {
-    let mut lines = Vec::new();
-    let mut results = Vec::new();
-    for id in ids {
-        let w = waiting(env, id)?.ok_or_else(|| {
+    // Every ID first, so one that isn't scheduled stops them all.
+    let mut plan = Vec::new();
+    for id in once(ids) {
+        let w = waiting(env, &id)?.ok_or_else(|| {
             Fail::Error(format!(
                 "{id} isn't scheduled. emails Scheduled lists what is."
             ))
         })?;
         let account = env.account(w.account_id)?;
         env.need(&account, Access::Send, "change scheduled mail")?;
-        let change = env
-            .engine
-            .unschedule(w.id, false)
-            .await
-            .map_err(|e| Fail::Error(e.to_string()))?;
+        plan.push((id, w));
+    }
+    let mut lines = Vec::new();
+    let mut results = Vec::new();
+    let mut failed = 0;
+    for (id, w) in plan {
+        let change = match env.engine.unschedule(w.id, false).await {
+            Ok(change) => change,
+            Err(e) => {
+                failed += 1;
+                lines.push(format!("{id} couldn't be taken back: {e}"));
+                results.push(json!({ "id": id, "result": "failed", "error": e.to_string() }));
+                continue;
+            }
+        };
         lines.push(match &change {
             QueuedChange::TakenBack { draft_id } => {
                 format!("{id} unscheduled: it's back in Drafts as draft {draft_id}.")
@@ -878,14 +995,21 @@ async fn unschedule(env: &Env<'_>, ids: &[String]) -> Done {
         results
             .push(json!({ "id": id, "result": serde_json::to_value(change).unwrap_or_default() }));
     }
-    Ok(Reply {
-        targets: ids.to_vec(),
-        summary: format!("unscheduled {}", count(ids.len(), "email", "emails")),
-        effect: Some(Effect::Changed {
+    let went = results.len() - failed;
+    let targets = results
+        .iter()
+        .map(|r| r["id"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    finish(
+        results,
+        lines,
+        failed,
+        format!("unscheduled {}", count(went, "email", "emails")),
+        Some(Effect::Changed {
             summary: "unscheduled an email".into(),
         }),
-        ..Reply::new(json!({ "results": results }), lines.join("\n"))
-    })
+        targets,
+    )
 }
 
 // ---- Contacts ----

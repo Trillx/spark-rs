@@ -640,3 +640,31 @@ fn waiting_finds_sent_email_nobody_answered() {
     let unreplied = f.ok("search", json!({ "filter": "is:unreplied from:ana" }));
     assert!(subjects(&unreplied).contains(&"Re: Proposal".to_owned()));
 }
+
+#[test]
+fn a_send_with_one_bad_id_sends_nothing() {
+    let f = Fixture::new("send-checked-first");
+    f.allow(f.work, Access::Send);
+    let v = f.ok(
+        "draft",
+        json!({ "to": ["bo@example.com"], "subject": "Hi", "body": "Hello" }),
+    );
+    let draft = v["id"].as_i64().unwrap();
+    let out = f.run(
+        "action",
+        json!({ "action_name": "send", "message_ids": [draft.to_string(), "99999"] }),
+    );
+    assert!(out.is_error, "{}", out.text);
+    assert_eq!(
+        f.ok("emails", json!({ "folder": "Scheduled" }))["total"],
+        0,
+        "the good draft waited"
+    );
+    // The same ID twice goes once.
+    let sent = f.ok(
+        "action",
+        json!({ "action_name": "send", "message_ids": [draft.to_string(), draft.to_string()] }),
+    );
+    assert_eq!(sent["results"].as_array().unwrap().len(), 1);
+    assert_eq!(f.ok("emails", json!({ "folder": "Scheduled" }))["total"], 1);
+}

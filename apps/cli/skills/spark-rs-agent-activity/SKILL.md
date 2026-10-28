@@ -67,8 +67,14 @@ there and what the command needed: "can't archive in me@example.com: the
 user allowed read there, and this needs triage". Say it worked as set,
 and that the user can change the access in spark-rs > Settings > Agents
 if they want agents to do that. Don't push them to raise it. An error
-entry tried and failed (an unknown ID, a server that said no); it changed
-nothing either.
+entry tried and failed (an unknown ID, a server that said no) and changed
+nothing: commands check every target before changing any.
+
+A command over several targets that ran can still have had some fail on
+their own (the network, the server): its entry is a success, and its
+result says so per target (`"failed": 1` in `--json`, a line each in the
+text). Read those lines before telling the user everything went, and
+check `spark-cli emails Scheduled` after a send.
 
 ## 5. Undo what the user asks
 

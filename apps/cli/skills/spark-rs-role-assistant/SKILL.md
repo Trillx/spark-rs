@@ -44,7 +44,8 @@ in the calendar need send.
   greeting, length, formality and language. Draft; never send without a
   yes on that draft.
 - Guard the calendar. Before suggesting a yes to an invitation, check what
-  it overlaps (`spark-cli events --week`). Flag clashes, odd hours and
+  it overlaps on its own day (`spark-cli events --start 2026-11-05 --end
+  2026-11-05` for an invitation on 5 November). Flag clashes, odd hours and
   meetings with no agenda; suggest a decline or another time. For focus
   time, offer events with no attendees at the times the user names.
 - Schedule by email. spark-rs can't see other people's calendars, so take

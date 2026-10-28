@@ -401,7 +401,7 @@ impl Params {
 pub async fn run(mail: Mail, json: bool) -> Result<()> {
     let p = Params::default();
     let mut stream = false;
-    let mut upload: Option<PathBuf> = None;
+    let mut upload: Option<Upload> = None;
     let (tool, params) = match mail {
         Mail::Accounts => ("accounts", p),
         Mail::Folders { account } => ("folders", p.str("account", account)),
@@ -475,9 +475,9 @@ pub async fn run(mail: Mail, json: bool) -> Result<()> {
                 .map(|p| absolute(p).display().to_string())
                 .collect();
             if let Some(name) = attach_stream {
-                let path = read_stdin_file(&name)?;
-                files.push(path.display().to_string());
-                upload = Some(path);
+                let piped = read_stdin_file(&name)?;
+                files.push(piped.path.display().to_string());
+                upload = Some(piped);
             }
             (
                 "draft",
@@ -601,11 +601,8 @@ pub async fn run(mail: Mail, json: bool) -> Result<()> {
     let result = Link::new(&caller())
         .request("tools/call", json!({ "name": tool, "arguments": params.0 }))
         .await;
-    if let Some(path) = upload
-        && let Some(dir) = path.parent()
-    {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    // spark-rs has read the piped file by now.
+    drop(upload);
     let result = result?;
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
     if result["isError"].as_bool().unwrap_or(false) {
@@ -657,9 +654,21 @@ fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
 }
 
-/// Saves what's piped to stdin as `name` in a folder of its own, for
-/// spark-rs to attach; the caller removes the folder after.
-fn read_stdin_file(name: &str) -> Result<PathBuf> {
+/// A file piped in for `--attach-stream`, in a folder of its own that goes
+/// when this does: once spark-rs has read it, or as soon as saving fails.
+struct Upload {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Saves what's piped to stdin as `name`, for spark-rs to attach.
+fn read_stdin_file(name: &str) -> Result<Upload> {
     let name = Path::new(name)
         .file_name()
         .context("--attach-stream needs a file name, e.g. --attach-stream report.pdf")?;
@@ -683,9 +692,12 @@ fn read_stdin_file(name: &str) -> Result<PathBuf> {
                 .map_or(0, |d| d.as_nanos())
         ));
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(name);
-    std::fs::write(&path, bytes)?;
-    Ok(path)
+    let upload = Upload {
+        path: dir.join(name),
+        dir,
+    };
+    std::fs::write(&upload.path, bytes)?;
+    Ok(upload)
 }
 
 /// `spark-cli skill`: prints a skill (the base one unless named), lists

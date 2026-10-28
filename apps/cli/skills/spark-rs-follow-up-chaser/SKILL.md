@@ -30,13 +30,16 @@ Search every folder, not just Sent, so a conversation that was archived
 still counts:
 
 ```bash
-spark-cli search --filter "is:waiting newer_than:30d older_than:3d" --json
+spark-cli search --filter "is:waiting newer_than:30d" --json
 ```
 
-Start with that window: younger than three days is too soon to chase,
-older than a month is usually dead. Widen it if the user asks ("anything
-from this quarter"). One row is a conversation; its `id` is the user's
-latest email in it.
+One row is a conversation; its `id` and `.date` are the user's latest
+email in it, which may be a nudge they already sent. Then drop the rows
+whose `.date` is under three days old: too soon to chase again. Don't put
+`older_than:` in the filter itself, or a conversation nudged yesterday
+shows up by its older first email and gets chased twice. Older than a
+month is usually dead; widen the window if the user asks ("anything from
+this quarter").
 
 ## 2. Leave out what doesn't need an answer
 

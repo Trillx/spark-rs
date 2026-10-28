@@ -105,7 +105,28 @@ enum AiProvider {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            let shown = matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            // With --json, a mistyped command answers in JSON too.
+            if !shown && std::env::args_os().any(|a| a == "--json") {
+                let message = e.to_string();
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": { "message": message.trim() } })
+                );
+                std::process::exit(1);
+            }
+            e.exit();
+        }
+    };
     let json = cli.json;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

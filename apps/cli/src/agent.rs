@@ -313,16 +313,31 @@ fn attach_file(result: &mut Value) {
 }
 
 fn resource(path: &str, mime: &str, blob: String) -> Value {
-    let uri = format!(
-        "file:///{}",
-        path.replace('\\', "/").trim_start_matches('/')
-    );
+    let uri = file_uri(path);
     let mime = if mime.is_empty() {
         "application/octet-stream"
     } else {
         mime
     };
     json!({ "type": "resource", "resource": { "uri": uri, "mimeType": mime, "blob": blob } })
+}
+
+/// `path` as a `file:` URI, with spaces, `#`, `%` and the like escaped.
+fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let mut uri = String::from("file://");
+    if !path.starts_with('/') {
+        uri.push('/');
+    }
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
 }
 
 fn error(id: Value, code: i64, message: String) -> Value {
@@ -429,6 +444,15 @@ mod tests {
         assert!(!updating(&marker, written + UPDATE_TIMEOUT));
         assert!(!updating(&marker, written - Duration::from_secs(60)));
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn attachment_uris_escape_what_a_file_name_can_hold() {
+        assert_eq!(
+            file_uri("C:\\Temp\\agent-files\\1114-2\\Quote #42 é.pdf"),
+            "file:///C:/Temp/agent-files/1114-2/Quote%20%2342%20%C3%A9.pdf"
+        );
+        assert_eq!(file_uri("/tmp/a%b.txt"), "file:///tmp/a%25b.txt");
     }
 
     #[tokio::test]

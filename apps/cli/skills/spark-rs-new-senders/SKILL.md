@@ -41,14 +41,16 @@ where waiting mail shows `.new_sender`).
 spark-cli accounts
 spark-cli thread 1114
 spark-cli contact bo@example.net
-spark-cli search --filter "to:bo@example.net"
+spark-cli search --filter "to:bo@example.net" --in Sent
 spark-cli contacts fabrikam.example
 ```
 
 Signs of a real contact:
 
 - The email answers something the user sent, or the user has written to
-  this address (`search --filter "to:…"` finds the user's own mail to them).
+  this address: `search --filter "to:…" --in Sent` lists the user's own
+  mail to them. Without `--in Sent`, `to:` also finds other people's mail
+  to that address with the user on Cc, which proves nothing.
 - A company domain where the user already knows people (`contacts` with the
   domain), or a colleague's domain (the same as one of the user's accounts).
 - Mail the user would expect: a reply to a form they filled in, an
