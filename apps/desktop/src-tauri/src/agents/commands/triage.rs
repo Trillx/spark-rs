@@ -576,7 +576,7 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
                             from: r.remind_at,
                             to: at,
                             account: r.account_id,
-                            subject: r.subject,
+                            email: store.reminder_email(id).map_err(db)?,
                         });
                     }
                 }
@@ -598,7 +598,7 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
                         id,
                         at: Some(at),
                         account: m.account_id,
-                        subject: m.subject.clone(),
+                        email: store.reminder_email(id).map_err(db)?,
                     });
                 }
                 None => {

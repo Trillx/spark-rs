@@ -114,8 +114,8 @@ pub enum Step {
         #[serde(default)]
         print: u64,
     },
-    /// A reminder the agent set, for `at`. Its account and subject tell
-    /// it from a later reminder that got its id.
+    /// A reminder the agent set, for `at`. Its account and email
+    /// (`Store::reminder_email`) tell it from a later reminder given its id.
     Reminder {
         id: i64,
         #[serde(default)]
@@ -123,7 +123,7 @@ pub enum Step {
         #[serde(default)]
         account: i64,
         #[serde(default)]
-        subject: String,
+        email: Option<(Option<String>, i64)>,
     },
     /// A reminder the agent cleared, all of it.
     ReminderCleared {
@@ -135,24 +135,26 @@ pub enum Step {
         from: i64,
         to: i64,
         account: i64,
-        subject: String,
+        email: Option<(Option<String>, i64)>,
     },
 }
 
 /// What a draft says, as a number that changes when it does: its subject,
-/// To, Cc, Bcc and text (FNV-1a, which stays the same across builds).
+/// To, Cc, Bcc, text, HTML and files (FNV-1a, which stays the same across
+/// builds).
 pub fn draft_print(store: &Store, id: i64) -> spark_store::Result<u64> {
     let subject = store.message(id)?.map(|m| m.subject).unwrap_or_default();
-    let fields = match store.content(id)? {
-        Some(c) => [c.to.join(","), c.cc.join(","), c.bcc.join(","), c.text],
-        None => Default::default(),
-    };
+    let mut fields = vec![subject];
+    if let Some(c) = store.content(id)? {
+        fields.extend([c.to.join(","), c.cc.join(","), c.bcc.join(","), c.text]);
+        fields.push(c.html.unwrap_or_default());
+        // Its files by what they are; the server's ids for them come later.
+        for a in &c.attachments {
+            fields.push(format!("{}\u{1}{}\u{1}{}", a.name, a.mime, a.size));
+        }
+    }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in [vec![subject], fields.to_vec()]
-        .concat()
-        .join("\u{0}")
-        .bytes()
-    {
+    for byte in fields.join("\u{0}").bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -721,10 +723,10 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
             id,
             at,
             account,
-            subject,
+            email,
         } => match store.reminder(*id)? {
             None => return Ok(Some(format!("reminder {id} is gone"))),
-            Some(r) if r.account_id != *account || r.subject != *subject => {
+            Some(r) if r.account_id != *account || store.reminder_email(*id)? != *email => {
                 return Ok(Some(format!("reminder {id} is gone")));
             }
             Some(r) if r.due || at.is_some_and(|at| r.remind_at != at) => {
@@ -742,10 +744,10 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
             from,
             to,
             account,
-            subject,
+            email,
         } => match store.reminder(*id)? {
             None => return Ok(Some(format!("reminder {id} is gone"))),
-            Some(r) if r.account_id != *account || r.subject != *subject => {
+            Some(r) if r.account_id != *account || store.reminder_email(*id)? != *email => {
                 return Ok(Some(format!("reminder {id} is gone")));
             }
             Some(r) if r.due || r.remind_at != *to => {

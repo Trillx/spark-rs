@@ -1084,3 +1084,80 @@ fn undo_leaves_a_reminder_that_reused_the_id() {
         "B's reminder stays: {out}"
     );
 }
+
+#[test]
+fn undo_keeps_a_draft_given_a_file_since() {
+    let f = Fixture::new("draft-file-undo");
+    f.allow(f.work, Access::Triage);
+    let draft = f.ok(
+        "draft",
+        json!({ "to": ["bo@example.com"], "subject": "Hi", "body": "Hello" }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    let wrote = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let file = f.dir.join("quote.txt");
+    std::fs::write(&file, "EUR 40").unwrap();
+    let edited = f.ok(
+        "draft",
+        json!({ "edit": draft.to_string(), "attach": [file.display().to_string()] }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    f.ok("history", json!({ "undo": wrote.to_string() }));
+    assert!(
+        f.engine.store().is_draft(edited).unwrap(),
+        "the draft with its new file stays"
+    );
+}
+
+#[test]
+fn undo_tells_reminders_on_same_subject_emails_apart() {
+    let f = Fixture::new("reminder-same-subject");
+    f.allow(f.work, Access::Triage);
+    let sent = |uid: u32, minutes: i64| {
+        let added = f
+            .engine
+            .store()
+            .add_incoming(
+                &Incoming {
+                    account_id: f.work,
+                    mailbox: Some("INBOX".into()),
+                    uid: Some(uid),
+                    message_id: Some(format!("<invoice-{uid}@work.com>")),
+                    from_name: "Me Myself".into(),
+                    from_address: "me@work.com".into(),
+                    to: vec!["Ana Ruiz <ana@parts.com>".into()],
+                    subject: "Invoice".into(),
+                    date: now_ms() - 60_000 * minutes,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        match added {
+            spark_store::Added::New(id) | spark_store::Added::Known(id) => id,
+        }
+    };
+    let (a, b) = (sent(60, 90), sent(61, 80));
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [a], "date": "2099-03-02" }),
+    );
+    let set_a = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    f.ok(
+        "action",
+        json!({ "action_name": "clearReminder", "message_ids": [a] }),
+    );
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [b], "date": "2099-03-02" }),
+    );
+    let kept = f.engine.store().reminders_on(b).unwrap();
+    f.ok("history", json!({ "undo": set_a.to_string() }));
+    assert_eq!(f.engine.store().reminders_on(b).unwrap(), kept);
+}

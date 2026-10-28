@@ -788,9 +788,10 @@ pub async fn availability(env: &Env<'_>, a: &Args<'_>) -> Done {
         .filter(|(c, _, _)| c.own)
         .map(|(c, _, _)| c.id)
         .collect();
+    // A day either side: all-day events are kept in UTC days.
     let mut busy: Vec<(i64, i64)> = env
         .store()
-        .events_between(start, end)
+        .events_between(start - DAY, end + DAY)
         .map_err(db)?
         .into_iter()
         .filter(|e| own.contains(&e.calendar_id))

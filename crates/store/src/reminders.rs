@@ -155,6 +155,19 @@ impl Store {
         Ok(())
     }
 
+    /// The sent email a reminder is about: its Message-ID (when known) and
+    /// when it was sent. With the account, it tells a reminder from a later
+    /// one given the same id.
+    pub fn reminder_email(&self, id: i64) -> Result<Option<(Option<String>, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT message_id, sent_at FROM reminders WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
     /// Removes a reminder, returning all of it so `restore_reminder` can
     /// put it back.
     pub fn remove_reminder(&mut self, id: i64) -> Result<Option<RemovedReminder>> {
