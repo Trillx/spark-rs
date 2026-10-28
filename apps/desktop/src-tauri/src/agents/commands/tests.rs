@@ -293,6 +293,34 @@ fn emails_list_conversations_newest_first_with_filters() {
         spread["emails"][0]["folders"],
         json!({ "Done": 1, "Inbox": 1 })
     );
+    // A label on an email that stays where it is counts too, as Gmail keeps it.
+    let reply = f.id("Re: Bracket quote");
+    {
+        let mut store = f.engine.store();
+        let label = spark_store::RemoteFolder {
+            remote_id: "Projects".into(),
+            parent: None,
+            name: "Projects".into(),
+            role: None,
+            selectable: true,
+        };
+        store.replace_folders(f.work, &[label]).unwrap();
+        let folder = store
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.name == "Projects")
+            .unwrap()
+            .id;
+        store
+            .set_folder_members(folder, &[(reply, Some(2))])
+            .unwrap();
+    }
+    let labelled = f.ok("search", json!({ "filter": "from:ana" }));
+    assert_eq!(
+        labelled["emails"][0]["folders"],
+        json!({ "Done": 1, "Inbox": 1, "Projects": 1 })
+    );
     let news = f.ok(
         "emails",
         json!({ "filter": "category:newsletter is:unread" }),

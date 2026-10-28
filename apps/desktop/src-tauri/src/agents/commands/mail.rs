@@ -360,7 +360,20 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
             .or_insert((m, 0, m.date, BTreeMap::new()));
         row.1 += 1;
         row.2 = row.2.min(m.date);
-        *row.3.entry(view.folder_name(m)).or_default() += 1;
+        // Where it is, and the user's folders or labels it's also in
+        // (Gmail keeps one email under several), each once.
+        let mut places = vec![view.folder_name(m)];
+        for &f in m.folders.iter().chain(m.folder.iter()) {
+            if view.folders.iter().any(|x| x.id == f && x.role.is_none()) {
+                let path = view.path(f).to_owned();
+                if !places.contains(&path) {
+                    places.push(path);
+                }
+            }
+        }
+        for place in places {
+            *row.3.entry(place).or_default() += 1;
+        }
         if (m.date, m.id) > (row.0.date, row.0.id) {
             row.0 = m;
         }
@@ -381,7 +394,7 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
                 row["messages"] = json!(n);
                 row["first_date"] = json!(iso(*first));
             }
-            // Matches in several folders: how many in each.
+            // Matches in several folders or labels: how many in each.
             if folders.len() > 1 {
                 row["folders"] = json!(folders);
             }
