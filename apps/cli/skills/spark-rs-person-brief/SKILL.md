@@ -37,14 +37,14 @@ both. `contact` gives their category, Priority and Gatekeeper status.
 ```bash
 spark-cli search --filter "from:ana@example.com" --page-size 200 --json
 spark-cli search --filter "to:ana@example.com" --page-size 200 --json
-spark-cli search --filter "from:ana@example.com" --order ascending --page-size 5
 ```
 
 Each row is a conversation, dated by its newest match; `.messages` counts
 its matching emails when there's more than one, so add up `.messages // 1`
-for an email count. The third line gives the oldest conversations. A long
-thread can start before its row's date: read the first two with `thread`
-for the true first contact.
+for an email count. First contact is the earliest `.first_date // .date`
+across all the rows of both searches (`.first_date` is when the
+conversation's first matching email came), not the first row of an
+ascending list, which sorts conversations by their newest email.
 
 ## 3. Find the topics
 

@@ -261,6 +261,8 @@ fn emails_list_conversations_newest_first_with_filters() {
         ["Dinner Sunday", "Weekly deals", "Re: Bracket quote"]
     );
     assert_eq!(inbox["emails"][2]["messages"], 2);
+    // The conversation's row is its newest email, with when the first came.
+    assert!(inbox["emails"][2]["first_date"].as_str().unwrap() < inbox["emails"][2]["date"].as_str().unwrap());
     let work = f.ok(
         "emails",
         json!({ "folder": "me@work.com", "filter": "from:ana -category:newsletter" }),

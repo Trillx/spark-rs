@@ -341,17 +341,19 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
     };
     let hits = filter.apply(&store, view, candidates, found.as_ref(), now_ms())?;
     drop(store);
-    // One row a conversation: its newest match, counting the rest.
-    let mut rows: BTreeMap<i64, (&Message, usize)> = BTreeMap::new();
+    // One row a conversation: its newest match, counting the rest and
+    // keeping when the first was.
+    let mut rows: BTreeMap<i64, (&Message, usize, i64)> = BTreeMap::new();
     for m in hits {
-        let row = rows.entry(m.conversation).or_insert((m, 0));
+        let row = rows.entry(m.conversation).or_insert((m, 0, m.date));
         row.1 += 1;
+        row.2 = row.2.min(m.date);
         if (m.date, m.id) > (row.0.date, row.0.id) {
             row.0 = m;
         }
     }
-    let mut rows: Vec<(&Message, usize)> = rows.into_values().collect();
-    rows.sort_by_key(|(m, _)| (m.date, m.id));
+    let mut rows: Vec<(&Message, usize, i64)> = rows.into_values().collect();
+    rows.sort_by_key(|(m, _, _)| (m.date, m.id));
     if !ascending {
         rows.reverse();
     }
@@ -360,10 +362,11 @@ fn list(env: &Env, view: &View, scopes: &[Scope], a: &Args) -> Result<Value, Fai
         .iter()
         .skip((page - 1) * size)
         .take(size)
-        .map(|(m, n)| {
+        .map(|(m, n, first)| {
             let mut row = summary(view, m);
             if *n > 1 {
                 row["messages"] = json!(n);
+                row["first_date"] = json!(iso(*first));
             }
             row
         })

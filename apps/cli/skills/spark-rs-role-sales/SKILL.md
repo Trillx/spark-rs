@@ -29,7 +29,9 @@ every time.
 1. **Replies from buyers.** Someone who wrote back gets an answer the same
    day: `spark-cli search --filter "is:unreplied newer_than:7d -category:newsletter -category:notification"`.
 2. **Who went quiet.** Outreach and proposals with no answer, by how long
-   and how much is at stake: `spark-cli search --filter "is:waiting newer_than:30d older_than:3d"`.
+   and how much is at stake: `spark-cli search --filter "is:waiting newer_than:30d"`,
+   leaving out rows whose `.date` (the user's latest email there, maybe a
+   nudge) is under three days old.
 3. **Calls.** A brief before each one, a recap after.
 4. **Cadence.** Every open deal has a next touch, and nobody gets a second
    nudge within a week.

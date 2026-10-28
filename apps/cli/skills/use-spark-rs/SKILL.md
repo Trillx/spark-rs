@@ -136,7 +136,9 @@ spark-cli emails --page 2 --page-size 20 --order ascending
 
 One row a conversation: its newest email's ID, date, sender, subject and
 flags (unread, pinned, priority, attachment, snoozed, how many emails). Use
-the ID with `thread` and `action`.
+the ID with `thread` and `action`. In JSON, a conversation with several
+matching emails has `.messages` (how many) and `.first_date` (when the
+first of them came), and lists sort conversations by their newest email.
 
 **Folders:** a bare name means that list in every account: `Inbox`,
 `New Senders`, `Pinned`, `Snoozed`, `Set Aside`, `Done` (`Archive`), `Sent`,

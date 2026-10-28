@@ -31,8 +31,10 @@ spark-cli events --start 2026-10-28 --end 2026-11-30 --json
 
 Of the events, keep those whose `.response` is `none`, not `.canceled`,
 with an organizer other than the user. A meeting is often both an email
-and an event: match them by title and time and list it once; an event
-already answered means its email is done with. Work the range out from
+and an event: match them by account, organizer, title and time and list
+it once; an event already answered means that account's email is done
+with. The same meeting can reach two of the user's accounts, each with
+its own answer: keep those apart, and when a match isn't clear, list both. Work the range out from
 today in the user's time zone (at most three months a call).
 
 ## 2. Check each day for clashes
