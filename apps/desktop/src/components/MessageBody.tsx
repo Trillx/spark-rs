@@ -1,6 +1,7 @@
 import { Ellipsis, ImageOff } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { cardColor, cssColor, darkColors, type Rgb } from "../lib/darkColors";
+import { findLinks, MAYBE_LINK } from "../lib/linkify";
 import { openLink } from "../lib/links";
 import { cssIsRemote, isRemoteUrl, srcsetIsRemote } from "../lib/remoteImages";
 import { cidKey } from "../lib/richText";
@@ -75,7 +76,7 @@ function QuoteToggle({ shown, onToggle }: { shown: boolean; onToggle: () => void
   );
 }
 
-/** Plain-text paragraphs, with web addresses as links. A reply's quote folds away unless `quotes` is off. */
+/** Plain-text paragraphs, with web and email addresses as links. A reply's quote folds away unless `quotes` is off. */
 export function TextBody({
   paragraphs,
   quotes = true,
@@ -123,23 +124,52 @@ function quoteStart(paragraphs: string[]) {
 function linkify(text: string): ReactNode[] {
   const parts: ReactNode[] = [];
   let last = 0;
-  for (const match of text.matchAll(/https?:\/\/[^\s<>"]+/g)) {
-    // Trailing punctuation usually ends the sentence, not the URL.
-    const url = match[0].replace(/[.,;:!?)\]'"]+$/, "");
-    parts.push(text.slice(last, match.index));
+  for (const { start, end, href } of findLinks(text)) {
+    parts.push(text.slice(last, start));
     const open = (e: ReactMouseEvent) => {
       e.preventDefault();
-      openLink(url);
+      openLink(href);
     };
     parts.push(
-      <a key={match.index} href={url} data-tip={url} onClick={open} onAuxClick={open} className="text-primary hover:underline">
-        {url}
+      <a key={start} href={href} data-tip={href} onClick={open} onAuxClick={open} className="text-primary hover:underline">
+        {text.slice(start, end)}
       </a>,
     );
-    last = match.index + url.length;
+    last = end;
   }
   parts.push(text.slice(last));
   return parts;
+}
+
+/** Where text is never made a link: in one already, in code the page doesn't show, or in a control. */
+const NOT_LINKED = "a, style, script, noscript, template, svg, textarea, select, option, button";
+
+/**
+ * Makes the web and email addresses an HTML email writes out as plain text
+ * into links (`findLinks`), as Gmail and Outlook show them.
+ */
+function linkifyText(doc: Document) {
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const found: Text[] = [];
+  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+    if (MAYBE_LINK.test(node.data) && !node.parentElement?.closest(NOT_LINKED)) found.push(node);
+  }
+  for (const node of found) {
+    const text = node.data;
+    const links = findLinks(text);
+    if (!links.length) continue;
+    const parts: (string | Node)[] = [];
+    let last = 0;
+    for (const { start, end, href } of links) {
+      const a = doc.createElement("a");
+      a.setAttribute("href", href);
+      a.textContent = text.slice(start, end);
+      parts.push(text.slice(last, start), a);
+      last = end;
+    }
+    parts.push(text.slice(last));
+    node.replaceWith(...parts);
+  }
 }
 
 /**
@@ -317,8 +347,8 @@ interface Frame {
  * email. Its own CSP, base, refresh and <link> tags are dropped (a policy can
  * only be tightened, but a refresh or prefetch would still reach the network).
  * Embedded images become data URLs; ones not (yet) fetched stay hidden by
- * FRAME_CSS rather than showing as broken. `card` is the dark theme's card
- * color, null in the light theme.
+ * FRAME_CSS rather than showing as broken. Addresses written out as text
+ * become links. `card` is the dark theme's card color, null in the light theme.
  */
 function frameDocument(
   html: string,
@@ -344,6 +374,7 @@ function frameDocument(
     }
   }
   preferColorScheme(doc, dark);
+  linkifyText(doc);
   const remote = loadsRemote(doc);
   const quoted = quotes && foldQuote(doc);
   const imgSrc = remoteImages ? "data: cid: https: http:" : "data: cid:";
