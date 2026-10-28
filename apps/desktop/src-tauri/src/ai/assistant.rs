@@ -196,13 +196,24 @@ impl AssistantState {
     }
 
     /// Stops the answer being written in chat `id`, keeping what it did so far.
+    /// The run stays registered until the chat is sealed and saved, so a
+    /// second Stop waits for the same lock (and changes nothing), and a
+    /// follow-up isn't taken while the chat is still being written.
     fn stop(&self, id: &str) -> Option<Answer> {
-        let run = self.runs.lock().unwrap().remove(id)?;
-        run.task.abort();
-        let mut session = run.live.stop();
-        session.updated = now_ms();
-        let _ = self.sessions.save(&session);
-        Some(session.answer().clone())
+        let (run, live) = {
+            let runs = self.runs.lock().unwrap();
+            let run = runs.get(id)?;
+            run.task.abort();
+            (run.run, run.live.clone())
+        };
+        let answer = {
+            let mut session = live.stop();
+            session.updated = now_ms();
+            let _ = self.sessions.save(&session);
+            session.answer().clone()
+        };
+        self.finished(id, run);
+        Some(answer)
     }
 
     /// Drops a finished run, unless a newer one replaced it.
@@ -1170,6 +1181,42 @@ mod tests {
         assert!(is_error);
         assert_eq!(state, MessageState::Inbox);
         assert_eq!(session.turns[2].parts.len(), 1);
+    }
+
+    #[test]
+    fn a_chat_stays_running_until_its_stop_has_saved_it() {
+        let dir = std::env::temp_dir().join(format!("spark-assistant-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = AssistantState::new(dir.clone());
+        let live = Arc::new(live("Archive it"));
+        state.runs.lock().unwrap().insert(
+            "c1".into(),
+            Run {
+                run: 7,
+                task: tauri::async_runtime::spawn(async {}),
+                live: live.clone(),
+            },
+        );
+        // An approved change holds the chat's lock while the mail store is busy.
+        let busy = live.session.lock().unwrap();
+        std::thread::scope(|s| {
+            let first = s.spawn(|| state.stop("c1"));
+            let second = s.spawn(|| state.stop("c1"));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                state.running("c1").is_some(),
+                "a follow-up must wait for the stop"
+            );
+            drop(busy);
+            assert!(first.join().unwrap().is_some());
+            assert!(second.join().unwrap().is_some());
+        });
+        assert!(state.running("c1").is_none());
+        assert_eq!(
+            state.sessions.load("c1").unwrap().answer().status,
+            Status::Stopped
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
