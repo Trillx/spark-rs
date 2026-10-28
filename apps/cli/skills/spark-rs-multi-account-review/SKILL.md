@@ -42,8 +42,8 @@ Settings → Agents.
 
 ```bash
 spark-cli emails --filter "is:unread" --page-size 1000 --json | jq '.emails | group_by(.account) | map({account: .[0].account, unread: length, priority: (map(select(.priority)) | length), people: (map(select(.category == "personal" and (.priority | not))) | length), notifications: (map(select(.category == "notification")) | length), newsletters: (map(select(.category == "newsletter")) | length)})'
-spark-cli emails me@example.com --json | jq '.total, .new_senders'
-spark-cli emails me@example.org --json | jq '.total, .new_senders'
+spark-cli emails me@example.com --json | jq '.total, (.new_senders // 0)'
+spark-cli emails me@example.org --json | jq '.total, (.new_senders // 0)'
 ```
 
 The first splits the Unified Inbox's unread conversations by account and

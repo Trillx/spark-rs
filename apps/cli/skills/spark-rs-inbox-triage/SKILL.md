@@ -27,11 +27,12 @@ triage, and answering an invitation needs send.
 
 ```bash
 spark-cli accounts
-spark-cli emails --json | jq '.total, .new_senders'
+spark-cli emails --json | jq '.total, (.new_senders // 0)'
 ```
 
 `.total` is how many conversations are in the Inbox; `.new_senders` how
-many the Gatekeeper holds back. On a read-only account you can only
+many the Gatekeeper holds back (it's left out, so 0, when the Gatekeeper
+isn't screening new senders before the Inbox). On a read-only account you can only
 propose; say so.
 
 ## 2. Go through the categories in order

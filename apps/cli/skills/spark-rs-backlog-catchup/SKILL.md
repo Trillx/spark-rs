@@ -32,7 +32,7 @@ Ask when the user left (and came back, if not today). The examples use
 ## 2. Size it
 
 ```bash
-spark-cli emails --filter "after:2026/10/19" --json | jq '.total, .new_senders'
+spark-cli emails --filter "after:2026/10/19" --json | jq '.total, (.new_senders // 0)'
 spark-cli emails --filter "category:priority after:2026/10/19" --json | jq '.total'
 spark-cli emails --filter "category:personal -category:priority after:2026/10/19" --json | jq '.total'
 spark-cli emails --filter "category:invitation after:2026/10/19" --json | jq '.total'
