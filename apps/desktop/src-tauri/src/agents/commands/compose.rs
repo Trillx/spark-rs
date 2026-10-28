@@ -287,7 +287,7 @@ async fn compose(env: &Env<'_>, a: &Args<'_>) -> Done {
         )
         .map_err(Fail::Error)
     })?;
-    let saved_at = env.store().draft_saved_at(saved).map_err(db)?;
+    let print = super::history::draft_print(&env.store(), saved).map_err(db)?;
 
     let composed = composed_body(&draft);
     let files: Vec<&str> = draft
@@ -339,10 +339,7 @@ async fn compose(env: &Env<'_>, a: &Args<'_>) -> Done {
     let undo = match edit {
         // An edit isn't undone; a draft the agent wrote is deleted.
         Some(_) => Vec::new(),
-        None => vec![Step::Draft {
-            id: saved,
-            saved_at,
-        }],
+        None => vec![Step::Draft { id: saved, print }],
     };
     Ok(Reply {
         summary: match (&answering, &original, edit) {
@@ -394,9 +391,10 @@ fn answer(
         .content(m.id)
         .map_err(db)?
         .ok_or_else(|| super::no_message(m.id))?;
-    draft.reply_to = Some(m.id);
     match kind {
         Answer::Reply | Answer::ReplyAll => {
+            // A forward isn't a reply: the composer leaves it out too.
+            draft.reply_to = Some(m.id);
             let (to, cc) = recipients(
                 m,
                 &content,
@@ -474,15 +472,11 @@ fn recipients(
                 continue;
             }
             seen.push(address);
-            out.push(entry.clone());
+            out.push(entry_for(entry));
         }
         out
     };
-    let from = if m.from_name.trim().is_empty() {
-        m.from_address.clone()
-    } else {
-        format!("{} <{}>", m.from_name.trim(), m.from_address)
-    };
+    let from = mailbox_entry(&m.from_name, &m.from_address);
     let targets = if content.reply_to.is_empty() {
         vec![from]
     } else {
@@ -500,8 +494,36 @@ fn recipients(
     (to, cc)
 }
 
+/// `Name <address>` written so it parses back: a name with a comma or
+/// other specials quoted, as `"Ruiz, Ana" <ana@example.com>`.
+fn mailbox_entry(name: &str, address: &str) -> String {
+    let name = name.trim().trim_matches('"').trim();
+    if name.is_empty() || name.eq_ignore_ascii_case(address) {
+        return address.to_owned();
+    }
+    if name.chars().any(|c| ",;<>\"@:()[]\\".contains(c)) {
+        format!(
+            "\"{}\" <{address}>",
+            name.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    } else {
+        format!("{name} <{address}>")
+    }
+}
+
+/// A stored display entry (`Ruiz, Ana <ana@example.com>`) written so it
+/// parses back.
+fn entry_for(entry: &str) -> String {
+    let address = address_of(entry);
+    let name = match entry.rfind('<') {
+        Some(at) => &entry[..at],
+        None => "",
+    };
+    mailbox_entry(name, address)
+}
+
 /// The address in `Name <address>`, or the entry itself.
-fn address_of(entry: &str) -> &str {
+pub(super) fn address_of(entry: &str) -> &str {
     match (entry.rfind('<'), entry.rfind('>')) {
         (Some(start), Some(end)) if start < end => entry[start + 1..end].trim(),
         _ => entry.trim(),
@@ -512,10 +534,7 @@ fn split(field: &str) -> Vec<String> {
     spark_mail::draft::recipients(field)
         .map(|list| {
             list.into_iter()
-                .map(|m| match &m.name {
-                    Some(name) if !name.is_empty() => format!("{name} <{}>", m.email),
-                    _ => m.email.to_string(),
-                })
+                .map(|m| mailbox_entry(m.name.as_deref().unwrap_or_default(), m.email.as_ref()))
                 .collect()
         })
         .unwrap_or_default()
@@ -887,6 +906,20 @@ mod tests {
         let html = markdown("Hi **Ana**,\n\n- one\n- two");
         assert!(html.contains("<strong>Ana</strong>"));
         assert!(html.contains("<li>one</li>"));
+    }
+
+    #[test]
+    fn names_with_commas_are_quoted_so_they_parse() {
+        let entry = mailbox_entry("Ruiz, Ana", "ana@example.com");
+        assert_eq!(entry, "\"Ruiz, Ana\" <ana@example.com>");
+        assert_eq!(entry_for("Ruiz, Ana <ana@example.com>"), entry);
+        assert_eq!(
+            entry_for("Bo Lind <bo@example.com>"),
+            "Bo Lind <bo@example.com>"
+        );
+        assert_eq!(entry_for("bo@example.com"), "bo@example.com");
+        let both = format!("{entry}, {}", entry_for("Say \"Hi\" <hi@example.com>"));
+        assert_eq!(spark_mail::draft::recipients(&both).unwrap().len(), 2);
     }
 
     #[test]

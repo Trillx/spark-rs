@@ -167,6 +167,14 @@ pub async fn run(env: &Env<'_>, name: &str, args: &Value) -> Outcome {
     };
     let a = Args(&args);
     let started = now_ms();
+    // What the entry could hold comes from these: agents see it only while
+    // they can read them all.
+    let shared: Vec<i64> = env
+        .grants()
+        .into_iter()
+        .filter(|(_, access)| *access >= Access::Read)
+        .map(|(id, _)| id)
+        .collect();
     let result = match name {
         "accounts" => mail::accounts(env),
         "folders" => mail::folders(env, &a),
@@ -188,8 +196,15 @@ pub async fn run(env: &Env<'_>, name: &str, args: &Value) -> Outcome {
         other => Err(Fail::Error(format!("spark-rs has no command {other}."))),
     };
     if name != "history" || a.str("undo").is_some() {
-        env.log
-            .record(env.agent, name, &args, level(name, &a), started, &result);
+        let run = history::Run {
+            agent: env.agent,
+            command: name,
+            args: &args,
+            access: level(name, &a),
+            at: started,
+            accounts: shared,
+        };
+        env.log.record(run, &result);
     }
     match result {
         Ok(reply) => {

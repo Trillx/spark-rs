@@ -10,7 +10,10 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use spark_store::{Category, Change, Message, MessageState, Patch, PriorityUndo, Store, now_ms};
+use spark_store::{
+    Category, Change, Decision, Message, MessageState, Patch, PriorityUndo, RemovedReminder,
+    Screen, Store, now_ms,
+};
 
 use super::{Args, Done, Env, Fail, Reply, db, parse_time, refuse, when};
 use crate::agents::Access;
@@ -86,6 +89,7 @@ pub enum Step {
         before: Snapshot,
         after: Snapshot,
     },
+    /// Undone only while the conversation is still as the agent left it.
     Muted {
         conversation: i64,
         before: bool,
@@ -98,17 +102,44 @@ pub enum Step {
     Priority {
         undo: PriorityUndo,
     },
+    /// `undo` puts back what `set` changed, for screens still as `set` left them.
     Gatekeeper {
         undo: Vec<Change>,
+        #[serde(default)]
+        set: Vec<Change>,
     },
-    /// A draft the agent wrote, as saved then.
+    /// A draft the agent wrote, with `draft_print` of it then.
     Draft {
         id: i64,
-        saved_at: Option<i64>,
+        #[serde(default)]
+        print: u64,
     },
+    /// A reminder the agent set, for `at`.
     Reminder {
         id: i64,
+        #[serde(default)]
+        at: Option<i64>,
     },
+    /// A reminder the agent cleared, all of it.
+    ReminderCleared {
+        reminder: RemovedReminder,
+    },
+}
+
+/// What a draft says, as a number that changes when it does: its subject,
+/// recipients and text (FNV-1a, which stays the same across builds).
+pub fn draft_print(store: &Store, id: i64) -> spark_store::Result<u64> {
+    let subject = store.message(id)?.map(|m| m.subject).unwrap_or_default();
+    let (to, text) = match store.content(id)? {
+        Some(c) => (c.to.join(","), c.text),
+        None => (String::new(), String::new()),
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in [subject, to, text].join("\u{0}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    Ok(hash)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,6 +162,27 @@ pub struct Entry {
     pub undo: Vec<Step>,
     #[serde(default)]
     pub undone: bool,
+    /// The accounts agents could read when it ran: an agent sees the entry
+    /// only while it can read all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<i64>,
+}
+
+impl Entry {
+    fn visible(&self, readable: &[i64]) -> bool {
+        self.accounts.iter().all(|a| readable.contains(a))
+    }
+}
+
+/// A command as it ran, for its entry.
+pub struct Run<'a> {
+    pub agent: &'a str,
+    pub command: &'a str,
+    pub args: &'a Value,
+    pub access: Level,
+    pub at: i64,
+    /// The accounts agents could read then (`Entry::accounts`).
+    pub accounts: Vec<i64>,
 }
 
 /// The history file. Requests run at once, so writes take turns.
@@ -181,15 +233,15 @@ impl Log {
 
     /// Adds a command's entry; the history failing to write mustn't fail
     /// the command, which has run.
-    pub fn record(
-        &self,
-        agent: &str,
-        command: &str,
-        args: &Value,
-        access: Level,
-        at: i64,
-        result: &Result<Reply, Fail>,
-    ) {
+    pub fn record(&self, run: Run, result: &Result<Reply, Fail>) {
+        let Run {
+            agent,
+            command,
+            args,
+            access,
+            at,
+            accounts,
+        } = run;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let id = match *last {
             Some(id) => id,
@@ -213,6 +265,7 @@ impl Log {
             detail,
             undo: reply.map(|r| r.undo.clone()).unwrap_or_default(),
             undone: false,
+            accounts,
         };
         // Pruned a day late, so it's rewritten at most once a day.
         let stale = self
@@ -263,7 +316,7 @@ pub fn history(env: &Env, a: &Args) -> Done {
     if let Some(id) = a.string("undo") {
         return undo(env, &id);
     }
-    env.readable()?;
+    let readable: Vec<i64> = env.readable()?.iter().map(|(a, _)| a.id).collect();
     let lowest = match a.str("access") {
         None | Some("triage") => Level::Triage,
         Some("readOnly" | "read" | "read-only") => Level::ReadOnly,
@@ -294,7 +347,7 @@ pub fn history(env: &Env, a: &Args) -> Done {
         .log
         .read()
         .into_iter()
-        .filter(|e| e.at >= now - KEEP_MS)
+        .filter(|e| e.at >= now - KEEP_MS && e.visible(&readable))
         .filter(|e| e.access >= lowest)
         .filter(|e| result.is_none_or(|r| e.result == r))
         .filter(|e| from.is_none_or(|f| e.at >= f) && to.is_none_or(|t| e.at < t))
@@ -379,21 +432,24 @@ fn undo(env: &Env, id: &str) -> Done {
         .trim()
         .parse()
         .map_err(|_| Fail::Error(format!("{id} isn't a history ID.")))?;
+    let readable: Vec<i64> = env.readable()?.iter().map(|(a, _)| a.id).collect();
     // Undoing needs triage where it acts, as doing did; the grants hold
     // still meanwhile.
     let (entry, skipped) = env.prefs.with_agent_access(|grants| {
-        put_back_entry(env.engine, env.log, id, &|store, account| {
-            let accounts = match account {
-                Some(a) => vec![a],
-                None => store.accounts().map_err(db)?.iter().map(|a| a.id).collect(),
-            };
-            for a in accounts {
-                if let Some(account) = store.account(a).map_err(db)? {
-                    refuse(env.agent, grants, &account, Access::Triage, "undo that")?;
+        put_back_entry(
+            env.engine,
+            env.log,
+            id,
+            &|e| e.visible(&readable),
+            &|store, accounts| {
+                for &a in accounts {
+                    if let Some(account) = store.account(a).map_err(db)? {
+                        refuse(env.agent, grants, &account, Access::Triage, "undo that")?;
+                    }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     })?;
     let mut out = format!("Undid entry {id}: {}.", entry.summary);
     for s in &skipped {
@@ -418,27 +474,29 @@ pub fn undo_for_user(
     log: &Log,
     id: u64,
 ) -> Result<(String, Vec<String>), String> {
-    let (entry, skipped) =
-        put_back_entry(engine, log, id, &|_, _| Ok(())).map_err(|e| e.message().to_owned())?;
+    let (entry, skipped) = put_back_entry(engine, log, id, &|_| true, &|_, _| Ok(()))
+        .map_err(|e| e.message().to_owned())?;
     Ok((entry.summary, skipped))
 }
 
-/// Whether a step may act in an account (`None`: every account).
-type Allowed<'a> = dyn Fn(&Store, Option<i64>) -> Result<(), Fail> + 'a;
+/// Whether steps may act in these accounts.
+type Allowed<'a> = dyn Fn(&Store, &[i64]) -> Result<(), Fail> + 'a;
 
-/// Puts back what entry `id` changed, once `allowed` lets each step act in
-/// its account, and marks it undone.
+/// Puts back what entry `id` changed, once `allowed` lets every step act
+/// in its accounts (all checked before any step runs), and marks it undone.
+/// An entry `visible` hides doesn't exist for the caller.
 fn put_back_entry(
     engine: &spark_mail::Engine,
     log: &Log,
     id: u64,
+    visible: &dyn Fn(&Entry) -> bool,
     allowed: &Allowed,
 ) -> Result<(Entry, Vec<String>), Fail> {
     let _turn = log.last.lock().unwrap_or_else(|e| e.into_inner());
     let mut entries = log.read();
     let entry = entries
         .iter()
-        .find(|e| e.id == id)
+        .find(|e| e.id == id && visible(e))
         .cloned()
         .ok_or_else(|| Fail::Error(format!("There's no history entry {id}.")))?;
     if entry.undone {
@@ -449,10 +507,21 @@ fn put_back_entry(
             "Entry {id} changed nothing that can be put back: only actions, contact actions and drafts an agent wrote can be."
         )));
     }
+    {
+        let store = engine.store();
+        let mut accounts = Vec::new();
+        for step in &entry.undo {
+            for a in step_accounts(&store, step).map_err(db)? {
+                if !accounts.contains(&a) {
+                    accounts.push(a);
+                }
+            }
+        }
+        allowed(&store, &accounts)?;
+    }
     let mut skipped = Vec::new();
     for step in entry.undo.iter().rev() {
         let mut store = engine.store();
-        allowed(&store, step_account(&store, step).map_err(db)?)?;
         match put_back(&mut store, step).map_err(db)? {
             Some(why) => skipped.push(why),
             None => {
@@ -487,26 +556,44 @@ pub fn recent(log: &Log, reads: bool, limit: usize) -> Vec<Entry> {
     entries
 }
 
-/// The account a step acts in; `None` for settings of every account.
-fn step_account(store: &Store, step: &Step) -> spark_store::Result<Option<i64>> {
+/// The accounts a step acts in: its email's, or every account for a
+/// sender's settings. None when what it changed is gone.
+fn step_accounts(store: &Store, step: &Step) -> spark_store::Result<Vec<i64>> {
     Ok(match step {
-        Step::Message { id, .. } | Step::Draft { id, .. } => {
-            store.message(*id)?.map(|m| m.account_id)
-        }
+        Step::Message { id, .. } | Step::Draft { id, .. } => store
+            .message(*id)?
+            .map(|m| m.account_id)
+            .into_iter()
+            .collect(),
         Step::Muted { conversation, .. } => store
             .messages()?
             .iter()
             .find(|m| m.conversation == *conversation)
-            .map(|m| m.account_id),
-        Step::Reminder { .. }
-        | Step::Category { .. }
-        | Step::Priority { .. }
-        | Step::Gatekeeper { .. } => None,
+            .map(|m| m.account_id)
+            .into_iter()
+            .collect(),
+        Step::Reminder { id, .. } => store
+            .reminder(*id)?
+            .map(|r| r.account_id)
+            .into_iter()
+            .collect(),
+        Step::ReminderCleared { reminder } => vec![reminder.account_id],
+        Step::Category { .. } | Step::Priority { .. } | Step::Gatekeeper { .. } => {
+            store.accounts()?.iter().map(|a| a.id).collect()
+        }
     })
 }
 
-/// Puts back one step; says why if it's left alone because what it changed
-/// has changed since.
+/// A sender's or a domain's Gatekeeper decision now.
+fn decision(store: &Store, screen: &Screen) -> spark_store::Result<Option<Decision>> {
+    Ok(match screen {
+        Screen::Sender(address) => store.sender_status(address)?.sender,
+        Screen::Domain(domain) => store.sender_status(&format!("someone@{domain}"))?.domain,
+    })
+}
+
+/// Puts back one step, only where what it changed is still as it left it;
+/// says why when it leaves something alone.
 fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String>> {
     let now = now_ms();
     match step {
@@ -522,7 +609,20 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
         Step::Muted {
             conversation,
             before,
-        } => store.set_muted(*conversation, *before)?,
+        } => {
+            let muted = store
+                .messages()?
+                .iter()
+                .find(|m| m.conversation == *conversation)
+                .map(|m| m.muted);
+            match muted {
+                None => return Ok(Some(format!("conversation {conversation} is gone"))),
+                Some(muted) if muted == *before => {
+                    return Ok(Some(format!("conversation {conversation} changed since")));
+                }
+                Some(_) => store.set_muted(*conversation, *before)?,
+            }
+        }
         Step::Category {
             address,
             before,
@@ -533,15 +633,65 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
             }
             store.set_sender_category(address, *before)?;
         }
-        Step::Priority { undo } => store.undo_prioritize(undo)?,
-        Step::Gatekeeper { undo } => {
-            store.decide(undo, now)?;
+        Step::Priority { undo } => {
+            // The agent made these Priority (or not); put back only those
+            // still as it left them.
+            let set = !undo.priority;
+            let now_priority = store.priority_senders()?;
+            let senders: Vec<String> = undo
+                .senders
+                .iter()
+                .filter(|s| now_priority.iter().any(|p| p.eq_ignore_ascii_case(s)) == set)
+                .cloned()
+                .collect();
+            let mut messages = Vec::new();
+            for &id in &undo.messages {
+                if store.message(id)?.is_some_and(|m| m.priority == set) {
+                    messages.push(id);
+                }
+            }
+            let left = undo.senders.len() - senders.len();
+            store.undo_prioritize(&PriorityUndo {
+                senders,
+                messages,
+                priority: undo.priority,
+            })?;
+            if left > 0 {
+                return Ok(Some(format!("{left} Priority sender(s) changed since")));
+            }
         }
-        Step::Draft { id, saved_at } => {
+        Step::Gatekeeper { undo, set } => {
+            let mut still = Vec::new();
+            let mut left = Vec::new();
+            for change in undo {
+                let made = set
+                    .iter()
+                    .find(|c| c.screen == change.screen)
+                    .map(|c| c.decision);
+                let unchanged = match made {
+                    Some(made) => decision(store, &change.screen)? == made,
+                    // Written before the history kept what was set.
+                    None => true,
+                };
+                if unchanged {
+                    still.push(change.clone());
+                } else {
+                    left.push(match &change.screen {
+                        Screen::Sender(s) => s.clone(),
+                        Screen::Domain(d) => d.clone(),
+                    });
+                }
+            }
+            store.decide(&still, now)?;
+            if !left.is_empty() {
+                return Ok(Some(format!("{} decided again since", left.join(", "))));
+            }
+        }
+        Step::Draft { id, print } => {
             if !store.is_draft(*id)? {
                 return Ok(Some(format!("draft {id} is gone")));
             }
-            if store.draft_saved_at(*id)? != *saved_at {
+            if draft_print(store, *id)? != *print {
                 return Ok(Some(format!("draft {id} was edited since")));
             }
             if store.draft_held(*id)? || store.draft_reserved(*id)? {
@@ -550,7 +700,18 @@ fn put_back(store: &mut Store, step: &Step) -> spark_store::Result<Option<String
             // Deleted by the caller, as Discard does, with the store let go.
             return Ok(None);
         }
-        Step::Reminder { id } => store.set_reminder(*id, None)?,
+        Step::Reminder { id, at } => match store.reminder(*id)? {
+            None => return Ok(Some(format!("reminder {id} is gone"))),
+            Some(r) if r.due || at.is_some_and(|at| r.remind_at != at) => {
+                return Ok(Some(format!("reminder {id} changed since")));
+            }
+            Some(_) => store.set_reminder(*id, None)?,
+        },
+        Step::ReminderCleared { reminder } => {
+            if store.reminder(reminder.id)?.is_some() || !store.restore_reminder(reminder)? {
+                return Ok(Some(format!("reminder {} couldn't come back", reminder.id)));
+            }
+        }
     }
     Ok(None)
 }

@@ -339,7 +339,7 @@ spark-cli contact ana@example.com
 ```
 
 `contacts` finds people by name or address among those the user writes to
-and hears from. `contact` shows how spark-rs treats a sender: their category,
+and hears from, in the accounts shared with agents. `contact` shows how spark-rs treats a sender: their category,
 whether they're a Priority sender, and whether the Gatekeeper accepted or
 blocked them or their domain. Check it before changing them.
 
@@ -422,7 +422,8 @@ Every command an agent runs is kept on this computer for 30 days: when, which
 agent, the command, what it touched and how it ended (success, error or
 blocked). `history undo <ID>` puts back what an action, a contact action or a
 draft an agent wrote changed, as long as what it changed hasn't changed
-again. Sends and calendar changes can't be undone from here. Tell the user
+again. Sends and calendar changes can't be undone from here. Agents see an entry
+only while they can still read every account that was shared when it ran. Tell the user
 about the history when they ask what you did.
 
 ## Not in spark-rs

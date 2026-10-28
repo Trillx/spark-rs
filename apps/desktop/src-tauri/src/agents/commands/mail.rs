@@ -425,7 +425,7 @@ pub async fn thread(env: &Env<'_>, a: &Args<'_>) -> Done {
         .or_else(|| a.string("id"))
         .ok_or("Pass message_id: an email ID from emails or search.")?;
     let asked = message_id(&asked)?;
-    let (m, _) = env.message(asked)?;
+    let (m, account) = env.message(asked)?;
     let view = view(env, None)?;
     let elsewhere = |x: &Message| {
         matches!(x.state, MessageState::Deleted | MessageState::Blocked) && x.state != m.state
@@ -511,6 +511,8 @@ pub async fn thread(env: &Env<'_>, a: &Args<'_>) -> Done {
         message["attachments"] = json!(attachments);
         messages.push(message);
     }
+    // Read again: the grant may have gone while bodies and files downloaded.
+    env.need(&account, Access::Read, "read mail")?;
     let value = json!({
         "id": asked,
         "subject": members.first().map_or(m.subject.as_str(), |x| x.subject.as_str()),

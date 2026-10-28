@@ -107,6 +107,8 @@ async fn fetch(
             ));
         }
     }
+    // Read again: the grants may have changed while the servers answered.
+    let shared = env.readable()?;
     let calendars = env.store().calendars().map_err(db)?;
     let visible = calendars
         .into_iter()

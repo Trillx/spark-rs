@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use rusqlite::{OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize};
 
 use crate::{Result, Store};
 
@@ -51,6 +52,23 @@ pub struct NewReminder<'a> {
     pub remind_at: i64,
     /// Only if nobody else wrote in the conversation since it was sent.
     pub if_no_reply: bool,
+}
+
+/// A reminder as it was stored, all of it (`Store::remove_reminder`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovedReminder {
+    pub id: i64,
+    pub account_id: i64,
+    message_id: Option<String>,
+    reply_to: Option<i64>,
+    subject: String,
+    to_list: String,
+    sent_at: i64,
+    pub remind_at: i64,
+    if_no_reply: bool,
+    state: String,
+    message_row: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +153,65 @@ impl Store {
                 .execute("DELETE FROM reminders WHERE id = ?1", [id])?,
         };
         Ok(())
+    }
+
+    /// Removes a reminder, returning all of it so `restore_reminder` can
+    /// put it back.
+    pub fn remove_reminder(&mut self, id: i64) -> Result<Option<RemovedReminder>> {
+        let tx = self.conn.transaction()?;
+        let removed = tx
+            .query_row(
+                "SELECT id, account_id, message_id, reply_to, subject, to_list, sent_at,
+                        remind_at, if_no_reply, state, message_row
+                 FROM reminders WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(RemovedReminder {
+                        id: r.get(0)?,
+                        account_id: r.get(1)?,
+                        message_id: r.get(2)?,
+                        reply_to: r.get(3)?,
+                        subject: r.get(4)?,
+                        to_list: r.get(5)?,
+                        sent_at: r.get(6)?,
+                        remind_at: r.get(7)?,
+                        if_no_reply: r.get(8)?,
+                        state: r.get(9)?,
+                        message_row: r.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        tx.execute("DELETE FROM reminders WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Puts back a reminder `remove_reminder` took out, under its own id;
+    /// false if that id is taken again or its account is gone. Emails it
+    /// pointed to that are gone since are left out.
+    pub fn restore_reminder(&self, r: &RemovedReminder) -> Result<bool> {
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO reminders (id, account_id, message_id, reply_to, subject,
+                 to_list, sent_at, remind_at, if_no_reply, state, message_row)
+             SELECT ?1, ?2, ?3, (SELECT id FROM messages WHERE id = ?4), ?5, ?6, ?7, ?8, ?9,
+                    ?10, (SELECT id FROM messages WHERE id = ?11)
+             WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ?2)",
+            params![
+                r.id,
+                r.account_id,
+                r.message_id,
+                r.reply_to,
+                r.subject,
+                r.to_list,
+                r.sent_at,
+                r.remind_at,
+                r.if_no_reply,
+                r.state,
+                r.message_row
+            ],
+        )?;
+        Ok(added == 1)
     }
 
     /// The reminders to come or waiting on stored email `message`: one set

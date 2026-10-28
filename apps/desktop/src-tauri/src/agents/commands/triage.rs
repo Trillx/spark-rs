@@ -565,11 +565,13 @@ fn remind(env: &Env, a: &Args, view: &View, named: &[&Message], set: bool) -> Do
                             if_no_reply: true,
                         })
                         .map_err(db)?;
-                    undo.push(Step::Reminder { id });
+                    undo.push(Step::Reminder { id, at: Some(at) });
                 }
                 None => {
                     for id in store.reminders_on(m.id).map_err(db)? {
-                        store.set_reminder(id, None).map_err(db)?;
+                        if let Some(reminder) = store.remove_reminder(id).map_err(db)? {
+                            undo.push(Step::ReminderCleared { reminder });
+                        }
                     }
                 }
             }
@@ -1014,8 +1016,26 @@ async fn unschedule(env: &Env<'_>, ids: &[String]) -> Done {
 
 // ---- Contacts ----
 
+/// The addresses in the mail of the accounts agents may read: the people
+/// `contacts` and `contact` may show. Someone known only from an account
+/// agents can't read stays hidden.
+fn visible_people(env: &Env) -> Result<HashSet<String>, Fail> {
+    let readable: HashSet<i64> = env.readable()?.iter().map(|(a, _)| a.id).collect();
+    let mut people = HashSet::new();
+    for m in env.store().messages().map_err(db)? {
+        if readable.contains(&m.account_id) {
+            people.insert(m.from_address.to_lowercase());
+            for to in &m.to {
+                people.insert(super::compose::address_of(to).to_lowercase());
+            }
+        }
+    }
+    Ok(people)
+}
+
 pub fn contacts(env: &Env, a: &Args) -> Done {
-    env.readable()?;
+    let people = visible_people(env)?;
+    let shown = |c: &spark_store::Contact| people.contains(&c.address.to_lowercase());
     let limit = a.int("limit")?.unwrap_or(25);
     if !(1..=1000).contains(&limit) {
         return Err("limit must be from 1 to 1000.".into());
@@ -1025,7 +1045,13 @@ pub fn contacts(env: &Env, a: &Args) -> Done {
     let store = env.store();
     let (query, kind, found) = match a.str("query") {
         Some(q) => {
-            let strict = store.suggest_contacts(q, now, limit).map_err(db)?;
+            let strict: Vec<_> = store
+                .suggest_contacts(q, now, 1_000)
+                .map_err(db)?
+                .into_iter()
+                .filter(|c| shown(c))
+                .take(limit)
+                .collect();
             if strict.is_empty() {
                 // Then anything with it inside the name or address.
                 let wanted = q.to_lowercase();
@@ -1034,8 +1060,9 @@ pub fn contacts(env: &Env, a: &Args) -> Done {
                     .map_err(db)?
                     .into_iter()
                     .filter(|c| {
-                        c.name.to_lowercase().contains(&wanted)
-                            || c.address.to_lowercase().contains(&wanted)
+                        shown(c)
+                            && (c.name.to_lowercase().contains(&wanted)
+                                || c.address.to_lowercase().contains(&wanted))
                     })
                     .take(limit)
                     .collect();
@@ -1044,7 +1071,14 @@ pub fn contacts(env: &Env, a: &Args) -> Done {
                 (Some(q), "strict", strict)
             }
         }
-        None => (None, "top", store.top_contacts(now, limit).map_err(db)?),
+        None => {
+            let top = store.top_contacts(now, 5_000).map_err(db)?;
+            (
+                None,
+                "top",
+                top.into_iter().filter(|c| shown(c)).take(limit).collect(),
+            )
+        }
     };
     let list: Vec<Value> = found
         .iter()
@@ -1070,7 +1104,7 @@ pub fn contacts(env: &Env, a: &Args) -> Done {
 }
 
 pub fn contact(env: &Env, a: &Args) -> Done {
-    env.readable()?;
+    let people = visible_people(env)?;
     let email = a
         .str("email")
         .ok_or("Pass email: the contact's address.")?
@@ -1085,12 +1119,7 @@ pub fn contact(env: &Env, a: &Args) -> Done {
         .map_err(db)?
         .into_iter()
         .find(|c| c.address.eq_ignore_ascii_case(&email));
-    let wrote = store
-        .messages()
-        .map_err(db)?
-        .iter()
-        .any(|m| m.from_address.eq_ignore_ascii_case(&email));
-    if known.is_none() && !wrote {
+    if !people.contains(&email) {
         return Err(Fail::Error(format!(
             "spark-rs doesn't know {email}: no mail from or to them."
         )));
@@ -1239,7 +1268,10 @@ fn decide(env: &Env, verb: &str, emails: &[String]) -> Done {
     Ok(Reply {
         targets: names.clone(),
         summary: summary.clone(),
-        undo: vec![Step::Gatekeeper { undo }],
+        undo: vec![Step::Gatekeeper {
+            undo,
+            set: changes.clone(),
+        }],
         effect: Some(Effect::Changed {
             summary: summary.clone(),
         }),

@@ -668,3 +668,262 @@ fn a_send_with_one_bad_id_sends_nothing() {
     assert_eq!(sent["results"].as_array().unwrap().len(), 1);
     assert_eq!(f.ok("emails", json!({ "folder": "Scheduled" }))["total"], 1);
 }
+
+/// Adds an email to an account's inbox, `minutes` ago.
+fn add(
+    f: &Fixture,
+    account: i64,
+    uid: u32,
+    name: &str,
+    from: &str,
+    subject: &str,
+    minutes: i64,
+) -> i64 {
+    let mut store = f.engine.store();
+    store
+        .add_incoming(
+            &Incoming {
+                account_id: account,
+                mailbox: Some("INBOX".into()),
+                uid: Some(uid),
+                message_id: Some(format!("<{uid}@add.example>")),
+                from_name: name.into(),
+                from_address: from.into(),
+                to: vec!["Ana Ruiz <ana@parts.com>".into()],
+                subject: subject.into(),
+                text: subject.into(),
+                date: now_ms() - 60_000 * minutes,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    drop(store);
+    f.id(subject)
+}
+
+#[test]
+fn contacts_from_an_unshared_account_stay_hidden() {
+    let f = Fixture::new("contacts-scope");
+    f.allow(f.work, Access::Read);
+    let found = f.ok("contacts", json!({ "query": "mom" }));
+    assert_eq!(found["contacts"], json!([]));
+    let top = f.ok("contacts", json!({ "limit": 100 }));
+    assert!(!top.to_string().contains("mom@family.com"), "{top}");
+    assert!(
+        f.run("contact", json!({ "email": "mom@family.com" }))
+            .is_error
+    );
+    f.allow(f.home, Access::Read);
+    assert_eq!(
+        f.ok("contacts", json!({ "query": "mom" }))["contacts"][0]["email"],
+        "mom@family.com"
+    );
+}
+
+#[test]
+fn history_hides_entries_once_their_account_is_unshared() {
+    let f = Fixture::new("history-scope");
+    f.allow(f.work, Access::Triage);
+    f.allow(f.home, Access::Triage);
+    let mom = f.id("Dinner Sunday");
+    f.ok(
+        "action",
+        json!({ "action_name": "archive", "message_ids": [mom] }),
+    );
+    let entry = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    f.allow(f.home, Access::None);
+    assert_eq!(f.ok("history", json!({ "access": "readOnly" }))["total"], 0);
+    assert!(
+        f.run("history", json!({ "undo": entry.to_string() }))
+            .is_error
+    );
+    assert_eq!(f.state("Dinner Sunday"), MessageState::Done);
+}
+
+#[test]
+fn undo_checks_every_account_before_changing_any() {
+    let f = Fixture::new("undo-all-first");
+    f.allow(f.work, Access::Triage);
+    f.allow(f.home, Access::Triage);
+    // Undo runs last step first: work's email would go back before home's refusal.
+    let ids = [f.id("Dinner Sunday"), f.id("Weekly deals")];
+    f.ok(
+        "action",
+        json!({ "action_name": "archive", "message_ids": ids }),
+    );
+    let entry = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    f.allow(f.home, Access::Read);
+    let out = f.run("history", json!({ "undo": entry.to_string() }));
+    assert!(out.is_error, "{}", out.text);
+    assert_eq!(
+        f.state("Weekly deals"),
+        MessageState::Done,
+        "nothing put back"
+    );
+    assert_eq!(f.state("Dinner Sunday"), MessageState::Done);
+}
+
+#[test]
+fn undo_leaves_a_newer_gatekeeper_decision_alone() {
+    use spark_store::{Change, Decision, Screen};
+    let f = Fixture::new("undo-newer-block");
+    f.allow(f.work, Access::Triage);
+    f.allow(f.home, Access::Triage);
+    f.ok(
+        "contact-action",
+        json!({ "action_name": "acceptContact", "emails": ["news@vendor.com"] }),
+    );
+    let entry = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    // The user blocks the sender afterwards.
+    let block = Change {
+        screen: Screen::Sender("news@vendor.com".into()),
+        decision: Some(Decision::Blocked),
+    };
+    f.engine.store().decide(&[block], now_ms()).unwrap();
+    let out = f.ok("history", json!({ "undo": entry.to_string() }));
+    assert!(
+        out["left_alone"].to_string().contains("news@vendor.com"),
+        "{out}"
+    );
+    assert_eq!(
+        f.engine
+            .store()
+            .sender_status("news@vendor.com")
+            .unwrap()
+            .sender,
+        Some(Decision::Blocked)
+    );
+}
+
+#[test]
+fn reminders_undo_in_their_own_account_and_clearing_one_can_be_undone() {
+    let f = Fixture::new("reminder-undo");
+    f.allow(f.work, Access::Triage);
+    let sent = add(
+        &f,
+        f.work,
+        30,
+        "Me Myself",
+        "me@work.com",
+        "Quote request",
+        120,
+    );
+    f.ok(
+        "action",
+        json!({ "action_name": "changeReminder", "message_ids": [sent], "date": "2099-01-05" }),
+    );
+    let set = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(f.engine.store().reminders_on(sent).unwrap().len(), 1);
+    f.ok(
+        "action",
+        json!({ "action_name": "clearReminder", "message_ids": [sent] }),
+    );
+    assert!(f.engine.store().reminders_on(sent).unwrap().is_empty());
+    let cleared = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    // Home is unshared: undoing a reminder in work needs only work.
+    f.ok("history", json!({ "undo": cleared.to_string() }));
+    assert_eq!(
+        f.engine.store().reminders_on(sent).unwrap().len(),
+        1,
+        "back"
+    );
+    f.ok("history", json!({ "undo": set.to_string() }));
+    assert!(f.engine.store().reminders_on(sent).unwrap().is_empty());
+}
+
+#[test]
+fn forwards_aren_t_replies_and_comma_names_reply_fine() {
+    let f = Fixture::new("forward-and-commas");
+    f.allow(f.work, Access::Triage);
+    let ana = add(
+        &f,
+        f.work,
+        31,
+        "Ruiz, Ana",
+        "ana.r@parts.com",
+        "Comma name",
+        5,
+    );
+    let reply = f.ok(
+        "draft",
+        json!({ "reply_to": ana.to_string(), "body": "Thanks." }),
+    );
+    assert_eq!(reply["to"][0], "\"Ruiz, Ana\" <ana.r@parts.com>");
+    assert_eq!(reply["reply_to"], ana);
+    let fwd = f.ok(
+        "draft",
+        json!({ "forward": ana.to_string(), "to": ["bo@example.com"], "body": "FYI" }),
+    );
+    assert_eq!(fwd["reply_to"], Value::Null);
+    assert_eq!(fwd["subject"], "Fwd: Comma name");
+}
+
+#[test]
+fn a_draft_the_server_took_can_still_be_undone() {
+    let f = Fixture::new("draft-uploaded-undo");
+    f.allow(f.work, Access::Triage);
+    let draft = f.ok(
+        "draft",
+        json!({ "to": ["bo@example.com"], "subject": "Hi", "body": "Hello" }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    {
+        let mut store = f.engine.store();
+        let upload = store
+            .draft_uploads(f.work, i64::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.message_id == draft)
+            .unwrap();
+        let copy = spark_store::DraftCopy {
+            mailbox: Some("Drafts".into()),
+            uid: Some(77),
+            remote_id: None,
+            message_id: None,
+        };
+        store.draft_uploaded(&upload, &copy, &[]).unwrap();
+        // The next sync finds it in the account's Drafts folder.
+        let drafts = spark_store::RemoteFolder {
+            remote_id: "Drafts".into(),
+            parent: None,
+            name: "Drafts".into(),
+            role: Some(spark_store::FolderRole::Drafts),
+            selectable: true,
+        };
+        store.replace_folders(f.work, &[drafts]).unwrap();
+        let folder = store
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|x| x.account_id == f.work)
+            .unwrap()
+            .id;
+        store
+            .set_folder_members(folder, &[(draft, Some(77))])
+            .unwrap();
+        assert!(store.is_draft(draft).unwrap());
+        assert_eq!(
+            store.draft_saved_at(draft).unwrap(),
+            None,
+            "the upload's record is gone"
+        );
+    }
+    let entry = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let out = f.ok("history", json!({ "undo": entry.to_string() }));
+    assert_eq!(out["left_alone"], json!([]), "{out}");
+    assert!(!f.engine.store().is_draft(draft).unwrap());
+}

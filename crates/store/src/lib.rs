@@ -45,7 +45,7 @@ pub use gatekeeper::{
     Change, Decision, GatekeeperMode, Screen, SenderStatus, domain_of, is_public_domain,
 };
 pub use priority::PriorityUndo;
-pub use reminders::{NewReminder, Reminder};
+pub use reminders::{NewReminder, Reminder, RemovedReminder};
 pub use rusqlite::Error;
 pub use search::{Query, Term};
 pub use signatures::{DefaultSignature, Signature};
