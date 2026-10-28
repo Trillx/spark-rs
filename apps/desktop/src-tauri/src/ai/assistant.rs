@@ -317,10 +317,14 @@ pub async fn assistant_send(
     Ok(Some(id))
 }
 
-/// Stops the answer being written; returns it as it stands.
+/// Stops the answer being written; returns it as it stands. Async, so it
+/// waits off the main thread when an approved change is being made.
 #[tauri::command]
-pub fn assistant_stop(state: State<'_, AssistantState>, session: String) -> Option<Answer> {
-    state.stop(&session)
+pub async fn assistant_stop(
+    state: State<'_, AssistantState>,
+    session: String,
+) -> Result<Option<Answer>, String> {
+    Ok(state.stop(&session))
 }
 
 /// Approves or skips a card waiting in chat `session`.
@@ -495,8 +499,7 @@ async fn answer(
                     parts: Vec::new(),
                 });
                 for (id, name, input) in calls {
-                    let result = run_tool(host, live, emit, &id, &name, &input).await;
-                    live.push_result(result);
+                    run_tool(host, live, emit, &id, &name, &input).await;
                     host.save(live);
                 }
             }
@@ -523,8 +526,8 @@ async fn answer(
     )
 }
 
-/// Runs one tool call and returns its result for the model. Changes wait
-/// for the user's decision on their card.
+/// Runs one tool call and puts its result in the chat for the model.
+/// Changes wait for the user's decision on their card.
 async fn run_tool(
     host: &impl Host,
     live: &Live,
@@ -532,12 +535,12 @@ async fn run_tool(
     id: &str,
     name: &str,
     input: &Value,
-) -> Part {
+) {
     let label = tools::label(name).to_owned();
     live.answer(|a| a.steps.push(label.clone()));
     emit(AssistantEvent::Step { label });
     if let Some(invalid) = Part::invalid_input(id, input) {
-        return invalid;
+        return live.push_result(invalid);
     }
     // Calendar questions get the days fetched from the server first: the
     // stored events cover only what the calendar has shown lately.
@@ -553,10 +556,14 @@ async fn run_tool(
     };
     let prepared = host.with_store(|store| tools::prepare(store, id, name, input, now_ms()));
     let outcome = match prepared {
-        Prepared::Ran(outcome) => tools::note_stale(outcome, &stale),
+        Prepared::Ran(outcome) => {
+            let outcome = tools::note_stale(outcome, &stale);
+            live.push_result(result_part(id, outcome.text.clone(), outcome.is_error));
+            outcome
+        }
         Prepared::Draft { card, result } => {
             show_card(live, emit, card, true);
-            return result_part(id, result, false);
+            return live.push_result(result_part(id, result, false));
         }
         Prepared::Confirm { mut card, apply } => {
             let (decide, decided) = oneshot::channel();
@@ -566,18 +573,37 @@ async fn run_tool(
             if !approved {
                 card.settle(CardState::Skipped);
                 show_card(live, emit, card, false);
-                return result_part(id, "The user skipped this; nothing changed.".into(), false);
+                return live.push_result(result_part(
+                    id,
+                    "The user skipped this; nothing changed.".into(),
+                    false,
+                ));
             }
-            let outcome = host.with_store(|store| tools::apply(store, &apply, now_ms()));
-            if outcome.is_error {
-                if let Card::Action { note, .. } = &mut card {
-                    *note = Some(outcome.text.clone());
+            // The change and its result go in under the chat's lock, which
+            // Stop takes too: a Stop lands either before the change, and
+            // nothing changes, or after it, with its result in the chat.
+            let outcome = {
+                let mut session = live.session.lock().unwrap();
+                if live.stopped.load(Ordering::Relaxed) {
+                    return;
                 }
-                card.settle(CardState::Failed);
-            } else {
-                card.settle(CardState::Done);
-            }
-            show_card(live, emit, card, false);
+                let outcome = host.with_store(|store| tools::apply(store, &apply, now_ms()));
+                if outcome.is_error {
+                    if let Card::Action { note, .. } = &mut card {
+                        *note = Some(outcome.text.clone());
+                    }
+                    card.settle(CardState::Failed);
+                } else {
+                    card.settle(CardState::Done);
+                }
+                session.answer().update_card(&card);
+                if let Some(turn) = session.turns.last_mut() {
+                    turn.parts
+                        .push(result_part(id, outcome.text.clone(), outcome.is_error));
+                }
+                outcome
+            };
+            emit(AssistantEvent::Card { card });
             outcome
         }
     };
@@ -590,7 +616,6 @@ async fn run_tool(
             emails: outcome.emails,
         });
     }
-    result_part(id, outcome.text, outcome.is_error)
 }
 
 fn show_card(live: &Live, emit: &impl Fn(AssistantEvent), card: Card, new: bool) {
@@ -1089,6 +1114,62 @@ mod tests {
             matches!(first, Part::ToolResult { id, is_error: false, content } if id == "t1" && content.contains("updated"))
         );
         assert!(matches!(second, Part::ToolResult { id, is_error: true, .. } if id == "t2"));
+    }
+
+    #[test]
+    fn a_stop_right_after_approve_either_changes_nothing_or_records_the_change() {
+        let (host, id) = host();
+        let model = Script::new(vec![
+            (
+                vec![],
+                reply(
+                    StopReason::ToolUse,
+                    vec![call(
+                        "t1",
+                        "update_emails",
+                        json!({ "ids": [id], "action": "done" }),
+                    )],
+                ),
+            ),
+            (
+                vec!["Late"],
+                reply(StopReason::EndTurn, vec![Part::text("Late")]),
+            ),
+        ]);
+        let live = live("Archive it");
+        let shared = &live;
+        let decider = async {
+            loop {
+                let waiting = shared.waiting.lock().unwrap().remove("t1");
+                if let Some(decide) = waiting {
+                    // Stop lands before the task gets back to the change.
+                    decide.send(true).unwrap();
+                    drop(shared.stop());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let emit = |_| {};
+        tauri::async_runtime::block_on(async {
+            futures_util::join!(answer(&model, &host, &live, &emit), decider)
+        });
+        let state = host
+            .store
+            .lock()
+            .unwrap()
+            .message(id)
+            .unwrap()
+            .unwrap()
+            .state;
+        let session = live.session.lock().unwrap();
+        let Part::ToolResult { is_error, .. } = &session.turns[2].parts[0] else {
+            panic!("a result");
+        };
+        // The chat and the mail agree: stopped, and nothing changed.
+        assert!(is_error);
+        assert_eq!(state, MessageState::Inbox);
+        assert_eq!(session.turns[2].parts.len(), 1);
     }
 
     #[test]

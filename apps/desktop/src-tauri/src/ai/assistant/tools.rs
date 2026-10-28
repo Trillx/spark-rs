@@ -530,14 +530,22 @@ impl Span {
     }
 }
 
-/// The span a `list_events` call asks about.
+/// The span a `list_events` call asks about. A date is a whole local day,
+/// so with no end it runs to the next midnight, which isn't always 24 hours
+/// away.
 pub fn event_span(input: &Value) -> Result<Span, String> {
     let today = Local::now().date_naive();
-    let start = match time(&input["start"], false)? {
-        Some(start) => start,
-        None => local_midnight(today)?,
+    let next = |d: NaiveDate| local_midnight(d.succ_opt().unwrap_or(d));
+    let from = bound(&input["start"])?.unwrap_or(Bound::Date(today));
+    let start = match from {
+        Bound::Date(d) => local_midnight(d)?,
+        Bound::Instant(t) => t,
     };
-    let end = time(&input["end"], true)?.unwrap_or(start + DAY_MS);
+    let end = match (bound(&input["end"])?, from) {
+        (Some(Bound::Date(d)), _) | (None, Bound::Date(d)) => next(d)?,
+        (Some(Bound::Instant(t)), _) => t,
+        (None, Bound::Instant(t)) => t + DAY_MS,
+    };
     if end <= start {
         return Err("end must be after start.".into());
     }
@@ -559,23 +567,25 @@ pub fn event_span(input: &Value) -> Result<Span, String> {
     })
 }
 
-/// `value` as a time: a date is its start, or its end when `end` (both in
-/// the user's time zone).
-fn time(value: &Value, end: bool) -> Result<Option<i64>, String> {
+/// A start or end as asked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bound {
+    /// A whole day on the user's calendar.
+    Date(NaiveDate),
+    /// Unix ms.
+    Instant(i64),
+}
+
+fn bound(value: &Value) -> Result<Option<Bound>, String> {
     let Some(text) = value.as_str().map(str::trim).filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
     if let Ok(t) = DateTime::parse_from_rfc3339(text) {
-        return Ok(Some(t.timestamp_millis()));
+        return Ok(Some(Bound::Instant(t.timestamp_millis())));
     }
-    let date = NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .map_err(|_| format!("{text} isn't a date such as 2026-10-28 or an RFC 3339 time."))?;
-    let date = if end {
-        date.succ_opt().unwrap_or(date)
-    } else {
-        date
-    };
-    local_midnight(date).map(Some)
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map(|d| Some(Bound::Date(d)))
+        .map_err(|_| format!("{text} isn't a date such as 2026-10-28 or an RFC 3339 time."))
 }
 
 fn local_midnight(date: NaiveDate) -> Result<i64, String> {
@@ -879,22 +889,35 @@ mod tests {
 
     #[test]
     fn dates_mean_whole_local_days() {
+        let date = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
         let span = event_span(&json!({ "start": "2026-10-28" })).unwrap();
-        assert!(span.end - span.start >= 23 * 3_600_000 && span.end - span.start <= 25 * 3_600_000);
-        assert_eq!(span.first, NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
-        assert_eq!(span.last, span.first);
-        let week = event_span(&json!({ "start": "2026-10-26", "end": "2026-11-01" })).unwrap();
-        assert_eq!(week.last, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert_eq!(span.start, local_midnight(date(2026, 10, 28)).unwrap());
+        // To the next midnight, which is 23 or 25 hours away when the clocks change.
+        assert_eq!(span.end, local_midnight(date(2026, 10, 29)).unwrap());
         assert_eq!(
-            time(&json!("2026-10-28T09:00:00Z"), false).unwrap(),
-            Some(
-                DateTime::parse_from_rfc3339("2026-10-28T09:00:00Z")
-                    .unwrap()
-                    .timestamp_millis()
-            )
+            (span.first, span.last),
+            (date(2026, 10, 28), date(2026, 10, 28))
         );
-        assert!(time(&json!("next week"), false).is_err());
-        assert_eq!(time(&Value::Null, false).unwrap(), None);
+        let changing = event_span(&json!({ "start": "2026-11-01" })).unwrap();
+        assert_eq!(changing.end, local_midnight(date(2026, 11, 2)).unwrap());
+        assert_eq!(changing.last, date(2026, 11, 1));
+        let week = event_span(&json!({ "start": "2026-10-26", "end": "2026-11-01" })).unwrap();
+        assert_eq!(week.last, date(2026, 11, 1));
+        let at = DateTime::parse_from_rfc3339("2026-10-28T09:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            bound(&json!("2026-10-28T09:00:00Z")).unwrap(),
+            Some(Bound::Instant(at))
+        );
+        assert_eq!(
+            event_span(&json!({ "start": "2026-10-28T09:00:00Z" }))
+                .unwrap()
+                .end,
+            at + DAY_MS
+        );
+        assert!(bound(&json!("next week")).is_err());
+        assert_eq!(bound(&Value::Null).unwrap(), None);
         assert!(event_span(&json!({ "start": "2026-01-01", "end": "2026-12-31" })).is_err());
         assert!(event_span(&json!({ "start": "2026-10-28", "end": "2026-10-27" })).is_err());
     }
