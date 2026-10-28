@@ -233,7 +233,9 @@ fn person(p: &Person) -> String {
 
 pub async fn events(env: &Env<'_>, a: &Args<'_>) -> Done {
     let (start, end) = range(a)?;
-    let (calendars, problems) = fetch(env, start, end).await?;
+    // A day either side, as the store is read: all-day events are kept in
+    // UTC days, and a deleted one there must go from the copy too.
+    let (calendars, problems) = fetch(env, start - DAY, end + DAY).await?;
     let wanted = a.str("in");
     let picked: Vec<&(Calendar, String, Access)> = calendars
         .iter()
@@ -775,7 +777,8 @@ async fn rsvp(env: &Env<'_>, a: &Args<'_>) -> Done {
 
 pub async fn availability(env: &Env<'_>, a: &Args<'_>) -> Done {
     let (start, end) = range(a)?;
-    let (calendars, mut problems) = fetch(env, start, end).await?;
+    // A day either side, as below: all-day events are kept in UTC days.
+    let (calendars, mut problems) = fetch(env, start - DAY, end + DAY).await?;
     let attendees = a.addresses("attendees");
     if !attendees.is_empty() {
         problems.push(format!(

@@ -1183,3 +1183,69 @@ fn undo_tells_reminders_on_same_subject_emails_apart() {
     f.ok("history", json!({ "undo": set_a.to_string() }));
     assert_eq!(f.engine.store().reminders_on(b).unwrap(), kept);
 }
+
+/// Uploads draft `id` as the account's next round would, into a Drafts
+/// folder it then finds the draft in.
+fn upload(f: &Fixture, id: i64) {
+    let mut store = f.engine.store();
+    let upload = store
+        .draft_uploads(f.work, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .find(|u| u.message_id == id)
+        .unwrap();
+    let copy = spark_store::DraftCopy {
+        mailbox: Some("Drafts".into()),
+        uid: Some(78),
+        remote_id: None,
+        message_id: None,
+    };
+    store.draft_uploaded(&upload, &copy, &[]).unwrap();
+    let drafts = spark_store::RemoteFolder {
+        remote_id: "Drafts".into(),
+        parent: None,
+        name: "Drafts".into(),
+        role: Some(spark_store::FolderRole::Drafts),
+        selectable: true,
+    };
+    store.replace_folders(f.work, &[drafts]).unwrap();
+    let folder = store
+        .folders()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.account_id == f.work)
+        .unwrap()
+        .id;
+    store.set_folder_members(folder, &[(id, Some(78))]).unwrap();
+}
+
+#[test]
+fn undo_keeps_an_uploaded_draft_given_a_file_offline() {
+    let f = Fixture::new("uploaded-draft-file");
+    f.allow(f.work, Access::Triage);
+    let draft = f.ok(
+        "draft",
+        json!({ "to": ["bo@example.com"], "subject": "Hi", "body": "Hello" }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    let wrote = f.ok("history", json!({}))["entries"][0]["id"]
+        .as_u64()
+        .unwrap();
+    upload(&f, draft);
+    // Saved again with a file, not uploaded yet: the email's own list
+    // still shows the server copy's files.
+    let file = f.dir.join("plan.txt");
+    std::fs::write(&file, "plan").unwrap();
+    let edited = f.ok(
+        "draft",
+        json!({ "edit": draft.to_string(), "attach": [file.display().to_string()] }),
+    )["id"]
+        .as_i64()
+        .unwrap();
+    f.ok("history", json!({ "undo": wrote.to_string() }));
+    assert!(
+        f.engine.store().is_draft(edited).unwrap(),
+        "the draft with its new file stays"
+    );
+}

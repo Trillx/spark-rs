@@ -140,19 +140,41 @@ pub enum Step {
 }
 
 /// What a draft says, as a number that changes when it does: its subject,
-/// To, Cc, Bcc, text, HTML and files (FNV-1a, which stays the same across
-/// builds).
+/// To, Cc, Bcc, text, HTML and files' names (FNV-1a, which stays the same
+/// across builds).
 pub fn draft_print(store: &Store, id: i64) -> spark_store::Result<u64> {
     let subject = store.message(id)?.map(|m| m.subject).unwrap_or_default();
     let mut fields = vec![subject];
-    if let Some(c) = store.content(id)? {
-        fields.extend([c.to.join(","), c.cc.join(","), c.bcc.join(","), c.text]);
-        fields.push(c.html.unwrap_or_default());
-        // Its files by what they are; the server's ids for them come later.
-        for a in &c.attachments {
-            fields.push(format!("{}\u{1}{}\u{1}{}", a.name, a.mime, a.size));
-        }
+    let content = store.content(id)?;
+    if let Some(c) = &content {
+        fields.extend([
+            c.to.join(","),
+            c.cc.join(","),
+            c.bcc.join(","),
+            c.text.clone(),
+        ]);
+        fields.push(c.html.clone().unwrap_or_default());
     }
+    // Its files by name: those of a save still waiting to upload, which
+    // the email's own list doesn't show until then, else the email's.
+    let waiting = store
+        .draft(id)?
+        .and_then(|json| serde_json::from_str::<spark_mail::draft::Draft>(&json).ok());
+    let mut names: Vec<String> = match waiting {
+        Some(draft) => draft
+            .attachments
+            .iter()
+            .map(|a| match a {
+                spark_mail::draft::OutgoingAttachment::File { name, .. }
+                | spark_mail::draft::OutgoingAttachment::Message { name, .. } => name.clone(),
+            })
+            .collect(),
+        None => content
+            .map(|c| c.attachments.into_iter().map(|a| a.name).collect())
+            .unwrap_or_default(),
+    };
+    names.sort();
+    fields.push(names.join("\u{1}"));
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in fields.join("\u{0}").bytes() {
         hash ^= u64::from(byte);
