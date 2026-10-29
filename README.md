@@ -285,7 +285,8 @@ up to 1 GB, the least recently used going first, and an account's going
 with it.
 Program files (`.exe`, `.js`, `.lnk` and the like) ask first, as Spark's do
 ("Open Anyway"), and downloaded files are marked as coming from the
-internet, so Windows checks them and Office opens them in Protected View. Attach files with the paperclip,
+internet, so Windows checks them and Office opens them in Protected View
+(not pictures, which Photos would only ask about each time). Attach files with the paperclip,
 Ctrl+Shift+A in the composer, or by dropping them on the window (pictures
 dropped on the message itself go in it); forwards keep
 the original's attachments. Messages over 10 MB are stored without their body

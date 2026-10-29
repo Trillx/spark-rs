@@ -76,12 +76,26 @@ const RISKY: &[&str] = &[
 ];
 
 pub fn is_risky(name: &str) -> bool {
-    let ext = name
-        .trim_end_matches(['.', ' '])
+    RISKY.contains(&extension(name).as_str())
+}
+
+/// Pictures, which nothing on Windows opens more carefully for coming from
+/// the internet: marked, Photos only asks "Is this file from a trusted
+/// source?" each time one opens. Not SVG, which can carry script.
+const PICTURES: &[&str] = &[
+    "png", "jpg", "jpeg", "jfif", "gif", "bmp", "webp", "heic", "heif", "avif", "tif", "tiff",
+    "ico",
+];
+
+fn is_picture(name: &str) -> bool {
+    PICTURES.contains(&extension(name).as_str())
+}
+
+fn extension(name: &str) -> String {
+    name.trim_end_matches(['.', ' '])
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
-        .unwrap_or_default();
-    RISKY.contains(&ext.as_str())
+        .unwrap_or_default()
 }
 
 /// A name that's safe as one file name on Windows: no folders, reserved
@@ -132,9 +146,13 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 
 /// Writes a downloaded file and marks it as coming from the internet, so
 /// Windows and Office treat it with the usual care (Protected View).
+/// Pictures aren't marked (`PICTURES`).
 pub fn write_downloaded(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(path, bytes).map_err(|e| format!("Couldn't save {}: {e}", path.display()))?;
-    mark_from_internet(path);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if !is_picture(&name) {
+        mark_from_internet(path);
+    }
     Ok(())
 }
 
@@ -186,6 +204,36 @@ mod tests {
         assert!(!is_risky("invoice.pdf"));
         assert!(!is_risky("drawing.dxf"));
         assert!(!is_risky("exe"));
+    }
+
+    #[test]
+    fn pictures_are_pictures_drawings_with_script_are_not() {
+        assert!(is_picture("Screenshot 2026-10-26 084809.png"));
+        assert!(is_picture("IMG_0042.JPG"));
+        assert!(!is_picture("logo.svg"));
+        assert!(!is_picture("photo.png.exe"));
+        assert!(!is_picture("png"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn downloads_are_marked_from_the_internet_but_pictures() {
+        let dir = std::env::temp_dir().join(format!("spark-files-marked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let zone = |name: &str| {
+            let path = dir.join(name);
+            write_downloaded(&path, b"x").unwrap();
+            let mut stream = path.into_os_string();
+            stream.push(":Zone.Identifier");
+            fs::read_to_string(stream).ok()
+        };
+        assert_eq!(
+            zone("quote.pdf").as_deref(),
+            Some("[ZoneTransfer]\r\nZoneId=3\r\n")
+        );
+        assert_eq!(zone("Screenshot.png"), None, "Photos would ask each time");
+        assert!(zone("logo.svg").is_some());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
