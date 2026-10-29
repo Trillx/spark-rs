@@ -252,9 +252,8 @@ export default function AssistantPanel({
       }}
     >
       <div aria-hidden className="pointer-events-none absolute inset-0 bg-ai-tint" />
-      {/* Its buttons sit in from the panel's rounded corners, so a hovered one doesn't run into the curve. */}
-      <header className="relative flex h-11 shrink-0 items-center border-b border-hairline px-3">
-        <HeaderButton label="Close" onClick={onClose}>
+      <header className="relative flex h-11 shrink-0 items-center border-b border-hairline px-1">
+        <HeaderButton label="Close" onClick={onClose} corner="left">
           <X size={18} />
         </HeaderButton>
         <h2 className="flex flex-1 items-center justify-center gap-1.5 text-[13px] font-semibold">
@@ -264,7 +263,7 @@ export default function AssistantPanel({
         <HeaderButton label="Start new chat" onClick={() => void newChat()} disabled={chat.entries.length === 0}>
           <SquarePen size={17} />
         </HeaderButton>
-        <HeaderButton label="View past chats" onClick={() => setHistoryOpen((o) => !o)} active={historyOpen}>
+        <HeaderButton label="View past chats" onClick={() => setHistoryOpen((o) => !o)} active={historyOpen} corner="right">
           <History size={17} />
         </HeaderButton>
         {historyOpen && (
@@ -336,12 +335,18 @@ function HeaderButton({
   onClick,
   disabled,
   active,
+  corner,
   children,
 }: {
   label: string;
   onClick: () => void;
   disabled?: boolean;
   active?: boolean;
+  /**
+   * The panel's top corner it sits in. That corner of it follows the panel's curve: 15px is the
+   * panel's 20px less its 1px border and the button's 4px inset.
+   */
+  corner?: "left" | "right";
   children: ReactNode;
 }) {
   return (
@@ -351,9 +356,9 @@ function HeaderButton({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className={`grid size-8 place-items-center rounded-lg text-text-2 hover:bg-base-content/10 hover:text-base-content disabled:opacity-40 disabled:hover:bg-transparent ${
-        active ? "bg-base-content/10 text-base-content" : ""
-      }`}
+      className={`grid size-9 place-items-center rounded-lg text-text-2 hover:bg-base-content/10 hover:text-base-content disabled:opacity-40 disabled:hover:bg-transparent ${
+        corner === "left" ? "rounded-tl-[15px]" : corner === "right" ? "rounded-tr-[15px]" : ""
+      } ${active ? "bg-base-content/10 text-base-content" : ""}`}
     >
       {children}
     </button>
@@ -924,7 +929,7 @@ function HistoryPopup({
       ref={ref}
       role="dialog"
       aria-label="Past chats"
-      className="absolute right-3 top-10 z-10 flex max-h-[60vh] w-[300px] flex-col overflow-hidden rounded-xl border border-hairline bg-base-100 shadow-popup"
+      className="absolute right-2 top-10 z-10 flex max-h-[60vh] w-[300px] flex-col overflow-hidden rounded-xl border border-hairline bg-base-100 shadow-popup"
     >
       <header className="px-3 pb-1 pt-2.5 text-xs font-semibold text-text-2">Past chats</header>
       <ul className="overflow-y-auto pb-1.5">
