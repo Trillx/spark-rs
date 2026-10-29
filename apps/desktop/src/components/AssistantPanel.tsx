@@ -85,7 +85,10 @@ export function AssistantPill({ suggestions, onAsk }: { suggestions: string[]; o
   );
 }
 
-/** A question asked from outside the panel (the pill); `nonce` tells two asks of the same apart. */
+/**
+ * A question asked from outside the panel (the pill), which starts a chat of its own; `nonce`
+ * tells two asks of the same apart.
+ */
 export interface Ask {
   text: string;
   nonce: number;
@@ -93,8 +96,8 @@ export interface Ask {
 
 /**
  * The AI Assistant: a chat at the right of the window over the user's mail and calendar,
- * answered by their own AI provider. It stays mounted while closed, so a chat goes on where it
- * was; New chat starts over and History brings back an earlier one.
+ * answered by their own AI provider. It stays mounted while closed, so reopening it goes on with
+ * the chat where it was; New chat starts over and History brings back an earlier one.
  */
 export default function AssistantPanel({
   open,
@@ -153,17 +156,17 @@ export default function AssistantPanel({
     });
   }
 
-  async function send(question: string) {
+  /** Asks `question` in this chat, or with `fresh` in a new one. */
+  async function send(question: string, fresh = false) {
     const text = question.trim();
     if (!text) return;
     if (working && chat.id) await stop();
     const token = ++run.current;
+    if (fresh) chatId.current = null;
+    const asked: Entry[] = [{ role: "user", text }, { role: "assistant", answer: emptyAnswer() }];
     setLive(true);
     setInput("");
-    setChat((c) => ({
-      ...c,
-      entries: [...c.entries, { role: "user", text }, { role: "assistant", answer: emptyAnswer() }],
-    }));
+    setChat((c) => (fresh ? { id: null, entries: asked } : { ...c, entries: [...c.entries, ...asked] }));
     const onEvent = (event: AssistantEvent) => updateAnswer(token, (a) => reduceAnswer(a, event));
     try {
       const id = await assistantSend(chatId.current, text, screen, onEvent);
@@ -209,12 +212,13 @@ export default function AssistantPanel({
     inputRef.current?.focus();
   }
 
-  // A question from the pill.
+  // A question from the pill is about what's on screen now, so the chat from before doesn't
+  // come into it; that chat stays in History.
   const asked = useRef<number | null>(null);
   useEffect(() => {
     if (!ask || asked.current === ask.nonce) return;
     asked.current = ask.nonce;
-    void send(ask.text);
+    void send(ask.text, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ask]);
 
@@ -248,7 +252,8 @@ export default function AssistantPanel({
       }}
     >
       <div aria-hidden className="pointer-events-none absolute inset-0 bg-ai-tint" />
-      <header className="relative flex h-11 shrink-0 items-center border-b border-hairline px-1">
+      {/* Its buttons sit in from the panel's rounded corners, so a hovered one doesn't run into the curve. */}
+      <header className="relative flex h-11 shrink-0 items-center border-b border-hairline px-3">
         <HeaderButton label="Close" onClick={onClose}>
           <X size={18} />
         </HeaderButton>
@@ -346,7 +351,7 @@ function HeaderButton({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className={`grid size-9 place-items-center rounded-lg text-text-2 hover:bg-base-content/10 hover:text-base-content disabled:opacity-40 disabled:hover:bg-transparent ${
+      className={`grid size-8 place-items-center rounded-lg text-text-2 hover:bg-base-content/10 hover:text-base-content disabled:opacity-40 disabled:hover:bg-transparent ${
         active ? "bg-base-content/10 text-base-content" : ""
       }`}
     >
@@ -919,7 +924,7 @@ function HistoryPopup({
       ref={ref}
       role="dialog"
       aria-label="Past chats"
-      className="absolute right-2 top-10 z-10 flex max-h-[60vh] w-[300px] flex-col overflow-hidden rounded-xl border border-hairline bg-base-100 shadow-popup"
+      className="absolute right-3 top-10 z-10 flex max-h-[60vh] w-[300px] flex-col overflow-hidden rounded-xl border border-hairline bg-base-100 shadow-popup"
     >
       <header className="px-3 pb-1 pt-2.5 text-xs font-semibold text-text-2">Past chats</header>
       <ul className="overflow-y-auto pb-1.5">
