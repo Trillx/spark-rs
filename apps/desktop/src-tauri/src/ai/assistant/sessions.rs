@@ -380,6 +380,7 @@ mod tests {
             senders: Vec::new(),
             state: CardState::Waiting,
             note: None,
+            event: None,
         });
         s.seal();
         assert_eq!(s.turns.len(), 3);

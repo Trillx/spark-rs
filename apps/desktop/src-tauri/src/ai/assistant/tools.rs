@@ -1,16 +1,17 @@
 //! What the assistant can do. Reading mail uses the tools agents get through
-//! `spark-cli` (`agents/tools.rs`), over every account. Changes to mail wait
-//! on a card for the user's Approve, and an email it writes is a draft on a
-//! card that the user opens in the composer: it can't send.
+//! `spark-cli` (`agents/tools.rs`), over every account. Changes to mail and
+//! new calendar events wait on a card for the user's Approve, and an email
+//! it writes is a draft on a card that the user opens in the composer: it
+//! can't send.
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{DateTime, Local, NaiveDate, SecondsFormat, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, SecondsFormat, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use spark_ai::Tool;
-use spark_mail::calendar::{Event, Response, ShowAs};
-use spark_store::{Store, domain_of};
+use spark_mail::calendar::{Event, EventDraft, Response, ShowAs};
+use spark_store::{Calendar, Store, domain_of};
 
 use crate::agents::Access;
 use crate::agents::tools as agent;
@@ -41,7 +42,7 @@ pub struct EmailRef {
     rename_all_fields = "camelCase"
 )]
 pub enum Card {
-    /// A change to mail, waiting for Approve or Skip.
+    /// A change to mail or a new event, waiting for Approve or Skip.
     Action {
         id: String,
         /// What it does, e.g. "Mark 3 emails Done".
@@ -52,6 +53,9 @@ pub enum Card {
         /// Why it failed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// The event it adds to the calendar.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<EventCard>,
     },
     /// An email to open in the composer.
     Draft { id: String, draft: DraftCard },
@@ -98,6 +102,40 @@ pub struct DraftCard {
     pub reply_to: Option<i64>,
 }
 
+/// An event a card adds, as the user reads it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventCard {
+    pub title: String,
+    /// When, on the user's clock: "Thu, Oct 29, 1:00 – 2:00 PM".
+    pub when: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub location: String,
+    /// The calendar and its account: "Calendar · me@work.example".
+    pub calendar: String,
+}
+
+/// Settings → Calendar's length and alerts for new events, which the
+/// calendar's editor gives them too.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NewEvent {
+    pub minutes: i64,
+    /// Minutes before it starts.
+    pub alert: Option<i64>,
+    /// Minutes before an all-day event's day starts.
+    pub all_day_alert: Option<i64>,
+}
+
+impl Default for NewEvent {
+    fn default() -> Self {
+        Self {
+            minutes: 60,
+            alert: Some(10),
+            all_day_alert: Some(720),
+        }
+    }
+}
+
 /// What a tool returned.
 #[derive(Debug, Default)]
 pub struct Outcome {
@@ -118,11 +156,17 @@ impl Outcome {
     }
 }
 
-/// A change to make once the user approves it: an agent tool and its input.
+/// A change to make once the user approves it.
 #[derive(Debug)]
-pub struct Apply {
-    tool: &'static str,
-    args: Value,
+pub enum Apply {
+    /// An agent tool and its input, which change mail.
+    Mail { tool: &'static str, args: Value },
+    /// An event to make in the user's calendar; `made` is what the model
+    /// hears once it's there.
+    Event {
+        draft: Box<EventDraft>,
+        made: String,
+    },
 }
 
 pub enum Prepared {
@@ -147,6 +191,7 @@ pub fn label(name: &str) -> &'static str {
         "list_accounts" => "Checking your accounts",
         "list_events" => "Checking your calendar",
         "update_emails" | "decide_senders" => "Performing an action",
+        "create_event" => "Adding an event",
         "draft_email" => "Drafting an email",
         _ => "Working",
     }
@@ -174,7 +219,7 @@ pub fn catalog() -> Vec<Tool> {
     vec![
         tool(
             "list_accounts",
-            "The user's email accounts: id, address, label, provider and the signature the composer adds below drafts from it.",
+            "The user's email accounts: id, address, label, provider, the calendars create_event can add to (the default first) and the signature the composer adds below drafts from it.",
             schema("list_accounts"),
         ),
         tool(
@@ -211,6 +256,19 @@ pub fn catalog() -> Vec<Tool> {
             schema("decide_senders"),
         ),
         tool(
+            "create_event",
+            "Adds an event to one of the user's calendars, such as a meeting, webinar or appointment from an email. The user sees a card with the event and approves or skips it, so call it as soon as they ask, without asking first in words. It invites no one. Only Microsoft 365 calendars can take events: list_accounts shows which accounts have one.",
+            json!({ "type": "object", "properties": {
+                "title": { "type": "string", "description": "What the event is, short: \"Fulcrum livestream\"." },
+                "start": { "type": "string", "description": "An RFC 3339 time with the offset of the time zone it was given in, e.g. 2026-10-29T14:00:00-04:00 for 2pm Eastern Daylight Time; or a date such as 2026-10-29 for an all-day event." },
+                "end": { "type": "string", "description": "An RFC 3339 time; for an all-day event, the last date it covers. Default: the user's usual event length after start, or one day." },
+                "location": { "type": "string", "description": "Where it is: a place, or the link to join an online meeting (the calendar's Join button opens it)." },
+                "notes": { "type": "string", "description": "Plain text worth keeping with the event: an agenda, dial-in numbers, who's speaking." },
+                "account": { "type": "integer", "description": "An account id from list_accounts. Default: the first with a calendar." },
+                "calendar": { "type": "string", "description": "A calendar's name from list_accounts. Default: the account's default calendar." },
+            }, "required": ["title", "start"] }),
+        ),
+        tool(
             "draft_email",
             "Writes an email or a reply as a draft on a card in the chat. The user opens it in the composer, edits it and sends it; you can't send email. To reply, pass reply_to with the email's id: the recipient and subject default to the original's. If the account has a signature (list_accounts), the composer adds it below the body, so don't end with a sign-off or the user's name then.",
             json!({ "type": "object", "properties": {
@@ -226,15 +284,31 @@ pub fn catalog() -> Vec<Tool> {
 }
 
 /// Runs a tool, or gets a card ready for the ones that wait on the user.
-pub fn prepare(store: &mut Store, id: &str, name: &str, input: &Value, now: i64) -> Prepared {
+/// New events get `new_event`'s length and alert.
+pub fn prepare(
+    store: &mut Store,
+    id: &str,
+    name: &str,
+    input: &Value,
+    now: i64,
+    new_event: &NewEvent,
+) -> Prepared {
     match name {
         "list_accounts" => {
             let mut outcome = run_agent(store, "list_accounts", input, now);
+            let calendars = own_calendars(store).unwrap_or_default();
             if let Ok(mut value) = serde_json::from_str::<Value>(&outcome.text)
                 && let Some(accounts) = value["accounts"].as_array_mut()
             {
                 for account in accounts.iter_mut().filter_map(Value::as_object_mut) {
                     account.remove("access");
+                    let account_id = account.get("id").and_then(Value::as_i64);
+                    let names: Vec<&str> = calendars
+                        .iter()
+                        .filter(|c| Some(c.account_id) == account_id)
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    account.insert("calendars".into(), json!(names));
                 }
                 outcome.text = value.to_string();
             }
@@ -250,14 +324,26 @@ pub fn prepare(store: &mut Store, id: &str, name: &str, input: &Value, now: i64)
         ),
         "update_emails" => confirm_update(store, id, input, now),
         "decide_senders" => confirm_senders(id, input),
+        "create_event" => confirm_event(store, id, input, now, new_event),
         "draft_email" => draft(store, id, input),
         other => Prepared::Ran(Outcome::error(format!("There's no tool named {other}."))),
     }
 }
 
-/// Makes an approved change.
-pub fn apply(store: &mut Store, apply: &Apply, now: i64) -> Outcome {
-    run_agent(store, apply.tool, &apply.args, now)
+/// Makes an approved change to mail (`Apply::Mail`).
+pub fn apply(store: &mut Store, tool: &str, args: &Value, now: i64) -> Outcome {
+    run_agent(store, tool, args, now)
+}
+
+/// What the model hears once an approved event was made, or why not.
+pub fn event_made(made: &str, result: Result<(), String>) -> Outcome {
+    match result {
+        Ok(()) => Outcome {
+            text: made.to_owned(),
+            ..Outcome::default()
+        },
+        Err(e) => Outcome::error(format!("Microsoft didn't take the event: {e}")),
+    }
 }
 
 /// An agent tool, with change rights in every account (the user approves
@@ -376,8 +462,9 @@ fn confirm_update(store: &mut Store, id: &str, input: &Value, now: i64) -> Prepa
             senders: Vec::new(),
             state: CardState::Waiting,
             note: None,
+            event: None,
         },
-        apply: Apply {
+        apply: Apply::Mail {
             tool: "update_messages",
             args: input.clone(),
         },
@@ -426,11 +513,229 @@ fn confirm_senders(id: &str, input: &Value) -> Prepared {
             senders,
             state: CardState::Waiting,
             note: None,
+            event: None,
         },
-        apply: Apply {
+        apply: Apply::Mail {
             tool: "decide_senders",
             args: input.clone(),
         },
+    }
+}
+
+const NO_CALENDAR: &str = "None of the user's accounts has a calendar spark-rs can add events to. It adds them to Microsoft 365 calendars only, once the calendar screen has them (it may ask to sign in again first); Gmail and other calendars aren't supported yet.";
+
+/// The user's own calendars, where events can be made: each account's
+/// default first.
+fn own_calendars(store: &Store) -> Result<Vec<Calendar>, String> {
+    let mut own: Vec<Calendar> = store
+        .calendars()
+        .map_err(|e| format!("spark-rs couldn't read its calendar: {e}"))?
+        .into_iter()
+        .filter(|c| c.own)
+        .collect();
+    own.sort_by_key(|c| !c.is_default);
+    Ok(own)
+}
+
+fn confirm_event(
+    store: &Store,
+    id: &str,
+    input: &Value,
+    now: i64,
+    new_event: &NewEvent,
+) -> Prepared {
+    let refused = |text: String| Prepared::Ran(Outcome::error(text));
+    let text = |key: &str| input[key].as_str().unwrap_or_default().trim().to_owned();
+    let title = text("title");
+    if title.is_empty() {
+        return refused("Pass title: what the event is.".into());
+    }
+    let (start, end, all_day) = match event_times(&input["start"], &input["end"], new_event.minutes)
+    {
+        Ok(times) => times,
+        Err(e) => return refused(e),
+    };
+    let (calendar, account) = match event_calendar(store, input) {
+        Ok(found) => found,
+        Err(e) => return refused(e),
+    };
+    let draft = EventDraft {
+        calendar: calendar.id,
+        title: title.clone(),
+        start,
+        end,
+        all_day,
+        location: text("location"),
+        notes: text("notes"),
+        reminder: if all_day {
+            new_event.all_day_alert
+        } else {
+            new_event.alert
+        },
+        // As the calendar's editor makes them: an all-day event doesn't
+        // block the day.
+        show_as: if all_day { ShowAs::Free } else { ShowAs::Busy },
+        ..EventDraft::default()
+    };
+    let when = when_text(start, end, all_day, now);
+    let made = format!(
+        "Added \"{title}\" to {account}'s calendar {}: {when}.",
+        calendar.name
+    );
+    Prepared::Confirm {
+        card: Card::Action {
+            id: id.to_owned(),
+            title: "Add to calendar".into(),
+            emails: Vec::new(),
+            senders: Vec::new(),
+            state: CardState::Waiting,
+            note: None,
+            event: Some(EventCard {
+                title,
+                when,
+                location: draft.location.clone(),
+                calendar: format!("{} · {account}", calendar.name),
+            }),
+        },
+        apply: Apply::Event {
+            draft: Box::new(draft),
+            made,
+        },
+    }
+}
+
+/// When a new event starts and ends, and whether it's all day. An all-day
+/// event is kept from its first date's UTC midnight to the one after its
+/// last date, as the calendar keeps them.
+fn event_times(start: &Value, end: &Value, minutes: i64) -> Result<(i64, i64, bool), String> {
+    let Some(from) = bound(start)? else {
+        return Err("Pass start: when the event begins.".into());
+    };
+    let utc = |d: NaiveDate| d.and_time(NaiveTime::MIN).and_utc().timestamp_millis();
+    match (from, bound(end)?) {
+        (Bound::Date(first), until) => {
+            let last = match until {
+                None => first,
+                Some(Bound::Date(d)) => d,
+                Some(Bound::Instant(_)) => {
+                    return Err(
+                        "An all-day event ends on a date: pass end as its last day, such as 2026-10-30."
+                            .into(),
+                    );
+                }
+            };
+            if last < first {
+                return Err("end must be on or after start.".into());
+            }
+            Ok((utc(first), utc(last) + DAY_MS, true))
+        }
+        (Bound::Instant(start), until) => {
+            let end = match until {
+                None => start + minutes * 60_000,
+                Some(Bound::Instant(t)) => t,
+                Some(Bound::Date(_)) => {
+                    return Err(
+                        "A timed event ends at a time: pass end as an RFC 3339 time.".into(),
+                    );
+                }
+            };
+            if end <= start {
+                return Err("end must be after start.".into());
+            }
+            Ok((start, end, false))
+        }
+    }
+}
+
+/// The calendar a new event goes in, with its account's address: the one
+/// named, else the account's default, in the account asked for, else in
+/// the first account with a calendar.
+fn event_calendar(store: &Store, input: &Value) -> Result<(Calendar, String), String> {
+    let accounts = store
+        .accounts()
+        .map_err(|e| format!("spark-rs couldn't read its mail database: {e}"))?;
+    let account = match input["account"].as_i64() {
+        Some(wanted) => Some(
+            accounts
+                .iter()
+                .find(|a| a.id == wanted)
+                .ok_or("There's no such account. list_accounts shows them.")?,
+        ),
+        None => None,
+    };
+    let own = own_calendars(store)?;
+    let mut fits = own
+        .iter()
+        .filter(|c| account.is_none_or(|a| c.account_id == a.id));
+    let found = match input["calendar"].as_str().map(str::trim) {
+        Some(name) if !name.is_empty() => fits
+            .find(|c| c.name.trim().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!("There's no calendar called {name} to add to. list_accounts lists them.")
+            })?,
+        // Defaults come first; the first account's goes before the others'.
+        _ => accounts
+            .iter()
+            .find_map(|a| fits.clone().find(|c| c.account_id == a.id))
+            .ok_or_else(|| match account {
+                Some(a) => format!(
+                    "{}'s calendar can't take events from spark-rs: only Microsoft 365 calendars can so far.",
+                    a.email
+                ),
+                None => NO_CALENDAR.into(),
+            })?,
+    };
+    let email = accounts
+        .iter()
+        .find(|a| a.id == found.account_id)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    Ok((found.clone(), email))
+}
+
+/// When an event happens, on the user's clock: "Thu, Oct 29, 1:00 – 2:00
+/// PM", or "Thu, Oct 29 – Sat, Oct 31, all day". The year shows when it
+/// isn't `now`'s.
+fn when_text(start: i64, end: i64, all_day: bool, now: i64) -> String {
+    let this_year = Local.timestamp_millis_opt(now).single().map(|t| t.year());
+    let day = |d: NaiveDate| {
+        if Some(d.year()) == this_year {
+            d.format("%a, %b %-d").to_string()
+        } else {
+            d.format("%a, %b %-d, %Y").to_string()
+        }
+    };
+    if all_day {
+        let (first, last) = all_day_dates(start, end);
+        return if first == last {
+            format!("{}, all day", day(first))
+        } else {
+            format!("{} – {}, all day", day(first), day(last))
+        };
+    }
+    let at = |ms: i64| Local.timestamp_millis_opt(ms).single();
+    let (Some(from), Some(to)) = (at(start), at(end)) else {
+        return String::new();
+    };
+    let time = |t: DateTime<Local>| t.format("%-I:%M %p").to_string();
+    if from.date_naive() != to.date_naive() {
+        format!(
+            "{}, {} – {}, {}",
+            day(from.date_naive()),
+            time(from),
+            day(to.date_naive()),
+            time(to)
+        )
+    } else if from.format("%p").to_string() == to.format("%p").to_string() {
+        // "1:00 – 2:00 PM": one AM or PM for both.
+        format!(
+            "{}, {} – {}",
+            day(from.date_naive()),
+            from.format("%-I:%M"),
+            time(to)
+        )
+    } else {
+        format!("{}, {} – {}", day(from.date_naive()), time(from), time(to))
     }
 }
 
@@ -522,7 +827,7 @@ impl Span {
 
     fn covers(&self, stored: &spark_store::StoredEvent, all_day: bool) -> bool {
         if all_day {
-            let (first, last) = all_day_dates(stored);
+            let (first, last) = all_day_dates(stored.start, stored.end);
             first <= self.last && last >= self.first
         } else {
             stored.start < self.end && stored.end > self.start
@@ -597,20 +902,16 @@ fn local_midnight(date: NaiveDate) -> Result<i64, String> {
         .ok_or_else(|| format!("{date} has no midnight in this time zone."))
 }
 
-/// An all-day event's first and last dates: it's stored from its first
+/// An all-day event's first and last dates: it's kept from its first
 /// date's UTC midnight to the one after its last.
-fn all_day_dates(stored: &spark_store::StoredEvent) -> (NaiveDate, NaiveDate) {
+fn all_day_dates(start: i64, end: i64) -> (NaiveDate, NaiveDate) {
     let date = |ms: i64| {
         DateTime::from_timestamp_millis(ms)
             .unwrap_or_default()
             .date_naive()
     };
-    let first = date(stored.start);
-    let last = if stored.end > stored.start {
-        date(stored.end - 1)
-    } else {
-        first
-    };
+    let first = date(start);
+    let last = if end > start { date(end - 1) } else { first };
     (first, last)
 }
 
@@ -648,7 +949,7 @@ fn events(store: &Store, span: &Span) -> Result<Outcome, String> {
         .take(MAX_EVENTS)
         .map(|(stored, event)| {
             let (start, end) = if event.all_day {
-                let (first, last) = all_day_dates(&stored);
+                let (first, last) = all_day_dates(stored.start, stored.end);
                 (first.to_string(), last.to_string())
             } else {
                 (local(stored.start), local(stored.end))
@@ -771,6 +1072,7 @@ mod tests {
             "search_email",
             &json!({ "query": "contract" }),
             0,
+            &NewEvent::default(),
         ) else {
             panic!("search runs at once");
         };
@@ -790,6 +1092,7 @@ mod tests {
             "update_emails",
             &json!({ "ids": [id], "action": "done" }),
             1,
+            &NewEvent::default(),
         ) else {
             panic!("a change needs approval");
         };
@@ -811,7 +1114,10 @@ mod tests {
             spark_store::MessageState::Inbox
         );
 
-        let outcome = super::apply(&mut store, &apply, 2);
+        let Apply::Mail { tool, args } = apply else {
+            panic!("a change to mail");
+        };
+        let outcome = super::apply(&mut store, tool, &args, 2);
         assert!(!outcome.is_error, "{}", outcome.text);
         assert!(outcome.changed);
         assert_eq!(
@@ -831,7 +1137,14 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    prepare(&mut store, "t", "update_emails", &input, 1),
+                    prepare(
+                        &mut store,
+                        "t",
+                        "update_emails",
+                        &input,
+                        1,
+                        &NewEvent::default()
+                    ),
                     Prepared::Ran(Outcome { is_error: true, .. })
                 ),
                 "{input}"
@@ -846,6 +1159,7 @@ mod tests {
             "decide_senders",
             &json!({ "senders": ["a@spam.example", "b@spam.example"], "action": "block_domain" }),
             1,
+            &NewEvent::default(),
         )
         else {
             panic!("blocking needs approval");
@@ -866,6 +1180,7 @@ mod tests {
             "draft_email",
             &json!({ "reply_to": id, "body": "Looks good." }),
             1,
+            &NewEvent::default(),
         )
         else {
             panic!("a draft card");
@@ -881,7 +1196,8 @@ mod tests {
                 "t4",
                 "draft_email",
                 &json!({ "to": "x@example.com" }),
-                1
+                1,
+                &NewEvent::default(),
             ),
             Prepared::Ran(Outcome { is_error: true, .. })
         ));
@@ -1042,5 +1358,228 @@ mod tests {
         let value: Value = serde_json::from_str(&stale.text).unwrap();
         assert_eq!(value["not_up_to_date"][0], "me@work.example: sign in again");
         assert_eq!(value["total"], 2);
+    }
+
+    /// Local `h:m` on October `d`, 2026, as Unix ms.
+    fn at(d: u32, h: u32, m: u32) -> i64 {
+        let time = NaiveDate::from_ymd_opt(2026, 10, d)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap();
+        Local
+            .from_local_datetime(&time)
+            .earliest()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn ask_event(store: &mut Store, input: Value, new_event: &NewEvent) -> Prepared {
+        prepare(store, "e1", "create_event", &input, at(28, 9, 0), new_event)
+    }
+
+    fn refused(prepared: Prepared) -> String {
+        match prepared {
+            Prepared::Ran(Outcome {
+                is_error: true,
+                text,
+                ..
+            }) => text,
+            _ => panic!("refused before any card"),
+        }
+    }
+
+    #[test]
+    fn an_event_waits_on_a_card_saying_what_when_and_where() {
+        let (mut store, account, _) = mailbox();
+        calendar(&mut store, account);
+        let calendar = store.calendars().unwrap()[0].id;
+        let new_event = NewEvent {
+            minutes: 45,
+            alert: Some(5),
+            all_day_alert: None,
+        };
+        let Prepared::Confirm { card, apply } = ask_event(
+            &mut store,
+            json!({
+                "title": " Fulcrum livestream ",
+                "start": "2026-10-29T14:00:00-04:00",
+                "location": "https://fulcrumpro.zoom.us/j/94290485198",
+                "notes": "Sunny Han and Alex Troesch",
+            }),
+            &new_event,
+        ) else {
+            panic!("a new event needs approval");
+        };
+        let Apply::Event { draft, made } = apply else {
+            panic!("an event to make");
+        };
+        let start = DateTime::parse_from_rfc3339("2026-10-29T18:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(draft.calendar, calendar);
+        assert_eq!(draft.title, "Fulcrum livestream");
+        assert_eq!((draft.start, draft.end), (start, start + 45 * 60_000));
+        assert!(!draft.all_day);
+        assert_eq!(draft.location, "https://fulcrumpro.zoom.us/j/94290485198");
+        assert_eq!(draft.notes, "Sunny Han and Alex Troesch");
+        assert_eq!(draft.reminder, Some(5));
+        assert_eq!(draft.show_as, ShowAs::Busy);
+        assert!(draft.attendees.is_empty(), "it invites no one");
+        let when = when_text(draft.start, draft.end, false, at(28, 9, 0));
+        let Card::Action {
+            title,
+            state,
+            event: Some(event),
+            ..
+        } = card
+        else {
+            panic!("an action card with the event");
+        };
+        assert_eq!(title, "Add to calendar");
+        assert_eq!(state, CardState::Waiting);
+        assert_eq!(
+            event,
+            EventCard {
+                title: "Fulcrum livestream".into(),
+                when: when.clone(),
+                location: "https://fulcrumpro.zoom.us/j/94290485198".into(),
+                calendar: "Work · me@work.example".into(),
+            }
+        );
+        assert_eq!(
+            made,
+            format!("Added \"Fulcrum livestream\" to me@work.example's calendar Work: {when}.")
+        );
+
+        // A date makes it all day, through its last date; it doesn't block the days.
+        let Prepared::Confirm {
+            apply: Apply::Event { draft, .. },
+            ..
+        } = ask_event(
+            &mut store,
+            json!({ "title": "Offsite", "start": "2026-10-29", "end": "2026-10-31" }),
+            &new_event,
+        )
+        else {
+            panic!("an all-day event");
+        };
+        let utc = |date: &str| {
+            DateTime::parse_from_rfc3339(&format!("{date}T00:00:00Z"))
+                .unwrap()
+                .timestamp_millis()
+        };
+        assert!(draft.all_day);
+        assert_eq!(draft.start, utc("2026-10-29"));
+        assert_eq!(draft.end, utc("2026-11-01"));
+        assert_eq!(draft.show_as, ShowAs::Free);
+        assert_eq!(draft.reminder, None);
+    }
+
+    #[test]
+    fn events_are_refused_without_what_they_need() {
+        let (mut store, account, _) = mailbox();
+        let no_calendar = refused(ask_event(
+            &mut store,
+            json!({ "title": "Lunch", "start": "2026-10-29T12:00:00-05:00" }),
+            &NewEvent::default(),
+        ));
+        assert!(no_calendar.contains("Microsoft 365"), "{no_calendar}");
+        assert!(no_calendar.contains("Gmail"), "{no_calendar}");
+
+        calendar(&mut store, account);
+        for (input, says) in [
+            (json!({ "start": "2026-10-29T12:00:00-05:00" }), "title"),
+            (json!({ "title": "Lunch" }), "start"),
+            (json!({ "title": "Lunch", "start": "noon" }), "isn't a date"),
+            (
+                json!({ "title": "Lunch", "start": "2026-10-29T12:00:00-05:00", "end": "2026-10-29T11:00:00-05:00" }),
+                "after start",
+            ),
+            (
+                json!({ "title": "Lunch", "start": "2026-10-29T12:00:00-05:00", "end": "2026-10-30" }),
+                "ends at a time",
+            ),
+            (
+                json!({ "title": "Offsite", "start": "2026-10-29", "end": "2026-10-29T17:00:00-05:00" }),
+                "ends on a date",
+            ),
+            (
+                json!({ "title": "Offsite", "start": "2026-10-29", "end": "2026-10-28" }),
+                "on or after start",
+            ),
+            (
+                json!({ "title": "Lunch", "start": "2026-10-29T12:00:00-05:00", "account": 999 }),
+                "no such account",
+            ),
+            (
+                json!({ "title": "Lunch", "start": "2026-10-29T12:00:00-05:00", "calendar": "Birthdays" }),
+                "no calendar called Birthdays",
+            ),
+        ] {
+            let text = refused(ask_event(&mut store, input.clone(), &NewEvent::default()));
+            assert!(text.contains(says), "{input}: {text}");
+        }
+        // Calendars are matched by name, whatever the case.
+        assert!(matches!(
+            ask_event(
+                &mut store,
+                json!({ "title": "Lunch", "start": "2026-10-29T12:00:00-05:00", "account": account, "calendar": "work" }),
+                &NewEvent::default(),
+            ),
+            Prepared::Confirm { .. }
+        ));
+    }
+
+    #[test]
+    fn accounts_list_the_calendars_events_can_go_in() {
+        let (mut store, account, _) = mailbox();
+        calendar(&mut store, account);
+        let Prepared::Ran(outcome) = prepare(
+            &mut store,
+            "t",
+            "list_accounts",
+            &json!({}),
+            1,
+            &NewEvent::default(),
+        ) else {
+            panic!("runs at once");
+        };
+        let value: Value = serde_json::from_str(&outcome.text).unwrap();
+        assert_eq!(value["accounts"][0]["calendars"], json!(["Work"]));
+        assert!(value["accounts"][0].get("access").is_none());
+    }
+
+    #[test]
+    fn cards_say_when_on_the_users_clock() {
+        let now = at(28, 9, 0);
+        assert_eq!(
+            when_text(at(29, 13, 0), at(29, 14, 0), false, now),
+            "Thu, Oct 29, 1:00 – 2:00 PM"
+        );
+        assert_eq!(
+            when_text(at(29, 11, 30), at(29, 13, 0), false, now),
+            "Thu, Oct 29, 11:30 AM – 1:00 PM"
+        );
+        assert_eq!(
+            when_text(at(29, 23, 0), at(30, 1, 0), false, now),
+            "Thu, Oct 29, 11:00 PM – Fri, Oct 30, 1:00 AM"
+        );
+        let utc = |date: &str| {
+            DateTime::parse_from_rfc3339(&format!("{date}T00:00:00Z"))
+                .unwrap()
+                .timestamp_millis()
+        };
+        assert_eq!(
+            when_text(utc("2026-10-29"), utc("2026-10-30"), true, now),
+            "Thu, Oct 29, all day"
+        );
+        assert_eq!(
+            when_text(utc("2026-10-29"), utc("2026-11-01"), true, now),
+            "Thu, Oct 29 – Sat, Oct 31, all day"
+        );
+        assert_eq!(
+            when_text(utc("2027-01-07"), utc("2027-01-08"), true, now),
+            "Thu, Jan 7, 2027, all day"
+        );
     }
 }

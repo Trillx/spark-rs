@@ -1200,6 +1200,9 @@ export const onMailboxChanged = (handler: () => void) => on<null>("mailbox-chang
 /** The folder list changed, or a folder synced for the first time: reload `listFolders`. */
 export const onFoldersChanged = (handler: () => void) => on<null>("folders-changed", handler);
 
+/** Something besides the calendar screen (the AI Assistant) changed events: reload `listEvents`. */
+export const onCalendarChanged = (handler: () => void) => on<null>("calendar-changed", handler);
+
 /** An account was added, removed or renamed (demo mode may have ended): reload `listAccounts`. */
 export const onAccountsChanged = (handler: () => void) => on<null>("accounts-changed", handler);
 

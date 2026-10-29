@@ -794,6 +794,14 @@ function ActionView({ card, onDecide }: { card: Extract<Card, { type: "action" }
   return (
     <>
       <p className="text-sm font-semibold">{card.title}</p>
+      {card.event && (
+        <div className="flex min-w-0 flex-col gap-0.5 border-l-2 border-secondary pl-2 text-[13px]">
+          <span className="font-medium">{card.event.title}</span>
+          <span className="text-text-2">{card.event.when}</span>
+          {card.event.location && <span className="truncate text-text-2">{card.event.location}</span>}
+          <span className="truncate text-xs text-text-2">{card.event.calendar}</span>
+        </div>
+      )}
       {card.emails.length > 0 && (
         <ul className="flex flex-col gap-1">
           {card.emails.slice(0, SHOWN_EMAILS).map((e) => (

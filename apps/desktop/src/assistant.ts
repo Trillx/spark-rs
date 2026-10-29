@@ -25,6 +25,16 @@ export interface DraftCard {
   replyTo?: number;
 }
 
+/** An event a card adds, as the user reads it. */
+export interface EventCard {
+  title: string;
+  /** When, on the user's clock: "Thu, Oct 29, 1:00 – 2:00 PM". */
+  when: string;
+  location?: string;
+  /** The calendar and its account: "Calendar · me@work.example". */
+  calendar: string;
+}
+
 /** Something in the chat for the user to act on. */
 export type Card =
   | {
@@ -36,6 +46,8 @@ export type Card =
       senders: string[];
       state: CardState;
       note?: string;
+      /** The event it adds to the calendar. */
+      event?: EventCard;
     }
   | { type: "draft"; id: string; draft: DraftCard };
 
@@ -166,7 +178,7 @@ export function assistantDeleteSession(id: string): Promise<void> {
 
 // ---- browser preview (`npm run dev`) ----
 // No AI runs: a labeled stand-in answer streams in, with a step, a citation and, when asked to
-// archive or draft, a card, so the panel can be tried.
+// archive, add to the calendar or draft, a card, so the panel can be tried.
 
 interface PreviewSession {
   id: string;
@@ -264,6 +276,22 @@ function previewCard(question: string): Card | null {
       emails: [PREVIEW_EMAIL],
       senders: [],
       state: "waiting",
+    };
+  }
+  if (/\b(calendar|event|meeting)\b/i.test(question)) {
+    return {
+      type: "action",
+      id: `card${Date.now()}`,
+      title: "Add to calendar",
+      emails: [],
+      senders: [],
+      state: "waiting",
+      event: {
+        title: "Lease signing (preview only)",
+        when: "Fri, 10:00 – 10:30 AM",
+        location: "Whitfield Properties, 12 Harbor St",
+        calendar: "Calendar · you@example.com",
+      },
     };
   }
   if (/\b(draft|write)\b/i.test(question)) {

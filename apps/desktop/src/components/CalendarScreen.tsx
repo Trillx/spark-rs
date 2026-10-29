@@ -8,6 +8,7 @@ import {
   getPrefs,
   listCalendars,
   listEvents,
+  onCalendarChanged,
   openExternal,
   reconnectAccount,
   refreshCalendars,
@@ -252,6 +253,9 @@ export default function CalendarScreen({
   useEffect(() => {
     void load().then(refresh);
   }, [load, refresh]);
+
+  // The AI Assistant beside it added an event, and read the calendar again.
+  useEffect(() => (demo ? undefined : onCalendarChanged(() => void load())), [demo, load]);
 
   useEffect(() => {
     const timer = window.setInterval(() => void refresh(), REFRESH_MS);

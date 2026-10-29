@@ -468,8 +468,12 @@ small number in the answer, listed under Sources, and clicking one opens
 that email. "This email" means the one open in the reader.
 
 Ask it to tidy up and it proposes the change on a card: mark emails Done,
-snooze, pin, set aside or delete them, or accept or block senders. Nothing
-changes until you click Approve. When it writes an email or a reply, it
+snooze, pin, set aside or delete them, or accept or block senders. Ask it to
+add something to your calendar, such as a webinar from an email, and the card
+shows the event, when it is on your clock and which calendar it goes in; it
+gets your usual length and alert from Settings → Calendar, and invites no one.
+Events go in Microsoft 365 calendars only. Nothing changes until you click
+Approve. When it writes an email or a reply, it
 shows a draft with **Open Draft**, which opens it in the composer for you to
 edit and send. The assistant can't send email itself.
 
