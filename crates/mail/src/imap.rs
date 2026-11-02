@@ -374,6 +374,8 @@ async fn tls(server: &Server, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
 /// Finds (or, if the server has none, creates) the folders Done and Delete
 /// move mail to: special-use `\Archive`, else `\All` (Gmail's All Mail),
 /// else one named "Archive"; `\Trash`, else one named like a trash folder.
+/// Named ones are found at the top or in INBOX, and made in INBOX on
+/// servers that keep every folder there.
 pub async fn find_folders(session: &mut Session, state: &mut SyncState) -> Result<()> {
     if state.archive.is_some() && state.trash.is_some() {
         return Ok(());
@@ -392,7 +394,10 @@ pub async fn find_folders(session: &mut Session, state: &mut SyncState) -> Resul
     let named = |candidates: &[&str]| {
         names
             .iter()
-            .find(|n| candidates.iter().any(|c| n.name().eq_ignore_ascii_case(c)))
+            .find(|n| {
+                let name = unnested(n.name(), n.delimiter());
+                candidates.iter().any(|c| name.eq_ignore_ascii_case(c))
+            })
             .map(|n| n.name().to_owned())
     };
     let archive = with(NameAttribute::Archive)
@@ -402,19 +407,22 @@ pub async fn find_folders(session: &mut Session, state: &mut SyncState) -> Resul
         .or_else(|| named(&["Trash", "Deleted Items", "Deleted Messages", "Deleted"]));
     state.archive = Some(match archive {
         Some(name) => name,
-        None => {
-            session.create("Archive").await?;
-            "Archive".into()
-        }
+        None => create_folder(session, None, "Archive").await?,
     });
     state.trash = Some(match trash {
         Some(name) => name,
-        None => {
-            session.create("Trash").await?;
-            "Trash".into()
-        }
+        None => create_folder(session, None, "Trash").await?,
     });
     Ok(())
+}
+
+/// A mailbox name without the INBOX it's in, on servers that keep every
+/// folder there: "INBOX.Trash" is "Trash". Others are left as they are.
+fn unnested<'a>(name: &'a str, delimiter: Option<&str>) -> &'a str {
+    delimiter
+        .and_then(|d| name.split_once(d))
+        .filter(|(parent, _)| parent.eq_ignore_ascii_case(INBOX))
+        .map_or(name, |(_, rest)| rest)
 }
 
 /// The account's folders. INBOX isn't one (the Inbox is always there), and
@@ -568,14 +576,7 @@ fn folders_from(listed: &[Listed], state: &SyncState) -> Vec<RemoteFolder> {
 /// Spark's Blocked folder: "Blocked" at the top, or in INBOX on servers
 /// that keep every folder there.
 fn is_blocked_folder(l: &Listed) -> bool {
-    let name = l.name.as_str();
-    let nested = l
-        .delimiter
-        .as_deref()
-        .and_then(|d| name.split_once(d))
-        .filter(|(parent, _)| parent.eq_ignore_ascii_case(INBOX))
-        .map(|(_, leaf)| leaf);
-    nested.unwrap_or(name).eq_ignore_ascii_case(BLOCKED)
+    unnested(&l.name, l.delimiter.as_deref()).eq_ignore_ascii_case(BLOCKED)
 }
 
 /// The account's Blocked folder: the one found before, else one already
@@ -3778,6 +3779,76 @@ mod tests {
                 ("Acme", Some("INBOX.Clients"), None, true),
             ]
         );
+    }
+
+    /// A server that keeps every folder in INBOX, as Dovecot set up the
+    /// Courier way does: "." between names, no special-use attributes, and
+    /// a NO to a folder made outside INBOX. It has `folders` to start with;
+    /// also returns the ones made since.
+    async fn inbox_only_server(folders: &[&str]) -> (Server, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = Server {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            security: Security::Plain,
+            trusted_cert: None,
+        };
+        let mut names: Vec<String> = std::iter::once(INBOX)
+            .chain(folders.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let made = Arc::new(Mutex::new(Vec::new()));
+        let made_here = made.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(b"* OK ready\r\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let (tag, command) = line.split_once(' ').unwrap();
+                let reply = if command.starts_with("LIST ") {
+                    let pattern = command.rsplit_once(' ').unwrap().1.trim_matches('"');
+                    let listed: String = names
+                        .iter()
+                        .filter(|n| pattern == "*" || n.as_str() == pattern)
+                        .map(|n| format!("* LIST () \".\" \"{n}\"\r\n"))
+                        .collect();
+                    format!("{listed}{tag} OK done\r\n")
+                } else if let Some(name) = command.strip_prefix("CREATE ") {
+                    let name = name.trim_matches('"');
+                    if name.starts_with("INBOX.") {
+                        names.push(name.to_owned());
+                        made_here.lock().unwrap().push(name.to_owned());
+                        format!("{tag} OK done\r\n")
+                    } else {
+                        format!(
+                            "{tag} NO Client tried to access nonexistent namespace. (Mailbox \
+                             name should probably be prefixed with: INBOX.)\r\n"
+                        )
+                    }
+                } else {
+                    format!("{tag} OK done\r\n")
+                };
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (server, made)
+    }
+
+    #[tokio::test]
+    async fn done_and_delete_use_folders_kept_in_the_inbox() {
+        // Its Trash is there, and no Archive but a client's: one is made.
+        let (server, made) =
+            inbox_only_server(&["INBOX.Sent", "INBOX.Trash", "INBOX.Clients.Archive"]).await;
+        let mut session = login(&server, "me", "pw").await.unwrap();
+        let mut state = SyncState::default();
+        find_folders(&mut session, &mut state).await.unwrap();
+        assert_eq!(state.archive.as_deref(), Some("INBOX.Archive"));
+        assert_eq!(state.trash.as_deref(), Some("INBOX.Trash"));
+        assert_eq!(*made.lock().unwrap(), ["INBOX.Archive"]);
     }
 
     #[test]
