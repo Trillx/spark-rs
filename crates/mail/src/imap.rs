@@ -372,39 +372,13 @@ async fn tls(server: &Server, tcp: TcpStream) -> Result<TlsStream<TcpStream>> {
 }
 
 /// Finds (or, if the server has none, creates) the folders Done and Delete
-/// move mail to: special-use `\Archive`, else `\All` (Gmail's All Mail),
-/// else one named "Archive"; `\Trash`, else one named like a trash folder.
-/// Named ones are found at the top or in INBOX, and made in INBOX on
-/// servers that keep every folder there.
+/// move mail to (`destinations`). One that's made goes in INBOX on servers
+/// that keep every folder there.
 pub async fn find_folders(session: &mut Session, state: &mut SyncState) -> Result<()> {
     if state.archive.is_some() && state.trash.is_some() {
         return Ok(());
     }
-    let names: Vec<_> = session
-        .list(Some(""), Some("*"))
-        .await?
-        .try_collect()
-        .await?;
-    let with = |attr: NameAttribute<'static>| {
-        names
-            .iter()
-            .find(|n| n.attributes().contains(&attr))
-            .map(|n| n.name().to_owned())
-    };
-    let named = |candidates: &[&str]| {
-        names
-            .iter()
-            .find(|n| {
-                let name = unnested(n.name(), n.delimiter());
-                candidates.iter().any(|c| name.eq_ignore_ascii_case(c))
-            })
-            .map(|n| n.name().to_owned())
-    };
-    let archive = with(NameAttribute::Archive)
-        .or_else(|| with(NameAttribute::All))
-        .or_else(|| named(&["Archive", "Archives"]));
-    let trash = with(NameAttribute::Trash)
-        .or_else(|| named(&["Trash", "Deleted Items", "Deleted Messages", "Deleted"]));
+    let (archive, trash) = destinations(&list_all(session).await?);
     state.archive = Some(match archive {
         Some(name) => name,
         None => create_folder(session, None, "Archive").await?,
@@ -414,6 +388,63 @@ pub async fn find_folders(session: &mut Session, state: &mut SyncState) -> Resul
         None => create_folder(session, None, "Trash").await?,
     });
     Ok(())
+}
+
+/// Of the folders `listed`, the ones Done and Delete move mail to:
+/// special-use `\Archive`, else `\All` (Gmail's All Mail), else one named
+/// "Archive"; `\Trash`, else one named like a trash folder. A name is
+/// looked for at the top, then in INBOX. One that can't hold mail isn't
+/// taken.
+fn destinations(listed: &[Listed]) -> (Option<String>, Option<String>) {
+    let usable: Vec<&Listed> = listed
+        .iter()
+        .filter(|l| {
+            !l.attributes
+                .iter()
+                .any(|a| matches!(a, Attr::NoSelect | Attr::NonExistent))
+        })
+        .collect();
+    let with = |attr: Attr| {
+        usable
+            .iter()
+            .find(|l| l.attributes.contains(&attr))
+            .map(|l| l.name.clone())
+    };
+    let named = |candidates: &[&str]| {
+        let is = |name: &str| candidates.iter().any(|c| name.eq_ignore_ascii_case(c));
+        usable
+            .iter()
+            .find(|l| is(&l.name))
+            .or_else(|| {
+                usable
+                    .iter()
+                    .find(|l| is(unnested(&l.name, l.delimiter.as_deref())))
+            })
+            .map(|l| l.name.clone())
+    };
+    let archive = with(Attr::Archive)
+        .or_else(|| with(Attr::All))
+        .or_else(|| named(&["Archive", "Archives"]));
+    let trash = with(Attr::Trash)
+        .or_else(|| named(&["Trash", "Deleted Items", "Deleted Messages", "Deleted"]));
+    (archive, trash)
+}
+
+/// Every mailbox the server lists.
+async fn list_all(session: &mut Session) -> Result<Vec<Listed>> {
+    let names: Vec<_> = session
+        .list(Some(""), Some("*"))
+        .await?
+        .try_collect()
+        .await?;
+    Ok(names
+        .iter()
+        .map(|n| Listed {
+            name: n.name().to_owned(),
+            delimiter: n.delimiter().map(str::to_owned),
+            attributes: n.attributes().iter().filter_map(attribute).collect(),
+        })
+        .collect())
 }
 
 /// A mailbox name without the INBOX it's in, on servers that keep every
@@ -431,20 +462,7 @@ fn unnested<'a>(name: &'a str, delimiter: Option<&str>) -> &'a str {
 /// and Delete use. Gmail's `[Gmail]` container is left out, its folders
 /// listed at the top.
 pub async fn list_folders(session: &mut Session, state: &SyncState) -> Result<Vec<RemoteFolder>> {
-    let names: Vec<_> = session
-        .list(Some(""), Some("*"))
-        .await?
-        .try_collect()
-        .await?;
-    let listed: Vec<Listed> = names
-        .iter()
-        .map(|n| Listed {
-            name: n.name().to_owned(),
-            delimiter: n.delimiter().map(str::to_owned),
-            attributes: n.attributes().iter().filter_map(attribute).collect(),
-        })
-        .collect();
-    Ok(folders_from(&listed, state))
+    Ok(folders_from(&list_all(session).await?, state))
 }
 
 /// A LIST reply, reduced to what `folders_from` needs.
@@ -585,20 +603,9 @@ async fn blocked_folder(session: &mut Session, state: &mut SyncState) -> Result<
     if let Some(name) = &state.blocked {
         return Ok(name.clone());
     }
-    let names: Vec<_> = session
-        .list(Some(""), Some("*"))
-        .await?
-        .try_collect()
-        .await?;
-    let found = names.iter().find(|n| {
-        is_blocked_folder(&Listed {
-            name: n.name().to_owned(),
-            delimiter: n.delimiter().map(str::to_owned),
-            attributes: Vec::new(),
-        })
-    });
+    let found = list_all(session).await?.into_iter().find(is_blocked_folder);
     let name = match found {
-        Some(n) => n.name().to_owned(),
+        Some(l) => l.name,
         None => create_folder(session, None, BLOCKED).await?,
     };
     state.blocked = Some(name.clone());
@@ -3778,6 +3785,58 @@ mod tests {
                 ("Clients", None, None, false),
                 ("Acme", Some("INBOX.Clients"), None, true),
             ]
+        );
+    }
+
+    #[test]
+    fn done_and_delete_take_a_folder_at_the_top_before_one_in_the_inbox() {
+        let found = |listed: &[Listed]| {
+            let (archive, trash) = destinations(listed);
+            (archive.unwrap_or_default(), trash.unwrap_or_default())
+        };
+        // Kept in INBOX: found there, but not deeper.
+        assert_eq!(
+            found(&[
+                listed("INBOX", ".", &[]),
+                listed("INBOX.Clients.Archive", ".", &[]),
+                listed("INBOX.Archive", ".", &[]),
+                listed("INBOX.Deleted Messages", ".", &[]),
+            ]),
+            ("INBOX.Archive".into(), "INBOX.Deleted Messages".into())
+        );
+        assert_eq!(
+            found(&[listed("INBOX.Clients.Archive", ".", &[])]),
+            (String::new(), String::new())
+        );
+        // A name at the top wins, wherever it's listed.
+        assert_eq!(
+            found(&[
+                listed("INBOX/Archive", "/", &[]),
+                listed("INBOX/Trash", "/", &[]),
+                listed("Archive", "/", &[]),
+                listed("Trash", "/", &[]),
+            ]),
+            ("Archive".into(), "Trash".into())
+        );
+        // One that can't hold mail isn't taken.
+        assert_eq!(
+            found(&[
+                listed("Archive", "/", &[Attr::NoSelect]),
+                listed("INBOX/Archive", "/", &[]),
+                listed("Saved", "/", &[Attr::Trash, Attr::NonExistent]),
+                listed("Trash", "/", &[]),
+            ]),
+            ("INBOX/Archive".into(), "Trash".into())
+        );
+        // Special-use first.
+        assert_eq!(
+            found(&[
+                listed("Archive", "/", &[]),
+                listed("Trash", "/", &[]),
+                listed("Kept", "/", &[Attr::Archive]),
+                listed("Bin", "/", &[Attr::Trash]),
+            ]),
+            ("Kept".into(), "Bin".into())
         );
     }
 
