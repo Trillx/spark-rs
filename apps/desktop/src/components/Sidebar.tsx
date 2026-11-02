@@ -16,9 +16,11 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import type { AccountId, AccountView, FolderView, Message } from "../types";
 import { useAccounts } from "../lib/accounts";
@@ -56,6 +58,7 @@ import {
 } from "../lib/sidebar";
 import { tipAttrs, tipLabel, type Tip } from "../lib/tooltip";
 import AccountMark from "./AccountMark";
+import AccountTile from "./AccountTile";
 import CalendarIcon from "./CalendarIcon";
 import { ConfirmDialog, PromptDialog } from "./Dialog";
 import FolderPicker from "./FolderPicker";
@@ -254,65 +257,334 @@ function Rail(props: ViewProps) {
   );
 }
 
-/** The Inbox, and on hover a toggle that drops down one button per account. */
+/** How long the pointer rests on the Inbox before its accounts menu opens, and may be away before it closes. */
+const MENU_OPEN_DELAY = 220;
+const MENU_CLOSE_DELAY = 160;
+/** How long a dragged message is held over the Inbox before the menu opens to drop it on one account. */
+const MENU_DRAG_DELAY = 400;
+
+/** What opened the accounts menu: resting the pointer closes it on leaving, a drag when it ends. */
+type MenuVia = "hover" | "click" | "key" | "drag";
+
+/**
+ * The Inbox; a click shows every account's mail. With more than one account,
+ * resting on it, clicking its arrow or holding a dragged message over it opens
+ * a menu beside the rail that narrows it to one account. Nothing in the rail moves.
+ */
 function RailInbox({ current, account, counts, folders, actions }: ViewProps) {
   const accounts = useAccounts();
   const drop = useRowDrop(folders);
-  const [open, setOpen] = useState(false);
+  const drag = useMessageDrag();
+  const anchor = useRef<HTMLDivElement>(null);
+  const arrow = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const timer = useRef<number | undefined>(undefined);
+  const [menu, setMenu] = useState<{ via: MenuVia; top: number; left: number } | null>(null);
   const inbox = current === "inbox";
   const narrowed = inbox && account !== "all" ? accounts.find((a) => a.id === account) : undefined;
+  const many = accounts.length > 1;
+
+  const later = (run: () => void, ms: number) => {
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(run, ms);
+  };
+  const open = (via: MenuVia) => {
+    window.clearTimeout(timer.current);
+    const r = anchor.current?.getBoundingClientRect();
+    if (r) setMenu({ via, top: r.top, left: r.right });
+  };
+  /** Keyboard focus in the menu goes back to the arrow, so it isn't lost. */
+  const close = () => {
+    window.clearTimeout(timer.current);
+    const focused = document.activeElement;
+    const keyboard = focused instanceof HTMLElement && menuRef.current?.contains(focused) && focused.matches(":focus-visible");
+    setMenu(null);
+    if (keyboard) arrow.current?.focus();
+  };
+  const select = (a: AccountFilter) => {
+    close();
+    actions.select("inbox", a);
+  };
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  // Open: a click outside or Esc closes it. Capture phase, so Esc closes nothing behind it.
+  const isOpen = menu !== null;
+  useEffect(() => {
+    if (!isOpen) return;
+    const onPointer = (e: PointerEvent) => {
+      if (!anchor.current?.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      close();
+    };
+    window.addEventListener("pointerdown", onPointer);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", onPointer);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [isOpen]);
+
+  // A message held over the Inbox opens the menu. Moving it to another list closes the menu, and so does
+  // dropping it, if the drag opened it. The pointer is captured while dragging, so no enter/leave arrives.
+  const dragging = drag !== null;
+  const overInbox = drag?.over?.key === "inbox";
+  const overOther = drag?.over != null && drag.over.key !== "inbox";
+  useEffect(() => {
+    if (!many) return;
+    if (!dragging) {
+      if (menu?.via === "drag") close();
+      return;
+    }
+    if (overOther) close();
+    else if (overInbox && !isOpen) later(() => open("drag"), MENU_DRAG_DELAY);
+    else if (!isOpen) window.clearTimeout(timer.current);
+  }, [dragging, overInbox, overOther, isOpen]);
+
   return (
-    <div className="group relative flex w-full justify-center">
-      {accounts.length > 1 && (
+    <div
+      ref={anchor}
+      className="relative flex w-full justify-center"
+      onPointerEnter={() => {
+        if (!many) return;
+        if (isOpen) window.clearTimeout(timer.current);
+        else later(() => open("hover"), MENU_OPEN_DELAY);
+      }}
+      onPointerLeave={() => {
+        if (!isOpen) window.clearTimeout(timer.current);
+        else if (menu.via === "hover") later(close, MENU_CLOSE_DELAY);
+      }}
+    >
+      {/* With a menu to show, it takes the tooltip's place. */}
+      <RailButton
+        title="Inbox"
+        tip={!many}
+        active={inbox}
+        dot={counts.inbox > 0}
+        drop={drop("inbox")}
+        onClick={() => select("all")}
+      >
+        <Inbox size={18} />
+        {narrowed && <NarrowedMark account={narrowed} />}
+      </RailButton>
+      {many && (
         <button
-          aria-label={open ? "Hide accounts" : "Show accounts"}
-          aria-expanded={open}
-          className="absolute left-1.5 top-[7px] grid size-4 place-items-center rounded opacity-0 hover:text-white focus-visible:opacity-100 group-hover:opacity-100"
-          onClick={() => setOpen((o) => !o)}
+          ref={arrow}
+          aria-label="Inbox accounts"
+          aria-haspopup="menu"
+          aria-expanded={isOpen}
+          className={`absolute right-1.5 top-1/2 grid size-4 -translate-y-1/2 place-items-center rounded transition-[color,transform] duration-150 hover:text-white ${
+            isOpen ? "translate-x-0.5 text-white/70" : "text-neutral-content/40"
+          }`}
+          // A click pins a menu the pointer opened; Enter or Space also moves focus into it.
+          onClick={(e) => (isOpen && menu.via !== "hover" ? close() : open(e.detail === 0 ? "key" : "click"))}
         >
-          <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
+          <ChevronRight size={11} />
         </button>
       )}
-      <div className={`flex flex-col items-center gap-1 rounded-lg ${open ? "bg-sidebar-hover pb-1" : ""}`}>
-        <RailButton
-          title="Inbox"
-          active={inbox && (account === "all" || !open)}
-          dot={counts.inbox > 0}
-          drop={drop("inbox")}
-          onClick={() => actions.select("inbox", "all")}
-        >
-          <Inbox size={18} />
-          {narrowed && !open && <NarrowedMark account={narrowed} />}
-        </RailButton>
-        {open &&
-          accounts.map((a) => (
-            <RailButton
-              key={a.id}
-              title={accountTitle(a)}
-              active={inbox && account === a.id}
-              alert={a.sync.status === "error"}
-              drop={drop("inbox", a.id)}
-              onClick={() => actions.select("inbox", a.id)}
-            >
-              <AccountMark color={a.color} />
-            </RailButton>
-          ))}
-      </div>
+      {many && menu && (
+        <AccountsMenu
+          menuRef={menuRef}
+          top={menu.top}
+          left={menu.left}
+          focus={menu.via === "key"}
+          inbox={inbox}
+          account={account}
+          counts={counts}
+          folders={folders}
+          onSelect={select}
+          onClose={close}
+        />
+      )}
     </div>
+  );
+}
+
+/**
+ * The Inbox's accounts beside the rail: All Inboxes, then each account with its
+ * address (or sync error) and unread count. Rows take a dragged message.
+ */
+function AccountsMenu({
+  menuRef,
+  top,
+  left,
+  focus,
+  inbox,
+  account,
+  counts,
+  folders,
+  onSelect,
+  onClose,
+}: {
+  menuRef: RefObject<HTMLDivElement | null>;
+  /** The rail's Inbox row: the menu lines up with its top, just over the rail's edge. */
+  top: number;
+  left: number;
+  /** Opened from the keyboard: focus the checked row. */
+  focus: boolean;
+  inbox: boolean;
+  account: AccountFilter;
+  counts: SidebarCounts;
+  folders: FolderView[];
+  onSelect: (account: AccountFilter) => void;
+  onClose: () => void;
+}) {
+  const accounts = useAccounts();
+  const drop = useRowDrop(folders);
+  const [y, setY] = useState(top - 6);
+
+  // Kept inside the window.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (el) setY(Math.max(8, Math.min(top - 6, window.innerHeight - el.offsetHeight - 8)));
+  }, [top]);
+
+  useEffect(() => {
+    if (!focus) return;
+    const items = [...(menuRef.current?.querySelectorAll<HTMLElement>("[role='menuitemradio']") ?? [])];
+    (items.find((i) => i.getAttribute("aria-checked") === "true") ?? items[0])?.focus();
+  }, []);
+
+  function onKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    const items = [...e.currentTarget.querySelectorAll<HTMLElement>("[role='menuitemradio']")];
+    const at = items.indexOf(document.activeElement as HTMLElement);
+    const move = (i: number) => items[(i + items.length) % items.length]?.focus();
+    switch (e.key) {
+      case "ArrowDown":
+        move(at + 1);
+        break;
+      case "ArrowUp":
+        move(at < 0 ? -1 : at - 1);
+        break;
+      case "Home":
+        move(0);
+        break;
+      case "End":
+        move(-1);
+        break;
+      case "ArrowLeft":
+        onClose();
+        break;
+      case "Tab":
+        // Focus goes back to the arrow, and Tab moves on from there.
+        onClose();
+        return;
+      default:
+        return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  return (
+    <div
+      ref={menuRef}
+      role="menu"
+      aria-label="Inbox accounts"
+      onKeyDown={onKeyDown}
+      className="flyout-in fixed z-[2020] max-h-[calc(100vh-16px)] w-64 overflow-y-auto rounded-xl bg-[#34373c] p-1.5 text-neutral-content shadow-[0_10px_30px_rgba(0,0,0,.45)] ring-1 ring-white/10"
+      style={{ left: left - 4, top: y }}
+    >
+      <AccountsMenuRow
+        icon={
+          <span className="grid size-7 place-items-center rounded-lg bg-white/10 text-white">
+            <Inbox size={15} />
+          </span>
+        }
+        label="All Inboxes"
+        count={counts.inbox}
+        checked={inbox && account === "all"}
+        drop={drop("inbox")}
+        onClick={() => onSelect("all")}
+      />
+      <div role="separator" className="mx-2 my-1 h-px bg-white/10" />
+      {accounts.map((a, i) => {
+        const error = a.sync.status === "error";
+        return (
+          <AccountsMenuRow
+            key={a.id}
+            delay={40 + i * 25}
+            icon={<AccountTile account={a} size={28} />}
+            label={a.label}
+            detail={error ? (a.sync.message ?? "Couldn't sync") : a.email}
+            alert={error}
+            count={counts.accounts[a.id] ?? 0}
+            checked={inbox && account === a.id}
+            drop={drop("inbox", a.id)}
+            onClick={() => onSelect(a.id)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function AccountsMenuRow({
+  icon,
+  label,
+  detail,
+  alert = false,
+  count,
+  checked,
+  drop,
+  delay,
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  detail?: string;
+  /** A sync error: `detail` says what, and it shows in place of the count. */
+  alert?: boolean;
+  count: number;
+  checked: boolean;
+  drop?: RowDrop;
+  /** The rows slide in a beat after the menu, one after another. */
+  delay?: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      role="menuitemradio"
+      aria-checked={checked}
+      tabIndex={-1}
+      {...dropAttrs(drop?.target)}
+      onClick={onClick}
+      style={delay ? { animationDelay: `${delay}ms` } : undefined}
+      className={`flex w-full items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left outline-none ${
+        drop?.over ? DROP_OVER : checked ? "bg-white/[.08]" : "hover:bg-white/[.06] focus-visible:bg-white/[.06]"
+      } ${drop && !drop.target ? "opacity-40" : ""}`}
+    >
+      {icon}
+      <span className="min-w-0 flex-1">
+        <span className={`block truncate text-[13px] ${checked ? "font-semibold text-white" : "text-white/90"}`}>{label}</span>
+        {detail && (
+          <span className={`block truncate text-[11px] ${alert ? "text-error" : "text-neutral-content/70"}`}>{detail}</span>
+        )}
+      </span>
+      {alert ? (
+        <CircleAlert size={14} className="shrink-0 text-error" />
+      ) : (
+        count > 0 && <span className="text-xs tabular-nums text-neutral-content/80">{count}</span>
+      )}
+      <span className="grid w-4 shrink-0 place-items-center text-primary">{checked && <Check size={14} />}</span>
+    </button>
   );
 }
 
 /** The account a rail list is narrowed to, on its icon's corner. */
 function NarrowedMark({ account }: { account: AccountView }) {
   return (
-    <span className="absolute -bottom-0.5 -right-0.5 rounded-full bg-neutral">
-      <AccountMark color={account.color} />
+    <span className="absolute -bottom-1 -right-1 rounded ring-2 ring-neutral">
+      <AccountTile account={account} size={14} />
     </span>
   );
 }
 
 function RailButton({
   title,
+  tip = true,
   active = false,
   dot = false,
   alert = false,
@@ -322,6 +594,8 @@ function RailButton({
   children,
 }: {
   title: Tip;
+  /** Whether `title` shows as a tooltip; it's the button's label either way. */
+  tip?: boolean;
   active?: boolean;
   /** Unread mail. */
   dot?: boolean;
@@ -334,7 +608,7 @@ function RailButton({
 }) {
   return (
     <button
-      {...tipAttrs(title)}
+      {...(tip ? tipAttrs(title) : {})}
       {...dropAttrs(drop?.target)}
       data-tip-side="right"
       aria-label={tipLabel(title)}

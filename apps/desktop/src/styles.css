@@ -361,6 +361,33 @@
   }
 }
 
+/* The rail's Inbox accounts menu (Sidebar.tsx) slides out of the rail, its rows a beat behind. */
+@keyframes flyout-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px) scale(0.97);
+  }
+}
+@keyframes flyout-row-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+}
+.flyout-in {
+  transform-origin: left top;
+  animation: flyout-in 150ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.flyout-in > [role="menuitemradio"] {
+  animation: flyout-row-in 160ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .flyout-in,
+  .flyout-in > [role="menuitemradio"] {
+    animation: none;
+  }
+}
+
 /* The meeting pop-up's window (popup.html) is transparent around its cards. */
 html[data-window="popup"],
 html[data-window="popup"] body {
