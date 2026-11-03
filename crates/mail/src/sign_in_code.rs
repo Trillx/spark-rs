@@ -29,8 +29,6 @@ const ABOUT_NEAR: usize = 300;
 
 /// Words that say an email is about signing in or proving who you are;
 /// without one, a number near "code" is a door code, an order or an offer.
-/// "Your code is" and "use this code" aren't among them: shops write them
-/// over their offers ("Your code is STYLE25").
 const ABOUT_SIGNING_IN: &[&str] = &[
     "verif",
     "sign in",
@@ -66,6 +64,19 @@ const ABOUT_SIGNING_IN: &[&str] = &[
     "anmeld",
     "einmal",
     "inlog",
+];
+
+/// Words that say less: an account's terse code ("Your code is 751936. It
+/// expires in 5 minutes.") has only these, but so do shops' offers ("Your
+/// code is STYLE25"). With only these, only a number is taken.
+const ABOUT_A_CODE: &[&str] = &[
+    "your code is",
+    "is your code",
+    "enter the code",
+    "enter this code",
+    "use this code",
+    "use the following code",
+    "the code below",
 ];
 
 /// Meeting invites carry passcodes and IDs that aren't for signing in.
@@ -284,14 +295,24 @@ const UNITS: &[&str] = &[
 ];
 
 /// The code in an email with this subject, text and HTML, as the user
-/// would type it: "G-482913" and "482 913" give "482913".
+/// would type it: "G-482913" and "482 913" give "482913". This reads
+/// anyone's mail as it syncs, so a slip in it finds nothing rather than
+/// stopping the sync.
 pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
+    std::panic::catch_unwind(|| guess(subject, text, html))
+        .ok()
+        .flatten()
+}
+
+fn guess(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
     let text = head(text, LOOK);
     let subject_lc = subject.to_ascii_lowercase();
     let text_lc = text.to_ascii_lowercase();
-    if !(about(&subject_lc) || about(&text_lc)) || MEETINGS.iter().any(|w| text_lc.contains(w)) {
+    let says = |lc: &str| about(lc) || about_a_code(lc);
+    if !(says(&subject_lc) || says(&text_lc)) || MEETINGS.iter().any(|w| text_lc.contains(w)) {
         return None;
     }
+    let numbers_only = !(about(&subject_lc) || about(&text_lc));
     // A subject naming a code for something else ("Your delivery
     // verification code") speaks for the email, whatever the text calls it.
     let named = anchors(&subject_lc);
@@ -303,8 +324,8 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
     let vouched = about(&subject_lc);
     // The likelier of the subject's and the text's, the subject's if they tie.
     [
-        best(subject, &subject_lc, true),
-        best(text, &text_lc, vouched),
+        best(subject, &subject_lc, true, numbers_only),
+        best(text, &text_lc, vouched, numbers_only),
     ]
     .into_iter()
     .flatten()
@@ -314,7 +335,7 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
         // ("code</td><td>482913" reads "code482913"): read it again
         // with a space at every tag.
         let spaced = spaced(html?);
-        best(&spaced, &spaced.to_ascii_lowercase(), vouched)
+        best(&spaced, &spaced.to_ascii_lowercase(), vouched, numbers_only)
     })
     .map(|(_, code)| code)
     // A code the subject gives is the text's too: if the text or the HTML
@@ -332,7 +353,9 @@ fn spaced(html: &str) -> String {
 }
 
 /// Whether `src` makes `code` one to hand over or a shop's: where it shows
-/// it ("681 492"), or where it talks of a code if it doesn't show it.
+/// it ("681 492"), or where it talks of a code if it doesn't show it (an
+/// offer then in the same sentence: "enter the code from the subject at
+/// checkout", not "manage your gift cards" further on).
 fn handed_over_in(src: &str, code: &str) -> bool {
     let lc = src.to_ascii_lowercase();
     let shown: Vec<(usize, usize)> = candidates(src)
@@ -343,7 +366,7 @@ fn handed_over_in(src: &str, code: &str) -> bool {
     if shown.is_empty() {
         return anchors(&lc)
             .iter()
-            .any(|a| promoted(&lc, a.start, a.end) || handed_over(src, &lc, a.start, a.end));
+            .any(|a| offered_in_sentence(&lc, a.start) || handed_over(src, &lc, a.start, a.end));
     }
     shown
         .into_iter()
@@ -353,6 +376,21 @@ fn handed_over_in(src: &str, code: &str) -> bool {
 /// Whether `lc` (lower case) says it's about signing in.
 fn about(lc: &str) -> bool {
     ABOUT_SIGNING_IN.iter().any(|w| lc.contains(w))
+}
+
+/// Whether `lc` (lower case) says only that it gives a code, maybe with a
+/// name in it: "your Instagram code is", "is your Facebook code".
+fn about_a_code(lc: &str) -> bool {
+    if ABOUT_A_CODE.iter().any(|w| lc.contains(w)) {
+        return true;
+    }
+    let words: Vec<&str> = lc
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(4)
+        .any(|w| matches!(w, ["your", _, "code", "is"] | ["is", "your", _, "code"]))
 }
 
 /// The start of `s`, up to `max` bytes, cut at a character.
@@ -407,12 +445,16 @@ struct Candidate {
 /// The best candidate in `src` (`lc` is it in ASCII lower case), the one
 /// closest to a word that names a code, with its score (lower is likelier).
 /// Unless `vouched`, only words with talk of signing in near them count.
-fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
+/// With `numbers_only` (the email only says it gives a code), "your code is"
+/// counts as that talk, and only numbers are taken.
+fn best(src: &str, lc: &str, vouched: bool, numbers_only: bool) -> Option<(usize, String)> {
     let (others, mut anchors): (Vec<Anchor>, Vec<Anchor>) =
         anchors(lc).into_iter().partition(|a| a.other);
     if !vouched {
         anchors.retain(|a| {
-            about(&lc[floor(lc, a.start.saturating_sub(ABOUT_NEAR))..ceil(lc, a.end + ABOUT_NEAR)])
+            let near =
+                &lc[floor(lc, a.start.saturating_sub(ABOUT_NEAR))..ceil(lc, a.end + ABOUT_NEAR)];
+            about(near) || numbers_only && about_a_code(near)
         });
     }
     if anchors.is_empty() {
@@ -421,7 +463,10 @@ fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
     let mut best: Option<(usize, &Candidate)> = None;
     let candidates = candidates(src);
     for c in &candidates {
-        if promoted(lc, c.start, c.end) || handed_over(src, lc, c.start, c.end) {
+        if c.mixed && numbers_only
+            || promoted(lc, c.start, c.end)
+            || handed_over(src, lc, c.start, c.end)
+        {
             continue;
         }
         let Some(likely) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
@@ -532,15 +577,40 @@ fn own_line(src: &str, c: &Candidate) -> bool {
 }
 
 /// Whether the words near `start..end` of `lc` make what's there a shop's code.
-/// "Checkout" in a sentence about signing in is no offer: "sign in to
-/// Shop and enjoy faster checkout".
 fn promoted(lc: &str, start: usize, end: usize) -> bool {
     let from = floor(lc, start.saturating_sub(150));
     let near = &lc[from..ceil(lc, end + 150)];
-    PROMOTIONS.iter().any(|w| {
-        near.match_indices(w)
-            .any(|(at, _)| *w != "checkout" || !about(sentence(lc, from + at)))
-    })
+    PROMOTIONS
+        .iter()
+        .any(|w| near.match_indices(w).any(|(at, _)| offer(lc, from + at, w)))
+}
+
+/// Whether offer word `w` at `at` of `lc` offers something: "faster
+/// checkout" is what signing in to an account gives, "at checkout" is where
+/// an offer's code goes.
+fn offer(lc: &str, at: usize, w: &str) -> bool {
+    w != "checkout"
+        || ![
+            "faster",
+            "quicker",
+            "quick",
+            "express",
+            "speedy",
+            "easier",
+            "seamless",
+            "accelerated",
+        ]
+        .iter()
+        .any(|b| lc[..at].trim_end().ends_with(b))
+}
+
+/// Whether the sentence around `at` of `lc` is an offer's.
+fn offered_in_sentence(lc: &str, at: usize) -> bool {
+    let line = sentence(lc, at);
+    let from = line.as_ptr() as usize - lc.as_ptr() as usize;
+    PROMOTIONS
+        .iter()
+        .any(|w| line.match_indices(w).any(|(i, _)| offer(lc, from + i, w)))
 }
 
 /// Whether a driver, courier or delivery person is named near `start..end`
@@ -578,15 +648,18 @@ fn next_word(lc: &str, at: usize) -> Option<&str> {
 /// Whether the recipient at `at` (followed by word `next`) is part of an
 /// app's name the user signs in to: capitalized after a brand ("Uber
 /// Driver", not "your Driver"), and either naming a code ("Uber Driver
-/// verification code") or what's signed in to ("sign in to Bolt Driver").
+/// verification code") or what's signed in to or opened ("sign in to Bolt
+/// Driver", "Welcome back to Uber Driver", "Open Bolt Driver").
 fn app_name(src: &str, lc: &str, at: usize, next: Option<&str>) -> bool {
     if !src[at..].starts_with(|c: char| c.is_ascii_uppercase()) {
         return false;
     }
-    let lead = src[..at].trim_end_matches([' ', '\t']);
+    let lead = src[..at].trim_end();
     let brand_at = lead
-        .rfind(|c: char| !c.is_alphanumeric())
-        .map_or(0, |i| i + 1);
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !c.is_alphanumeric())
+        .map_or(0, |(i, c)| i + c.len_utf8());
     let brand = &lead[brand_at..];
     let branded = brand.starts_with(|c: char| c.is_ascii_uppercase())
         && !DETERMINERS.contains(&brand.to_ascii_lowercase().as_str());
@@ -603,6 +676,10 @@ fn app_name(src: &str, lc: &str, at: usize, next: Option<&str>) -> bool {
             "log into",
             "signing in to",
             "logging in to",
+            "welcome to",
+            "welcome back to",
+            "open",
+            "opening",
         ]
         .iter()
         .any(|w| before.ends_with(w))
@@ -610,16 +687,25 @@ fn app_name(src: &str, lc: &str, at: usize, next: Option<&str>) -> bool {
     branded && (names_a_code || signed_in_to)
 }
 
-/// Whether the words before position `at` of `lc`, on its line, make what's
-/// there the user: "Dear …", "Hi valued …", "as a …", "as a DoorDash …".
+/// Whether the words before position `at` of `lc` make what's there the
+/// user: a greeting opening its line ("Dear valued delivery partner",
+/// "Hello, delivery partner!", not "Say hello to your driver" or "Hi Sam,
+/// your driver …"), or "as a …", "as a DoorDash …" in its clause.
 fn as_the_user(lc: &str, at: usize) -> bool {
-    let line = &lc[lc[..at]
-        .rfind(['\n', ',', '.', ';', '!', '?'])
-        .map_or(0, |i| i + 1)..at];
-    let words: Vec<&str> = line.split_whitespace().collect();
-    // Within the last three words, so "Dear valued delivery partner" counts.
+    let line = &lc[lc[..at].rfind(['\n', '.', '!', '?']).map_or(0, |i| i + 1)..at];
+    let words: Vec<&str> = line
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let greeted = words.len() <= 3
+        && words
+            .first()
+            .is_some_and(|w| matches!(*w, "dear" | "hi" | "hello" | "hey"))
+        && !words[1..].iter().any(|w| DETERMINERS.contains(w));
+    let clause = &line[line.rfind([',', ';']).map_or(0, |i| i + 1)..];
+    let words: Vec<&str> = clause.split_whitespace().collect();
     let recent = &words[words.len().saturating_sub(3)..];
-    recent.iter().any(|w| matches!(*w, "dear" | "hi" | "hello"))
+    greeted
         || recent
             .windows(2)
             .any(|pair| pair[0] == "as" && matches!(pair[1], "a" | "an"))
@@ -1444,6 +1530,86 @@ mod tests {
             code("", "Your sign-in PIN code is 583719.").as_deref(),
             Some("583719")
         );
+    }
+
+    /// Mail in any script, with every kind of space, never trips it up:
+    /// `guess` itself, not `find`'s safety net.
+    #[test]
+    fn reads_any_text_without_panicking() {
+        let pieces = [
+            "Your",
+            "Uber",
+            "Driver",
+            "Delivery Partner",
+            "verification",
+            "code",
+            "Code:",
+            "is",
+            "9437",
+            "482 913",
+            "G-482913",
+            "4K7-9QX",
+            "2F4KD",
+            "INR",
+            "₹5,000",
+            "-£1,250.00",
+            "€",
+            "PIN",
+            "sign-in",
+            "one-time",
+            "OTP",
+            "Dear",
+            "Hello,",
+            "as a",
+            "share",
+            "with",
+            "your",
+            "the",
+            "driver's",
+            "checkout",
+            "faster",
+            "% off",
+            "Welcome back to",
+            "Open",
+            "é",
+            "日本語",
+            "🙂",
+            "—",
+            "’s",
+            "ß",
+            "İ",
+            "\u{301}",
+            ".",
+            ",",
+            "!",
+            ":",
+            ";",
+            "#",
+            "$",
+            "/",
+            "@",
+            "XXXX1234",
+            "03-11-26",
+            "14:35",
+        ];
+        let gaps = [" ", "\u{a0}", "", "\n", "\u{2009}", "\t", "\u{3000}"];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            for _ in 0..(5 + next(25)) {
+                text.push_str(pieces[next(pieces.len())]);
+                text.push_str(gaps[next(gaps.len())]);
+            }
+            let cut = &text[..floor(&text, text.len() / 3)];
+            guess(cut, &text, None);
+            guess("", &text, Some(&text));
+        }
     }
 
     #[test]

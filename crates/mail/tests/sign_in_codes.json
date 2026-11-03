@@ -1188,5 +1188,246 @@
     "subject": "Bank details for your international transfer",
     "text": "Sign in to online banking to make your transfer.\nSWIFT BIC code: MIDLGB22\nSort code: 401827\nCheck these details with the recipient before sending money.",
     "code": null
+  },
+  {
+    "what": "Instagram terse branded code",
+    "subject": "Your Instagram code",
+    "text": "Your Instagram code is 593728.",
+    "code": "593728"
+  },
+  {
+    "what": "Facebook terse confirmation",
+    "subject": "482637 is your Facebook code",
+    "text": "482637 is your Facebook code.",
+    "code": "482637"
+  },
+  {
+    "what": "TikTok short code with expiry",
+    "subject": "Your TikTok code",
+    "text": "Your code is 751936. It expires in 5 minutes.",
+    "code": "751936"
+  },
+  {
+    "what": "Snapchat terse reverse code",
+    "subject": "638492 is your Snapchat code",
+    "text": "638492 is your Snapchat code. Happy Snapping!",
+    "code": "638492"
+  },
+  {
+    "what": "Netflix terse code",
+    "subject": "Your Netflix code",
+    "text": "Your code is 894631. This code expires in 15 minutes.",
+    "code": "894631"
+  },
+  {
+    "what": "Spotify short access email",
+    "subject": "Your Spotify code",
+    "text": "Use this code: 367185\nThis code is valid for 10 minutes.",
+    "code": "367185"
+  },
+  {
+    "what": "Apple email address confirmation fresh",
+    "subject": "Verify your Apple Account",
+    "text": "Enter this code to verify your email address:\n\n527839\n\nIf you did not make this request, ignore this message.",
+    "code": "527839"
+  },
+  {
+    "what": "Google email challenge fresh",
+    "subject": "Google verification code",
+    "text": "G-638174 is your Google verification code. Only enter it on the page where you requested it.",
+    "code": "638174"
+  },
+  {
+    "what": "Microsoft security challenge fresh",
+    "subject": "Microsoft account security code",
+    "text": "Please use the following security code for your Microsoft account:\n\n8392617\n\nThanks,\nThe Microsoft account team",
+    "code": "8392617"
+  },
+  {
+    "what": "WhatsApp email ownership fresh",
+    "subject": "WhatsApp email verification",
+    "text": "Your verification code is 418-739. Enter this code in WhatsApp to confirm your email address.",
+    "code": "418739"
+  },
+  {
+    "what": "Telegram new login fresh",
+    "subject": "Telegram login code",
+    "text": "Your login code: 59273\nEnter it in Telegram to continue. Do not give this code to anyone.",
+    "code": "59273"
+  },
+  {
+    "what": "Chase browser sign-in fresh",
+    "subject": "Finish signing in to Chase",
+    "text": "Your one-time code is 627381. Enter it to continue to Chase Online. This code expires in 10 minutes.",
+    "code": "627381"
+  },
+  {
+    "what": "Monzo web account fresh",
+    "subject": "Your Monzo verification code",
+    "text": "Hi Alex,\nUse code 839174 to verify your identity and access your account. If this was not you, contact us in the app.",
+    "code": "839174"
+  },
+  {
+    "what": "Uber Driver welcome branding",
+    "subject": "Your Uber verification code",
+    "text": "Welcome back to Uber Driver.\nYour verification code is 6938.\nEnter it to sign in.",
+    "code": "6938"
+  },
+  {
+    "what": "Bolt Driver app instruction",
+    "subject": "Your Bolt login code",
+    "text": "Open Bolt Driver and enter code 7284 to log in. This code expires in 5 minutes.",
+    "code": "7284"
+  },
+  {
+    "what": "Delivery partner comma greeting",
+    "subject": "Your Amazon Flex sign-in code",
+    "text": "Hello, delivery partner!\nYour verification code is 826539. Enter it to sign in to Amazon Flex.",
+    "code": "826539"
+  },
+  {
+    "what": "Deliveroo Rider login fresh",
+    "subject": "Your Deliveroo Rider login code",
+    "text": "Hi Alex,\nUse your one-time code 493728 to sign in to the Rider app. Keep this code private.",
+    "code": "493728"
+  },
+  {
+    "what": "Shop Pay checkout sign-in fresh",
+    "subject": "Shop Pay code: 718392",
+    "text": "Your code is 718392. Use it to sign in to Shop Pay for a faster checkout.",
+    "code": "718392"
+  },
+  {
+    "what": "ASOS subject-only sign-in with account benefits",
+    "subject": "Your ASOS sign-in code: 582741",
+    "text": "Enter the code in the subject line to sign in.\nManage your orders, returns and gift cards in your account.",
+    "code": "582741"
+  },
+  {
+    "what": "Uber Driver HTML nonbreaking brand space",
+    "subject": "Your Uber verification code",
+    "text": "Your Uber Driver verification code is 9437.\nEnter it to sign in.",
+    "html": "<p>Your Uber&nbsp;Driver verification code is <b>9437</b>.</p><p>Enter it to sign in.</p>",
+    "code": "9437"
+  },
+  {
+    "what": "Adidas members offer sign-in checkout sentence",
+    "subject": "Your adidas code: RUN25",
+    "text": "Sign in and use code RUN25 at checkout to save on your next pair. Valid until Sunday.",
+    "code": null
+  },
+  {
+    "what": "Nike subject-only personal offer fresh",
+    "subject": "Your code is TRAIN20",
+    "text": "Use the code from the subject at checkout for 20% off your next purchase. Sign in to see your member benefits.",
+    "code": null
+  },
+  {
+    "what": "H&M short shipping offer fresh",
+    "subject": "A treat for your next order",
+    "text": "Your code is POST7. Enjoy free shipping on your next order this week.",
+    "code": null
+  },
+  {
+    "what": "Sephora personal coupon fresh",
+    "subject": "Your beauty treat is here",
+    "text": "Your one-time code is BEAUTY15. Use it at checkout for a discount on your next order.",
+    "code": null
+  },
+  {
+    "what": "Amazon parcel subject-only fresh",
+    "subject": "Your one-time password: 753192",
+    "text": "Please tell your courier this code when your parcel arrives. Only give it after checking the parcel.",
+    "code": null
+  },
+  {
+    "what": "DHL delivery verification fresh",
+    "subject": "Your DHL delivery update",
+    "text": "Your one-time code is 381926. Your Delivery Agent needs it when you receive your parcel.",
+    "code": null
+  },
+  {
+    "what": "Uber rider greeting names driver",
+    "subject": "Meet your driver",
+    "text": "Say hello to your driver, Alex.\nYour one-time PIN is 6281. Use it to start your trip.",
+    "code": null
+  },
+  {
+    "what": "Uber Eats food PIN fresh",
+    "subject": "Your order is on its way",
+    "text": "Your one-time code is 6194. Your delivery partner needs this code at the door.",
+    "code": null
+  },
+  {
+    "what": "Lyft receipt fresh",
+    "subject": "Your Wednesday evening ride",
+    "text": "Thanks for riding with Lyft.\nDriver: Sam\nTotal: USD 23.60\nSign in for your receipt.",
+    "code": null
+  },
+  {
+    "what": "Amazon receipt fresh",
+    "subject": "We received your order",
+    "text": "Order number: 114-7382619-4926153\nTotal: USD 32.75\nSign in to track your order or start a return.",
+    "code": null
+  },
+  {
+    "what": "PayPal receipt fresh",
+    "subject": "Your payment to Green Books",
+    "text": "You paid Green Books GBP 18.25.\nTransaction ID: 8MK39271PL631827C\nSign in to view your activity.",
+    "code": null
+  },
+  {
+    "what": "GitHub invitation fresh",
+    "subject": "Invitation to join lantern-tools",
+    "text": "Sam has invited you to join lantern-tools on GitHub. Sign in to accept this invitation within 7 days.",
+    "code": null
+  },
+  {
+    "what": "Zoom meeting fresh",
+    "subject": "Invitation: Product review",
+    "text": "Join our Zoom meeting.\nMeeting ID: 856 7392 4186\nPasscode: 7T2K9P\nJoin the meeting at 2 PM.",
+    "code": null
+  },
+  {
+    "what": "Google security notice fresh",
+    "subject": "New sign-in on Windows",
+    "text": "Your Google Account was used to sign in on a Windows device. If this was you, no action is needed. Otherwise, review your security activity.",
+    "code": null
+  },
+  {
+    "what": "Microsoft password reset notice fresh",
+    "subject": "Your password was changed",
+    "text": "Your Microsoft account password was changed. If you did not do this, sign in to review your security information. Never share your security code with anyone.",
+    "code": null
+  },
+  {
+    "what": "Booking property PIN fresh",
+    "subject": "Your stay at Willow Lodge",
+    "text": "Your confirmation number: 9372618450\nPIN code: 5836\nSign in to manage your reservation.",
+    "code": null
+  },
+  {
+    "what": "easyJet reservation fresh",
+    "subject": "Your flight is confirmed",
+    "text": "Your booking code is K8P3W2. Use this code to manage your trip. Sign in to select a seat.",
+    "code": null
+  },
+  {
+    "what": "Hilton booking fresh",
+    "subject": "Your reservation is confirmed",
+    "text": "Confirmation number: 69283174\nCheck-in on Friday from 3 PM. Sign in to view your stay details.",
+    "code": null
+  },
+  {
+    "what": "Wise bank instructions fresh",
+    "subject": "Details for your transfer",
+    "text": "Sign in to review your transfer.\nSWIFT BIC code: CHASUS33\nSort code: 203948\nCheck the recipient details before sending.",
+    "code": null
+  },
+  {
+    "what": "Evri tracking notice fresh",
+    "subject": "Your parcel is on the way",
+    "text": "Tracking number: 593728164930\nSign in to choose a safe place or change your delivery day.",
+    "code": null
   }
 ]
