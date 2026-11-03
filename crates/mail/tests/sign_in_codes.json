@@ -358,5 +358,354 @@
     "subject": "Your order is out for delivery",
     "text": "Your one-time code is 719483. Please share this code with the delivery executive when your package arrives.",
     "code": null
+  },
+  {
+    "what": "Retail login with shipping footer",
+    "subject": "Your verification code: 573618",
+    "text": "Your verification code is 573618. Enter it to sign in to your account. This code expires in 10 minutes.\n\nFree shipping on orders over £50.",
+    "code": "573618"
+  },
+  {
+    "what": "Reddit login",
+    "subject": "Your Reddit login code",
+    "text": "Your one-time code is 385716. Enter it on Reddit to log in. This code is valid for 10 minutes.",
+    "code": "385716"
+  },
+  {
+    "what": "Notion login",
+    "subject": "Your Notion login code: 965-217",
+    "text": "Enter the temporary login code below to finish signing in.\n\n965-217\n\nThis code expires shortly.",
+    "code": "965217"
+  },
+  {
+    "what": "Figma login",
+    "subject": "Sign in to Figma",
+    "text": "Here is your sign-in code:\n\n632184\n\nReturn to Figma and enter this code to continue.",
+    "code": "632184"
+  },
+  {
+    "what": "Dropbox login",
+    "subject": "Dropbox security code",
+    "text": "We need to verify it is you. Your security code is 749281. Enter this code to finish signing in to Dropbox.",
+    "code": "749281"
+  },
+  {
+    "what": "LinkedIn login",
+    "subject": "Your LinkedIn verification code",
+    "text": "Use this verification code to complete your sign in:\n\n261853\n\nIf you did not request this code, you can ignore this message.",
+    "code": "261853"
+  },
+  {
+    "what": "X login",
+    "subject": "Your X confirmation code is 895173",
+    "text": "To help keep your account safe, enter this confirmation code to sign in:\n\n895173\n\nDo not share it with anyone.",
+    "code": "895173"
+  },
+  {
+    "what": "Twitch login",
+    "subject": "Your Twitch login verification code",
+    "text": "Your verification code is 461925. Use it to finish logging in to Twitch. This code expires in 10 minutes.",
+    "code": "461925"
+  },
+  {
+    "what": "Nintendo login",
+    "subject": "Nintendo Account: Verification code",
+    "text": "Your verification code is 357182. Enter this code on the Nintendo Account sign-in screen.",
+    "code": "357182"
+  },
+  {
+    "what": "Adobe login",
+    "subject": "Your Adobe verification code",
+    "text": "Your verification code is:\n\n621738\n\nEnter it to sign in to your Adobe account. This code is valid for 10 minutes.",
+    "code": "621738"
+  },
+  {
+    "what": "DocuSign login",
+    "subject": "Your DocuSign verification code",
+    "text": "To verify your identity, enter this code in your browser:\n\n293641\n\nDo not share this code.",
+    "code": "293641"
+  },
+  {
+    "what": "Shopify login",
+    "subject": "Your Shopify authentication code",
+    "text": "Your authentication code is 451826. Enter this code to finish signing in. If you did not request it, contact support.",
+    "code": "451826"
+  },
+  {
+    "what": "Uber driver portal",
+    "subject": "Sign in to your Uber Driver account",
+    "text": "Your Uber Driver verification code is 9743. Use it to sign in to the Driver app. Do not share your code.",
+    "code": "9743"
+  },
+  {
+    "what": "DoorDash Dasher login",
+    "subject": "Your Dasher verification code",
+    "text": "Your verification code is 831572. Enter it to sign in to your Dasher account. Never share this code.",
+    "code": "831572"
+  },
+  {
+    "what": "Deliveroo rider portal",
+    "subject": "Your Deliveroo rider sign-in code",
+    "text": "Your rider account verification code is 298416. Use it to sign in. This code is valid for 5 minutes.",
+    "code": "298416"
+  },
+  {
+    "what": "Evri courier portal",
+    "subject": "Your Evri courier verification code",
+    "text": "Your courier account verification code is 517294. Enter this code to sign in to the courier portal.",
+    "code": "517294"
+  },
+  {
+    "what": "HSBC spaced sign in PIN",
+    "subject": "Your HSBC sign in PIN",
+    "text": "Your sign in PIN is 831649. Enter it to sign in to online banking. Never share your PIN.",
+    "code": "831649"
+  },
+  {
+    "what": "Bank log-in PIN code",
+    "subject": "Your online banking log-in PIN code",
+    "text": "Your log-in PIN code is 752618. Enter it to log in to online banking. This code expires in 10 minutes.",
+    "code": "752618"
+  },
+  {
+    "what": "PayPal euro payment OTP",
+    "subject": "Your one-time passcode for your payment",
+    "text": "Use this one-time passcode to verify your payment.\nAmount: €1,250.00 EUR\n\n471628\n\nNever share this passcode with anyone.",
+    "code": "471628"
+  },
+  {
+    "what": "SBI rupee payment OTP",
+    "subject": "Your one-time password",
+    "text": "Your one-time password for this online payment:\nAmount: ₹2,500.00 INR\n\n648317\n\nDo not share your OTP.",
+    "code": "648317"
+  },
+  {
+    "what": "Amazon delivery ask driver",
+    "subject": "Your package is arriving today",
+    "text": "Your one-time password is 497163. Your driver will ask for this password before handing over your package. Do not share it until your package arrives.",
+    "code": null
+  },
+  {
+    "what": "Uber trip tell driver",
+    "subject": "Your PIN for this trip",
+    "text": "Your one-time code is 6294. Tell your driver this code before your trip begins.",
+    "code": null
+  },
+  {
+    "what": "Uber Eats provide partner",
+    "subject": "Your food is on its way",
+    "text": "Your one-time code is 3752. Please provide your delivery partner with this code when your order arrives.",
+    "code": null
+  },
+  {
+    "what": "Amazon delivery grouped body OTP",
+    "subject": "Your one-time password: 846295",
+    "text": "Your one-time password is:\n\n846 295\n\nPlease share this code with your driver when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "Flipkart assigned executive",
+    "subject": "Your order is out for delivery",
+    "text": "Your one-time code is 184629. Please share this code with the assigned delivery executive when your order arrives.",
+    "code": null
+  },
+  {
+    "what": "Amazon receipt",
+    "subject": "Order delivered: wireless mouse",
+    "text": "Your order has been delivered. Order number: 113-5827391-4926173. Total paid: GBP 24.99. Sign in to see your order details.",
+    "code": null
+  },
+  {
+    "what": "Uber ride receipt",
+    "subject": "Your Thursday evening trip",
+    "text": "Thanks for riding with Uber. Driver: Sam. Total: EUR 23.80. Sign in to view this trip and get help.",
+    "code": null
+  },
+  {
+    "what": "Deliveroo food receipt",
+    "subject": "Your order from Green Bowl",
+    "text": "Thanks for your order. Order number: 291748. Total: GBP 19.50. Sign in to view your receipt.",
+    "code": null
+  },
+  {
+    "what": "Stripe invoice",
+    "subject": "Your Acme subscription invoice",
+    "text": "Invoice number: 731824. Amount due: USD 39.00. Sign in to download a PDF of your invoice.",
+    "code": null
+  },
+  {
+    "what": "Xero invoice",
+    "subject": "Invoice INV-619274 from Northwind",
+    "text": "Your invoice is ready. Customer code: 648291. Amount due: GBP 875.00. Sign in to view payment options.",
+    "code": null
+  },
+  {
+    "what": "Adidas offer",
+    "subject": "A little something for your next run",
+    "text": "Use code RUN25 to save on your next order. Sign in to redeem your discount. Offer ends Sunday.",
+    "code": null
+  },
+  {
+    "what": "Grocery promo",
+    "subject": "Your weekly member offers",
+    "text": "Member discount code: 731825. Sign in to shop now and save 15% off your next basket.",
+    "code": null
+  },
+  {
+    "what": "Zoom webinar invite",
+    "subject": "Invitation: November product update",
+    "text": "Join our Zoom meeting.\nMeeting ID: 927 3186 4521\nPasscode: 583164\nJoin the meeting at 2 PM.",
+    "code": null
+  },
+  {
+    "what": "Teams calendar invite",
+    "subject": "Invitation: Operations catch-up",
+    "text": "Microsoft Teams meeting\nMeeting ID: 731 852 946\nPasscode: 8G2H6K\nJoin the meeting on Friday.",
+    "code": null
+  },
+  {
+    "what": "Google account alert",
+    "subject": "Security alert: new sign-in",
+    "text": "We noticed a new sign-in to your Google Account on a Pixel device. If this was you, no further action is needed. Review your activity to secure your account.",
+    "code": null
+  },
+  {
+    "what": "Dropbox password alert",
+    "subject": "Your Dropbox password was changed",
+    "text": "Your password was changed successfully. If you made this change, no action is needed. Otherwise, sign in to review your account security.",
+    "code": null
+  },
+  {
+    "what": "Booking hotel confirmation",
+    "subject": "Your stay at Riverside Hotel is confirmed",
+    "text": "Confirmation number: 5831629407\nPIN code: 7614\nCheck-in from 3 PM. Sign in to manage your reservation.",
+    "code": null
+  },
+  {
+    "what": "Airline booking confirmation",
+    "subject": "Your flight confirmation",
+    "text": "Your booking reference is 8R6K2P. Flight number: BA 412. Sign in to manage your booking and select your seat.",
+    "code": null
+  },
+  {
+    "what": "Wise transfer completed",
+    "subject": "Your transfer has arrived",
+    "text": "We sent EUR 125.00 to Alex. Transfer number: 61849273. Sign in to see your transfer receipt.",
+    "code": null
+  },
+  {
+    "what": "Bank transfer details",
+    "subject": "Your international payment details",
+    "text": "Sign in to view your transfer.\nSWIFT BIC code: HBUKGB4B\nSort code: 403219\nUse these bank details when sending your payment.",
+    "code": null
+  },
+  {
+    "what": "delivery hyphenated display",
+    "subject": "Your one-time password: 386152",
+    "text": "Your one-time password is:\n\n386-152\n\nPlease share this code with the delivery person when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "delivery digit boxes",
+    "subject": "Your one-time password: 593826",
+    "text": "Your one-time password is:\n\n5 9 3 8 2 6\n\nPlease share this code with your driver when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "delivery subject only code",
+    "subject": "Your one-time password: 726491",
+    "text": "Your package is arriving today. Please share this code with your driver when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "delivery person early verb",
+    "subject": "Your order arrives today",
+    "text": "Your one-time password is 491628. Give your delivery person this code when you receive your package.",
+    "code": null
+  },
+  {
+    "what": "delivery person no repeat",
+    "subject": "Your order arrives today",
+    "text": "Your one-time password is 491628. The delivery person will ask for this code when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "delivery executive early verb",
+    "subject": "Your order arrives today",
+    "text": "Your one-time password is 491628. Tell your delivery executive this code when you receive your package.",
+    "code": null
+  },
+  {
+    "what": "delivery executive assigned",
+    "subject": "Your order arrives today",
+    "text": "Your one-time password is 491628. Share this code with your assigned delivery executive when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "delivery driver modified",
+    "subject": "Your order arrives today",
+    "text": "Your one-time password is 491628. Share this code with your Amazon delivery driver when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "driver trips noun",
+    "subject": "Your Uber trip verification code",
+    "text": "Your verification code is 6852. Read this code to your driver before your trip begins.",
+    "code": null
+  },
+  {
+    "what": "courier signature driver",
+    "subject": "Sign in to your Uber Driver account",
+    "text": "Your verification code is 4176. Enter it to sign in to your Driver account. Never share this code with anyone.",
+    "code": "4176"
+  },
+  {
+    "what": "pin sign-in plain",
+    "subject": "Your HSBC sign-in PIN",
+    "text": "Your sign-in PIN is 681729. Use it to sign in to your account.",
+    "code": "681729"
+  },
+  {
+    "what": "pin log in plain",
+    "subject": "Your log in PIN",
+    "text": "Your log in PIN is 681729. Use it to log in to your account.",
+    "code": "681729"
+  },
+  {
+    "what": "pin sign-in code",
+    "subject": "Your sign-in PIN code",
+    "text": "Your sign-in PIN code is 681729. Use it to sign in to your account.",
+    "code": "681729"
+  },
+  {
+    "what": "amount GBP",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode for this payment:\nAmount: £1,250.00 GBP\n\n719286\n\nDo not share this code.",
+    "code": "719286"
+  },
+  {
+    "what": "amount JPY",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode for this payment:\nAmount: ¥5,000 JPY\n\n719286\n\nDo not share this code.",
+    "code": "719286"
+  },
+  {
+    "what": "currency separated symbol",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode for this payment:\nAmount: € 1,250.00 EUR\n\n719286\n\nDo not share this code.",
+    "code": "719286"
+  },
+  {
+    "what": "currency negative amount",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode for this payment:\nAmount: -£1,250.00 GBP\n\n719286\n\nDo not share this code.",
+    "code": "719286"
+  },
+  {
+    "what": "subject OTP HTML delivery",
+    "subject": "Your one-time password: 592716",
+    "text": "Your one-time password is 592716.",
+    "code": null,
+    "html": "<p>Your one-time password is <strong>592716</strong>.</p><p>Please share this code with your driver when your package arrives.</p>"
   }
 ]

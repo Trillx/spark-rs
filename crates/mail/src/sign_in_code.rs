@@ -103,7 +103,8 @@ const PROMOTIONS: &[&str] = &[
 ];
 
 /// Whom a code is handed to when it's not for signing in ("share this code
-/// with your driver"), and the verbs that hand it over.
+/// with your driver", "your driver will ask for it"). Mail that names them
+/// near a code is about handing it over, however it words that.
 const RECIPIENTS: &[&str] = &[
     "driver",
     "courier",
@@ -115,7 +116,21 @@ const RECIPIENTS: &[&str] = &[
     "delivery boy",
     "delivery staff",
 ];
-const HAND_OVER: &[&str] = &["share", "give", "show", "tell", "provide", "hand"];
+/// After one of `RECIPIENTS`, these make it the user's own account: "your
+/// driver account", "the courier portal", "driver's license".
+const THEIR_OWN: &[&str] = &[
+    "account",
+    "app",
+    "portal",
+    "profile",
+    "dashboard",
+    "hub",
+    "login",
+    "log",
+    "sign",
+    "license",
+    "licence",
+];
 
 /// Words ending in "code" that aren't one to type.
 const NOT_CODES: &[&str] = &[
@@ -299,19 +314,41 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
         // HTML without spaces between its tags runs words together
         // ("code</td><td>482913" reads "code482913"): read it again
         // with a space at every tag.
-        let spaced = html_to_text(&head(html?, LOOK_HTML).replace('<', " <"));
-        let spaced = head(&spaced, LOOK);
-        best(spaced, &spaced.to_ascii_lowercase(), vouched)
+        let spaced = spaced(html?);
+        best(&spaced, &spaced.to_ascii_lowercase(), vouched)
     })
     .map(|(_, code)| code)
-    // A code the subject gives is the text's too: if the text hands it over
-    // ("Your one-time password: 681492" … "share this code with your
-    // driver"), it's not for signing in.
+    // A code the subject gives is the text's too: if the text or the HTML
+    // hands it over ("Your one-time password: 681492" … "share this code
+    // with your driver"), it's not for signing in.
     .filter(|code| {
-        !text
-            .match_indices(code.as_str())
-            .any(|(at, _)| for_something_else(&text_lc, at, at + code.len()))
+        !handed_over_in(text, code) && !html.is_some_and(|html| handed_over_in(&spaced(html), code))
     })
+}
+
+/// The start of `html` as text, with a space at every tag.
+fn spaced(html: &str) -> String {
+    let text = html_to_text(&head(html, LOOK_HTML).replace('<', " <"));
+    head(&text, LOOK).to_owned()
+}
+
+/// Whether `src` hands `code` over: where it shows it ("681 492"), or where
+/// it talks of a code if it doesn't show it.
+fn handed_over_in(src: &str, code: &str) -> bool {
+    let lc = src.to_ascii_lowercase();
+    let shown: Vec<(usize, usize)> = candidates(src)
+        .into_iter()
+        .filter(|c| c.code == code)
+        .map(|c| (c.start, c.end))
+        .collect();
+    let places = if shown.is_empty() {
+        anchors(&lc).iter().map(|a| (a.start, a.end)).collect()
+    } else {
+        shown
+    };
+    places
+        .into_iter()
+        .any(|(start, end)| handed_over(src, &lc, start, end))
 }
 
 /// Whether `lc` (lower case) says it's about signing in.
@@ -385,7 +422,7 @@ fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
     let mut best: Option<(usize, &Candidate)> = None;
     let candidates = candidates(src);
     for c in &candidates {
-        if for_something_else(lc, c.start, c.end) {
+        if promoted(lc, c.start, c.end) || handed_over(src, lc, c.start, c.end) {
             continue;
         }
         let Some(likely) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
@@ -495,23 +532,40 @@ fn own_line(src: &str, c: &Candidate) -> bool {
     src[start..c.start].trim().is_empty() && src[c.end..end].trim().is_empty()
 }
 
-/// Whether the words near `start..end` of `lc` make what's there a shop's
-/// code, or one to hand over ("share this code with your driver"; a driver
-/// signing in to their driver account keeps theirs).
-fn for_something_else(lc: &str, start: usize, end: usize) -> bool {
+/// Whether the words near `start..end` of `lc` make what's there a shop's code.
+fn promoted(lc: &str, start: usize, end: usize) -> bool {
     let near = &lc[floor(lc, start.saturating_sub(150))..ceil(lc, end + 150)];
     PROMOTIONS.iter().any(|w| near.contains(w))
-        || RECIPIENTS.iter().any(|r| {
-            near.match_indices(r).any(|(at, _)| {
-                let lead = near[floor(near, at.saturating_sub(60))..at].trim_end();
-                let lead = ["the", "your", "our", "a", "an"]
-                    .iter()
-                    .find_map(|article| lead.strip_suffix(article))
-                    .map_or(lead, str::trim_end);
-                (lead.ends_with(" with") || lead.ends_with(" to"))
-                    && HAND_OVER.iter().any(|verb| lead.contains(verb))
-            })
+}
+
+/// Whether a driver, courier or delivery person is named near `start..end`
+/// of `src` (`lc` is it in lower case), making what's there a code to hand
+/// over. Not when it's the user's own account or the app's name: "sign in
+/// to your driver account", "Your Uber Driver verification code".
+fn handed_over(src: &str, lc: &str, start: usize, end: usize) -> bool {
+    let from = floor(lc, start.saturating_sub(150));
+    let near = &lc[from..ceil(lc, end + 150)];
+    RECIPIENTS.iter().any(|r| {
+        near.match_indices(r).any(|(at, _)| {
+            let at = from + at;
+            let rest = &lc[at + r.len()..];
+            let mut next = rest
+                .split(|c: char| !c.is_alphabetic())
+                .filter(|w| !w.is_empty());
+            let next_word = match next.next() {
+                // "driver's license"
+                Some("s") if rest.starts_with('\'') || rest.starts_with('’') => next.next(),
+                w => w,
+            };
+            let own = next_word.is_some_and(|w| THEIR_OWN.contains(&w));
+            // A capital in mid-sentence: the app's name, as in "Uber Driver".
+            let lead = src[..at].trim_end_matches([' ', '\t']);
+            let named = src[at..].starts_with(|c: char| c.is_ascii_uppercase())
+                && !lead.is_empty()
+                && !lead.ends_with(['.', '!', '?', '\n', ':']);
+            !own && !named
         })
+    })
 }
 
 /// The words in `lc` that name a code.
@@ -786,7 +840,7 @@ fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
     let after_a_number = rest[rest.rfind('\n').map_or(0, |i| i + 1)..]
         .split_whitespace()
         .last()
-        .map(|w| w.trim_start_matches(['$', '€', '£', '¥', '₹']))
+        .map(|w| w.trim_start_matches(['-', '+', '$', '€', '£', '¥', '₹']))
         .is_some_and(|w| {
             w.contains(|c: char| c.is_ascii_digit())
                 && w.chars()
