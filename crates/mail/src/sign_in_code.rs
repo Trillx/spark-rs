@@ -56,6 +56,8 @@ const ABOUT_SIGNING_IN: &[&str] = &[
     "never share",
     "confirm your",
     "identity",
+    "access your account",
+    "access your workspace",
     // Spanish, Portuguese, French, Italian, German, Dutch.
     "código",
     "vérif",
@@ -105,6 +107,12 @@ const PROMOTIONS: &[&str] = &[
     "checkout",
     "redeem",
     "referral",
+];
+
+/// Words that make "checkout" an offer's, and a bare number code a shop's.
+const SAVINGS: &[&str] = &[
+    "save", "saving", "savings", "price", "prices", "deal", "deals", "discount", "off", "treat",
+    "birthday", "sale", "offer", "purchase",
 ];
 
 /// Whom a code is handed to when it's not for signing in ("share this code
@@ -463,7 +471,7 @@ fn best(src: &str, lc: &str, vouched: bool, numbers_only: bool) -> Option<(usize
     let mut best: Option<(usize, &Candidate)> = None;
     let candidates = candidates(src);
     for c in &candidates {
-        if c.mixed && numbers_only
+        if numbers_only && (c.mixed || saving_near(lc, c.start, c.end))
             || promoted(lc, c.start, c.end)
             || handed_over(src, lc, c.start, c.end)
         {
@@ -576,6 +584,15 @@ fn own_line(src: &str, c: &Candidate) -> bool {
     src[start..c.start].trim().is_empty() && src[c.end..end].trim().is_empty()
 }
 
+/// Whether saving words are near `start..end` of `lc`: with only "your code
+/// is" to go on, "Your code is 846275 … a special birthday price" is a
+/// shop's.
+fn saving_near(lc: &str, start: usize, end: usize) -> bool {
+    lc[floor(lc, start.saturating_sub(150))..ceil(lc, end + 150)]
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| SAVINGS.contains(&w))
+}
+
 /// Whether the words near `start..end` of `lc` make what's there a shop's code.
 fn promoted(lc: &str, start: usize, end: usize) -> bool {
     let from = floor(lc, start.saturating_sub(150));
@@ -585,32 +602,61 @@ fn promoted(lc: &str, start: usize, end: usize) -> bool {
         .any(|w| near.match_indices(w).any(|(at, _)| offer(lc, from + at, w)))
 }
 
-/// Whether offer word `w` at `at` of `lc` offers something: "faster
-/// checkout" is what signing in to an account gives, "at checkout" is where
-/// an offer's code goes.
+/// Whether offer word `w` at `at` of `lc` offers something. "Checkout" is
+/// where an offer's code goes, unless the sentence is about signing in or
+/// what it gives ("faster checkout") and saves nothing: "enter code 846291
+/// at checkout to sign in to Shop Pay", not "sign in and use code SPEED25
+/// in our express checkout to save".
 fn offer(lc: &str, at: usize, w: &str) -> bool {
-    w != "checkout"
-        || ![
-            "faster",
-            "quicker",
-            "quick",
-            "express",
-            "speedy",
-            "easier",
-            "seamless",
-            "accelerated",
-        ]
-        .iter()
-        .any(|b| lc[..at].trim_end().ends_with(b))
+    if w != "checkout" {
+        return true;
+    }
+    let line = sentence(lc, at);
+    let benefit = [
+        "faster",
+        "quicker",
+        "quick",
+        "express",
+        "speedy",
+        "easier",
+        "seamless",
+        "accelerated",
+    ]
+    .iter()
+    .any(|b| lc[..at].trim_end().ends_with(b));
+    let saves = line
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| SAVINGS.contains(&w));
+    saves || !(benefit || about(line))
 }
 
-/// Whether the sentence around `at` of `lc` is an offer's.
+/// Whether the sentence around `at` of `lc`, or the one after it going on
+/// about the code ("Use the code in the subject. Redeem it for 30% off"), is
+/// an offer's.
 fn offered_in_sentence(lc: &str, at: usize) -> bool {
+    let offered = |line: &str| {
+        let from = line.as_ptr() as usize - lc.as_ptr() as usize;
+        PROMOTIONS
+            .iter()
+            .any(|w| line.match_indices(w).any(|(i, _)| offer(lc, from + i, w)))
+    };
     let line = sentence(lc, at);
-    let from = line.as_ptr() as usize - lc.as_ptr() as usize;
-    PROMOTIONS
-        .iter()
-        .any(|w| line.match_indices(w).any(|(i, _)| offer(lc, from + i, w)))
+    let end = line.as_ptr() as usize - lc.as_ptr() as usize + line.len();
+    // Past the sentence's end and the spaces and breaks after it.
+    let after = lc[end..]
+        .find(|c: char| !matches!(c, '.' | '!' | '?') && !c.is_whitespace())
+        .map(|i| end + i);
+    // The next sentence counts when it goes on about the code: "Redeem it
+    // for 30% off", not "Manage your gift cards in your account".
+    let about_it = |next: &str| {
+        next.split(|c: char| !c.is_alphanumeric())
+            .any(|w| matches!(w, "it" | "code" | "codes"))
+    };
+    offered(line)
+        || after.is_some_and(|after| {
+            let next = sentence(lc, after);
+            about_it(next) && offered(next)
+        })
 }
 
 /// Whether a driver, courier or delivery person is named near `start..end`
@@ -697,11 +743,21 @@ fn as_the_user(lc: &str, at: usize) -> bool {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .collect();
+    // A comma may follow the greeting ("Hello, delivery partner"), not a
+    // name after it ("Hi Sam, driver Alex …" greets Sam).
+    let to_someone = line
+        .trim_start()
+        .split_once(|c: char| !c.is_alphanumeric())
+        .is_some_and(|(_, rest)| {
+            rest.split_once(',')
+                .is_some_and(|(name, _)| !name.trim().is_empty())
+        });
     let greeted = words.len() <= 3
         && words
             .first()
             .is_some_and(|w| matches!(*w, "dear" | "hi" | "hello" | "hey"))
-        && !words[1..].iter().any(|w| DETERMINERS.contains(w));
+        && !words[1..].iter().any(|w| DETERMINERS.contains(w))
+        && !to_someone;
     let clause = &line[line.rfind([',', ';']).map_or(0, |i| i + 1)..];
     let words: Vec<&str> = clause.split_whitespace().collect();
     let recent = &words[words.len().saturating_sub(3)..];

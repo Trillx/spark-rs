@@ -1429,5 +1429,248 @@
     "subject": "Your parcel is on the way",
     "text": "Tracking number: 593728164930\nSign in to choose a safe place or change your delivery day.",
     "code": null
+  },
+  {
+    "what": "Airbnb terse account access",
+    "subject": "Your Airbnb code",
+    "text": "Your Airbnb code is 864275.",
+    "code": "864275"
+  },
+  {
+    "what": "Linear short account access",
+    "subject": "Your Linear code",
+    "text": "Your code is 7Q8NX. Enter it to access your workspace. This code expires in 10 minutes.",
+    "code": "7Q8NX"
+  },
+  {
+    "what": "Pinterest number before brand",
+    "subject": "731856 is your Pinterest code",
+    "text": "731856 is your Pinterest code. Enter it in the window you left open.",
+    "code": "731856"
+  },
+  {
+    "what": "Spotify numeric access",
+    "subject": "Continue to Spotify",
+    "text": "Use the following code: 592847\nIt expires in 10 minutes.",
+    "code": "592847"
+  },
+  {
+    "what": "Shop Pay sign-in during checkout",
+    "subject": "Your Shop Pay sign-in code",
+    "text": "Enter code 846291 at checkout to sign in to Shop Pay. This code expires in 10 minutes.",
+    "code": "846291"
+  },
+  {
+    "what": "Retail account checkout securely",
+    "subject": "Your account verification code",
+    "text": "Your verification code is 368429. Sign in to your account to checkout securely with your saved details.",
+    "code": "368429"
+  },
+  {
+    "what": "Bank browser challenge",
+    "subject": "Santander: Complete your sign-in",
+    "text": "Enter your one-time passcode: 852714. Use it only in the browser where you requested it.",
+    "code": "852714"
+  },
+  {
+    "what": "Bank account PIN",
+    "subject": "Your online banking sign-in PIN",
+    "text": "Your sign-in PIN is 764825. It expires in 5 minutes.",
+    "code": "764825"
+  },
+  {
+    "what": "SaaS grouped access",
+    "subject": "Your Miro login code",
+    "text": "Use this login code to open your workspace:\n\n572-846\n\nIf you did not ask for this, ignore this message.",
+    "code": "572846"
+  },
+  {
+    "what": "SaaS new browser mixed code",
+    "subject": "Your Sentry authentication code",
+    "text": "Your authentication code is 6H3K9P. Return to Sentry to complete signing in.",
+    "code": "6H3K9P"
+  },
+  {
+    "what": "Game Guard challenge",
+    "subject": "Steam Guard: New computer",
+    "text": "Here is the Steam Guard code you need to login:\n\n9CW4K\n\nIf this was not you, secure your account.",
+    "code": "9CW4K"
+  },
+  {
+    "what": "Game two step digits",
+    "subject": "Nintendo Account two-step verification",
+    "text": "Your verification code is 654872. Return to the Nintendo Account page to finish signing in.",
+    "code": "654872"
+  },
+  {
+    "what": "Flex possessive greeting",
+    "subject": "Amazon Flex: Complete sign-in",
+    "text": "Dear Amazon delivery partner,\nYour verification code is 825741. Enter it in Amazon Flex to continue.",
+    "code": "825741"
+  },
+  {
+    "what": "Courier greeting with possessive",
+    "subject": "Your courier sign-in code",
+    "text": "Hello valued courier,\nYour one-time code is 748256. Enter it in the app to go online.",
+    "code": "748256"
+  },
+  {
+    "what": "Gig brand after welcome",
+    "subject": "Your Bolt verification code",
+    "text": "Welcome to Bolt Driver. Your code is 4826. Use it to sign in and go online.",
+    "code": "4826"
+  },
+  {
+    "what": "Gig Driver opened brand",
+    "subject": "Your Uber sign-in code",
+    "text": "Opening Uber Driver? Enter code 9673 to sign in.",
+    "code": "9673"
+  },
+  {
+    "what": "HTML only NBSP brand",
+    "subject": "Your Uber verification code",
+    "text": "Your Uber Driver verification code is 4582.\nEnter it to sign in.\n",
+    "html": "<html><body><p>Your Uber&nbsp;Driver verification code is <strong>4582</strong>.</p><p>Enter it to sign in.</p></body></html>",
+    "code": "4582"
+  },
+  {
+    "what": "HTML only adjoining table cells",
+    "subject": "Verify your Webflow account",
+    "text": "Your verification code682459Enter it to sign in.\n",
+    "html": "<html><body><table><tr><td>Your verification code</td><td>682459</td></tr></table><p>Enter it to sign in.</p></body></html>",
+    "code": "682459"
+  },
+  {
+    "what": "HTML only digit boxes",
+    "subject": "Your account sign-in code",
+    "text": "Your sign-in code is\n736925Use it in your browser.\n",
+    "html": "<html><body><p>Your sign-in code is</p><table><tr><td>7</td><td>3</td><td>6</td><td>9</td><td>2</td><td>5</td></tr></table><p>Use it in your browser.</p></body></html>",
+    "code": "736925"
+  },
+  {
+    "what": "Subject only access with rewards footer",
+    "subject": "Your Uniqlo sign-in code: 594728",
+    "text": "Enter the code from the subject to sign in.\nOnce you are in, you can view your orders and gift cards.",
+    "code": "594728"
+  },
+  {
+    "what": "Numeric personal shop offer",
+    "subject": "A little treat for your birthday",
+    "text": "Your code is 846275. Enter it on our site for a special birthday price. Valid until Friday.",
+    "code": null
+  },
+  {
+    "what": "Shipping benefit mixed offer",
+    "subject": "Your weekend treat",
+    "text": "Use this code: POSTAGE8. Delivery is on us this weekend.",
+    "code": null
+  },
+  {
+    "what": "Numeric subject only offer split sentences",
+    "subject": "Your one-time code: 741826",
+    "text": "Use the code in the subject. Enter it at checkout to save on your next order.",
+    "code": null
+  },
+  {
+    "what": "Mixed subject only offer split lines",
+    "subject": "Your one-time code: STYLE30",
+    "text": "Use the code in the subject.\nRedeem it for 30% off your next purchase before midnight.",
+    "code": null
+  },
+  {
+    "what": "Checkout benefit promotion",
+    "subject": "A special offer for members",
+    "text": "Sign in and use code SPEED25 in our express checkout to save on your next purchase.",
+    "code": null
+  },
+  {
+    "what": "Plain numeric coupon",
+    "subject": "Your personal discount",
+    "text": "Your discount code is 782491. Enter it when you pay to save on your order.",
+    "code": null
+  },
+  {
+    "what": "Parcel courier instructions",
+    "subject": "Your parcel is almost there",
+    "text": "Your one-time password is 943781. Your courier will need it when you accept the parcel.",
+    "code": null
+  },
+  {
+    "what": "Driver greeting comma trap",
+    "subject": "Your ride is on its way",
+    "text": "Hi Sam, driver Alex is on the way. Your one-time code is 7392. Tell Alex this code before the trip starts.",
+    "code": null
+  },
+  {
+    "what": "Driver greeting with determiner",
+    "subject": "Meet your driver",
+    "text": "Hi, your driver Alex is waiting outside. Your one-time PIN is 8264. Show it before the trip starts.",
+    "code": null
+  },
+  {
+    "what": "Delivery partner greeting personal",
+    "subject": "Your food is close",
+    "text": "Hi Alex, delivery partner Sam will arrive soon. Your one-time code is 5826. Tell Sam the code when your food arrives.",
+    "code": null
+  },
+  {
+    "what": "Delivery executive generic handover",
+    "subject": "Your delivery today",
+    "text": "Your one-time password is 357926. Show it to the delivery executive after checking your parcel.",
+    "code": null
+  },
+  {
+    "what": "Ride receipt with driver",
+    "subject": "Your ride receipt",
+    "text": "Thanks for riding with us.\nDriver: Priya\nTotal: USD 32.60\nSign in to view trip details.",
+    "code": null
+  },
+  {
+    "what": "SaaS paid invoice",
+    "subject": "Your Figma payment receipt",
+    "text": "Invoice number: 854729\nTotal paid: USD 15.00\nSign in to download your invoice.",
+    "code": null
+  },
+  {
+    "what": "Shop purchase receipt",
+    "subject": "Your order is confirmed",
+    "text": "Order number: 673829\nTotal: GBP 29.50\nSign in to track your order.",
+    "code": null
+  },
+  {
+    "what": "Video call invite",
+    "subject": "Invitation: Weekly catch-up",
+    "text": "Join our Zoom meeting.\nMeeting ID: 935 7428 1629\nPasscode: 684275\nSee you on Thursday.",
+    "code": null
+  },
+  {
+    "what": "Repository invitation",
+    "subject": "Join the orchard team",
+    "text": "You have been invited to the orchard organization. Sign in to accept the invitation before it expires.",
+    "code": null
+  },
+  {
+    "what": "New device alert",
+    "subject": "Security alert: Was this you?",
+    "text": "A new sign-in was detected on Safari on iPhone. If this was you, you can ignore this email. Otherwise review your account activity.",
+    "code": null
+  },
+  {
+    "what": "Password change notification",
+    "subject": "Your password has been changed",
+    "text": "Your account password was changed. Sign in to review your devices if you did not make this change. Never share your security code.",
+    "code": null
+  },
+  {
+    "what": "Hotel door PIN",
+    "subject": "Your hotel check-in instructions",
+    "text": "Your booking is confirmed.\nPIN code: 7362\nUse this PIN at the entrance. Sign in to view your reservation.",
+    "code": null
+  },
+  {
+    "what": "Flight booking code",
+    "subject": "Your flight to Rome",
+    "text": "Your booking code is 6N8Q4W. Use this code to retrieve your tickets. Sign in to manage your trip.",
+    "code": null
   }
 ]
