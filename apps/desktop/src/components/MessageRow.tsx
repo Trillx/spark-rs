@@ -14,12 +14,12 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { memo } from "react";
+import { memo, useEffect, useReducer } from "react";
 import type { Message } from "../types";
 import { dragMessage } from "../lib/drag";
 import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
 import { recipientNames } from "../lib/recipients";
-import { rowCode } from "../lib/signInCode";
+import { CODE_FRESH_MS, rowCode } from "../lib/signInCode";
 import { hint } from "../lib/shortcuts";
 import Avatar from "./Avatar";
 import { AutoLabelChip } from "./AutoLabelChip";
@@ -91,6 +91,7 @@ function MessageRow({
   const to = recipients ? recipientNames(m.to) : null;
   const weight = m.unread ? "font-semibold" : "font-medium";
   const code = rowCode(m);
+  useCodeExpiry(code ? m.timestamp : undefined);
   return (
     <div
       role="option"
@@ -251,6 +252,19 @@ function MessageRow({
       </div>
     </div>
   );
+}
+
+/**
+ * Renders the row again once the sign-in code of an email that arrived at `arrived` stops being offered (see
+ * `rowCode`): the row is memoized, and nothing else about it changes then.
+ */
+function useCodeExpiry(arrived: number | undefined) {
+  const [, expire] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    if (arrived === undefined) return;
+    const timer = window.setTimeout(expire, Math.max(0, arrived + CODE_FRESH_MS - Date.now()) + 1000);
+    return () => window.clearTimeout(timer);
+  }, [arrived]);
 }
 
 /** The leading column's Done circle: outline on hover, filled for Done mail; a check for picked rows. */

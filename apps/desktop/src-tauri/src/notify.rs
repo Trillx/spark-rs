@@ -497,12 +497,29 @@ fn show_tagged(app: &AppHandle, alert: &Alert, sound: bool, tag: Option<&str>) -
 }
 
 /// A toast's Copy button: the code goes on the clipboard, and its email is
-/// marked as Settings → Notifications says.
+/// marked as Settings → Notifications says. The clipboard is opened on the
+/// main thread, for the window it owns (`clipboard::set_text`).
 fn copy_code(app: &AppHandle, id: i64, code: &str) {
-    if let Err(e) = clipboard::set_text(code) {
+    let on_main = app.clone();
+    let code = code.to_owned();
+    let ran = app.run_on_main_thread(move || {
+        if let Err(e) = clipboard::set_text(&on_main, &code) {
+            eprintln!("spark-rs: couldn't copy the sign-in code: {e}");
+            return;
+        }
+        // Not on the main thread: marking waits for the store, which a sync
+        // may be holding.
+        let app = on_main.clone();
+        tauri::async_runtime::spawn_blocking(move || mark_after_copy(&app, id));
+    });
+    if let Err(e) = ran {
         eprintln!("spark-rs: couldn't copy the sign-in code: {e}");
-        return;
     }
+}
+
+/// Marks email `id` once its code is copied, and tells the window and the
+/// account's worker.
+fn mark_after_copy(app: &AppHandle, id: i64) {
     let after = app.state::<PrefsState>().get().after_code_copy;
     let mailbox = app.state::<Mailbox>();
     let marked = mark_copied(&mut mailbox.live.engine.store(), id, after, now_ms());
@@ -528,10 +545,8 @@ fn mark_copied(
     let Some(copied) = store.message(id)? else {
         return Ok(None);
     };
-    let mut ids = store.conversation_before(id, 100)?;
-    ids.push(id);
     let mut changed = false;
-    for other in ids {
+    for other in store.conversation_of(id)? {
         let Some(m) = store.message(other)? else {
             continue;
         };
@@ -590,6 +605,7 @@ fn show_xml_tagged(
 mod clipboard {
     use std::{ptr, thread, time::Duration};
 
+    use tauri::{AppHandle, Manager};
     use windows::Win32::Foundation::{GlobalFree, HANDLE};
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -599,11 +615,18 @@ mod clipboard {
     /// The `CF_UNICODETEXT` format: UTF-16 ending in a zero.
     const UNICODE_TEXT: u32 = 13;
 
-    pub fn set_text(text: &str) -> Result<(), String> {
+    /// Run on the main thread. The clipboard is opened for the main window
+    /// (hidden or not): emptied with no owner, it takes no text.
+    pub fn set_text(app: &AppHandle, text: &str) -> Result<(), String> {
+        let owner = app
+            .get_webview_window("main")
+            .ok_or("the main window is gone")?
+            .hwnd()
+            .map_err(|e| e.to_string())?;
         let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
         // Another app may have it open for a moment.
         let mut tries = 0;
-        while unsafe { OpenClipboard(None) }.is_err() {
+        while unsafe { OpenClipboard(Some(owner)) }.is_err() {
             tries += 1;
             if tries == 10 {
                 return Err("another app is using the clipboard".into());
@@ -635,7 +658,9 @@ mod clipboard {
 
 #[cfg(not(windows))]
 mod clipboard {
-    pub fn set_text(_text: &str) -> Result<(), String> {
+    use tauri::AppHandle;
+
+    pub fn set_text(_app: &AppHandle, _text: &str) -> Result<(), String> {
         Err("Copying from a notification is only available on Windows.".into())
     }
 }
@@ -1086,8 +1111,9 @@ mod tests {
         );
         assert!(read(&store, older).unread && read(&store, newer).unread);
 
+        // From the older email's toast too, the newer one is marked.
         assert_eq!(
-            mark_copied(&mut store, newer, AfterCodeCopy::Read, NOW).unwrap(),
+            mark_copied(&mut store, older, AfterCodeCopy::Read, NOW).unwrap(),
             Some(account)
         );
         assert!(!read(&store, older).unread && !read(&store, newer).unread);
@@ -1098,7 +1124,7 @@ mod tests {
         );
 
         assert_eq!(
-            mark_copied(&mut store, newer, AfterCodeCopy::Done, NOW).unwrap(),
+            mark_copied(&mut store, older, AfterCodeCopy::Done, NOW).unwrap(),
             Some(account)
         );
         assert_eq!(read(&store, older).state, MessageState::Done);

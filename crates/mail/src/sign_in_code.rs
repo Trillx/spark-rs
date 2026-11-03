@@ -22,6 +22,10 @@ const AFTER_OWN_LINE: usize = 300;
 const BEFORE: usize = 60;
 /// How far before it may be otherwise ("482913. This code expires…").
 const BEFORE_LOOSE: usize = 20;
+/// How near a word naming a code the text must say it's about signing in,
+/// when the subject doesn't: a "Sign in" link in a receipt's footer
+/// doesn't make its order code one.
+const ABOUT_NEAR: usize = 300;
 
 /// Words that say an email is about signing in or proving who you are;
 /// without one, a number near "code" is a door code or an order.
@@ -172,6 +176,37 @@ const OTHER_CODES: &[&str] = &[
     "html",
     "sample",
     "example",
+    "customer",
+    "client",
+    "member",
+    "membership",
+    "loyalty",
+    "invoice",
+    "billing",
+    "pickup",
+    "delivery",
+    "parcel",
+    "package",
+    "shipment",
+    "locker",
+    "store",
+    "shop",
+    "item",
+];
+
+/// Currencies, as words before or after an amount ("INR 5000", "5000 USD").
+const CURRENCIES: &[&str] = &[
+    "inr", "rs", "rupees", "usd", "eur", "gbp", "cad", "aud", "nzd", "jpy", "cny", "rmb", "chf",
+    "sek", "nok", "dkk", "pln", "czk", "huf", "rub", "brl", "mxn", "ars", "clp", "cop", "zar",
+    "ngn", "kes", "egp", "aed", "sar", "qar", "ils", "sgd", "hkd", "twd", "krw", "idr", "php",
+    "thb", "myr", "vnd", "pkr", "bdt", "lkr", "npr", "dollars", "euros", "pounds", "yen",
+];
+
+/// Words after a number that make it a quantity, not a code.
+const UNITS: &[&str] = &[
+    "minutes", "minute", "mins", "min", "hours", "hour", "hrs", "days", "day", "seconds", "secs",
+    "sec", "years", "percent", "points", "pts", "items", "miles", "km", "kg", "lbs", "mb", "gb",
+    "kb",
 ];
 
 /// The code in an email with this subject, text and HTML, as the user
@@ -180,24 +215,34 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
     let text = head(text, LOOK);
     let subject_lc = subject.to_ascii_lowercase();
     let text_lc = text.to_ascii_lowercase();
-    let about = |lc: &str| ABOUT_SIGNING_IN.iter().any(|w| lc.contains(w));
     if !(about(&subject_lc) || about(&text_lc)) || MEETINGS.iter().any(|w| text_lc.contains(w)) {
         return None;
     }
+    // A subject about signing in vouches for the whole email; otherwise the
+    // text has to say so near the code.
+    let vouched = about(&subject_lc);
     // The likelier of the subject's and the text's, the subject's if they tie.
-    [best(subject, &subject_lc), best(text, &text_lc)]
-        .into_iter()
-        .flatten()
-        .min_by_key(|&(score, _)| score)
-        .or_else(|| {
-            // HTML without spaces between its tags runs words together
-            // ("code</td><td>482913" reads "code482913"): read it again
-            // with a space at every tag.
-            let spaced = html_to_text(&head(html?, LOOK_HTML).replace('<', " <"));
-            let spaced = head(&spaced, LOOK);
-            best(spaced, &spaced.to_ascii_lowercase())
-        })
-        .map(|(_, code)| code)
+    [
+        best(subject, &subject_lc, true),
+        best(text, &text_lc, vouched),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|&(score, _)| score)
+    .or_else(|| {
+        // HTML without spaces between its tags runs words together
+        // ("code</td><td>482913" reads "code482913"): read it again
+        // with a space at every tag.
+        let spaced = html_to_text(&head(html?, LOOK_HTML).replace('<', " <"));
+        let spaced = head(&spaced, LOOK);
+        best(spaced, &spaced.to_ascii_lowercase(), vouched)
+    })
+    .map(|(_, code)| code)
+}
+
+/// Whether `lc` (lower case) says it's about signing in.
+fn about(lc: &str) -> bool {
+    ABOUT_SIGNING_IN.iter().any(|w| lc.contains(w))
 }
 
 /// The start of `s`, up to `max` bytes, cut at a character.
@@ -248,8 +293,14 @@ struct Candidate {
 
 /// The best candidate in `src` (`lc` is it in ASCII lower case), the one
 /// closest to a word that names a code, with its score (lower is likelier).
-fn best(src: &str, lc: &str) -> Option<(usize, String)> {
-    let anchors = anchors(lc);
+/// Unless `vouched`, only words with talk of signing in near them count.
+fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
+    let mut anchors = anchors(lc);
+    if !vouched {
+        anchors.retain(|a| {
+            about(&lc[floor(lc, a.start.saturating_sub(ABOUT_NEAR))..ceil(lc, a.end + ABOUT_NEAR)])
+        });
+    }
     if anchors.is_empty() {
         return None;
     }
@@ -293,6 +344,11 @@ fn score(src: &str, lc: &str, a: &Anchor, c: &Candidate) -> Option<usize> {
         if !own_line && (c.mixed || c.year || ends_sentence(gap)) {
             return None;
         }
+        // "Your passcode for a payment of 5000 is 482913": the number the
+        // sentence gives as its answer beats one nearer the word.
+        if introduces(gap) {
+            return Some(5 + far / 10);
+        }
         Some(far)
     } else if c.end <= a.start {
         let gap = &lc[c.end..a.start];
@@ -314,6 +370,21 @@ fn score(src: &str, lc: &str, a: &Anchor, c: &Candidate) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Whether `gap` ends by giving what comes next: "… is", "…:".
+fn introduces(gap: &str) -> bool {
+    let gap = gap.trim_end();
+    gap.ends_with(':')
+        || gap
+            .rsplit(|c: char| !c.is_alphabetic())
+            .next()
+            .is_some_and(|w| {
+                matches!(
+                    w,
+                    "is" | "are" | "es" | "est" | "ist" | "lautet" | "è" | "é"
+                )
+            })
 }
 
 /// Only the letters of `s`.
@@ -370,6 +441,12 @@ fn anchors(lc: &str) -> Vec<Anchor> {
             .map(|j| words[j])
             .filter(|&(_, e)| start - e <= 3)
             .map(|(s, e)| &lc[s..e]);
+        // And the one before that, in the same phrase: "order confirmation code".
+        let two_before = before
+            .and(k.checked_sub(2))
+            .map(|j| (words[j], words[j + 1].0))
+            .filter(|&((_, e), next)| lc[e..next].chars().all(|c| c.is_whitespace() || c == '-'))
+            .map(|((s, e), _)| &lc[s..e]);
         let names_a_code = if word.ends_with("code") || word.ends_with("codes") {
             !NOT_CODES.contains(&word)
         } else {
@@ -388,7 +465,8 @@ fn anchors(lc: &str) -> Vec<Anchor> {
                     | "kód"
             ) || (word == "password" && matches!(before, Some("time" | "temporary" | "onetime")))
         };
-        if names_a_code && !before.is_some_and(|b| OTHER_CODES.contains(&b)) {
+        let other = |w: Option<&str>| w.is_some_and(|w| OTHER_CODES.contains(&w));
+        if names_a_code && !other(before) && !other(two_before) {
             anchors.push(Anchor { start, end });
         }
     }
@@ -422,10 +500,41 @@ fn candidates(src: &str) -> Vec<Candidate> {
     let at = |i: usize| bytes.get(i).copied();
     let before = |i: usize| i.checked_sub(1).map(|j| bytes[j]);
 
+    let capitals = |r: (usize, usize)| {
+        bytes[r.0..r.1]
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    let mixed = |chars: &[u8]| {
+        chars.iter().any(u8::is_ascii_digit) && chars.iter().any(u8::is_ascii_uppercase)
+    };
+
     let mut found = Vec::new();
     let mut i = 0;
     while i < runs.len() {
         let run = runs[i];
+        // Two groups of 3–4 capitals and digits: "4K7-9QX", "123-4K7".
+        if let Some(&next) = runs.get(i + 1)
+            && at(run.1) == Some(b'-')
+            && next.0 == run.1 + 1
+            && (3..=4).contains(&(run.1 - run.0))
+            && (3..=4).contains(&(next.1 - next.0))
+            && capitals(run)
+            && capitals(next)
+            && mixed(&bytes[run.0..next.1])
+        {
+            if clear_before(bytes, run.0) && clear_after(bytes, next.1) {
+                found.push(Candidate {
+                    start: run.0,
+                    end: next.1,
+                    code: src[run.0..next.1].to_owned(),
+                    mixed: true,
+                    year: false,
+                });
+            }
+            i += 2;
+            continue;
+        }
         if digits(run) {
             // Digits in a box each: 4–8 of them, a few spaces apart.
             if run.1 - run.0 == 1 {
@@ -475,7 +584,8 @@ fn candidates(src: &str) -> Vec<Candidate> {
                     joints.iter().all(|&joint| joint == joints[0])
                         && matches!(joints[0], b' ' | b'-')
                         && rest.iter().all(|g| g == a)
-                        && (*a == 3 || *a == 4 || (*a == 2 && groups.len() == 3))
+                        // "48 29 13", but "03-11-26" is a date.
+                        && (*a == 3 || *a == 4 || (*a == 2 && groups.len() == 3 && joints[0] == b' '))
                 }
                 [] => false,
             };
@@ -494,7 +604,12 @@ fn candidates(src: &str) -> Vec<Candidate> {
                 Some(_) => true,
                 None => clear_before(bytes, start),
             };
-            if grouped && (4..=8).contains(&total) && clear && clear_after(bytes, end) {
+            if grouped
+                && (4..=8).contains(&total)
+                && clear
+                && clear_after(bytes, end)
+                && !amount_or_quantity(src, prefix.map_or(start, |p| p.0), end)
+            {
                 let code: String = runs[i..=j].iter().map(|r| &src[r.0..r.1]).collect();
                 let year = total == 4 && (1900..=2099).contains(&code.parse::<u32>().unwrap_or(0));
                 found.push(Candidate {
@@ -508,45 +623,44 @@ fn candidates(src: &str) -> Vec<Candidate> {
             i = j + 1;
             continue;
         }
-        // Capitals and digits, maybe two groups joined by a hyphen.
-        let capitals = |r: (usize, usize)| {
-            bytes[r.0..r.1]
-                .iter()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-        };
-        if capitals(run) {
-            let mut end = run.1;
-            let mut j = i;
-            if at(end) == Some(b'-')
-                && i + 1 < runs.len()
-                && runs[i + 1].0 == end + 1
-                && capitals(runs[i + 1])
-                && (3..=4).contains(&(run.1 - run.0))
-                && (3..=4).contains(&(runs[i + 1].1 - runs[i + 1].0))
-            {
-                j = i + 1;
-                end = runs[j].1;
-            }
-            let chars = &bytes[run.0..end];
-            let shape = (4..=10)
-                .contains(&chars.iter().filter(|b| b.is_ascii_alphanumeric()).count())
-                && chars.iter().any(u8::is_ascii_digit)
-                && chars.iter().any(u8::is_ascii_uppercase);
-            if shape && clear_before(bytes, run.0) && clear_after(bytes, end) {
-                found.push(Candidate {
-                    start: run.0,
-                    end,
-                    code: src[run.0..end].to_owned(),
-                    mixed: true,
-                    year: false,
-                });
-            }
-            i = j + 1;
-            continue;
+        // Capitals and digits.
+        if capitals(run)
+            && (4..=10).contains(&(run.1 - run.0))
+            && mixed(&bytes[run.0..run.1])
+            && clear_before(bytes, run.0)
+            && clear_after(bytes, run.1)
+        {
+            found.push(Candidate {
+                start: run.0,
+                end: run.1,
+                code: src[run.0..run.1].to_owned(),
+                mixed: true,
+                year: false,
+            });
         }
         i += 1;
     }
     found
+}
+
+/// Whether the words around a number at `start..end` make it an amount
+/// ("INR 5000", "Rs. 5000", "5000 USD") or a quantity ("1440 minutes").
+fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
+    let word_before = src[..start]
+        .trim_end_matches(|c: char| c.is_whitespace() || c == '.')
+        .rsplit(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let word_after = src[end..]
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    CURRENCIES.contains(&word_before.as_str())
+        || CURRENCIES.contains(&word_after.as_str())
+        || UNITS.contains(&word_after.as_str())
 }
 
 /// Nothing before position `i` makes it part of something else: an amount,
@@ -815,6 +929,82 @@ mod tests {
                 "@octocat requested your review on: octo/repo#4821 Fix login code path\n\nYou can \
                  view, comment on, or merge this pull request online at: \
                  https://github.com/octo/repo/pull/4821",
+            ),
+        ];
+        for (subject, text) in none {
+            assert_eq!(code(subject, text), None, "{subject}: {text}");
+        }
+    }
+
+    #[test]
+    fn prefers_the_code_to_an_amount_or_a_date() {
+        // An amount in a currency's letters.
+        assert_eq!(
+            code(
+                "Your one-time passcode",
+                "Your one-time passcode for a payment of INR 5000 is 482913. Do not share it with \
+                 anyone."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // An amount with no currency: the sentence gives the code as its answer.
+        assert_eq!(
+            code(
+                "",
+                "Your OTP for the transaction of 5000 at Amazon is 482913."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("Sign in", "Your sign-in code expires in 1440 minutes.").as_deref(),
+            None
+        );
+        // A date in pairs of digits.
+        assert_eq!(
+            code(
+                "Security alert: sign-in code requested",
+                "Your sign-in code was requested on 03-11-26 at 14:35."
+            )
+            .as_deref(),
+            None
+        );
+        assert_eq!(
+            code("", "Your verification code is 48 29 13").as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn a_code_in_two_groups_may_start_with_digits() {
+        assert_eq!(
+            code(
+                "Your verification code",
+                "Your verification code is 123-4K7"
+            )
+            .as_deref(),
+            Some("123-4K7")
+        );
+    }
+
+    #[test]
+    fn leaves_codes_that_are_for_something_else_however_the_email_ends() {
+        let none = [
+            (
+                "Your order confirmation",
+                "Your order confirmation code is 482913. Sign in to view your order.",
+            ),
+            (
+                "Invoice 1042",
+                "Customer code: 482913\nSign in to pay online.",
+            ),
+            (
+                "Your table",
+                &format!(
+                    "Welcome! Your table code is 482913.\n\n{}\n\nSign in to manage your booking.",
+                    "We look forward to seeing you. ".repeat(12)
+                ),
             ),
         ];
         for (subject, text) in none {

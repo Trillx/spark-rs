@@ -960,6 +960,17 @@ impl Store {
         )
     }
 
+    /// Every email of email `id`'s conversation, it too, oldest first,
+    /// drafts left out.
+    pub fn conversation_of(&self, id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "WITH {MEMBERS}
+             SELECT m.id FROM members JOIN messages m ON m.id = members.id
+             WHERE {NOT_DRAFT} ORDER BY m.date, m.id"
+        ))?;
+        stmt.query_map([id], |r| r.get(0))?.collect()
+    }
+
     /// Up to `limit` emails of email `id`'s conversation from before it,
     /// oldest first, drafts left out: what a reply to it reads first.
     pub fn conversation_before(&self, id: i64, limit: usize) -> Result<Vec<i64>> {
