@@ -28,7 +28,9 @@ const BEFORE_LOOSE: usize = 20;
 const ABOUT_NEAR: usize = 300;
 
 /// Words that say an email is about signing in or proving who you are;
-/// without one, a number near "code" is a door code or an order.
+/// without one, a number near "code" is a door code, an order or an offer.
+/// "Your code is" and "use this code" aren't among them: shops write them
+/// over their offers ("Your code is STYLE25").
 const ABOUT_SIGNING_IN: &[&str] = &[
     "verif",
     "sign in",
@@ -51,13 +53,6 @@ const ABOUT_SIGNING_IN: &[&str] = &[
     "two-step",
     "authenticat",
     "security code",
-    "your code is",
-    "is your code",
-    "enter the code",
-    "enter this code",
-    "use this code",
-    "use the following code",
-    "the code below",
     "do not share",
     "don't share",
     "never share",
@@ -115,9 +110,9 @@ const RECIPIENTS: &[&str] = &[
     "delivery boy",
     "delivery staff",
 ];
-/// Words that hand a code over, in a sentence naming one of `RECIPIENTS`.
-const HAND_OVER: &[&str] = &[
-    "share", "give", "show", "tell", "provide", "hand", "read", "ask", "asks",
+/// Words before a name that make it someone's, not an app's: "your Driver".
+const DETERMINERS: &[&str] = &[
+    "your", "the", "our", "a", "an", "my", "his", "her", "their", "this", "that",
 ];
 
 /// After one of `RECIPIENTS`, these make it the user's own account: "your
@@ -336,9 +331,8 @@ fn spaced(html: &str) -> String {
     head(&text, LOOK).to_owned()
 }
 
-/// Whether `src` makes `code` one to hand over or a shop's where it shows
-/// it ("681 492"), or hands over a code where it talks of one, if it doesn't
-/// show it.
+/// Whether `src` makes `code` one to hand over or a shop's: where it shows
+/// it ("681 492"), or where it talks of a code if it doesn't show it.
 fn handed_over_in(src: &str, code: &str) -> bool {
     let lc = src.to_ascii_lowercase();
     let shown: Vec<(usize, usize)> = candidates(src)
@@ -349,7 +343,7 @@ fn handed_over_in(src: &str, code: &str) -> bool {
     if shown.is_empty() {
         return anchors(&lc)
             .iter()
-            .any(|a| handed_over(src, &lc, a.start, a.end));
+            .any(|a| promoted(&lc, a.start, a.end) || handed_over(src, &lc, a.start, a.end));
     }
     shown
         .into_iter()
@@ -538,60 +532,97 @@ fn own_line(src: &str, c: &Candidate) -> bool {
 }
 
 /// Whether the words near `start..end` of `lc` make what's there a shop's code.
+/// "Checkout" in a sentence about signing in is no offer: "sign in to
+/// Shop and enjoy faster checkout".
 fn promoted(lc: &str, start: usize, end: usize) -> bool {
-    let near = &lc[floor(lc, start.saturating_sub(150))..ceil(lc, end + 150)];
-    PROMOTIONS.iter().any(|w| near.contains(w))
+    let from = floor(lc, start.saturating_sub(150));
+    let near = &lc[from..ceil(lc, end + 150)];
+    PROMOTIONS.iter().any(|w| {
+        near.match_indices(w)
+            .any(|(at, _)| *w != "checkout" || !about(sentence(lc, from + at)))
+    })
 }
 
 /// Whether a driver, courier or delivery person is named near `start..end`
 /// of `src` (`lc` is it in lower case), making what's there a code to hand
 /// over. Not when it's the user: their own account ("sign in to your driver
-/// account"), what they sign in as ("Dear delivery partner", "sign in as a
-/// DoorDash driver"), or the app's name in mid-sentence ("Your Uber Driver
-/// verification code") unless the sentence hands the code over ("share
-/// this code with your Driver").
+/// account"), what they sign in as ("Dear valued delivery partner", "sign
+/// in as a DoorDash driver"), or the app they sign in to (`app_name`).
 fn handed_over(src: &str, lc: &str, start: usize, end: usize) -> bool {
     let from = floor(lc, start.saturating_sub(150));
     let near = &lc[from..ceil(lc, end + 150)];
     RECIPIENTS.iter().any(|r| {
         near.match_indices(r).any(|(at, _)| {
             let at = from + at;
-            let rest = &lc[at + r.len()..];
-            let mut next = rest
-                .split(|c: char| !c.is_alphabetic())
-                .filter(|w| !w.is_empty());
-            let next_word = match next.next() {
-                // "driver's license"
-                Some("s") if rest.starts_with('\'') || rest.starts_with('’') => next.next(),
-                w => w,
-            };
-            if next_word.is_some_and(|w| THEIR_OWN.contains(&w)) || as_the_user(lc, at) {
-                return false;
-            }
-            // A capital in mid-sentence may be the app's name.
-            let lead = src[..at].trim_end_matches([' ', '\t']);
-            let named = src[at..].starts_with(|c: char| c.is_ascii_uppercase())
-                && !lead.is_empty()
-                && !lead.ends_with(['.', '!', '?', '\n', ':']);
-            !named
-                || sentence(lc, at)
-                    .split(|c: char| !c.is_alphabetic())
-                    .any(|w| HAND_OVER.contains(&w))
+            let next = next_word(lc, at + r.len());
+            !(next.is_some_and(|w| THEIR_OWN.contains(&w))
+                || as_the_user(lc, at)
+                || app_name(src, lc, at, next))
         })
     })
 }
 
-/// Whether the words before position `at` of `lc` make what's there the
-/// user: "Dear …", "Hi …", "as a …", "as a DoorDash …".
+/// The word of `lc` from position `at` on, past a possessive ("driver's
+/// license" gives "license").
+fn next_word(lc: &str, at: usize) -> Option<&str> {
+    let rest = &lc[at..];
+    let mut words = rest
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty());
+    match words.next() {
+        Some("s") if rest.starts_with('\'') || rest.starts_with('’') => words.next(),
+        w => w,
+    }
+}
+
+/// Whether the recipient at `at` (followed by word `next`) is part of an
+/// app's name the user signs in to: capitalized after a brand ("Uber
+/// Driver", not "your Driver"), and either naming a code ("Uber Driver
+/// verification code") or what's signed in to ("sign in to Bolt Driver").
+fn app_name(src: &str, lc: &str, at: usize, next: Option<&str>) -> bool {
+    if !src[at..].starts_with(|c: char| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let lead = src[..at].trim_end_matches([' ', '\t']);
+    let brand_at = lead
+        .rfind(|c: char| !c.is_alphanumeric())
+        .map_or(0, |i| i + 1);
+    let brand = &lead[brand_at..];
+    let branded = brand.starts_with(|c: char| c.is_ascii_uppercase())
+        && !DETERMINERS.contains(&brand.to_ascii_lowercase().as_str());
+    let names_a_code = next.is_some_and(|w| {
+        SIGN_IN_CODES.contains(&w) || matches!(w, "code" | "otp" | "pin" | "passcode")
+    });
+    let signed_in_to = {
+        let before = lc[..brand_at].trim_end();
+        [
+            "sign in to",
+            "log in to",
+            "login to",
+            "sign into",
+            "log into",
+            "signing in to",
+            "logging in to",
+        ]
+        .iter()
+        .any(|w| before.ends_with(w))
+    };
+    branded && (names_a_code || signed_in_to)
+}
+
+/// Whether the words before position `at` of `lc`, on its line, make what's
+/// there the user: "Dear …", "Hi valued …", "as a …", "as a DoorDash …".
 fn as_the_user(lc: &str, at: usize) -> bool {
-    let lead = &lc[floor(lc, at.saturating_sub(40))..at];
-    let words: Vec<&str> = lead
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let as_a = |n: usize| n >= 2 && words[n - 2] == "as" && matches!(words[n - 1], "a" | "an");
-    let n = words.len();
-    matches!(words.last(), Some(&("dear" | "hi" | "hello"))) || as_a(n) || (n >= 1 && as_a(n - 1))
+    let line = &lc[lc[..at]
+        .rfind(['\n', ',', '.', ';', '!', '?'])
+        .map_or(0, |i| i + 1)..at];
+    let words: Vec<&str> = line.split_whitespace().collect();
+    // Within the last three words, so "Dear valued delivery partner" counts.
+    let recent = &words[words.len().saturating_sub(3)..];
+    recent.iter().any(|w| matches!(*w, "dear" | "hi" | "hello"))
+        || recent
+            .windows(2)
+            .any(|pair| pair[0] == "as" && matches!(pair[1], "a" | "an"))
 }
 
 /// The sentence of `lc` around position `at`.
