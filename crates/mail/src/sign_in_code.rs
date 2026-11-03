@@ -192,23 +192,29 @@ const OTHER_CODES: &[&str] = &[
     "item",
 ];
 
-/// Words before "code" that make it one for signing in, whatever comes
-/// before them: in "Your Shop verification code" the brand is no qualifier.
-const SIGN_IN_CODES: &[&str] = &[
-    "verification",
-    "verify",
-    "security",
-    "login",
-    "signin",
-    "authentication",
-    "auth",
-    "passcode",
-    "otp",
-    "mfa",
-    "fa",
-    "temporary",
-    "time",
-    "use",
+/// What a code is for that isn't signing in, however it's named: these
+/// count two words back too ("order confirmation code", "delivery
+/// verification code"), where a brand might stand ("Your Shop verification
+/// code"), so they're only ones no sign-in code is named after.
+const PURPOSES: &[&str] = &[
+    "order",
+    "delivery",
+    "pickup",
+    "parcel",
+    "package",
+    "shipment",
+    "tracking",
+    "locker",
+    "booking",
+    "reservation",
+    "ticket",
+    "invoice",
+    "promo",
+    "discount",
+    "coupon",
+    "voucher",
+    "gift",
+    "referral",
 ];
 
 /// Currencies, as words before or after an amount ("INR 5000", "5000 USD").
@@ -493,13 +499,12 @@ fn anchors(lc: &str) -> Vec<Anchor> {
                     | "kód"
             ) || (word == "password" && matches!(before, Some("time" | "temporary" | "onetime")))
         };
-        let other = |w: Option<&str>| w.is_some_and(|w| OTHER_CODES.contains(&w));
-        let sign_in = before.is_some_and(|w| SIGN_IN_CODES.contains(&w));
         if names_a_code {
             anchors.push(Anchor {
                 start,
                 end,
-                other: other(before) || !sign_in && other(two_before),
+                other: before.is_some_and(|w| OTHER_CODES.contains(&w))
+                    || two_before.is_some_and(|w| PURPOSES.contains(&w)),
             });
         }
     }
@@ -677,18 +682,21 @@ fn candidates(src: &str) -> Vec<Candidate> {
 }
 
 /// Whether the words around a number at `start..end` make it an amount
-/// ("INR 5000", "Rs. 5000", "5000 USD") or a quantity ("1440 minutes").
-/// Only the words on its own line count, and a currency after it that's
-/// another amount's ("482913 INR 5000") doesn't.
+/// ("INR 5000", "Rs. 5000", "INR" wrapped onto the line before, "5000
+/// USD") or a quantity ("1440 minutes"). A currency that's another amount's
+/// doesn't count: one after an amount ("5000 INR\n482913"), or one followed
+/// by an amount ("482913 INR 5000"). Words after it count on its own line.
 fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
-    let line_before = &src[src[..start].rfind('\n').map_or(0, |i| i + 1)..start];
-    let line_after = &src[end..src[end..].find('\n').map_or(src.len(), |i| end + i)];
-    let word_before = line_before
-        .trim_end_matches(|c: char| c.is_whitespace() || c == '.')
+    let before = src[..start].trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+    let word_before = before
         .rsplit(|c: char| !c.is_ascii_alphabetic())
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let after_a_number = before[..before.len() - word_before.len()]
+        .trim_end()
+        .ends_with(|c: char| c.is_ascii_digit());
+    let line_after = &src[end..src[end..].find('\n').map_or(src.len(), |i| end + i)];
     let after = line_after.trim_start();
     let word_after = after
         .split(|c: char| !c.is_ascii_alphabetic())
@@ -698,7 +706,7 @@ fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
     let then_a_number = after[word_after.len()..]
         .trim_start()
         .starts_with(|c: char| c.is_ascii_digit());
-    CURRENCIES.contains(&word_before.as_str())
+    CURRENCIES.contains(&word_before.as_str()) && !after_a_number
         || CURRENCIES.contains(&word_after.as_str()) && !then_a_number
         || UNITS.contains(&word_after.as_str())
 }
@@ -1104,6 +1112,47 @@ mod tests {
         assert_eq!(
             code("", "Your Customer verification code is 482913.").as_deref(),
             Some("482913")
+        );
+    }
+
+    #[test]
+    fn a_currency_wrapped_onto_the_line_before_still_makes_an_amount() {
+        assert_eq!(
+            code(
+                "Your one-time passcode",
+                "Your one-time passcode for a payment of INR\n5000\n\n482913\n\nDo not share this \
+                 code with anyone."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // A currency after an amount is that amount's, not the next line's.
+        assert_eq!(
+            code(
+                "Your one-time passcode",
+                "Amount: 5000 INR\nYour one-time passcode:\n482913"
+            )
+            .as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn a_purpose_before_verification_still_makes_it_something_else() {
+        assert_eq!(
+            code(
+                "Your delivery verification code",
+                "Your delivery verification code is 482913. Share this code with your delivery \
+                 partner."
+            ),
+            None
+        );
+        assert_eq!(
+            code(
+                "",
+                "Your order verification code is 482913. Sign in to track it."
+            ),
+            None
         );
     }
 
