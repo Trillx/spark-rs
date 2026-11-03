@@ -102,6 +102,15 @@ const PROMOTIONS: &[&str] = &[
     "shop now",
 ];
 
+/// Near a code, these make it one to hand someone, not to sign in with.
+const HANDOVERS: &[&str] = &[
+    "driver",
+    "courier",
+    "delivery partner",
+    "delivery agent",
+    "delivery associate",
+];
+
 /// Words ending in "code" that aren't one to type.
 const NOT_CODES: &[&str] = &[
     "unicode",
@@ -190,6 +199,28 @@ const OTHER_CODES: &[&str] = &[
     "shipment",
     "locker",
     "item",
+    "bic",
+    "iban",
+];
+
+/// Words before "code" (or "PIN") that make it one for signing in, whatever
+/// comes before them: in "Your Shop verification code" the brand is no
+/// qualifier, though "SWIFT BIC code" has one.
+const SIGN_IN_CODES: &[&str] = &[
+    "verification",
+    "verify",
+    "security",
+    "login",
+    "signin",
+    "authentication",
+    "auth",
+    "passcode",
+    "otp",
+    "mfa",
+    "fa",
+    "temporary",
+    "time",
+    "onetime",
 ];
 
 /// What a code is for that isn't signing in, however it's named: these
@@ -239,6 +270,12 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
     let subject_lc = subject.to_ascii_lowercase();
     let text_lc = text.to_ascii_lowercase();
     if !(about(&subject_lc) || about(&text_lc)) || MEETINGS.iter().any(|w| text_lc.contains(w)) {
+        return None;
+    }
+    // A subject naming a code for something else ("Your delivery
+    // verification code") speaks for the email, whatever the text calls it.
+    let named = anchors(&subject_lc);
+    if named.iter().any(|a| a.other) && named.iter().all(|a| a.other) {
         return None;
     }
     // A subject about signing in vouches for the whole email; otherwise the
@@ -334,7 +371,7 @@ fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
     let mut best: Option<(usize, &Candidate)> = None;
     let candidates = candidates(src);
     for c in &candidates {
-        if promotion_near(lc, c) {
+        if for_something_else(lc, c) {
             continue;
         }
         let Some(likely) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
@@ -444,9 +481,10 @@ fn own_line(src: &str, c: &Candidate) -> bool {
     src[start..c.start].trim().is_empty() && src[c.end..end].trim().is_empty()
 }
 
-fn promotion_near(lc: &str, c: &Candidate) -> bool {
+/// Whether the words near `c` make it a shop's code, or one to hand over.
+fn for_something_else(lc: &str, c: &Candidate) -> bool {
     let near = &lc[floor(lc, c.start.saturating_sub(150))..ceil(lc, c.end + 150)];
-    PROMOTIONS.iter().any(|w| near.contains(w))
+    PROMOTIONS.iter().chain(HANDOVERS).any(|w| near.contains(w))
 }
 
 /// The words in `lc` that name a code.
@@ -489,7 +527,6 @@ fn anchors(lc: &str) -> Vec<Anchor> {
                 "otp"
                     | "passcode"
                     | "passcodes"
-                    | "pin"
                     | "código"
                     | "codigo"
                     | "códigos"
@@ -498,13 +535,23 @@ fn anchors(lc: &str) -> Vec<Anchor> {
                     | "kode"
                     | "kód"
             ) || (word == "password" && matches!(before, Some("time" | "temporary" | "onetime")))
+                // A PIN says it's for signing in: "one-time PIN".
+                || (word == "pin" && before.is_some_and(|w| SIGN_IN_CODES.contains(&w)))
+        };
+        let sign_in = |w: Option<&str>| w.is_some_and(|w| SIGN_IN_CODES.contains(&w));
+        let other_before = match before {
+            // In India a PIN code is a postal code, and hotels give PIN codes
+            // for doors, unless it's a "one-time PIN code".
+            Some("pin") => !sign_in(two_before),
+            w => w.is_some_and(|w| OTHER_CODES.contains(&w)),
         };
         if names_a_code {
             anchors.push(Anchor {
                 start,
                 end,
-                other: before.is_some_and(|w| OTHER_CODES.contains(&w))
-                    || two_before.is_some_and(|w| PURPOSES.contains(&w)),
+                other: other_before
+                    || two_before.is_some_and(|w| PURPOSES.contains(&w))
+                    || two_before.is_some_and(|w| OTHER_CODES.contains(&w)) && !sign_in(before),
             });
         }
     }
@@ -693,9 +740,17 @@ fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let after_a_number = before[..before.len() - word_before.len()]
-        .trim_end()
-        .ends_with(|c: char| c.is_ascii_digit());
+    // An amount of its own: a number alone before it on its line, not a
+    // masked card ("XXXX1234") or one on the line above.
+    let rest = &before[..before.len() - word_before.len()];
+    let after_a_number = rest[rest.rfind('\n').map_or(0, |i| i + 1)..]
+        .split_whitespace()
+        .last()
+        .is_some_and(|w| {
+            w.contains(|c: char| c.is_ascii_digit())
+                && w.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, ',' | '.'))
+        });
     let line_after = &src[end..src[end..].find('\n').map_or(src.len(), |i| end + i)];
     let after = line_after.trim_start();
     let word_after = after
@@ -1154,6 +1209,56 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_masked_card_before_an_amount_leaves_it_an_amount() {
+        for card in ["XXXX1234", "xxxx1234"] {
+            let text = format!(
+                "Your one-time passcode for this payment:\nCard: {card}\nINR 5000\n\n482913\n\nDo \
+                 not share this code with anyone."
+            );
+            assert_eq!(
+                code("Your one-time passcode", &text).as_deref(),
+                Some("482913"),
+                "{card}"
+            );
+        }
+    }
+
+    #[test]
+    fn bank_and_hotel_codes_are_not_for_signing_in() {
+        let none = [
+            (
+                "Your wire transfer instructions",
+                "Sign in to Online Banking to send a wire.\nSWIFT BIC code: CHASUS33\nUse this code \
+                 for international wire transfers.",
+            ),
+            (
+                "Your booking is confirmed",
+                "Your reservation at City Hotel is confirmed.\nConfirmation number: 4829135701\nPIN \
+                 code: 5837\nSign in to manage your booking.",
+            ),
+        ];
+        for (subject, text) in none {
+            assert_eq!(code(subject, text), None, "{subject}: {text}");
+        }
+        assert_eq!(
+            code("", "Your one-time PIN is 482913. Don't share it.").as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("", "Your verification PIN code is 482913.").as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn a_code_to_give_the_driver_is_not_for_signing_in() {
+        let text = "Your one-time code is 681492. Please share this code with your driver when your \
+                    package arrives.";
+        assert_eq!(code("Your delivery verification code", text), None);
+        assert_eq!(code("Your package arrives today", text), None);
     }
 
     #[test]
