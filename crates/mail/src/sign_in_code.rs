@@ -102,14 +102,20 @@ const PROMOTIONS: &[&str] = &[
     "shop now",
 ];
 
-/// Near a code, these make it one to hand someone, not to sign in with.
-const HANDOVERS: &[&str] = &[
+/// Whom a code is handed to when it's not for signing in ("share this code
+/// with your driver"), and the verbs that hand it over.
+const RECIPIENTS: &[&str] = &[
     "driver",
     "courier",
     "delivery partner",
     "delivery agent",
     "delivery associate",
+    "delivery executive",
+    "delivery person",
+    "delivery boy",
+    "delivery staff",
 ];
+const HAND_OVER: &[&str] = &["share", "give", "show", "tell", "provide", "hand"];
 
 /// Words ending in "code" that aren't one to type.
 const NOT_CODES: &[&str] = &[
@@ -298,6 +304,14 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
         best(spaced, &spaced.to_ascii_lowercase(), vouched)
     })
     .map(|(_, code)| code)
+    // A code the subject gives is the text's too: if the text hands it over
+    // ("Your one-time password: 681492" … "share this code with your
+    // driver"), it's not for signing in.
+    .filter(|code| {
+        !text
+            .match_indices(code.as_str())
+            .any(|(at, _)| for_something_else(&text_lc, at, at + code.len()))
+    })
 }
 
 /// Whether `lc` (lower case) says it's about signing in.
@@ -371,7 +385,7 @@ fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
     let mut best: Option<(usize, &Candidate)> = None;
     let candidates = candidates(src);
     for c in &candidates {
-        if for_something_else(lc, c) {
+        if for_something_else(lc, c.start, c.end) {
             continue;
         }
         let Some(likely) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
@@ -481,10 +495,23 @@ fn own_line(src: &str, c: &Candidate) -> bool {
     src[start..c.start].trim().is_empty() && src[c.end..end].trim().is_empty()
 }
 
-/// Whether the words near `c` make it a shop's code, or one to hand over.
-fn for_something_else(lc: &str, c: &Candidate) -> bool {
-    let near = &lc[floor(lc, c.start.saturating_sub(150))..ceil(lc, c.end + 150)];
-    PROMOTIONS.iter().chain(HANDOVERS).any(|w| near.contains(w))
+/// Whether the words near `start..end` of `lc` make what's there a shop's
+/// code, or one to hand over ("share this code with your driver"; a driver
+/// signing in to their driver account keeps theirs).
+fn for_something_else(lc: &str, start: usize, end: usize) -> bool {
+    let near = &lc[floor(lc, start.saturating_sub(150))..ceil(lc, end + 150)];
+    PROMOTIONS.iter().any(|w| near.contains(w))
+        || RECIPIENTS.iter().any(|r| {
+            near.match_indices(r).any(|(at, _)| {
+                let lead = near[floor(near, at.saturating_sub(60))..at].trim_end();
+                let lead = ["the", "your", "our", "a", "an"]
+                    .iter()
+                    .find_map(|article| lead.strip_suffix(article))
+                    .map_or(lead, str::trim_end);
+                (lead.ends_with(" with") || lead.ends_with(" to"))
+                    && HAND_OVER.iter().any(|verb| lead.contains(verb))
+            })
+        })
 }
 
 /// The words in `lc` that name a code.
@@ -504,26 +531,40 @@ fn anchors(lc: &str) -> Vec<Anchor> {
     if let Some(s) = start {
         words.push((s, lc.len()));
     }
+    let word = |j: usize| &lc[words[j].0..words[j].1];
+    // The word before word `k` in the same phrase: only a space, a hyphen or
+    // so between them, or with `strict` only spaces and hyphens.
+    let previous = |k: usize, strict: bool| {
+        let j = k.checked_sub(1)?;
+        let gap = &lc[words[j].1..words[k].0];
+        let joined = if strict {
+            gap.chars().all(|c| c.is_whitespace() || c == '-')
+        } else {
+            gap.len() <= 3
+        };
+        joined.then_some(j)
+    };
+    // Whether word `j` makes a code one for signing in: "verification",
+    // "one-time", "sign-in".
+    let sign_in = |j: Option<usize>| {
+        j.is_some_and(|j| {
+            SIGN_IN_CODES.contains(&word(j))
+                || word(j) == "in"
+                    && previous(j, true).is_some_and(|i| matches!(word(i), "sign" | "log"))
+        })
+    };
     let mut anchors = Vec::new();
     for (k, &(start, end)) in words.iter().enumerate() {
-        let word = &lc[start..end];
-        // The word before, if only a space or a hyphen or so comes between.
-        let before = k
-            .checked_sub(1)
-            .map(|j| words[j])
-            .filter(|&(_, e)| start - e <= 3)
-            .map(|(s, e)| &lc[s..e]);
-        // And the one before that, in the same phrase: "order confirmation code".
-        let two_before = before
-            .and(k.checked_sub(2))
-            .map(|j| (words[j], words[j + 1].0))
-            .filter(|&((_, e), next)| lc[e..next].chars().all(|c| c.is_whitespace() || c == '-'))
-            .map(|((s, e), _)| &lc[s..e]);
-        let names_a_code = if word.ends_with("code") || word.ends_with("codes") {
-            !NOT_CODES.contains(&word)
+        let here = word(k);
+        let before = previous(k, false);
+        // And the one before that: "order confirmation code".
+        let two_before = before.and_then(|j| previous(j, true));
+        let is = |j: Option<usize>, list: &[&str]| j.is_some_and(|j| list.contains(&word(j)));
+        let names_a_code = if here.ends_with("code") || here.ends_with("codes") {
+            !NOT_CODES.contains(&here)
         } else {
             matches!(
-                word,
+                here,
                 "otp"
                     | "passcode"
                     | "passcodes"
@@ -534,24 +575,23 @@ fn anchors(lc: &str) -> Vec<Anchor> {
                     | "kod"
                     | "kode"
                     | "kód"
-            ) || (word == "password" && matches!(before, Some("time" | "temporary" | "onetime")))
-                // A PIN says it's for signing in: "one-time PIN".
-                || (word == "pin" && before.is_some_and(|w| SIGN_IN_CODES.contains(&w)))
+            ) || (here == "password" && is(before, &["time", "temporary", "onetime"]))
+                // A PIN says it's for signing in: "one-time PIN", "sign-in PIN".
+                || (here == "pin" && sign_in(before))
         };
-        let sign_in = |w: Option<&str>| w.is_some_and(|w| SIGN_IN_CODES.contains(&w));
-        let other_before = match before {
+        let other_before = match before.map(word) {
             // In India a PIN code is a postal code, and hotels give PIN codes
             // for doors, unless it's a "one-time PIN code".
             Some("pin") => !sign_in(two_before),
-            w => w.is_some_and(|w| OTHER_CODES.contains(&w)),
+            _ => is(before, OTHER_CODES),
         };
         if names_a_code {
             anchors.push(Anchor {
                 start,
                 end,
                 other: other_before
-                    || two_before.is_some_and(|w| PURPOSES.contains(&w))
-                    || two_before.is_some_and(|w| OTHER_CODES.contains(&w)) && !sign_in(before),
+                    || is(two_before, PURPOSES)
+                    || is(two_before, OTHER_CODES) && !sign_in(before),
             });
         }
     }
@@ -740,12 +780,13 @@ fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    // An amount of its own: a number alone before it on its line, not a
-    // masked card ("XXXX1234") or one on the line above.
+    // An amount of its own: a number alone before it on its line ("5000",
+    // "$5,000.00"), not a masked card ("XXXX1234") or one on the line above.
     let rest = &before[..before.len() - word_before.len()];
     let after_a_number = rest[rest.rfind('\n').map_or(0, |i| i + 1)..]
         .split_whitespace()
         .last()
+        .map(|w| w.trim_start_matches(['$', '€', '£', '¥', '₹']))
         .is_some_and(|w| {
             w.contains(|c: char| c.is_ascii_digit())
                 && w.chars()
@@ -1259,6 +1300,31 @@ mod tests {
                     package arrives.";
         assert_eq!(code("Your delivery verification code", text), None);
         assert_eq!(code("Your package arrives today", text), None);
+    }
+
+    #[test]
+    fn handing_over_takes_words_saying_so() {
+        assert_eq!(
+            code(
+                "Your order is out for delivery",
+                "Your one-time code is 719483. Please give this code to the delivery person."
+            ),
+            None
+        );
+        // A driver's own sign-in code is still one.
+        assert_eq!(
+            code(
+                "Your Uber Driver verification code",
+                "Your Uber Driver verification code is 5821. Enter this code to sign in to your \
+                 driver account."
+            )
+            .as_deref(),
+            Some("5821")
+        );
+        assert_eq!(
+            code("", "Your sign-in PIN code is 583719.").as_deref(),
+            Some("583719")
+        );
     }
 
     #[test]

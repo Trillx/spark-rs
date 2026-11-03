@@ -1,0 +1,362 @@
+[
+  {
+    "what": "Google",
+    "subject": "G-482913 is your Google verification code",
+    "text": "G-482913 is your Google verification code. Don't share this code with anyone.",
+    "code": "482913"
+  },
+  {
+    "what": "Microsoft",
+    "subject": "Microsoft account security code",
+    "text": "Use this security code for your Microsoft account: 5728314. If you did not request this code, you can ignore this email.",
+    "code": "5728314"
+  },
+  {
+    "what": "Apple",
+    "subject": "Verify your Apple Account email address",
+    "text": "Your verification code is:\n\n694281\n\nEnter this code to verify your email address. If you did not request this, ignore this email.",
+    "code": "694281"
+  },
+  {
+    "what": "GitHub",
+    "subject": "[GitHub] Please verify your device",
+    "text": "Hey octocat! A sign in attempt requires further verification because we did not recognize your device.\nVerification code: 381962\nIf you did not attempt to sign in, change your password.",
+    "code": "381962"
+  },
+  {
+    "what": "Amazon",
+    "subject": "Your Amazon verification code",
+    "text": "To verify your identity, please use the following code:\n\n921483\n\nDo not share this code with anyone.",
+    "code": "921483"
+  },
+  {
+    "what": "PayPal",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode for this payment:\nAmount: $5,000.00 USD\n\n718394\n\nDo not share this code with anyone.",
+    "code": "718394"
+  },
+  {
+    "what": "Uber rider",
+    "subject": "Your Uber code",
+    "text": "Your Uber code is 5821. Enter this code to sign in to your Uber account. Never share this code.",
+    "code": "5821"
+  },
+  {
+    "what": "Uber Driver",
+    "subject": "Your Uber Driver verification code",
+    "text": "Your Uber Driver verification code is 5821. Enter this code to sign in to your driver account. Never share this code.",
+    "code": "5821"
+  },
+  {
+    "what": "Slack",
+    "subject": "Slack confirmation code: 482-913",
+    "text": "Enter this confirmation code in your browser to sign in to Slack:\n\n482-913\n\nIf you did not request this email, you can safely ignore it.",
+    "code": "482913"
+  },
+  {
+    "what": "Discord",
+    "subject": "Verify your Discord login",
+    "text": "Your verification code is 629184. Enter this code to finish signing in. This code expires in 10 minutes.",
+    "code": "629184"
+  },
+  {
+    "what": "Steam",
+    "subject": "Your Steam account: Access from new computer",
+    "text": "Here is the Steam Guard code you need to login to account octocat:\n\n2F4KD\n\nThis email was generated because of a login attempt from a new computer.",
+    "code": "2F4KD"
+  },
+  {
+    "what": "Epic Games",
+    "subject": "Your two-factor sign in code",
+    "text": "Your security code is 391728. Enter this code to sign in to your Epic Games account. This code expires in 30 minutes.",
+    "code": "391728"
+  },
+  {
+    "what": "SBI",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode for this payment:\nCard: XXXX1234\nINR 5000\n\n482913\n\nDo not share this code with anyone.",
+    "code": "482913"
+  },
+  {
+    "what": "HDFC Bank",
+    "subject": "Your OTP for online payment",
+    "text": "Your OTP for a payment of INR 2500 on your HDFC Bank credit card is 734192. Do not share your OTP with anyone.",
+    "code": "734192"
+  },
+  {
+    "what": "ICICI Bank",
+    "subject": "Your one-time passcode",
+    "text": "Your OTP for an online payment of INR 5000 on card XX1234 is 482913. Do not share your OTP with anyone.",
+    "code": "482913"
+  },
+  {
+    "what": "Axis Bank",
+    "subject": "One-time password for Internet Banking",
+    "text": "Your one-time password is 826419. Use it to sign in to Axis Bank Internet Banking. Do not share this password with anyone.",
+    "code": "826419"
+  },
+  {
+    "what": "HSBC UK",
+    "subject": "Your sign-in PIN",
+    "text": "Your sign-in PIN is 583719. Enter this PIN to sign in to your HSBC account. Do not share it with anyone.",
+    "code": "583719"
+  },
+  {
+    "what": "Lloyds Bank",
+    "subject": "Your Internet Banking security code",
+    "text": "Your security code is 318746. Enter this code to finish signing in to Internet Banking. We will never ask you to share it.",
+    "code": "318746"
+  },
+  {
+    "what": "Barclays",
+    "subject": "Your verification code",
+    "text": "Your verification code is 842619. Enter it to confirm your identity. This code expires in 10 minutes.",
+    "code": "842619"
+  },
+  {
+    "what": "NatWest",
+    "subject": "Your one-time passcode",
+    "text": "Your one-time passcode is 729381. Use it to sign in to Online Banking. Never share your passcode with anyone.",
+    "code": "729381"
+  },
+  {
+    "what": "Chase",
+    "subject": "Your identification code",
+    "text": "To verify your identity, enter the following code:\n\n691482\n\nThis code expires in 10 minutes. Chase will never ask you to share this code.",
+    "code": "691482"
+  },
+  {
+    "what": "Bank of America",
+    "subject": "Your authorization code",
+    "text": "Your authorization code is 472819. Use this code to sign in to Online Banking. If you did not request this code, contact us.",
+    "code": "472819"
+  },
+  {
+    "what": "Wells Fargo",
+    "subject": "Your access code",
+    "text": "Your access code is 573291. Enter it to verify your identity and finish signing in. Do not share this code with anyone.",
+    "code": "573291"
+  },
+  {
+    "what": "Citi",
+    "subject": "Your one-time PIN",
+    "text": "Your one-time PIN is 931742. Enter this PIN to verify your identity. This PIN expires in 10 minutes.",
+    "code": "931742"
+  },
+  {
+    "what": "Capital One",
+    "subject": "Your temporary PIN",
+    "text": "Your temporary PIN is 628194. Enter it to sign in to your account. Do not share this PIN with anyone.",
+    "code": "628194"
+  },
+  {
+    "what": "Booking.com",
+    "subject": "Your Booking.com verification code",
+    "text": "Use this verification code to sign in to your Booking.com account:\n\n583192\n\nIf you did not request this code, ignore this email.",
+    "code": "583192"
+  },
+  {
+    "what": "British Airways",
+    "subject": "Verify your email address",
+    "text": "Your verification code is 392861. Enter this code to verify your email address for your British Airways Club account.",
+    "code": "392861"
+  },
+  {
+    "what": "United Airlines",
+    "subject": "Your MileagePlus verification code",
+    "text": "Your verification code is 817492. Enter this code to sign in to your MileagePlus account. Do not share this code.",
+    "code": "817492"
+  },
+  {
+    "what": "Delta Air Lines",
+    "subject": "Your SkyMiles verification code",
+    "text": "Your verification code is 751839. Enter it to confirm your identity and finish signing in to your SkyMiles account.",
+    "code": "751839"
+  },
+  {
+    "what": "American Airlines",
+    "subject": "Your AAdvantage one-time passcode",
+    "text": "Your one-time passcode is 483729. Use it to sign in to your AAdvantage account. This passcode expires in 10 minutes.",
+    "code": "483729"
+  },
+  {
+    "what": "Amazon receipt",
+    "subject": "Your Amazon order",
+    "text": "Thanks for your order. Order number: 112-4829135-1234567. Total: USD 49.99. Sign in to view your order.",
+    "code": null
+  },
+  {
+    "what": "Apple receipt",
+    "subject": "Your receipt from Apple",
+    "text": "Apple Music Individual\nOrder ID: MK2Q8L9P10\nTotal: USD 10.99\nSign in to view your purchase history.",
+    "code": null
+  },
+  {
+    "what": "Uber receipt",
+    "subject": "Your Tuesday afternoon trip with Uber",
+    "text": "Your trip with Daniel\nTotal: GBP 18.45\nThanks for riding with Uber. Sign in to view your trips.",
+    "code": null
+  },
+  {
+    "what": "PayPal receipt",
+    "subject": "Receipt for your payment",
+    "text": "You paid ACME STORE USD 48.29. Transaction ID: 8HK39271RD492175B. Sign in to view your activity.",
+    "code": null
+  },
+  {
+    "what": "Stripe receipt",
+    "subject": "Your receipt from Notion",
+    "text": "Amount paid: USD 120.00\nInvoice number: 1087\nYour payment was successful. Sign in to manage your subscription.",
+    "code": null
+  },
+  {
+    "what": "Amazon delivery",
+    "subject": "Your package arrives today",
+    "text": "Your one-time code is 681492. Please share this code with your driver when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "Flipkart delivery",
+    "subject": "Your delivery verification code",
+    "text": "Your one-time code is 719483. Give this code to the delivery executive when your parcel arrives. Sign in to track your order.",
+    "code": null
+  },
+  {
+    "what": "DHL delivery",
+    "subject": "Your parcel is ready to collect",
+    "text": "Your pickup code is 839172. Use this code at the collection point. Sign in to track your parcel.",
+    "code": null
+  },
+  {
+    "what": "Uber Eats delivery",
+    "subject": "Your Uber Eats order",
+    "text": "Your PIN is 5837. Share it with your delivery partner when your order arrives. Sign in to view your order.",
+    "code": null
+  },
+  {
+    "what": "Adobe invoice",
+    "subject": "Your Adobe invoice is ready",
+    "text": "Invoice number: 642871\nAmount due: USD 59.99\nSign in to download your invoice.",
+    "code": null
+  },
+  {
+    "what": "Microsoft invoice",
+    "subject": "Your Microsoft invoice is ready",
+    "text": "Invoice number: E040193842\nCustomer code: 482913\nSign in to view your billing statement.",
+    "code": null
+  },
+  {
+    "what": "Nike promo",
+    "subject": "Your member discount code",
+    "text": "Use code RUN20 for 20% off your next order. Sign in to shop now.",
+    "code": null
+  },
+  {
+    "what": "Steam promo",
+    "subject": "Your Steam discount code",
+    "text": "Your discount code is SAVE20. Sign in to redeem this offer before Sunday.",
+    "code": null
+  },
+  {
+    "what": "Zoom invite",
+    "subject": "Invitation: Project planning",
+    "text": "Join Zoom Meeting\nMeeting ID: 812 3456 7890\nPasscode: 482913\nPlease join the meeting at 10 AM.",
+    "code": null
+  },
+  {
+    "what": "Teams invite",
+    "subject": "Project review",
+    "text": "Microsoft Teams meeting\nMeeting ID: 391 729 184\nPasscode: 4K7Q9X\nJoin the meeting on Tuesday.",
+    "code": null
+  },
+  {
+    "what": "Google Calendar invite",
+    "subject": "Invitation: Design review",
+    "text": "Design review\nTuesday, 10:00–10:30 AM\nJoin with Google Meet: https://meet.google.com/abc-defg-hij\nSign in to view all event details.",
+    "code": null
+  },
+  {
+    "what": "Google security",
+    "subject": "Security alert",
+    "text": "A new sign-in on Windows. We noticed a new sign-in to your Google Account. If this was you, you do not need to do anything. Review your activity.",
+    "code": null
+  },
+  {
+    "what": "GitHub security",
+    "subject": "[GitHub] A new public key was added to your account",
+    "text": "Hey octocat! A new SSH authentication key was added to your account. If you did not add this key, sign in and remove it.",
+    "code": null
+  },
+  {
+    "what": "Microsoft security",
+    "subject": "Microsoft account unusual sign-in activity",
+    "text": "We detected something unusual about a recent sign-in. Country: United States. Platform: Windows. Browser: Edge. Review your recent activity.",
+    "code": null
+  },
+  {
+    "what": "GitHub PR",
+    "subject": "Re: [octo/repo] Fix login code path (#4821)",
+    "text": "octocat requested your review. View this pull request at https://github.com/octo/repo/pull/4821 .",
+    "code": null
+  },
+  {
+    "what": "GitHub issue",
+    "subject": "Re: [octo/repo] Error code 503 on sign in (#1739)",
+    "text": "A user reported an error code 503 when attempting to sign in. View the issue at https://github.com/octo/repo/issues/1739 .",
+    "code": null
+  },
+  {
+    "what": "Booking.com hotel",
+    "subject": "Your booking is confirmed",
+    "text": "Your reservation at City Hotel is confirmed.\nConfirmation number: 4829135701\nPIN code: 5837\nSign in to manage your booking.",
+    "code": null
+  },
+  {
+    "what": "Agoda hotel",
+    "subject": "Your hotel check-in details",
+    "text": "Your reservation at City Hotel is ready.\nDoor PIN: 6284\nCheck-in from 3 PM. Sign in to manage your booking.",
+    "code": null
+  },
+  {
+    "what": "British Airways booking",
+    "subject": "Your booking confirmation",
+    "text": "Your booking reference is 6K9Q2R. Flight BA 287. Sign in to Manage My Booking to view your itinerary.",
+    "code": null
+  },
+  {
+    "what": "Lufthansa booking",
+    "subject": "Your flight booking",
+    "text": "Your booking code is 4K7Q9X. Use this code to manage your reservation. Sign in to see your trip.",
+    "code": null
+  },
+  {
+    "what": "Wise transfer",
+    "subject": "Your international transfer details",
+    "text": "Sign in to view your transfer.\nSWIFT BIC code: CHASUS33\nUse this code for international transfers.",
+    "code": null
+  },
+  {
+    "what": "Chase transfer",
+    "subject": "Your wire transfer instructions",
+    "text": "Sign in to Online Banking to send a wire.\nSWIFT/BIC code: CHASUS33\nUse this code for international wire transfers.",
+    "code": null
+  },
+  {
+    "what": "HSBC transfer",
+    "subject": "Your account details",
+    "text": "Sign in to Online Banking to view your account details.\nSort code: 401276\nAccount number: 12345678\nUse these details for bank transfers.",
+    "code": null
+  },
+  {
+    "what": "Amazon delivery with subject OTP",
+    "subject": "Your one-time password: 681492",
+    "text": "Your one-time password for delivery is 681492. Please share this code with your driver when your package arrives.",
+    "code": null
+  },
+  {
+    "what": "Flipkart handover executive",
+    "subject": "Your order is out for delivery",
+    "text": "Your one-time code is 719483. Please share this code with the delivery executive when your package arrives.",
+    "code": null
+  }
+]
