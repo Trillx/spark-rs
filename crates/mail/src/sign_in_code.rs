@@ -189,9 +189,26 @@ const OTHER_CODES: &[&str] = &[
     "package",
     "shipment",
     "locker",
-    "store",
-    "shop",
     "item",
+];
+
+/// Words before "code" that make it one for signing in, whatever comes
+/// before them: in "Your Shop verification code" the brand is no qualifier.
+const SIGN_IN_CODES: &[&str] = &[
+    "verification",
+    "verify",
+    "security",
+    "login",
+    "signin",
+    "authentication",
+    "auth",
+    "passcode",
+    "otp",
+    "mfa",
+    "fa",
+    "temporary",
+    "time",
+    "use",
 ];
 
 /// Currencies, as words before or after an amount ("INR 5000", "5000 USD").
@@ -275,6 +292,9 @@ fn ceil(s: &str, mut i: usize) -> usize {
 struct Anchor {
     start: usize,
     end: usize,
+    /// For something else: "order confirmation code", "customer code". Its
+    /// number isn't one to sign in with, whatever other words name it.
+    other: bool,
 }
 
 /// Something that could be the code, by byte position in the text.
@@ -295,7 +315,8 @@ struct Candidate {
 /// closest to a word that names a code, with its score (lower is likelier).
 /// Unless `vouched`, only words with talk of signing in near them count.
 fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
-    let mut anchors = anchors(lc);
+    let (others, mut anchors): (Vec<Anchor>, Vec<Anchor>) =
+        anchors(lc).into_iter().partition(|a| a.other);
     if !vouched {
         anchors.retain(|a| {
             about(&lc[floor(lc, a.start.saturating_sub(ABOUT_NEAR))..ceil(lc, a.end + ABOUT_NEAR)])
@@ -310,11 +331,18 @@ fn best(src: &str, lc: &str, vouched: bool) -> Option<(usize, String)> {
         if promotion_near(lc, c) {
             continue;
         }
-        let Some(score) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
+        let Some(likely) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
             continue;
         };
-        if best.is_none_or(|(s, _)| score < s) {
-            best = Some((score, c));
+        // The number an "order confirmation code" names stays its, though a
+        // later "use this code" names it too.
+        if let Some(other) = others.iter().filter_map(|a| score(src, lc, a, c)).min()
+            && other <= likely
+        {
+            continue;
+        }
+        if best.is_none_or(|(s, _)| likely < s) {
+            best = Some((likely, c));
         }
     }
     best.map(|(score, c)| (score, c.code.clone()))
@@ -466,8 +494,13 @@ fn anchors(lc: &str) -> Vec<Anchor> {
             ) || (word == "password" && matches!(before, Some("time" | "temporary" | "onetime")))
         };
         let other = |w: Option<&str>| w.is_some_and(|w| OTHER_CODES.contains(&w));
-        if names_a_code && !other(before) && !other(two_before) {
-            anchors.push(Anchor { start, end });
+        let sign_in = before.is_some_and(|w| SIGN_IN_CODES.contains(&w));
+        if names_a_code {
+            anchors.push(Anchor {
+                start,
+                end,
+                other: other(before) || !sign_in && other(two_before),
+            });
         }
     }
     anchors
@@ -645,21 +678,28 @@ fn candidates(src: &str) -> Vec<Candidate> {
 
 /// Whether the words around a number at `start..end` make it an amount
 /// ("INR 5000", "Rs. 5000", "5000 USD") or a quantity ("1440 minutes").
+/// Only the words on its own line count, and a currency after it that's
+/// another amount's ("482913 INR 5000") doesn't.
 fn amount_or_quantity(src: &str, start: usize, end: usize) -> bool {
-    let word_before = src[..start]
+    let line_before = &src[src[..start].rfind('\n').map_or(0, |i| i + 1)..start];
+    let line_after = &src[end..src[end..].find('\n').map_or(src.len(), |i| end + i)];
+    let word_before = line_before
         .trim_end_matches(|c: char| c.is_whitespace() || c == '.')
         .rsplit(|c: char| !c.is_ascii_alphabetic())
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let word_after = src[end..]
-        .trim_start()
+    let after = line_after.trim_start();
+    let word_after = after
         .split(|c: char| !c.is_ascii_alphabetic())
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let then_a_number = after[word_after.len()..]
+        .trim_start()
+        .starts_with(|c: char| c.is_ascii_digit());
     CURRENCIES.contains(&word_before.as_str())
-        || CURRENCIES.contains(&word_after.as_str())
+        || CURRENCIES.contains(&word_after.as_str()) && !then_a_number
         || UNITS.contains(&word_after.as_str())
 }
 
@@ -1010,6 +1050,61 @@ mod tests {
         for (subject, text) in none {
             assert_eq!(code(subject, text), None, "{subject}: {text}");
         }
+    }
+
+    #[test]
+    fn a_code_named_for_something_else_stays_so() {
+        assert_eq!(
+            code(
+                "Your order confirmation",
+                "Your order confirmation code\n\n482913\n\nUse this code to collect your order."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_currency_on_the_next_line_or_before_another_amount_is_not_the_codes() {
+        assert_eq!(
+            code(
+                "Your one-time passcode",
+                "Your OTP is 482913\nINR 5000 will be charged to your card."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code(
+                "Your one-time passcode",
+                "Your OTP is 482913 INR 5000 at ACME"
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("Your one-time passcode", "Your OTP is 5000 INR").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_brand_before_a_verification_code_is_no_qualifier() {
+        assert_eq!(
+            code(
+                "Your Shop verification code",
+                "Your Shop verification code is 482913. Enter this code to sign in."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("", "Your App Store verification code is 482913.").as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("", "Your Customer verification code is 482913.").as_deref(),
+            Some("482913")
+        );
     }
 
     #[test]
