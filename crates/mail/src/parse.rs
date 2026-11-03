@@ -6,6 +6,7 @@ use spark_store::{Body, Category, Incoming};
 
 use crate::attachment;
 use crate::invite::Invite;
+use crate::sign_in_code;
 use crate::unsubscribe;
 
 pub use mail_parser::decoders::html::html_to_text;
@@ -46,6 +47,8 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
             .is_some_and(|v| !v.trim().eq_ignore_ascii_case("no")),
     };
 
+    let subject = m.subject().unwrap_or_default().trim().to_owned();
+    let sign_in_code = sign_in_code::find(&subject, &text, html.as_deref());
     Some(Incoming {
         message_id: m.message_id().map(bare_id),
         in_reply_to: ids(m.in_reply_to()).into_iter().next(),
@@ -57,7 +60,7 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
         to: display_list(m.to()),
         cc: display_list(m.cc()),
         bcc: display_list(m.bcc()),
-        subject: m.subject().unwrap_or_default().trim().to_owned(),
+        subject,
         date: m.date().map_or(0, |d| d.to_timestamp() * 1000),
         snippet: snippet(&text),
         text,
@@ -68,6 +71,7 @@ pub fn parse_message(raw: &[u8]) -> Option<Incoming> {
             m.header_raw("List-Unsubscribe")
                 .is_some_and(unsubscribe::offered),
         ),
+        sign_in_code,
         body: Body::Whole,
         ..Default::default()
     })

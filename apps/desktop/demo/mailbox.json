@@ -230,5 +230,12 @@
       { "title": "I'll sign it", "body": "Hi Dana,\n\nThanks for sending the renewal over. I'll sign it and get it back to you before Friday." },
       { "title": "A question first", "body": "Hi Dana,\n\nThanks for sending the renewal. Before I sign, could you tell me where parking spot 14B is?" }
     ]
+  },
+  {
+    "id": 29, "account": "personal", "category": "notifications", "unread": true, "signInCode": "482913",
+    "from": "Fernway", "address": "no-reply@fernway.example", "ageMinutes": 3,
+    "subject": "Your Fernway sign-in code",
+    "snippet": "Your sign-in code is 482913. It expires in 10 minutes. If you didn't try to sign in, you can ignore this email.",
+    "body": ["Your sign-in code is", "482913", "It expires in 10 minutes. If you didn't try to sign in, you can ignore this email.", "The Fernway team"]
   }
 ]

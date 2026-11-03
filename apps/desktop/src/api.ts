@@ -1406,6 +1406,8 @@ let browserPrefs: Prefs = {
   notify: "people",
   sound: true,
   snoozeAlert: true,
+  codeAlerts: true,
+  afterCodeCopy: "keep",
   badge: "new",
   badgeExcluded: [],
   keepRunning: true,

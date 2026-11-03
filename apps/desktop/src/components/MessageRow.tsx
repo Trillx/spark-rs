@@ -6,6 +6,7 @@ import {
   Circle,
   CircleCheck,
   Clock,
+  Copy,
   Ellipsis,
   Paperclip,
   Pin,
@@ -18,6 +19,7 @@ import type { Message } from "../types";
 import { dragMessage } from "../lib/drag";
 import { formatLater, formatLaterShort, formatListDate } from "../lib/format";
 import { recipientNames } from "../lib/recipients";
+import { rowCode } from "../lib/signInCode";
 import { hint } from "../lib/shortcuts";
 import Avatar from "./Avatar";
 import { AutoLabelChip } from "./AutoLabelChip";
@@ -36,6 +38,8 @@ export interface RowActions {
   read: (m: Message) => void;
   /** Opens the Command Center for this row. */
   more: (m: Message) => void;
+  /** Copies the email's sign-in code (see `rowCode`). */
+  copyCode: (m: Message) => void;
 }
 
 /** Every row's height: the list places rows it hasn't rendered by it. */
@@ -86,6 +90,7 @@ function MessageRow({
   const hover = inPriorityCard ? "hover:bg-priority-line/60" : "hover:bg-row-hover";
   const to = recipients ? recipientNames(m.to) : null;
   const weight = m.unread ? "font-semibold" : "font-medium";
+  const code = rowCode(m);
   return (
     <div
       role="option"
@@ -224,7 +229,25 @@ function MessageRow({
           {m.attachment && <Paperclip size={12} className="shrink-0 rotate-45 text-text-2" aria-label="Has attachment" />}
           {m.muted && <BellOff size={12} className="shrink-0 text-text-2" aria-label="Muted" />}
         </div>
-        <div className="truncate text-[13px] leading-5 text-text-2">{m.snippet || "No content"}</div>
+        {code ? (
+          <div className="flex items-center gap-1.5 text-[13px] leading-5 text-text-2">
+            <span className="min-w-0 flex-1 truncate">{m.snippet || "No content"}</span>
+            <button
+              data-tip="Copy sign-in code"
+              aria-label={`Copy sign-in code ${code}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                actions.copyCode(m);
+              }}
+              className="flex h-5 shrink-0 items-center gap-1 rounded-md bg-primary/10 px-1.5 text-xs font-semibold tabular-nums text-primary hover:bg-primary/20"
+            >
+              <Copy size={11} strokeWidth={2.5} />
+              {code}
+            </button>
+          </div>
+        ) : (
+          <div className="truncate text-[13px] leading-5 text-text-2">{m.snippet || "No content"}</div>
+        )}
       </div>
     </div>
   );

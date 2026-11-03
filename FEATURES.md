@@ -28,7 +28,7 @@ Last full check: 2026-10-26.
 | Smart Inbox | ✅ | Priority, Pins, Invitations, People, Responses, Notifications and Newsletters as cards (each can be turned off or show more), or as one focused list; a sender can be moved to another category |
 | Unified Inbox | ✅ | Every account in one inbox, with a row per account to see one alone |
 | Smart Search | 🟡 | Full-text search on your computer and on each mail server, in every account or just the one you're in, with `from:`, `has:attachment`, `is:unread` and `date:today`, search by sender and recent searches; no plain-language searches such as "PDFs from Anna last week" |
-| Smart Notifications | ✅ | Only mail from people notifies, unless you change it to all mail or only Priority mail |
+| Smart Notifications | ✅ | Only mail from people notifies, unless you change it to all mail or only Priority mail. Beyond Spark, as in Gmail: mail with a sign-in code notifies from any sender, with a button that copies the code, and the list and the open email offer to copy it too (not yet tried with a real account) |
 | Scheduled Sends | ✅ | Send Later with Spark's presets or a day and time you pick; the Scheduled list sends now, moves, edits or cancels what's waiting, and lists mail that couldn't be sent yet, with why, while it's tried again |
 | Snooze | 🟡 | Spark's presets, a custom date and time, and Discard Snooze; Snoozed lists mail by when it comes back, and it returns to the top of the Inbox with a notification. No Someday |
 | Set Aside | ✅ | |

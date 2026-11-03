@@ -196,6 +196,9 @@ pub struct Incoming {
     /// Whether its `List-Unsubscribe` header gives a way to leave the list;
     /// `None` when the fetch didn't read that header.
     pub unsubscribe: Option<bool>,
+    /// The one-time code it carries for signing in, as the user would type
+    /// it (`spark_mail::sign_in_code`).
+    pub sign_in_code: Option<String>,
     /// How much of the message the fetch brought: only a whole one fills in
     /// the body of one stored without it.
     pub body: Body,
@@ -331,6 +334,8 @@ pub struct Message {
     /// Whether it can be unsubscribed from (`Incoming::unsubscribe`);
     /// `None` for mail whose headers weren't read for it.
     pub unsubscribe: Option<bool>,
+    /// The one-time code it carries for signing in (`Incoming::sign_in_code`).
+    pub sign_in_code: Option<String>,
 }
 
 /// A reminder in the Inbox, on the email it came back as.
@@ -745,7 +750,7 @@ const MESSAGE_COLUMNS: &str = "id, account_id, category, state, snoozed_until, u
      json_extract(invite, '$.kind'), \
      (SELECT label FROM auto_labels WHERE message_id = messages.id), \
      (SELECT draft_id FROM auto_drafts WHERE message_id = messages.id ORDER BY created_at DESC, draft_id DESC LIMIT 1), \
-     content_rev, unsubscribe";
+     content_rev, unsubscribe, sign_in_code";
 
 /// The messages the list shows: all but drafts waiting in the outbox to be sent.
 const LISTED: &str = "id NOT IN (SELECT draft_message FROM outbox WHERE draft_message IS NOT NULL)";
@@ -971,6 +976,16 @@ impl Store {
                  ALTER TABLE messages ADD COLUMN unsubscribe INTEGER;",
             )?;
             tx.pragma_update(None, "user_version", 29)?;
+            tx.commit()?;
+        }
+        if version < 30 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "-- The one-time code it carries for signing in
+                 -- (`Message::sign_in_code`); NULL for mail stored before.
+                 ALTER TABLE messages ADD COLUMN sign_in_code TEXT;",
+            )?;
+            tx.pragma_update(None, "user_version", 30)?;
             tx.commit()?;
         }
         conn.execute_batch(contacts::WATCH_CONTACTS)?;
@@ -2736,7 +2751,7 @@ fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<Option<bo
         conn.prepare_cached(
             "UPDATE messages SET text_body = ?2, html_body = ?3, attachments = ?4, invite = ?5,
                 snippet = CASE WHEN ?6 = '' THEN snippet ELSE ?6 END, body_missing = 0,
-                content_rev = content_rev + 1
+                sign_in_code = ?7, content_rev = content_rev + 1
              WHERE id = ?1 AND body_missing != 0",
         )?
         .execute(params![
@@ -2745,7 +2760,8 @@ fn fill_in_body_in(conn: &Connection, id: i64, m: &Incoming) -> Result<Option<bo
             m.html,
             json(&m.attachments),
             m.invite,
-            m.snippet
+            m.snippet,
+            m.sign_in_code
         ])? > 0,
     ))
 }
@@ -2788,12 +2804,12 @@ fn insert_message(
             from_name, from_address, to_list, cc_list, subject, snippet, date,
             text_body, html_body, attachments, category, state, unread, pinned, screening,
             remote_place, remote_unread, remote_pinned, bcc_list, invite, reply_to_list,
-            auto_category, body_missing, unsubscribe)
+            auto_category, body_missing, unsubscribe, sign_in_code)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  ?16, ?17, ?18,
                  -- The sender's category if the user chose one, else what its headers say.
                  COALESCE((SELECT category FROM sender_categories WHERE address = ?10), ?19),
-                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19, ?28, ?29)",
+                 ?20, ?21, ?22, ?23, ?24, ?21, ?22, ?25, ?26, ?27, ?19, ?28, ?29, ?30)",
     )?
     .execute(params![
         m.account_id,
@@ -2825,6 +2841,7 @@ fn insert_message(
         json(m.reply_to.as_deref().unwrap_or_default()),
         m.body == Body::Missing,
         m.unsubscribe,
+        m.sign_in_code,
     ])?;
     let id = conn.last_insert_rowid();
     let threading = conversations::Threading {
@@ -2997,6 +3014,7 @@ fn message_row(r: &Row) -> Result<Message> {
         auto_draft: r.get(26)?,
         content_rev: r.get(27)?,
         unsubscribe: r.get(28)?,
+        sign_in_code: r.get(29)?,
     })
 }
 

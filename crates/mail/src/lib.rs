@@ -16,6 +16,7 @@ pub mod oauth;
 pub mod parse;
 pub mod recurrence;
 pub mod search;
+pub mod sign_in_code;
 pub mod signature;
 pub mod smtp;
 pub mod tls;

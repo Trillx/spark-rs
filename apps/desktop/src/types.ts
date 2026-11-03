@@ -132,6 +132,8 @@ export interface Message {
    * before it was kept, or from Microsoft 365). See `canUnsubscribe`.
    */
   unsubscribe?: boolean;
+  /** The one-time code it carries for signing in, as the user would type it ("482913"). See `lib/signInCode`. */
+  signInCode?: string;
 }
 
 /** Spark's Auto-Labels (AutoLabel in the store's automation.rs). */
@@ -256,6 +258,9 @@ export interface FolderView {
 /** Which new mail shows a notification. `people` is Spark's smart notifications. */
 export type NotifyFor = "people" | "all" | "priority" | "off";
 
+/** What copying an email's sign-in code does to it: nothing, mark its conversation read, or mark it Done. */
+export type AfterCodeCopy = "keep" | "read" | "done";
+
 /** What the app icon's badge counts: unread conversations in the Inbox, all of them, or nothing. */
 export type BadgeCount = "new" | "inbox" | "off";
 
@@ -273,6 +278,10 @@ export interface Prefs {
   sound: boolean;
   /** A notification when snoozed mail comes back. */
   snoozeAlert: boolean;
+  /** New mail with a sign-in code notifies, with a button that copies it, even from senders `notify` leaves out. */
+  codeAlerts: boolean;
+  /** What copying a sign-in code does to its email. */
+  afterCodeCopy: AfterCodeCopy;
   badge: BadgeCount;
   /** Accounts the badge leaves out. */
   badgeExcluded: AccountId[];

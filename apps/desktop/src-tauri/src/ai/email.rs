@@ -93,6 +93,7 @@ pub mod tests {
             auto_draft: None,
             content_rev: 0,
             unsubscribe: None,
+            sign_in_code: None,
         }
     }
 

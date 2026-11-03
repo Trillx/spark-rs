@@ -19,6 +19,7 @@ import {
   Forward,
   Group,
   Inbox,
+  KeyRound,
   ListChecks,
   MailX,
   Pin,
@@ -133,6 +134,8 @@ export interface ThreadActions {
   stopSummary: (m: Message) => void;
   deleteSummary: (m: Message) => void;
   summaryCopied: () => void;
+  /** Copies the email's sign-in code, then marks it as Settings → Notifications says. */
+  copyCode: (m: Message) => void;
   openAiSettings: () => void;
   /** Opens the settings page with Load remote images. */
   openImageSettings: () => void;
@@ -1296,6 +1299,7 @@ function MessageCard({
       ) : (
         <>
           <CardHeader message={m} account={account} content={null} onCollapse={onCollapse} actions={actions} />
+          {m.signInCode && <CodeBar code={m.signInCode} onCopy={() => actions.copyCode(m)} />}
           <div className="flow-root overflow-hidden" style={{ height: bodies.height(m.id) }}>
             <BodySkeleton />
           </div>
@@ -1360,6 +1364,7 @@ function CardContent({
   return (
     <>
       <CardHeader message={m} account={account} content={content} onCollapse={onCollapse} actions={actions} />
+      {m.signInCode && <CodeBar code={m.signInCode} onCopy={() => actions.copyCode(m)} />}
       {/* Measured for its placeholder (flow-root keeps the margins inside); a
           body loading again after the cache let it go keeps that height. */}
       <div
@@ -1463,6 +1468,24 @@ function CardHeader({
         </Dropdown>
       </div>
     </header>
+  );
+}
+
+/** The email's sign-in code, under its header, with a button that copies it. */
+function CodeBar({ code, onCopy }: { code: string; onCopy: () => void }) {
+  return (
+    <div className="mx-5 mb-1 mt-1.5 flex items-center gap-2.5 rounded-xl bg-chip py-1.5 pl-3 pr-1.5 text-[13px] leading-5">
+      <KeyRound size={14} className="shrink-0 text-text-2" aria-hidden />
+      <span className="text-text-2">Sign-in code</span>
+      <span className="select-all font-semibold tabular-nums tracking-[0.08em]">{code}</span>
+      <button
+        className="btn btn-sm ml-auto h-7 min-h-0 gap-1.5 rounded-lg border-0 bg-primary/10 px-3 text-primary shadow-none hover:bg-primary/20"
+        onClick={onCopy}
+      >
+        <Copy size={13} />
+        Copy
+      </button>
+    </div>
   );
 }
 

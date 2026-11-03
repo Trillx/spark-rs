@@ -1,0 +1,831 @@
+//! Sign-in codes: the one-time code an email carries to prove it's you
+//! ("Your verification code is 482913"), found as mail arrives so its
+//! notification and the list can offer to copy it, as Gmail does.
+//!
+//! It's a guess from the words around the code, made on the device: no AI,
+//! nothing sent anywhere. A miss only costs a copy button, while a wrong
+//! find puts a number on the clipboard and can notify about mail that
+//! wouldn't have, so when in doubt it finds nothing.
+
+use mail_parser::decoders::html::html_to_text;
+
+/// How much of an email's text is read, in bytes: codes come near the top.
+const LOOK: usize = 6000;
+/// How much of its HTML is read again when its text runs words together.
+const LOOK_HTML: usize = 200_000;
+/// How far after the word "code" its code may be, in characters.
+const AFTER: usize = 100;
+/// The same, for a code on a line of its own, as HTML emails show it big.
+const AFTER_OWN_LINE: usize = 300;
+/// How far before the word "code" it may be when the words between
+/// introduce it ("482913 is your Instagram code").
+const BEFORE: usize = 60;
+/// How far before it may be otherwise ("482913. This code expires…").
+const BEFORE_LOOSE: usize = 20;
+
+/// Words that say an email is about signing in or proving who you are;
+/// without one, a number near "code" is a door code or an order.
+const ABOUT_SIGNING_IN: &[&str] = &[
+    "verif",
+    "sign in",
+    "sign-in",
+    "signin",
+    "signing in",
+    "log in",
+    "login",
+    "log-in",
+    "logging in",
+    "one-time",
+    "one time",
+    "otp",
+    "passcode",
+    "2fa",
+    "mfa",
+    "two-factor",
+    "two factor",
+    "2-step",
+    "two-step",
+    "authenticat",
+    "security code",
+    "your code is",
+    "is your code",
+    "enter the code",
+    "enter this code",
+    "use this code",
+    "use the following code",
+    "the code below",
+    "do not share",
+    "don't share",
+    "never share",
+    "confirm your",
+    "identity",
+    // Spanish, Portuguese, French, Italian, German, Dutch.
+    "código",
+    "vérif",
+    "codice",
+    "bestätig",
+    "anmeld",
+    "einmal",
+    "inlog",
+];
+
+/// Meeting invites carry passcodes and IDs that aren't for signing in.
+const MEETINGS: &[&str] = &[
+    "meeting id",
+    "meeting-id",
+    "conference id",
+    "webinar id",
+    "join zoom",
+    "zoom meeting",
+    "teams meeting",
+    "join the meeting",
+    "dial-in",
+    "dial in",
+];
+
+/// Near a code, these make it a shop's.
+const PROMOTIONS: &[&str] = &[
+    "% off",
+    "promo",
+    "coupon",
+    "discount",
+    "voucher",
+    "gift card",
+    "checkout",
+    "redeem",
+    "referral",
+    "free shipping",
+    "shop now",
+];
+
+/// Words ending in "code" that aren't one to type.
+const NOT_CODES: &[&str] = &[
+    "unicode",
+    "barcode",
+    "barcodes",
+    "zipcode",
+    "postcode",
+    "decode",
+    "decodes",
+    "encode",
+    "encodes",
+    "opcode",
+    "geocode",
+    "transcode",
+    "shortcode",
+    "qrcode",
+    "dresscode",
+    "promocode",
+    "promocodes",
+    "pseudocode",
+    "hardcode",
+    "recode",
+    "sourcecode",
+];
+
+/// "… code" that isn't for signing in.
+const OTHER_CODES: &[&str] = &[
+    "promo",
+    "promotional",
+    "promotion",
+    "discount",
+    "coupon",
+    "voucher",
+    "gift",
+    "referral",
+    "offer",
+    "redemption",
+    "zip",
+    "postal",
+    "post",
+    "area",
+    "country",
+    "dialing",
+    "source",
+    "error",
+    "status",
+    "response",
+    "tracking",
+    "reference",
+    "booking",
+    "reservation",
+    "order",
+    "ticket",
+    "product",
+    "qr",
+    "bar",
+    "dress",
+    "invite",
+    "invitation",
+    "sale",
+    "bonus",
+    "reward",
+    "rewards",
+    "tax",
+    "swift",
+    "sort",
+    "routing",
+    "branch",
+    "airport",
+    "color",
+    "colour",
+    "html",
+    "sample",
+    "example",
+];
+
+/// The code in an email with this subject, text and HTML, as the user
+/// would type it: "G-482913" and "482 913" give "482913".
+pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
+    let text = head(text, LOOK);
+    let subject_lc = subject.to_ascii_lowercase();
+    let text_lc = text.to_ascii_lowercase();
+    let about = |lc: &str| ABOUT_SIGNING_IN.iter().any(|w| lc.contains(w));
+    if !(about(&subject_lc) || about(&text_lc)) || MEETINGS.iter().any(|w| text_lc.contains(w)) {
+        return None;
+    }
+    // The likelier of the subject's and the text's, the subject's if they tie.
+    [best(subject, &subject_lc), best(text, &text_lc)]
+        .into_iter()
+        .flatten()
+        .min_by_key(|&(score, _)| score)
+        .or_else(|| {
+            // HTML without spaces between its tags runs words together
+            // ("code</td><td>482913" reads "code482913"): read it again
+            // with a space at every tag.
+            let spaced = html_to_text(&head(html?, LOOK_HTML).replace('<', " <"));
+            let spaced = head(&spaced, LOOK);
+            best(spaced, &spaced.to_ascii_lowercase())
+        })
+        .map(|(_, code)| code)
+}
+
+/// The start of `s`, up to `max` bytes, cut at a character.
+fn head(s: &str, max: usize) -> &str {
+    &s[..floor(s, max)]
+}
+
+fn floor(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// A word that names a code: "code", "passcode", "Bestätigungscode", "OTP".
+#[derive(Debug)]
+struct Anchor {
+    start: usize,
+    end: usize,
+}
+
+/// Something that could be the code, by byte position in the text.
+#[derive(Debug)]
+struct Candidate {
+    start: usize,
+    end: usize,
+    /// As the user would type it.
+    code: String,
+    /// Letters and digits ("2F4KD"), which ordinary text has more of than
+    /// codes, so they need the words right before them to say so.
+    mixed: bool,
+    /// Four digits that could be a year.
+    year: bool,
+}
+
+/// The best candidate in `src` (`lc` is it in ASCII lower case), the one
+/// closest to a word that names a code, with its score (lower is likelier).
+fn best(src: &str, lc: &str) -> Option<(usize, String)> {
+    let anchors = anchors(lc);
+    if anchors.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &Candidate)> = None;
+    let candidates = candidates(src);
+    for c in &candidates {
+        if promotion_near(lc, c) {
+            continue;
+        }
+        let Some(score) = anchors.iter().filter_map(|a| score(src, lc, a, c)).min() else {
+            continue;
+        };
+        if best.is_none_or(|(s, _)| score < s) {
+            best = Some((score, c));
+        }
+    }
+    best.map(|(score, c)| (score, c.code.clone()))
+}
+
+/// How far `c` is from anchor `a`, lower being likelier; `None` if it's
+/// too far, or the words between don't fit.
+fn score(src: &str, lc: &str, a: &Anchor, c: &Candidate) -> Option<usize> {
+    if c.start >= a.end {
+        let gap = &lc[a.end..c.start];
+        let far = gap.chars().count();
+        // "Code: 482913", "code is 482913".
+        if far <= 30
+            && matches!(
+                letters(gap).as_str(),
+                "" | "is" | "es" | "est" | "ist" | "é" | "è"
+            )
+        {
+            return Some(0);
+        }
+        let own_line = own_line(src, c);
+        if far > if own_line { AFTER_OWN_LINE } else { AFTER } {
+            return None;
+        }
+        // Past the end of a sentence it's something else, unless it stands
+        // on its own, as codes are shown.
+        if !own_line && (c.mixed || c.year || ends_sentence(gap)) {
+            return None;
+        }
+        Some(far)
+    } else if c.end <= a.start {
+        let gap = &lc[c.end..a.start];
+        let far = gap.chars().count();
+        let words = gap.trim_start();
+        // "482913 is your Instagram code", "Use 482913 as your login code".
+        if far <= BEFORE
+            && ["is ", "as ", "es ", "est ", "ist ", "è "]
+                .iter()
+                .any(|w| words.starts_with(w))
+            && !ends_sentence(gap)
+        {
+            return Some(1);
+        }
+        if far > BEFORE_LOOSE || c.mixed || c.year || ends_sentence(gap) {
+            return None;
+        }
+        Some(far + 20)
+    } else {
+        None
+    }
+}
+
+/// Only the letters of `s`.
+fn letters(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphabetic()).collect()
+}
+
+/// Whether `gap` crosses the end of a sentence.
+fn ends_sentence(gap: &str) -> bool {
+    let mut chars = gap.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '.' | '!' | '?') && chars.peek().is_some_and(|n| n.is_whitespace()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `c` is all its line holds.
+fn own_line(src: &str, c: &Candidate) -> bool {
+    let start = src[..c.start].rfind('\n').map_or(0, |i| i + 1);
+    let end = src[c.end..].find('\n').map_or(src.len(), |i| c.end + i);
+    src[start..c.start].trim().is_empty() && src[c.end..end].trim().is_empty()
+}
+
+fn promotion_near(lc: &str, c: &Candidate) -> bool {
+    let near = &lc[floor(lc, c.start.saturating_sub(150))..ceil(lc, c.end + 150)];
+    PROMOTIONS.iter().any(|w| near.contains(w))
+}
+
+/// The words in `lc` that name a code.
+fn anchors(lc: &str) -> Vec<Anchor> {
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, ch) in lc.char_indices() {
+        match (ch.is_alphabetic(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                words.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        words.push((s, lc.len()));
+    }
+    let mut anchors = Vec::new();
+    for (k, &(start, end)) in words.iter().enumerate() {
+        let word = &lc[start..end];
+        // The word before, if only a space or a hyphen or so comes between.
+        let before = k
+            .checked_sub(1)
+            .map(|j| words[j])
+            .filter(|&(_, e)| start - e <= 3)
+            .map(|(s, e)| &lc[s..e]);
+        let names_a_code = if word.ends_with("code") || word.ends_with("codes") {
+            !NOT_CODES.contains(&word)
+        } else {
+            matches!(
+                word,
+                "otp"
+                    | "passcode"
+                    | "passcodes"
+                    | "pin"
+                    | "código"
+                    | "codigo"
+                    | "códigos"
+                    | "codice"
+                    | "kod"
+                    | "kode"
+                    | "kód"
+            ) || (word == "password" && matches!(before, Some("time" | "temporary" | "onetime")))
+        };
+        if names_a_code && !before.is_some_and(|b| OTHER_CODES.contains(&b)) {
+            anchors.push(Anchor { start, end });
+        }
+    }
+    anchors
+}
+
+/// Everything in `src` shaped like a code: 4–8 digits, maybe in groups
+/// ("482 913", "4829-1357") or one a box ("4 8 2 9 1 3"), maybe after a
+/// letter or two ("G-482913"); or 4–10 capitals and digits ("2F4KD",
+/// "4K7-9QX"). Dates, times, amounts, phone numbers and the numbers in
+/// links aren't.
+fn candidates(src: &str) -> Vec<Candidate> {
+    let bytes = src.as_bytes();
+    // Runs of ASCII letters and digits.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match (b.is_ascii_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                runs.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, bytes.len()));
+    }
+    let digits = |r: (usize, usize)| bytes[r.0..r.1].iter().all(u8::is_ascii_digit);
+    let at = |i: usize| bytes.get(i).copied();
+    let before = |i: usize| i.checked_sub(1).map(|j| bytes[j]);
+
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < runs.len() {
+        let run = runs[i];
+        if digits(run) {
+            // Digits in a box each: 4–8 of them, a few spaces apart.
+            if run.1 - run.0 == 1 {
+                let mut j = i;
+                while j + 1 < runs.len()
+                    && runs[j + 1].1 - runs[j + 1].0 == 1
+                    && digits(runs[j + 1])
+                    && runs[j + 1].0 - runs[j].1 <= 3
+                    && src[runs[j].1..runs[j + 1].0]
+                        .chars()
+                        .all(char::is_whitespace)
+                {
+                    j += 1;
+                }
+                if (4..=8).contains(&(j - i + 1))
+                    && clear_before(bytes, run.0)
+                    && clear_after(bytes, runs[j].1)
+                {
+                    found.push(Candidate {
+                        start: run.0,
+                        end: runs[j].1,
+                        code: runs[i..=j].iter().map(|r| &src[r.0..r.1]).collect(),
+                        mixed: false,
+                        year: false,
+                    });
+                    i = j + 1;
+                    continue;
+                }
+            }
+            // Digits joined by single separators: one number, a date, a
+            // time, an amount, a phone number or a code in groups.
+            let mut j = i;
+            let mut joints = Vec::new();
+            while j + 1 < runs.len() && runs[j + 1].0 - runs[j].1 == 1 && digits(runs[j + 1]) {
+                let joint = bytes[runs[j].1];
+                if !matches!(joint, b' ' | b'-' | b'.' | b',' | b'/' | b':') {
+                    break;
+                }
+                joints.push(joint);
+                j += 1;
+            }
+            let groups: Vec<usize> = runs[i..=j].iter().map(|r| r.1 - r.0).collect();
+            let total: usize = groups.iter().sum();
+            let grouped = match groups.as_slice() {
+                [_] => true,
+                [a, rest @ ..] => {
+                    joints.iter().all(|&joint| joint == joints[0])
+                        && matches!(joints[0], b' ' | b'-')
+                        && rest.iter().all(|g| g == a)
+                        && (*a == 3 || *a == 4 || (*a == 2 && groups.len() == 3))
+                }
+                [] => false,
+            };
+            let (start, end) = (run.0, runs[j].1);
+            // "G-482913": Google's code, typed without the G.
+            let prefix = (before(start) == Some(b'-'))
+                .then(|| i.checked_sub(1).map(|k| runs[k]))
+                .flatten()
+                .filter(|p| {
+                    p.1 + 1 == start
+                        && (1..=3).contains(&(p.1 - p.0))
+                        && bytes[p.0..p.1].iter().all(u8::is_ascii_uppercase)
+                        && clear_before(bytes, p.0)
+                });
+            let clear = match prefix {
+                Some(_) => true,
+                None => clear_before(bytes, start),
+            };
+            if grouped && (4..=8).contains(&total) && clear && clear_after(bytes, end) {
+                let code: String = runs[i..=j].iter().map(|r| &src[r.0..r.1]).collect();
+                let year = total == 4 && (1900..=2099).contains(&code.parse::<u32>().unwrap_or(0));
+                found.push(Candidate {
+                    start: prefix.map_or(start, |p| p.0),
+                    end,
+                    code,
+                    mixed: false,
+                    year,
+                });
+            }
+            i = j + 1;
+            continue;
+        }
+        // Capitals and digits, maybe two groups joined by a hyphen.
+        let capitals = |r: (usize, usize)| {
+            bytes[r.0..r.1]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        };
+        if capitals(run) {
+            let mut end = run.1;
+            let mut j = i;
+            if at(end) == Some(b'-')
+                && i + 1 < runs.len()
+                && runs[i + 1].0 == end + 1
+                && capitals(runs[i + 1])
+                && (3..=4).contains(&(run.1 - run.0))
+                && (3..=4).contains(&(runs[i + 1].1 - runs[i + 1].0))
+            {
+                j = i + 1;
+                end = runs[j].1;
+            }
+            let chars = &bytes[run.0..end];
+            let shape = (4..=10)
+                .contains(&chars.iter().filter(|b| b.is_ascii_alphanumeric()).count())
+                && chars.iter().any(u8::is_ascii_digit)
+                && chars.iter().any(u8::is_ascii_uppercase);
+            if shape && clear_before(bytes, run.0) && clear_after(bytes, end) {
+                found.push(Candidate {
+                    start: run.0,
+                    end,
+                    code: src[run.0..end].to_owned(),
+                    mixed: true,
+                    year: false,
+                });
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Nothing before position `i` makes it part of something else: an amount,
+/// a phone number, a link, an address, a hashtag or issue number.
+fn clear_before(bytes: &[u8], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).map(|j| bytes[j]) else {
+        return true;
+    };
+    match prev {
+        b'+' | b'#' | b'$' | b'/' | b'=' | b'?' | b'&' | b'@' | b'.' | b'_' | b'\\' | b'%' => false,
+        // "order-482913" (a short prefix, as in "G-482913", is the caller's).
+        b'-' => !i
+            .checked_sub(2)
+            .is_some_and(|j| bytes[j].is_ascii_alphanumeric()),
+        // Currency signs other than '$' take more than a byte: €, £, ¥, ₹.
+        _ => {
+            let tail = &bytes[i.saturating_sub(3)..i];
+            !["€", "£", "¥", "₹"]
+                .iter()
+                .any(|sign| tail.ends_with(sign.as_bytes()))
+        }
+    }
+}
+
+/// Nothing after position `i` makes it part of something else.
+fn clear_after(bytes: &[u8], i: usize) -> bool {
+    let Some(&next) = bytes.get(i) else {
+        return true;
+    };
+    let then = bytes.get(i + 1).copied();
+    match next {
+        b'%' | b'@' | b'_' | b'/' | b'\\' => false,
+        // Into another word or number: "482913-abc", "482913.jpg", "4,5".
+        b'-' | b'.' | b',' | b':' => !then.is_some_and(|b| b.is_ascii_alphanumeric()),
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code(subject: &str, text: &str) -> Option<String> {
+        find(subject, text, None)
+    }
+
+    #[test]
+    fn finds_the_codes_big_senders_send() {
+        // Google
+        assert_eq!(
+            code(
+                "G-482913 is your Google verification code",
+                "G-482913 is your Google verification code.\n\nDon't share this code with anyone."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // Microsoft
+        assert_eq!(
+            code(
+                "Microsoft account security code",
+                "Microsoft account\nSecurity code\nPlease use the following security code for the \
+                 Microsoft account jo*****@outlook.com.\nSecurity code: 4829135\nIf you don't \
+                 recognize the Microsoft account jo*****@outlook.com, you can click here to remove \
+                 your email address from that account.\nThanks,\nThe Microsoft account team"
+            )
+            .as_deref(),
+            Some("4829135")
+        );
+        // GitHub: the code is well down the email.
+        assert_eq!(
+            code(
+                "[GitHub] Please verify your device",
+                "Hey octocat!\n\nA sign in attempt requires further verification because we did \
+                 not recognize your device. To complete the sign in, enter the verification code \
+                 on the unrecognized device.\n\nDevice: Chrome on Windows\nVerification code: \
+                 482913\n\nIf you did not attempt to sign in to your account, your password may be \
+                 compromised. Visit https://github.com/settings/security to create a new, strong \
+                 password for your GitHub account."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // Apple: on a line of its own.
+        assert_eq!(
+            code(
+                "Verify your Apple Account email address",
+                "Your verification code is:\n\n482913\n\nIf you didn't ask for a code, you can \
+                 ignore this email."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // Instagram: in the subject, before the word.
+        assert_eq!(
+            code(
+                "482913 is your Instagram code",
+                "Hi octocat, Someone tried to log in to your Instagram account. If this was you, \
+                 please use the following code to confirm your identity:\n\n482913"
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("", "Use 4829135 as Microsoft account security code").as_deref(),
+            Some("4829135")
+        );
+        // Amazon
+        assert_eq!(
+            code(
+                "Your Amazon verification code",
+                "To verify your identity, please use the following code:\n\n482913\n\nAmazon takes \
+                 your account security very seriously."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn finds_codes_written_in_groups_or_with_letters() {
+        assert_eq!(
+            code(
+                "Your login code",
+                "Your login code is 482 913. It expires in 10 minutes."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("Sign in", "Your one-time code: 4829 1357").as_deref(),
+            Some("48291357")
+        );
+        // Each digit in a box of its own.
+        assert_eq!(
+            code(
+                "Verify your email",
+                "Your verification code\n4 8 2 9 1 3\nThis code expires in 10 minutes."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // Slack-style, a few lines down, on a line of its own.
+        assert_eq!(
+            code(
+                "Slack confirmation code: 482-913",
+                "Confirm your email address\nYour confirmation code is below — enter it in your \
+                 open browser window and we'll help you get signed in.\n\n482-913\n\nIf you didn't \
+                 request this email, there's nothing to worry about."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        // Steam Guard: capitals and digits.
+        assert_eq!(
+            code(
+                "Your Steam account: Access from new computer",
+                "Here is the Steam Guard code you need to login to account octocat:\n\n2F4KD\n\nThis \
+                 email was generated because of a login attempt from a new computer."
+            )
+            .as_deref(),
+            Some("2F4KD")
+        );
+        assert_eq!(
+            code("", "Your verification code is 4K7-9QX").as_deref(),
+            Some("4K7-9QX")
+        );
+        // A bank's, after an amount.
+        assert_eq!(
+            code(
+                "",
+                "Your one-time passcode (OTP) for the transaction of $1,234.00 at ACME STORE is \
+                 482913. Do not share it with anyone."
+            )
+            .as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn finds_codes_in_other_languages() {
+        assert_eq!(
+            code(
+                "Tu código de verificación",
+                "Tu código de verificación es 482913"
+            )
+            .as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("Anmeldung", "Ihr Bestätigungscode lautet: 482913").as_deref(),
+            Some("482913")
+        );
+        assert_eq!(
+            code("", "Votre code de vérification est 482913").as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn reads_html_that_runs_words_together() {
+        let html = "<html><head><style>.c{color:#FF0000}</style></head><body><table><tr><td>Your \
+                    verification code</td><td>482913</td></tr></table></body></html>";
+        let text = html_to_text(html);
+        assert_eq!(code("Verify", &text), None, "the text reads {text:?}");
+        assert_eq!(find("Verify", &text, Some(html)).as_deref(), Some("482913"));
+    }
+
+    #[test]
+    fn a_year_needs_the_words_right_before_it() {
+        assert_eq!(
+            code("", "Your verification code: 2024").as_deref(),
+            Some("2024")
+        );
+        assert_eq!(
+            code("", "Your verification code expires soon, 2026 Example Inc").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn leaves_mail_that_only_mentions_numbers_and_codes() {
+        let none = [
+            (
+                "20% off everything",
+                "Use code SAVE20 at checkout. Offer expires Sunday.",
+            ),
+            (
+                "Your discount code",
+                "Your discount code is WELCOME10. Sign in to use it.",
+            ),
+            (
+                "Invitation: Weekly sync",
+                "Join Zoom Meeting\nhttps://zoom.us/j/81234567890?pwd=abc\n\nMeeting ID: 812 3456 \
+                 7890\nPasscode: 482913",
+            ),
+            (
+                "Your order",
+                "Thanks for your order! Order number: 112-4829135-1234567. Sign in to track it.",
+            ),
+            (
+                "Shipped",
+                "Your tracking code is 1Z999AA10123456784. Log in to see where it is.",
+            ),
+            (
+                "Verify your email",
+                "Please verify your email address by clicking the link below. This link expires in \
+                 24 hours.\n\n© 2026 Example Inc, 1600 Main Street",
+            ),
+            (
+                "Sign in to Example",
+                "Click the button below to sign in. This link and code expire in 10 minutes.\n\n\
+                 Example Inc, 1600 Amphitheatre Parkway, Mountain View, CA 94043",
+            ),
+            (
+                "Your sign-in code",
+                "Didn't request this code? Call us at 1-800-555-0199 or +44 20 7946 0958.",
+            ),
+            (
+                "Sign-in attempt",
+                "Your sign-in code was requested on 03/11/2026 at 14:35 from 192.168.1.20.",
+            ),
+            ("Door", "Hey! The door code is 4829, see you at 7."),
+            (
+                "Re: [octo/repo] Fix login code path (#4821)",
+                "@octocat requested your review on: octo/repo#4821 Fix login code path\n\nYou can \
+                 view, comment on, or merge this pull request online at: \
+                 https://github.com/octo/repo/pull/4821",
+            ),
+        ];
+        for (subject, text) in none {
+            assert_eq!(code(subject, text), None, "{subject}: {text}");
+        }
+    }
+
+    #[test]
+    fn cuts_long_text_at_a_character() {
+        let long = "é".repeat(LOOK);
+        assert_eq!(code("Your verification code", &long), None);
+        assert_eq!(head("aé", 2), "a");
+    }
+}

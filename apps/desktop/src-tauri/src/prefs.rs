@@ -1,6 +1,7 @@
 //! Settings → Notifications: which new mail shows a notification, its sound,
-//! the app icon badge, calendar alerts, the meeting pop-up, and running in
-//! the background. Saved as `prefs.json` in the app's config directory.
+//! sign-in codes, the app icon badge, calendar alerts, the meeting pop-up,
+//! and running in the background. Saved as `prefs.json` in the app's config
+//! directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,19 @@ pub enum NotifyFor {
     /// Only Priority mail: from Priority senders, or in Priority conversations.
     Priority,
     Off,
+}
+
+/// What copying an email's sign-in code does to the email.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AfterCodeCopy {
+    /// Leaves it as it is.
+    #[default]
+    Keep,
+    /// Marks its conversation read.
+    Read,
+    /// Marks its conversation Done.
+    Done,
 }
 
 /// What the app icon's badge counts, as Spark's App icon badge setting.
@@ -61,6 +75,11 @@ pub struct Prefs {
     pub sound: bool,
     /// A notification when snoozed mail comes back.
     pub snooze_alert: bool,
+    /// New mail with a sign-in code notifies, with a button that copies the
+    /// code, even from senders `notify` leaves out (`notify::alerts`).
+    pub code_alerts: bool,
+    /// What copying a sign-in code does to its email.
+    pub after_code_copy: AfterCodeCopy,
     /// How long Undo can stop a message after Send, in seconds.
     pub undo_send_seconds: u32,
     /// Replies start with "Mark as Done after sending" on.
@@ -115,6 +134,8 @@ impl Default for Prefs {
             notify: NotifyFor::People,
             sound: true,
             snooze_alert: true,
+            code_alerts: true,
+            after_code_copy: AfterCodeCopy::Keep,
             undo_send_seconds: 5,
             send_and_done: false,
             reply_attachments: ReplyAttachments::Never,
@@ -329,6 +350,7 @@ mod tests {
         );
         assert!(prefs.event_alerts);
         assert_eq!(prefs.meeting_popup_minutes, 1, "a minute before, as Spark");
+        assert!(prefs.code_alerts && prefs.after_code_copy == AfterCodeCopy::Keep);
     }
 
     #[test]

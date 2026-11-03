@@ -104,6 +104,10 @@ pub struct Message {
     /// from Microsoft 365, whose listings leave headers out).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsubscribe: Option<bool>,
+    /// The one-time code it carries for signing in, as the user would type
+    /// it (`spark_mail::sign_in_code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in_code: Option<String>,
 }
 
 fn is_zero(n: &i64) -> bool {
@@ -418,6 +422,7 @@ fn from_store(m: spark_store::Message) -> Message {
         auto_draft: m.auto_draft,
         content_rev: m.content_rev,
         unsubscribe: m.unsubscribe,
+        sign_in_code: m.sign_in_code,
     }
 }
 
@@ -3058,6 +3063,7 @@ mod tests {
             auto_draft: None,
             content_rev: 0,
             unsubscribe: None,
+            sign_in_code: None,
         });
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["muted"], true);

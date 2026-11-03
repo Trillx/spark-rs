@@ -114,6 +114,7 @@ import type {
   AgentAccess,
   AgentActivity,
   AgentsView,
+  AfterCodeCopy,
   BadgeCount,
   DefaultSignature,
   GatekeeperMode,
@@ -1502,6 +1503,13 @@ function PriorityPage({
 
 // ---- Notifications ----
 
+/** What copying a sign-in code does to its email. */
+const AFTER_CODE_COPY_CHOICES: { key: AfterCodeCopy; label: string }[] = [
+  { key: "keep", label: "Leave it" },
+  { key: "read", label: "Mark as Read" },
+  { key: "done", label: "Mark as Done" },
+];
+
 const BADGE_CHOICES: { key: BadgeCount; label: string }[] = [
   { key: "new", label: "New emails" },
   { key: "inbox", label: "Whole Inbox" },
@@ -1754,8 +1762,8 @@ function NotificationsPage() {
         </div>
         <p className="mt-2 px-1 text-xs leading-[18px] text-text-2">
           Smart leaves out notifications and newsletters. Priority is mail from Priority senders and in Priority
-          conversations. Mail waiting in New senders doesn't notify, and while the spark-rs window is in front, new
-          mail just appears in the list.
+          conversations. Mail waiting in New senders doesn't notify, sign-in codes aside, and while the spark-rs window
+          is in front, new mail just appears in the list.
         </p>
       </section>
 
@@ -1769,6 +1777,36 @@ function NotificationsPage() {
           htmlFor="snooze-alert"
         >
           <Switch id="snooze-alert" on={prefs.snoozeAlert} onToggle={() => void change({ snoozeAlert: !prefs.snoozeAlert })} />
+        </Row>
+        <Row
+          label="Sign-in codes"
+          description="Emails with a one-time code notify from any sender, with a button that copies the code."
+          htmlFor="code-alerts"
+        >
+          <Switch
+            id="code-alerts"
+            on={prefs.codeAlerts}
+            disabled={off}
+            onToggle={() => void change({ codeAlerts: !prefs.codeAlerts })}
+          />
+        </Row>
+        <Row
+          label="After copying a code"
+          description="What copying a sign-in code, from a notification or the list, does to its email."
+          htmlFor="after-code-copy"
+        >
+          <select
+            id="after-code-copy"
+            value={prefs.afterCodeCopy}
+            onChange={(e) => void change({ afterCodeCopy: e.target.value as AfterCodeCopy })}
+            className="select select-sm h-8 w-40 rounded-lg border-hairline text-[13px]"
+          >
+            {AFTER_CODE_COPY_CHOICES.map((c) => (
+              <option key={c.key} value={c.key}>
+                {c.label}
+              </option>
+            ))}
+          </select>
         </Row>
         <Row label="Test notification" description="Check how new mail will look and sound.">
           <button className="btn btn-sm h-8 rounded-lg" disabled={status.kind === "busy"} onClick={() => void test()}>

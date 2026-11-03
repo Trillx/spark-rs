@@ -2771,6 +2771,8 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         _ => Vec::new(),
     };
     let invite = listed_invite(m).filter(|_| body_missing);
+    let subject = m.subject.clone().unwrap_or_default().trim().to_owned();
+    let sign_in_code = crate::sign_in_code::find(&subject, &text, html.as_deref());
     Incoming {
         account_id,
         remote_id: Some(m.id.clone()),
@@ -2785,7 +2787,7 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         to: m.to_recipients.iter().filter_map(display).collect(),
         cc: m.cc_recipients.iter().filter_map(display).collect(),
         bcc: m.bcc_recipients.iter().filter_map(display).collect(),
-        subject: m.subject.clone().unwrap_or_default().trim().to_owned(),
+        subject,
         snippet: snippet(m.body_preview.as_deref().unwrap_or(&text)),
         date: m
             .received_date_time
@@ -2799,6 +2801,7 @@ pub fn to_incoming(account_id: i64, m: &GraphMessage) -> Incoming {
         category,
         unread: !m.is_read.unwrap_or(false),
         flagged: m.flag.as_ref().is_some_and(|f| f.flag_status == "flagged"),
+        sign_in_code,
         body: if body_missing {
             Body::Missing
         } else {

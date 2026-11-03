@@ -23,6 +23,7 @@ import {
   Group,
   House,
   Inbox,
+  KeyRound,
   LayoutGrid,
   List,
   ListChecks,
@@ -195,6 +196,7 @@ import {
 } from "./lib/conversation";
 import { isDraft } from "./lib/drafts";
 import { andMore, canUnsubscribe, settleEach, unsubscribeTargets } from "./lib/unsubscribe";
+import { copiedText } from "./lib/signInCode";
 import { draftLeft, goneNotice, markTrying, stuckNotice } from "./lib/outbox";
 import {
   activate as activateHome,
@@ -415,6 +417,7 @@ type AppPrefs = Pick<
   | "autoCc"
   | "autoBcc"
   | "autoDownloadAttachments"
+  | "afterCodeCopy"
 >;
 
 /** Until the saved settings load: the Rust side's defaults. */
@@ -427,6 +430,7 @@ const DEFAULT_APP_PREFS: AppPrefs = {
   autoCc: {},
   autoBcc: {},
   autoDownloadAttachments: true,
+  afterCodeCopy: "keep",
 };
 
 /** What AI does in a composer (by `composerKey`), and its body (text and HTML) before AI started. */
@@ -1053,7 +1057,17 @@ export default function App() {
       () => {},
     );
     void getPrefs().then(
-      ({ badge, badgeExcluded, undoSendSeconds, sendAndDone, replyAttachments, autoCc, autoBcc, autoDownloadAttachments }) =>
+      ({
+        badge,
+        badgeExcluded,
+        undoSendSeconds,
+        sendAndDone,
+        replyAttachments,
+        autoCc,
+        autoBcc,
+        autoDownloadAttachments,
+        afterCodeCopy,
+      }) =>
         setAppPrefs({
           badge,
           badgeExcluded,
@@ -1063,6 +1077,7 @@ export default function App() {
           autoCc,
           autoBcc,
           autoDownloadAttachments,
+          afterCodeCopy,
         }),
       () => {},
     );
@@ -2023,6 +2038,28 @@ export default function App() {
     deleteForever: (m: Message) => deleteForeverAsk(together(m)),
     pin: (m: Message) => flag(m, "pinned", "Pinned", "Unpinned", ICONS.pin),
     priority: (m: Message) => flag(m, "priority", "Thread is Priority", "Thread is Not Priority", ICONS.priority),
+    /**
+     * Copies `m`'s sign-in code, then marks its conversation read or Done as Settings → Notifications says, with
+     * Undo. Mail waiting in New senders or brought back by a reminder isn't marked Done: that's for the user to decide.
+     */
+    copyCode: (m: Message) => {
+      const code = m.signInCode;
+      if (!code) return;
+      void navigator.clipboard.writeText(code).then(
+        () => {
+          const one = own(m);
+          const unread = appPrefs.afterCodeCopy === "read" ? threadOf(m).filter((x) => x.unread) : [];
+          const done =
+            appPrefs.afterCodeCopy === "done" && one.state === "inbox" && !one.screening && !one.reminder;
+          if (unread.length) {
+            holdRows(unread);
+            act(unread, { unread: false }, copiedText(code, "read"), ICONS.copy);
+          } else if (done) act(together(m), DONE, copiedText(code, "done"), ICONS.copy);
+          else showToast(copiedText(code, null), undefined, ICONS.copy);
+        },
+        (error) => showToast(`Couldn't copy the code: ${String(error)}`, undefined, ICONS.error),
+      );
+    },
     /** Reading marks the whole conversation read; unread marks `m`. */
     read: (m: Message) => {
       const unread = threadOf(m).filter((x) => x.unread);
@@ -3793,6 +3830,18 @@ export default function App() {
     const m = target && asThread(target, threadOf(target));
     const messageCommands: Command[] = m
       ? [
+          ...(m.signInCode
+            ? [
+                {
+                  id: "copy-code",
+                  label: "Copy Sign-in Code",
+                  keywords: "verification one-time otp passcode 2fa",
+                  Icon: KeyRound,
+                  detail: m.signInCode,
+                  run: () => actions.copyCode(m),
+                },
+              ]
+            : []),
           {
             id: "done",
             label: m.state === "done" ? "Move to Inbox" : "Done",
@@ -4272,6 +4321,7 @@ export default function App() {
     priority: actions.priority,
     read: actions.read,
     more: (m) => setPalette({ kind: "actions", targetId: m.id }),
+    copyCode: actions.copyCode,
   });
 
   const threadActions: ThreadActions = {

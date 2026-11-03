@@ -138,6 +138,9 @@ struct DemoEntry {
     /// For such a draft, the replies it offers.
     #[serde(default)]
     auto_draft_options: Vec<DraftOption>,
+    /// The sign-in code it carries, as sync would find it.
+    #[serde(default)]
+    sign_in_code: Option<String>,
 }
 
 /// The demo accounts and their mail in a store of their own, for recipient
@@ -574,6 +577,7 @@ impl DemoMailbox {
             auto_draft: None,
             content_rev: 0,
             unsubscribe: None,
+            sign_in_code: None,
         };
         messages.retain(|m| m.id != id);
         messages.push(saved);
@@ -757,6 +761,7 @@ fn demo_messages(now_ms: i64) -> Vec<Message> {
             auto_draft: e.auto_draft,
             content_rev: 0,
             unsubscribe: None,
+            sign_in_code: e.sign_in_code,
         })
         .collect()
 }
@@ -846,6 +851,20 @@ mod tests {
     use super::*;
 
     const NOW_MS: i64 = 1_790_000_000_000;
+
+    /// The demo's sign-in codes are the ones sync would find, and its other
+    /// mail has none.
+    #[test]
+    fn demo_sign_in_codes_are_what_sync_finds() {
+        let entries: Vec<DemoEntry> =
+            serde_json::from_str(include_str!("../../demo/mailbox.json")).unwrap();
+        assert!(entries.iter().any(|e| e.sign_in_code.is_some()));
+        for e in entries {
+            let found =
+                spark_mail::sign_in_code::find(&e.subject, &e.body.join("\n\n"), e.html.as_deref());
+            assert_eq!(found, e.sign_in_code, "demo email {}: {}", e.id, e.subject);
+        }
+    }
 
     #[test]
     fn demo_mailbox_parses_with_defaults() {

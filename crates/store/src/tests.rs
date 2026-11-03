@@ -1420,6 +1420,7 @@ fn version_27_databases_keep_their_queue_and_give_no_outbox_id_twice() {
                  PRAGMA foreign_keys = ON;
                  DROP TRIGGER temp.log_message_changed;
                  ALTER TABLE messages DROP COLUMN unsubscribe;
+                 ALTER TABLE messages DROP COLUMN sign_in_code;
                  PRAGMA user_version = 27;",
             )
             .unwrap();
@@ -1445,7 +1446,7 @@ fn version_27_databases_keep_their_queue_and_give_no_outbox_id_twice() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     let queued: Vec<_> = store
         .outbox_sends()
         .unwrap()
@@ -4314,6 +4315,7 @@ fn version_21_databases_index_pending_and_snoozed_mail() {
              DROP TRIGGER temp.log_message_changed;
              ALTER TABLE messages DROP COLUMN content_rev;
              ALTER TABLE messages DROP COLUMN unsubscribe;
+             ALTER TABLE messages DROP COLUMN sign_in_code;
              PRAGMA user_version = 21;",
         )
         .unwrap();
@@ -4371,6 +4373,7 @@ fn version_25_databases_have_every_body() {
                  DROP TRIGGER temp.log_message_changed;
                  ALTER TABLE messages DROP COLUMN content_rev;
                  ALTER TABLE messages DROP COLUMN unsubscribe;
+                 ALTER TABLE messages DROP COLUMN sign_in_code;
                  PRAGMA user_version = 25;",
             )
             .unwrap();
@@ -4841,6 +4844,41 @@ fn graph_mail_keyed_anew_is_stored_once() {
     assert!(!store.rekey_remote(account_id, busy, None).unwrap());
     assert!(store.message(busy).unwrap().is_some());
     assert!(store.has_remote_id(account_id, "rest-4").unwrap());
+}
+
+#[test]
+fn sign_in_codes_are_kept_and_come_with_a_body_downloaded_later() {
+    let (mut store, account) = store_with_account();
+    let code = Incoming {
+        sign_in_code: Some("482913".into()),
+        ..incoming(account, 1, "no-reply@accounts.example.com")
+    };
+    let id = new_id(store.add_incoming(&code, false).unwrap());
+    assert_eq!(
+        store.message(id).unwrap().unwrap().sign_in_code.as_deref(),
+        Some("482913")
+    );
+    // Stored without its body, its preview had none; the body has one.
+    let later = new_id(store.add_incoming(&head(account, 2), false).unwrap());
+    assert_eq!(store.message(later).unwrap().unwrap().sign_in_code, None);
+    let (_, mark) = store.messages_marked().unwrap();
+    let whole = Incoming {
+        sign_in_code: Some("771204".into()),
+        ..whole(account, 2)
+    };
+    assert_eq!(store.fill_in_body(later, &whole).unwrap(), Some(true));
+    assert_eq!(
+        store
+            .message(later)
+            .unwrap()
+            .unwrap()
+            .sign_in_code
+            .as_deref(),
+        Some("771204")
+    );
+    let changes = store.message_changes(&mark.unwrap()).unwrap().unwrap();
+    assert_eq!(changes.messages.len(), 1);
+    assert_eq!(changes.messages[0].sign_in_code.as_deref(), Some("771204"));
 }
 
 #[test]

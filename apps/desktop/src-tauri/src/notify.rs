@@ -1,6 +1,8 @@
 //! New-mail notifications: Windows toasts with the New Mail sound. Clicking
 //! one brings the window forward and opens the message (`open-message`).
-//! Calendar alerts (`alerts.rs`) show here too, with buttons.
+//! Mail with a sign-in code (`spark_mail::sign_in_code`) gets a button that
+//! copies the code without opening anything. Calendar alerts (`alerts.rs`)
+//! show here too, with buttons.
 //!
 //! An app without an installer has to introduce itself to Windows before its
 //! toasts show: `register` writes its name and icon under
@@ -9,14 +11,25 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use spark_mail::Engine;
-use spark_store::{Category, GatekeeperMode, Message, MessageState, Reminder};
+use spark_store::{
+    Category, GatekeeperMode, Message, MessageState, Patch, Reminder, Store, now_ms,
+};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::background;
-use crate::prefs::{NotifyFor, PrefsState};
+use crate::mailbox::Mailbox;
+use crate::prefs::{AfterCodeCopy, NotifyFor, PrefsState};
 
 /// More new mail than this in one sync becomes a single "N new emails".
 const MAX_SEPARATE: usize = 3;
+
+/// How long after it arrives a sign-in code is worth a notification of its
+/// own: they last minutes, and mail that comes in late (a laptop waking up)
+/// is past it.
+const CODE_FRESH_MS: i64 = 60 * 60 * 1000;
+
+/// The arguments of a toast's Copy button.
+const COPY_CODE: &str = "copy-code";
 
 /// One toast.
 #[derive(Debug, PartialEq, Eq)]
@@ -28,6 +41,8 @@ pub struct Alert {
     pub attribution: Option<String>,
     /// The message a click opens.
     pub message: Option<i64>,
+    /// Its sign-in code, which a button copies.
+    pub code: Option<String>,
 }
 
 /// Introduces the app to Windows' notification system. Run at every start:
@@ -69,7 +84,8 @@ pub fn new_mail(app: &AppHandle, engine: &Engine, account_id: i64, ids: &[i64]) 
     };
     // One sound per sync, not one per toast.
     let mut sound = prefs.sound;
-    for alert in alerts(&arrived, prefs.notify, account.as_deref()) {
+    let codes = prefs.code_alerts.then_some(now_ms());
+    for alert in alerts(&arrived, prefs.notify, codes, account.as_deref()) {
         if let Err(e) = show(app, &alert, sound) {
             eprintln!("spark-rs: couldn't show a notification: {e}");
             return;
@@ -128,6 +144,7 @@ pub fn reminder_alerts(due: &[Reminder]) -> Vec<Alert> {
             lines: vec!["Their emails are back in your Inbox.".into()],
             attribution: None,
             message: None,
+            code: None,
         }];
     }
     due.iter()
@@ -148,6 +165,7 @@ pub fn reminder_alerts(due: &[Reminder]) -> Vec<Alert> {
             ],
             attribution: None,
             message: r.message,
+            code: None,
         })
         .collect()
 }
@@ -173,6 +191,7 @@ pub fn returned_alerts(returned: &[Message]) -> Vec<Alert> {
             lines: vec![senders(&returned)],
             attribution: None,
             message: None,
+            code: None,
         }];
     }
     returned
@@ -189,6 +208,7 @@ pub fn returned_alerts(returned: &[Message]) -> Vec<Alert> {
             ],
             attribution: None,
             message: Some(m.id),
+            code: None,
         })
         .collect()
 }
@@ -203,6 +223,7 @@ pub fn kept_running(app: &AppHandle) {
         ],
         attribution: None,
         message: None,
+        code: None,
     };
     if let Err(e) = show(app, &alert, false) {
         eprintln!("spark-rs: couldn't show a notification: {e}");
@@ -223,6 +244,7 @@ pub fn agent_sending(app: &AppHandle, agent: &str, to: &str, subject: &str) {
         ],
         attribution: None,
         message: None,
+        code: None,
     };
     let sound = app.state::<PrefsState>().get().sound;
     if let Err(e) = show(app, &alert, sound) {
@@ -277,6 +299,7 @@ pub fn focus_alert(new_emails: u32) -> Alert {
         lines: vec![line],
         attribution: None,
         message: None,
+        code: None,
     }
 }
 
@@ -289,57 +312,81 @@ pub fn test_notification(app: AppHandle) -> Result<(), String> {
         lines: vec!["New mail will look like this.".into()],
         attribution: None,
         message: None,
+        code: None,
     };
     show(&app, &alert, sound)
 }
 
 /// What to show for the mail that arrived in one sync of one account.
-/// Mail waiting in New Senders (`screening`) or blocked shows none.
-pub fn alerts(arrived: &[Message], notify: NotifyFor, account: Option<&str>) -> Vec<Alert> {
-    let wanted: Vec<&Message> = arrived
+/// Mail waiting in New Senders (`screening`) or blocked shows none. With
+/// `codes` (the time now), mail with a fresh sign-in code shows anyway, from
+/// any sender but a muted conversation's, in a toast of its own: it's mail
+/// the user is waiting for, often from a service they're signing up to,
+/// whose sender is new.
+pub fn alerts(
+    arrived: &[Message],
+    notify: NotifyFor,
+    codes: Option<i64>,
+    account: Option<&str>,
+) -> Vec<Alert> {
+    let fresh_code = |m: &Message| {
+        notify != NotifyFor::Off
+            && m.sign_in_code.is_some()
+            && codes.is_some_and(|now| now - m.date < CODE_FRESH_MS)
+    };
+    let (mut with_codes, wanted): (Vec<&Message>, Vec<&Message>) = arrived
         .iter()
         .filter(|m| {
             m.unread
                 && m.state == MessageState::Inbox
-                && !m.screening
                 && !m.muted
-                && match notify {
-                    NotifyFor::People => m.category == Category::People,
-                    NotifyFor::All => true,
-                    NotifyFor::Priority => m.priority,
-                    NotifyFor::Off => false,
-                }
+                && (fresh_code(m)
+                    || !m.screening
+                        && match notify {
+                            NotifyFor::People => m.category == Category::People,
+                            NotifyFor::All => true,
+                            NotifyFor::Priority => m.priority,
+                            NotifyFor::Off => false,
+                        })
         })
-        .collect();
-    let attribution = account.map(str::to_owned);
-    if wanted.len() > MAX_SEPARATE {
-        return vec![Alert {
+        .partition(|m| fresh_code(m));
+    // The newest few, the newest last so its toast is on top.
+    with_codes.sort_by_key(|m| (m.date, m.id));
+    let with_codes = &with_codes[with_codes.len().saturating_sub(MAX_SEPARATE)..];
+    let mut shown = if wanted.len() > MAX_SEPARATE {
+        vec![Alert {
             title: format!("{} new emails", wanted.len()),
             lines: vec![senders(&wanted)],
-            attribution,
+            attribution: account.map(str::to_owned),
             message: None,
-        }];
-    }
-    wanted
-        .into_iter()
-        .map(|m| Alert {
-            title: sender(m).to_owned(),
-            lines: [
-                if m.subject.trim().is_empty() {
-                    "(no subject)"
-                } else {
-                    m.subject.as_str()
-                },
-                m.snippet.as_str(),
-            ]
+            code: None,
+        }]
+    } else {
+        wanted.into_iter().map(|m| one_alert(m, account)).collect()
+    };
+    shown.extend(with_codes.iter().map(|m| one_alert(m, account)));
+    shown
+}
+
+/// A toast for one new email: who, the subject and its start; a button for
+/// its sign-in code.
+fn one_alert(m: &Message, attribution: Option<&str>) -> Alert {
+    let subject = if m.subject.trim().is_empty() {
+        "(no subject)"
+    } else {
+        m.subject.as_str()
+    };
+    Alert {
+        title: sender(m).to_owned(),
+        lines: [subject, m.snippet.as_str()]
             .into_iter()
             .filter(|line| !line.trim().is_empty())
             .map(str::to_owned)
             .collect(),
-            attribution: attribution.clone(),
-            message: Some(m.id),
-        })
-        .collect()
+        attribution: attribution.map(str::to_owned),
+        message: Some(m.id),
+        code: m.sign_in_code.clone(),
+    }
 }
 
 fn sender(m: &Message) -> &str {
@@ -386,8 +433,17 @@ fn toast_xml(alert: &Alert, sound: bool) -> String {
     } else {
         r#"<audio silent="true"/>"#
     };
+    // Foreground, so the click comes to this process, which copies without
+    // showing the window.
+    let actions = match (&alert.code, alert.message) {
+        (Some(code), Some(_)) => format!(
+            r#"<actions><action activationType="foreground" arguments="{COPY_CODE}" content="Copy {}"/></actions>"#,
+            escape(code)
+        ),
+        _ => String::new(),
+    };
     format!(
-        r#"<toast><visual><binding template="ToastGeneric">{texts}</binding></visual>{audio}</toast>"#
+        r#"<toast><visual><binding template="ToastGeneric">{texts}</binding></visual>{actions}{audio}</toast>"#
     )
 }
 
@@ -426,13 +482,78 @@ fn show(app: &AppHandle, alert: &Alert, sound: bool) -> Result<(), String> {
 /// Shows an alert; one with a `tag` replaces the last with it, and can be taken down.
 fn show_tagged(app: &AppHandle, alert: &Alert, sound: bool, tag: Option<&str>) -> Result<(), String> {
     let message = alert.message;
+    let code = alert.code.clone();
     let clicked = app.clone();
-    show_xml_tagged(app, &toast_xml(alert, sound), None, tag, move |_| {
+    show_xml_tagged(app, &toast_xml(alert, sound), None, tag, move |click| {
+        if let (COPY_CODE, Some(id), Some(code)) = (click.button.as_str(), message, &code) {
+            copy_code(&clicked, id, code);
+            return;
+        }
         background::show(&clicked);
         if let Some(id) = message {
             let _ = clicked.emit("open-message", id);
         }
     })
+}
+
+/// A toast's Copy button: the code goes on the clipboard, and its email is
+/// marked as Settings → Notifications says.
+fn copy_code(app: &AppHandle, id: i64, code: &str) {
+    if let Err(e) = clipboard::set_text(code) {
+        eprintln!("spark-rs: couldn't copy the sign-in code: {e}");
+        return;
+    }
+    let after = app.state::<PrefsState>().get().after_code_copy;
+    let mailbox = app.state::<Mailbox>();
+    let marked = mark_copied(&mut mailbox.live.engine.store(), id, after, now_ms());
+    match marked {
+        Ok(Some(account)) => {
+            let _ = app.emit("mailbox-changed", ());
+            mailbox.live.nudge(account);
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("spark-rs: couldn't mark the email whose code was copied: {e}"),
+    }
+}
+
+/// Marks email `id`'s conversation read or Done once its code is copied,
+/// as the Inbox's own buttons would: Done takes the emails kept where it
+/// is. Returns its account if anything changed.
+fn mark_copied(
+    store: &mut Store,
+    id: i64,
+    after: AfterCodeCopy,
+    now: i64,
+) -> spark_store::Result<Option<i64>> {
+    let Some(copied) = store.message(id)? else {
+        return Ok(None);
+    };
+    let mut ids = store.conversation_before(id, 100)?;
+    ids.push(id);
+    let mut changed = false;
+    for other in ids {
+        let Some(m) = store.message(other)? else {
+            continue;
+        };
+        let patch = match after {
+            AfterCodeCopy::Keep => continue,
+            AfterCodeCopy::Read if m.unread => Patch {
+                unread: Some(false),
+                ..Patch::default()
+            },
+            AfterCodeCopy::Done
+                if copied.state == MessageState::Inbox && m.state == copied.state =>
+            {
+                Patch {
+                    state: Some(MessageState::Done),
+                    ..Patch::default()
+                }
+            }
+            _ => continue,
+        };
+        changed |= store.update(other, &patch, now)?.is_some();
+    }
+    Ok(changed.then_some(copied.account_id))
 }
 
 /// Shows a toast written in Windows' XML schema; `on_click` runs for a
@@ -460,6 +581,62 @@ fn show_xml_tagged(
     {
         let _ = (app, xml, expires, tag, on_click);
         Err("Notifications are only available on Windows for now.".into())
+    }
+}
+
+/// Text on the Windows clipboard, for a toast's Copy button: the window
+/// may be hidden, so the web view's clipboard can't do it.
+#[cfg(windows)]
+mod clipboard {
+    use std::{ptr, thread, time::Duration};
+
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+    /// The `CF_UNICODETEXT` format: UTF-16 ending in a zero.
+    const UNICODE_TEXT: u32 = 13;
+
+    pub fn set_text(text: &str) -> Result<(), String> {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        // Another app may have it open for a moment.
+        let mut tries = 0;
+        while unsafe { OpenClipboard(None) }.is_err() {
+            tries += 1;
+            if tries == 10 {
+                return Err("another app is using the clipboard".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let set = unsafe {
+            EmptyClipboard().and_then(|()| {
+                let memory = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)?;
+                let target = GlobalLock(memory).cast::<u16>();
+                if target.is_null() {
+                    let _ = GlobalFree(Some(memory));
+                    return Err(windows::core::Error::from_thread());
+                }
+                ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
+                let _ = GlobalUnlock(memory);
+                // The clipboard owns the memory once it takes it.
+                SetClipboardData(UNICODE_TEXT, Some(HANDLE(memory.0)))
+                    .map(drop)
+                    .inspect_err(|_| {
+                        let _ = GlobalFree(Some(memory));
+                    })
+            })
+        };
+        let _ = unsafe { CloseClipboard() };
+        set.map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+mod clipboard {
+    pub fn set_text(_text: &str) -> Result<(), String> {
+        Err("Copying from a notification is only available on Windows.".into())
     }
 }
 
@@ -607,7 +784,22 @@ mod toast {
 
 #[cfg(test)]
 mod tests {
+    use spark_store::{AccountKind, Added, Incoming, NewAccount};
+
     use super::*;
+
+    const NOW: i64 = 1_790_000_000_000;
+
+    /// Mail with a sign-in code, a minute old, from a sender `notify` leaves out.
+    fn code_mail(id: i64) -> Message {
+        Message {
+            category: Category::Notifications,
+            screening: true,
+            date: NOW - 60_000,
+            sign_in_code: Some(format!("48291{id}")),
+            ..message(id, "Fernway", "Your sign-in code")
+        }
+    }
 
     fn message(id: i64, from: &str, subject: &str) -> Message {
         Message {
@@ -639,6 +831,7 @@ mod tests {
             auto_draft: None,
             content_rev: 0,
             unsubscribe: None,
+            sign_in_code: None,
         }
     }
 
@@ -652,16 +845,20 @@ mod tests {
             },
         ];
         assert_eq!(
-            alerts(&arrived, NotifyFor::People, None),
+            alerts(&arrived, NotifyFor::People, None, None),
             [Alert {
                 title: "Ana".into(),
                 lines: vec!["Lunch?".into(), "About Lunch?".into()],
                 attribution: None,
                 message: Some(1),
+                code: None,
             }]
         );
-        assert_eq!(alerts(&arrived, NotifyFor::All, Some("Work")).len(), 2);
-        assert!(alerts(&arrived, NotifyFor::Off, None).is_empty());
+        assert_eq!(
+            alerts(&arrived, NotifyFor::All, None, Some("Work")).len(),
+            2
+        );
+        assert!(alerts(&arrived, NotifyFor::Off, None, None).is_empty());
     }
 
     #[test]
@@ -674,7 +871,7 @@ mod tests {
                 ..message(2, "Boss", "Budget")
             },
         ];
-        let shown = alerts(&arrived, NotifyFor::Priority, None);
+        let shown = alerts(&arrived, NotifyFor::Priority, None, None);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].message, Some(2));
     }
@@ -695,7 +892,7 @@ mod tests {
                 ..message(3, "Spam", "Win")
             },
         ];
-        assert!(alerts(&arrived, NotifyFor::All, None).is_empty());
+        assert!(alerts(&arrived, NotifyFor::All, None, None).is_empty());
     }
 
     #[test]
@@ -731,7 +928,7 @@ mod tests {
             muted: true,
             ..message(4, "Bob", "Quiet")
         };
-        assert!(alerts(&[muted], NotifyFor::All, None).is_empty());
+        assert!(alerts(&[muted], NotifyFor::All, None, None).is_empty());
     }
 
     #[test]
@@ -742,12 +939,13 @@ mod tests {
             .map(|(i, from)| message(i as i64, from, "Hello"))
             .collect();
         assert_eq!(
-            alerts(&arrived, NotifyFor::People, Some("Work")),
+            alerts(&arrived, NotifyFor::People, None, Some("Work")),
             [Alert {
                 title: "5 new emails".into(),
                 lines: vec!["From Ana, Bob and 2 others".into()],
                 attribution: Some("Work".into()),
                 message: None,
+                code: None,
             }]
         );
     }
@@ -759,7 +957,7 @@ mod tests {
             snippet: String::new(),
             ..message(1, "Ana", " ")
         }];
-        let alert = &alerts(&arrived, NotifyFor::People, None)[0];
+        let alert = &alerts(&arrived, NotifyFor::People, None, None)[0];
         assert_eq!(alert.title, "ana@x.com");
         assert_eq!(alert.lines, ["(no subject)"]);
     }
@@ -775,12 +973,150 @@ mod tests {
     }
 
     #[test]
+    fn fresh_sign_in_codes_notify_from_any_sender_with_a_copy_button() {
+        let shown = alerts(&[code_mail(1)], NotifyFor::People, Some(NOW), None);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            (shown[0].message, shown[0].code.as_deref()),
+            (Some(1), Some("482911"))
+        );
+        // Not with the setting off, nor once it's stale, muted, blocked, or
+        // with notifications off.
+        assert!(alerts(&[code_mail(1)], NotifyFor::People, None, None).is_empty());
+        let stale = Message {
+            date: NOW - CODE_FRESH_MS - 1,
+            ..code_mail(1)
+        };
+        assert!(alerts(&[stale], NotifyFor::People, Some(NOW), None).is_empty());
+        let muted = Message {
+            muted: true,
+            ..code_mail(1)
+        };
+        let blocked = Message {
+            state: MessageState::Blocked,
+            ..code_mail(2)
+        };
+        assert!(alerts(&[muted, blocked], NotifyFor::All, Some(NOW), None).is_empty());
+        assert!(alerts(&[code_mail(1)], NotifyFor::Off, Some(NOW), None).is_empty());
+        // Mail that notifies anyway still gets its button.
+        let from_people = Message {
+            category: Category::People,
+            screening: false,
+            date: 0,
+            ..code_mail(3)
+        };
+        assert_eq!(
+            alerts(&[from_people], NotifyFor::People, None, None)[0]
+                .code
+                .as_deref(),
+            Some("482913")
+        );
+    }
+
+    #[test]
+    fn a_code_keeps_its_own_toast_among_many_and_shows_last() {
+        let mut arrived: Vec<Message> = ["Ana", "Bob", "Cy", "Dee"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, from)| message(i as i64 + 10, from, "Hello"))
+            .collect();
+        arrived.insert(1, code_mail(1));
+        let shown = alerts(&arrived, NotifyFor::People, Some(NOW), None);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown[0].title, "4 new emails");
+        assert_eq!(shown[1].code.as_deref(), Some("482911"));
+    }
+
+    #[test]
+    fn a_code_toast_has_a_copy_button() {
+        let alert = &alerts(&[code_mail(1)], NotifyFor::People, Some(NOW), None)[0];
+        assert!(toast_xml(alert, false).contains(
+            r#"</visual><actions><action activationType="foreground" arguments="copy-code" content="Copy 482911"/></actions><audio"#
+        ));
+        let plain = &alerts(
+            &[message(2, "Ana", "Lunch?")],
+            NotifyFor::People,
+            None,
+            None,
+        )[0];
+        assert!(!toast_xml(plain, false).contains("<actions>"));
+    }
+
+    #[test]
+    fn copying_a_code_marks_its_conversation_as_asked() {
+        let mut store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Imap,
+                email: "me@x.com",
+                name: "Me",
+                label: "Me",
+                config: "{}",
+            })
+            .unwrap()
+            .id;
+        let mut add = |uid: u32, reply_to: Option<&str>| {
+            let incoming = Incoming {
+                account_id: account,
+                mailbox: Some("INBOX".into()),
+                uid: Some(uid),
+                message_id: Some(format!("{uid}@fernway.example")),
+                in_reply_to: reply_to.map(str::to_owned),
+                from_name: "Fernway".into(),
+                from_address: "no-reply@fernway.example".into(),
+                subject: "Your sign-in code".into(),
+                date: NOW - 1_000 + i64::from(uid),
+                unread: true,
+                sign_in_code: Some("482913".into()),
+                ..Default::default()
+            };
+            match store.add_incoming(&incoming, false).unwrap() {
+                Added::New(id) => id,
+                other => panic!("not stored: {other:?}"),
+            }
+        };
+        let older = add(1, None);
+        let newer = add(2, Some("1@fernway.example"));
+        drop(add);
+        let read = |store: &Store, id| store.message(id).unwrap().unwrap();
+
+        assert_eq!(
+            mark_copied(&mut store, newer, AfterCodeCopy::Keep, NOW).unwrap(),
+            None
+        );
+        assert!(read(&store, older).unread && read(&store, newer).unread);
+
+        assert_eq!(
+            mark_copied(&mut store, newer, AfterCodeCopy::Read, NOW).unwrap(),
+            Some(account)
+        );
+        assert!(!read(&store, older).unread && !read(&store, newer).unread);
+        // Nothing left to mark.
+        assert_eq!(
+            mark_copied(&mut store, newer, AfterCodeCopy::Read, NOW).unwrap(),
+            None
+        );
+
+        assert_eq!(
+            mark_copied(&mut store, newer, AfterCodeCopy::Done, NOW).unwrap(),
+            Some(account)
+        );
+        assert_eq!(read(&store, older).state, MessageState::Done);
+        assert_eq!(read(&store, newer).state, MessageState::Done);
+        assert_eq!(
+            mark_copied(&mut store, 999, AfterCodeCopy::Done, NOW).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn toast_xml_escapes_text_and_picks_the_sound() {
         let alert = Alert {
             title: "Ana <ana@x.com>".into(),
             lines: vec!["Q&A\u{b}\ttomorrow".into()],
             attribution: Some("Work".into()),
             message: Some(1),
+            code: None,
         };
         assert_eq!(
             toast_xml(&alert, true),
