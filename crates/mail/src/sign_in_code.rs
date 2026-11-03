@@ -87,7 +87,8 @@ const MEETINGS: &[&str] = &[
     "dial in",
 ];
 
-/// Near a code, these make it a shop's.
+/// Near a code, these make it a shop's. Banner lines ("Free shipping on
+/// orders over £50") aren't: they sit under sign-in codes too.
 const PROMOTIONS: &[&str] = &[
     "% off",
     "promo",
@@ -98,8 +99,6 @@ const PROMOTIONS: &[&str] = &[
     "checkout",
     "redeem",
     "referral",
-    "free shipping",
-    "shop now",
 ];
 
 /// Whom a code is handed to when it's not for signing in ("share this code
@@ -116,6 +115,11 @@ const RECIPIENTS: &[&str] = &[
     "delivery boy",
     "delivery staff",
 ];
+/// Words that hand a code over, in a sentence naming one of `RECIPIENTS`.
+const HAND_OVER: &[&str] = &[
+    "share", "give", "show", "tell", "provide", "hand", "read", "ask", "asks",
+];
+
 /// After one of `RECIPIENTS`, these make it the user's own account: "your
 /// driver account", "the courier portal", "driver's license".
 const THEIR_OWN: &[&str] = &[
@@ -320,7 +324,7 @@ pub fn find(subject: &str, text: &str, html: Option<&str>) -> Option<String> {
     .map(|(_, code)| code)
     // A code the subject gives is the text's too: if the text or the HTML
     // hands it over ("Your one-time password: 681492" … "share this code
-    // with your driver"), it's not for signing in.
+    // with your driver") or offers it at checkout, it's not for signing in.
     .filter(|code| {
         !handed_over_in(text, code) && !html.is_some_and(|html| handed_over_in(&spaced(html), code))
     })
@@ -332,8 +336,9 @@ fn spaced(html: &str) -> String {
     head(&text, LOOK).to_owned()
 }
 
-/// Whether `src` hands `code` over: where it shows it ("681 492"), or where
-/// it talks of a code if it doesn't show it.
+/// Whether `src` makes `code` one to hand over or a shop's where it shows
+/// it ("681 492"), or hands over a code where it talks of one, if it doesn't
+/// show it.
 fn handed_over_in(src: &str, code: &str) -> bool {
     let lc = src.to_ascii_lowercase();
     let shown: Vec<(usize, usize)> = candidates(src)
@@ -341,14 +346,14 @@ fn handed_over_in(src: &str, code: &str) -> bool {
         .filter(|c| c.code == code)
         .map(|c| (c.start, c.end))
         .collect();
-    let places = if shown.is_empty() {
-        anchors(&lc).iter().map(|a| (a.start, a.end)).collect()
-    } else {
-        shown
-    };
-    places
+    if shown.is_empty() {
+        return anchors(&lc)
+            .iter()
+            .any(|a| handed_over(src, &lc, a.start, a.end));
+    }
+    shown
         .into_iter()
-        .any(|(start, end)| handed_over(src, &lc, start, end))
+        .any(|(start, end)| promoted(&lc, start, end) || handed_over(src, &lc, start, end))
 }
 
 /// Whether `lc` (lower case) says it's about signing in.
@@ -540,8 +545,11 @@ fn promoted(lc: &str, start: usize, end: usize) -> bool {
 
 /// Whether a driver, courier or delivery person is named near `start..end`
 /// of `src` (`lc` is it in lower case), making what's there a code to hand
-/// over. Not when it's the user's own account or the app's name: "sign in
-/// to your driver account", "Your Uber Driver verification code".
+/// over. Not when it's the user: their own account ("sign in to your driver
+/// account"), what they sign in as ("Dear delivery partner", "sign in as a
+/// DoorDash driver"), or the app's name in mid-sentence ("Your Uber Driver
+/// verification code") unless the sentence hands the code over ("share
+/// this code with your Driver").
 fn handed_over(src: &str, lc: &str, start: usize, end: usize) -> bool {
     let from = floor(lc, start.saturating_sub(150));
     let near = &lc[from..ceil(lc, end + 150)];
@@ -557,15 +565,41 @@ fn handed_over(src: &str, lc: &str, start: usize, end: usize) -> bool {
                 Some("s") if rest.starts_with('\'') || rest.starts_with('’') => next.next(),
                 w => w,
             };
-            let own = next_word.is_some_and(|w| THEIR_OWN.contains(&w));
-            // A capital in mid-sentence: the app's name, as in "Uber Driver".
+            if next_word.is_some_and(|w| THEIR_OWN.contains(&w)) || as_the_user(lc, at) {
+                return false;
+            }
+            // A capital in mid-sentence may be the app's name.
             let lead = src[..at].trim_end_matches([' ', '\t']);
             let named = src[at..].starts_with(|c: char| c.is_ascii_uppercase())
                 && !lead.is_empty()
                 && !lead.ends_with(['.', '!', '?', '\n', ':']);
-            !own && !named
+            !named
+                || sentence(lc, at)
+                    .split(|c: char| !c.is_alphabetic())
+                    .any(|w| HAND_OVER.contains(&w))
         })
     })
+}
+
+/// Whether the words before position `at` of `lc` make what's there the
+/// user: "Dear …", "Hi …", "as a …", "as a DoorDash …".
+fn as_the_user(lc: &str, at: usize) -> bool {
+    let lead = &lc[floor(lc, at.saturating_sub(40))..at];
+    let words: Vec<&str> = lead
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let as_a = |n: usize| n >= 2 && words[n - 2] == "as" && matches!(words[n - 1], "a" | "an");
+    let n = words.len();
+    matches!(words.last(), Some(&("dear" | "hi" | "hello"))) || as_a(n) || (n >= 1 && as_a(n - 1))
+}
+
+/// The sentence of `lc` around position `at`.
+fn sentence(lc: &str, at: usize) -> &str {
+    let ends = |c: char| matches!(c, '.' | '!' | '?' | '\n');
+    let start = lc[..at].rfind(ends).map_or(0, |i| i + 1);
+    let end = lc[at..].find(ends).map_or(lc.len(), |i| at + i);
+    &lc[start..end]
 }
 
 /// The words in `lc` that name a code.
