@@ -16,10 +16,16 @@ GitHub (`Trillx/spark-rs`) is a read-only mirror of `main`, there for release do
 A change is finished when it builds and its tests pass. In the same turn:
 
 1. Commit only the files that belong to the change, with a message that says what changed.
-2. Push it: `git push origin main`. By default, changes go straight to `main`.
+2. Push it: `git push origin HEAD:main`. By default, changes go straight to `main`.
 3. Open a PR instead when the user asks for one. Push the branch, then follow "Pull requests" below.
 
 Don't end a turn with a finished change that's still only local. If the push fails, say so.
+
+## T3 Code worktrees
+
+T3 Code runs each thread in its own worktree, on a branch it names (`t3/…`, `feat/…`). That branch is only a local name: changes still go to `main`, which is why step 2 pushes `HEAD:main` rather than the branch.
+
+The SessionStart hook makes T3's branch menu agree with that. A branch with no upstream and no commits of its own gets `origin/main` as its upstream, and `push.default` is set to `upstream`, so a plain `git push` (and T3's Push button) sends it to `main`. After a push, T3 shows the branch in sync instead of "never pushed". Don't push T3's branch names to origin; only `main` and `wip/` branches belong there.
 
 ## Stopping partway through
 

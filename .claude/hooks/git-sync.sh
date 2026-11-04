@@ -9,6 +9,9 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 # The repo's git hooks (.githooks) need a per-clone setting; turn them on
 # unless this clone already uses hooks of its own.
 [ -n "$(git config core.hooksPath)" ] || git config core.hooksPath .githooks
+# A plain `git push` goes to the branch a checkout tracks, even when the names
+# differ: T3 Code's worktree branches track main (below) and push to it.
+[ -n "$(git config push.default)" ] || git config push.default upstream
 
 branch=$(git symbolic-ref --short -q HEAD) || {
   echo "git: detached HEAD, nothing synced."
@@ -20,6 +23,15 @@ if ! GIT_TERMINAL_PROMPT=0 timeout 20 git fetch -q origin 2>/dev/null; then
 fi
 
 dirty=$(git status --porcelain | wc -l)
+
+# T3 Code starts each thread's worktree on a branch of its own that tracks
+# nothing. Changes go to main, so one with no commits of its own tracks main:
+# T3's branch menu then shows it in sync, and its Push button pushes to main.
+if ! git rev-parse -q --verify '@{upstream}' >/dev/null 2>&1 &&
+  git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  git branch -q --set-upstream-to=origin/main "$branch" &&
+    echo "git: $branch had no upstream; it now tracks origin/main."
+fi
 
 upstream=$(git rev-parse --abbrev-ref -q '@{upstream}' 2>/dev/null) || {
   echo "git: $branch has no upstream on origin (never pushed), $dirty uncommitted file(s)."
