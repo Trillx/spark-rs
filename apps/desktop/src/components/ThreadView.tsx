@@ -1436,12 +1436,37 @@ function CardHeader({
       onClick={onCollapse}
     >
       <Avatar name={m.from} size="lg" account={m.account} />
-      <div className="min-w-0 flex-1 truncate text-sm leading-5">
-        <span className="font-bold" data-tip={m.address}>
-          {m.from}
-        </span>
-        {content && <Recipients content={content} account={account} />}
-      </div>
+      {content ? (
+        // Clicking who it's from and to opens everyone in full; the header's collapse stays out of it.
+        <div className="contents" onClick={(e) => e.stopPropagation()}>
+          <Popover
+            label="Email details"
+            wrapperClassName="flex min-w-0 flex-1"
+            className="w-[420px] max-w-[calc(100vw-2rem)] p-0!"
+            trigger={({ open, toggle }) => (
+              <button
+                className={`min-w-0 truncate rounded text-left text-sm leading-5 hover:underline hover:decoration-text-3 ${open ? "underline decoration-text-3" : ""}`}
+                aria-haspopup="dialog"
+                aria-expanded={open}
+                onClick={toggle}
+              >
+                <span className="font-bold" data-tip={m.address}>
+                  {m.from}
+                </span>
+                <Recipients content={content} account={account} />
+              </button>
+            )}
+          >
+            {() => <EmailDetails message={m} content={content} account={account} />}
+          </Popover>
+        </div>
+      ) : (
+        <div className="min-w-0 flex-1 truncate text-sm leading-5">
+          <span className="font-bold" data-tip={m.address}>
+            {m.from}
+          </span>
+        </div>
+      )}
       <time className="shrink-0 text-xs leading-5 text-text-2" dateTime={new Date(m.timestamp).toISOString()}>
         {formatFullDate(m.timestamp)}
       </time>
@@ -1632,6 +1657,59 @@ function Recipients({ content, account }: { content: MessageContent; account?: A
       {content.cc.length > 0 && <span className="text-text-2"> cc </span>}
       {list(content.cc)}
     </>
+  );
+}
+
+/** Everyone on the email in full, name and address each, as the header's line opens it. */
+function EmailDetails({
+  message: m,
+  content,
+  account,
+}: {
+  message: Message;
+  content: MessageContent;
+  account?: AccountView;
+}) {
+  const own = account?.email.toLowerCase();
+  const person = (raw: string) => {
+    const { name, address } = parseAddress(raw);
+    if (raw === "You" && account) return { name: "You", address: account.email, you: true };
+    return { name: name === address ? "" : name, address, you: address.toLowerCase() === own };
+  };
+  const groups: [string, string[]][] = [
+    ["From", [m.from && m.from !== m.address ? `${m.from} <${m.address}>` : m.address]],
+    ["To", content.to],
+    ["Cc", content.cc],
+    ["Reply to", content.replyTo ?? []],
+  ];
+  return (
+    <div className="max-h-[360px] select-text overflow-y-auto px-4 py-3">
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2.5 leading-5">
+        {groups
+          .filter(([, people]) => people.length > 0)
+          .map(([label, people]) => (
+            <Fragment key={label}>
+              <dt className="text-text-2">
+                {label}
+                {people.length > 1 && <span className="ml-1 text-text-3">{people.length}</span>}
+              </dt>
+              <dd className="space-y-1">
+                {people.map((raw, i) => {
+                  const p = person(raw);
+                  return (
+                    <div key={i} className="[overflow-wrap:anywhere]">
+                      {p.name && <span className={`font-medium ${p.you ? "text-primary" : ""}`}>{p.name} </span>}
+                      <span className={p.name ? "text-text-2" : "font-medium"}>{p.address}</span>
+                    </div>
+                  );
+                })}
+              </dd>
+            </Fragment>
+          ))}
+        <dt className="text-text-2">Date</dt>
+        <dd>{formatFullDate(m.timestamp)}</dd>
+      </dl>
+    </div>
   );
 }
 

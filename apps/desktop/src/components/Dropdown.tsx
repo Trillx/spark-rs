@@ -104,6 +104,7 @@ export function Popover({
   direction = "down",
   label,
   className = "w-72",
+  wrapperClassName = "",
 }: {
   trigger: (props: { open: boolean; toggle: () => void }) => ReactNode;
   children: (close: () => void) => ReactNode;
@@ -111,10 +112,12 @@ export function Popover({
   direction?: "down" | "up";
   label: string;
   className?: string;
+  /** Classes for the element holding the trigger and the panel, e.g. to size it in a flex row. */
+  wrapperClassName?: string;
 }) {
   const [open, setOpen, ref] = useDismissable();
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} className={`relative ${wrapperClassName}`}>
       {trigger({ open, toggle: () => setOpen((o) => !o) })}
       {open && (
         <div
