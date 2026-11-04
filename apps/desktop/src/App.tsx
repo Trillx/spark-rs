@@ -312,6 +312,7 @@ import { parseMailto } from "./lib/mailto";
 import { dropPlaceholders, hasPlaceholders, htmlText, replaceText, resendHtml, textToHtml } from "./lib/richText";
 import { pageList, pageReader, scrollToEnd } from "./lib/scroll";
 import { forgetSearch, loadRecentSearches, rememberSearch, useSearchHits, useServerSearch } from "./lib/search";
+import { wheelZoom } from "./lib/wheelZoom";
 import { applyZoom, loadZoom, stepZoom } from "./lib/zoom";
 import { autoDraftReply, chooseAutoDraftOption, onAutoDraftWriting } from "./automation";
 import { AUTO_LABEL_ORDER } from "./lib/autoLabels";
@@ -3730,6 +3731,21 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  // Ctrl+wheel and a touchpad pinch zoom too, wherever the pointer is, as in a browser.
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  useEffect(() => {
+    const step = wheelZoom();
+    function onWheel(e: WheelEvent) {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const dir = step(e);
+      if (dir) zoomRef.current(dir);
+    }
+    window.addEventListener("wheel", onWheel, { passive: false });
+    return () => window.removeEventListener("wheel", onWheel);
+  }, []);
 
   /** Moves the pane clicked last: the list, or the reader (also when it's all that shows). */
   function scrollByKey(action: "pageDown" | "pageUp" | "top" | "bottom") {

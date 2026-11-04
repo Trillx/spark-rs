@@ -47,6 +47,7 @@ import { IS_MAC } from "../lib/shortcuts";
 import { undoDarkMode } from "../lib/signatures";
 import { useDarkTheme } from "../lib/theme";
 import { tipAttrs, type Tip } from "../lib/tooltip";
+import { forwardWheelZoom } from "../lib/wheelZoom";
 
 // The body is HTML anyone may have pasted from anywhere, so like a
 // signature it's edited in a frame sandboxed without `allow-scripts`, under
@@ -723,6 +724,8 @@ const RichEditor = forwardRef<
         });
         if (!host.dispatchEvent(forwarded)) e.preventDefault();
       };
+      // Ctrl+wheel over the draft zooms the app, as it does everywhere else.
+      const onWheel = forwardWheelZoom(host);
       const onInput = (e: Event) => {
         const type = (e as InputEvent).inputType ?? "";
         // What's pasted may be from Outlook in dark mode.
@@ -807,6 +810,7 @@ const RichEditor = forwardRef<
         if (handle && e.button === 0) startResize(e, handle.classList.contains("left") ? -1 : 1);
       };
       d.addEventListener("keydown", onKey);
+      d.addEventListener("wheel", onWheel, { passive: false });
       d.addEventListener("input", onInput);
       d.addEventListener("selectionchange", onSelection);
       d.addEventListener("paste", onPaste);
@@ -820,6 +824,7 @@ const RichEditor = forwardRef<
       unwire = () => {
         observer.disconnect();
         d.removeEventListener("keydown", onKey);
+        d.removeEventListener("wheel", onWheel);
         d.removeEventListener("input", onInput);
         d.removeEventListener("selectionchange", onSelection);
         d.removeEventListener("paste", onPaste);

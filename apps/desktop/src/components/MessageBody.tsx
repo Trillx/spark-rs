@@ -6,6 +6,7 @@ import { openLink } from "../lib/links";
 import { cssIsRemote, isRemoteUrl, srcsetIsRemote } from "../lib/remoteImages";
 import { cidKey } from "../lib/richText";
 import { useDarkTheme } from "../lib/theme";
+import { forwardWheelZoom } from "../lib/wheelZoom";
 import type { InlineImages } from "../types";
 import { ImageViewer, type ViewedImage } from "./ImageViewer";
 
@@ -662,6 +663,8 @@ function wireFrame(
     });
     if (!host.dispatchEvent(forwarded)) e.preventDefault();
   };
+  // Ctrl+wheel over the email zooms the app, as it does everywhere else.
+  const onWheel = forwardWheelZoom(host);
   // Open menus close on an outside pointerdown, which a click in the frame wouldn't send.
   const onPointer = () => host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
   const onDoubleClick = (e: MouseEvent) => {
@@ -683,6 +686,7 @@ function wireFrame(
   doc.addEventListener("click", onClick);
   doc.addEventListener("auxclick", onClick);
   doc.addEventListener("keydown", onKey);
+  doc.addEventListener("wheel", onWheel, { passive: false });
   doc.addEventListener("pointerdown", onPointer);
   doc.addEventListener("dblclick", onDoubleClick);
   measure();
@@ -696,6 +700,7 @@ function wireFrame(
       doc.removeEventListener("click", onClick);
       doc.removeEventListener("auxclick", onClick);
       doc.removeEventListener("keydown", onKey);
+      doc.removeEventListener("wheel", onWheel);
       doc.removeEventListener("pointerdown", onPointer);
       doc.removeEventListener("dblclick", onDoubleClick);
     },
