@@ -9,7 +9,7 @@ import {
   type PopupAct,
 } from "../api";
 import { avatarColor, initials } from "../lib/format";
-import { timeLeft } from "../lib/calendar";
+import { snoozeChoices, timeLeft } from "../lib/calendar";
 import type { InvitePerson, PopupMeeting } from "../types";
 
 /** Room around the cards for their shadow and the dismiss-all button; the window is this much bigger. */
@@ -95,6 +95,16 @@ function Card({
 
   const copy = (link: string) => void copyText(link).then(() => setCopied(true), () => {});
 
+  // Snooze opens a row of lengths in place of the buttons; Esc closes it.
+  const [snoozing, setSnoozing] = useState(false);
+  const choices = snoozeChoices(m.start, m.end, now);
+  useEffect(() => {
+    if (!snoozing) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setSnoozing(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [snoozing]);
+
   return (
     <div className={`relative p-3 ${divided ? "border-t border-hairline" : ""}`}>
       <div className="flex gap-3">
@@ -107,34 +117,55 @@ function Card({
         </div>
       </div>
 
-      <div className="mt-2 flex items-center justify-end gap-1.5">
-        <Tool label="Open in Calendar" onClick={() => act({ action: "openCalendar", id: m.id })}>
-          <CalendarDays />
-        </Tool>
-        {m.callLink && (
-          <Tool label={copied ? "Copied" : "Copy link"} onClick={() => copy(m.callLink!)}>
-            {copied ? <Check /> : <Link2 />}
+      {snoozing && choices.length > 0 ? (
+        <div className="mt-2 flex flex-wrap items-center justify-end gap-1" title="Snooze for">
+          <Clock size={14} className="mr-0.5 text-text-2" aria-label="Snooze for" />
+          {choices.map((c) => (
+            <button
+              key={c.label}
+              className="h-7 rounded-lg bg-base-content/10 px-2 text-[12px] font-medium hover:bg-base-content/20"
+              onClick={() => act({ action: "snooze", id: m.id, until: c.until })}
+            >
+              {c.label}
+            </button>
+          ))}
+          <Tool label="Cancel" onClick={() => setSnoozing(false)}>
+            <X size={15} />
           </Tool>
-        )}
-        {m.callLink && m.joined && (
-          <Tool label="Open meeting" onClick={() => act({ action: "join", id: m.id })}>
-            <ArrowUpRight />
+        </div>
+      ) : (
+        <div className="mt-2 flex items-center justify-end gap-1.5">
+          <Tool label="Open in Calendar" onClick={() => act({ action: "openCalendar", id: m.id })}>
+            <CalendarDays />
           </Tool>
-        )}
-        <Tool label="Snooze for a minute" onClick={() => act({ action: "snooze", id: m.id })}>
-          <Clock />
-        </Tool>
-        {m.callLink && !m.joined && (
-          <button
-            className="btn btn-primary btn-sm ml-1.5 h-7 min-h-7 gap-1 rounded-lg px-3 text-[13px] font-medium"
-            title={m.callLink}
-            onClick={() => act({ action: "join", id: m.id })}
+          {m.callLink && (
+            <Tool label={copied ? "Copied" : "Copy link"} onClick={() => copy(m.callLink!)}>
+              {copied ? <Check /> : <Link2 />}
+            </Tool>
+          )}
+          {m.callLink && m.joined && (
+            <Tool label="Open meeting" onClick={() => act({ action: "join", id: m.id })}>
+              <ArrowUpRight />
+            </Tool>
+          )}
+          <Tool
+            label="Snooze…"
+            onClick={() => (choices.length ? setSnoozing(true) : act({ action: "snooze", id: m.id }))}
           >
-            Join
-            <ArrowUpRight size={14} />
-          </button>
-        )}
-      </div>
+            <Clock />
+          </Tool>
+          {m.callLink && !m.joined && (
+            <button
+              className="btn btn-primary btn-sm ml-1.5 h-7 min-h-7 gap-1 rounded-lg px-3 text-[13px] font-medium"
+              title={m.callLink}
+              onClick={() => act({ action: "join", id: m.id })}
+            >
+              Join
+              <ArrowUpRight size={14} />
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="absolute right-2 top-2 flex">
         <Tool label="Pop-up settings" small onClick={() => act({ action: "openSettings" })}>

@@ -329,7 +329,9 @@ export function meetingPopupMeetings(): Promise<PopupMeeting[]> {
 }
 
 export type PopupAct =
-  | { action: "join" | "snooze" | "dismiss" | "openCalendar"; id: number }
+  | { action: "join" | "dismiss" | "openCalendar"; id: number }
+  /** `until` in ms; a minute from now without it. */
+  | { action: "snooze"; id: number; until?: number }
   | { action: "dismissAll" | "openSettings" };
 
 /** Join opens the call; the card stays, with Open meeting in place of Join. */

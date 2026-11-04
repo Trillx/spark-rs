@@ -305,6 +305,17 @@ export function timeLeft(start: number, end: number, now: number) {
   return now < start ? `in ${duration(start - now)}` : `${duration(end - now)} left`;
 }
 
+/**
+ * How long the meeting pop-up can snooze a meeting for: a few lengths, and
+ * until it starts while it hasn't, soonest first. None reach its end, after
+ * which it wouldn't come back.
+ */
+export function snoozeChoices(start: number, end: number, now: number): { label: string; until: number }[] {
+  const choices = [1, 5, 10, 15, 30].map((m) => ({ label: `${m} min`, until: now + m * 60_000 }));
+  if (start - now > 60_000) choices.push({ label: "At start", until: start });
+  return choices.filter((c) => c.until < end).sort((a, b) => a.until - b.until);
+}
+
 function duration(ms: number) {
   const seconds = Math.max(0, Math.ceil(ms / 1000));
   if (seconds < 60) return plural(seconds, "second");

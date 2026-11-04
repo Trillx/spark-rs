@@ -36,7 +36,7 @@ use crate::prefs::PrefsState;
 pub const LABEL: &str = "meeting-popup";
 
 const MINUTE_MS: i64 = 60_000;
-/// Snooze brings it back after this long, as in Spark.
+/// Snooze brings it back after this long unless the pop-up picks a time.
 const SNOOZE_MS: i64 = MINUTE_MS;
 /// Events this long or longer (a conference, a trip) don't pop up.
 const LONGEST_MS: i64 = 24 * 60 * 60_000;
@@ -396,8 +396,11 @@ pub enum Act {
     Join {
         id: i64,
     },
+    /// Hides the meeting until `until` (ms), a minute from now without it.
     Snooze {
         id: i64,
+        #[serde(default)]
+        until: Option<i64>,
     },
     Dismiss {
         id: i64,
@@ -433,12 +436,14 @@ pub fn meeting_popup_act(
             meetings.join(id);
         }
         // Snoozing a joined meeting forgets it was joined, as in Spark.
-        Act::Snooze { id } => {
+        Act::Snooze { id, until } => {
             if id < 0 {
                 meetings.dismiss(id);
             } else {
+                let now = now_ms();
+                let until = until.filter(|&u| u > now).unwrap_or(now + SNOOZE_MS);
                 let mut state = meetings.lock();
-                state.snoozed.insert(id, now_ms() + SNOOZE_MS);
+                state.snoozed.insert(id, until);
                 state.joined.retain(|(joined, _), _| *joined != id);
             }
         }
@@ -698,6 +703,14 @@ mod tests {
         let act: Act =
             serde_json::from_value(serde_json::json!({ "action": "join", "id": 3 })).unwrap();
         assert!(matches!(act, Act::Join { id: 3 }));
+        let act: Act =
+            serde_json::from_value(serde_json::json!({ "action": "snooze", "id": 3 })).unwrap();
+        assert!(matches!(act, Act::Snooze { id: 3, until: None }));
+        let act: Act = serde_json::from_value(
+            serde_json::json!({ "action": "snooze", "id": 3, "until": 1_000 }),
+        )
+        .unwrap();
+        assert!(matches!(act, Act::Snooze { id: 3, until: Some(1_000) }));
         let act: Act =
             serde_json::from_value(serde_json::json!({ "action": "dismissAll" })).unwrap();
         assert!(matches!(act, Act::DismissAll));
