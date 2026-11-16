@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 use spark_mail::attachment::{AttachmentData, InlineImage, cid_refs, mime_for};
 use spark_mail::draft::{self, Draft, OutgoingAttachment};
-use spark_mail::engine::{folder_has_older, gmail_servers, inbox_has_older};
+use spark_mail::engine::{AccountConfig, folder_has_older, gmail_servers, inbox_has_older};
 use spark_mail::imap::Server;
 use spark_mail::invite::{Answer, Card, Invite};
 use spark_mail::unsubscribe::Unsubscribed;
@@ -370,6 +370,9 @@ impl Mailbox {
             kind: account.kind,
             provider: match account.kind {
                 AccountKind::Gmail => "Gmail",
+                AccountKind::Microsoft if shared_mailbox(&account) => {
+                    "Microsoft 365 shared mailbox"
+                }
                 AccountKind::Microsoft => "Microsoft 365",
                 AccountKind::Imap => "IMAP",
             },
@@ -389,6 +392,17 @@ impl Mailbox {
         let _ = app.emit("mailbox-changed", ());
         self.account_view(account)
     }
+}
+
+/// Whether the account is a shared mailbox someone else's sign-in opens.
+fn shared_mailbox(account: &Account) -> bool {
+    matches!(
+        spark_mail::engine::config(account),
+        Ok(AccountConfig::Microsoft {
+            signed_in_as: Some(_),
+            ..
+        })
+    )
 }
 
 fn from_store(m: spark_store::Message) -> Message {
@@ -1527,7 +1541,9 @@ pub fn trust_certificate(
     Ok(())
 }
 
-/// Opens Microsoft sign-in in the browser; resolves when it's done.
+/// Opens Microsoft sign-in in the browser; resolves when it's done. With
+/// `shared`, the account added is the shared mailbox at that address, opened
+/// with the user's sign-in.
 #[tauri::command]
 pub async fn add_microsoft_account(
     app: AppHandle,
@@ -1535,15 +1551,26 @@ pub async fn add_microsoft_account(
     client_id: String,
     tenant: String,
     label: String,
+    shared: Option<String>,
 ) -> Result<AccountView, String> {
     prepare_account_add(&app, &mailbox)?;
     let cancelled = mailbox.live.sign_in_cancel();
-    let sign_in = mailbox
-        .live
-        .engine
-        .add_microsoft_account(&client_id, &tenant, &label, |url| {
-            open::that_detached(url).map_err(|e| e.to_string())
-        });
+    let engine = &mailbox.live.engine;
+    let open_browser = |url: &str| open::that_detached(url).map_err(|e| e.to_string());
+    let sign_in = async {
+        match shared.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(address) => {
+                engine
+                    .add_shared_mailbox(&client_id, &tenant, address, &label, open_browser)
+                    .await
+            }
+            None => {
+                engine
+                    .add_microsoft_account(&client_id, &tenant, &label, open_browser)
+                    .await
+            }
+        }
+    };
     let account = tokio::select! {
         result = sign_in => result.map_err(text)?,
         _ = cancelled => return Err("Sign-in cancelled.".into()),

@@ -831,6 +831,7 @@ function savedMicrosoftApp(): { clientId: string; tenant: string } {
 
 function MicrosoftForm({ onAdded, onCancel }: FormProps) {
   const [app, setApp] = useState(savedMicrosoftApp);
+  const [shared, setShared] = useState("");
   const [label, setLabel] = useState("");
   const [waiting, setWaiting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -855,7 +856,8 @@ function MicrosoftForm({ onAdded, onCancel }: FormProps) {
     pending.current = true;
     cancelled.current = false;
     try {
-      await addMicrosoftAccount(clientId, tenant, label.trim() || "Work");
+      const sharedAddress = shared.trim();
+      await addMicrosoftAccount(clientId, tenant, label.trim() || (sharedAddress ? "" : "Work"), sharedAddress);
       pending.current = false;
       onAdded();
     } catch (err) {
@@ -901,7 +903,28 @@ function MicrosoftForm({ onAdded, onCancel }: FormProps) {
               className={INPUT}
             />
           </Row>
-          <LabelRow id="ms-label" placeholder="Work" value={label} onChange={setLabel} />
+          <Row
+            label="Shared mailbox"
+            htmlFor="ms-shared"
+            description="Optional. To open a shared mailbox you have access to, enter its address and sign in as yourself."
+          >
+            <input
+              id="ms-shared"
+              type="email"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="support@contoso.com"
+              value={shared}
+              onChange={(e) => setShared(e.target.value)}
+              className={INPUT}
+            />
+          </Row>
+          <LabelRow
+            id="ms-label"
+            placeholder={shared.trim() ? shared.trim().split("@")[0] || "Shared" : "Work"}
+            value={label}
+            onChange={setLabel}
+          />
         </Group>
       </fieldset>
       {waiting ? (

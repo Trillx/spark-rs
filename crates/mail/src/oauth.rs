@@ -27,12 +27,29 @@ pub const SCOPES: &str = "offline_access https://graph.microsoft.com/User.Read \
 /// so older sign-ins keep working for mail.
 pub const CALENDAR_SCOPE: &str = "https://graph.microsoft.com/Calendars.ReadWrite";
 
-fn scopes(calendar: bool) -> String {
-    if calendar {
-        format!("{SCOPES} {CALENDAR_SCOPE}")
-    } else {
-        SCOPES.to_owned()
+/// Open shared mailboxes the user has been given access to: read and change
+/// their mail and calendar, and send as them. None of these need an admin's
+/// consent.
+pub const SHARED_SCOPES: &str = "https://graph.microsoft.com/Mail.ReadWrite.Shared      https://graph.microsoft.com/Mail.Send.Shared      https://graph.microsoft.com/Calendars.ReadWrite.Shared";
+
+/// What a sign-in asks Microsoft for, besides `SCOPES`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Grant {
+    /// `CALENDAR_SCOPE`.
+    pub calendar: bool,
+    /// `SHARED_SCOPES`, for a shared mailbox.
+    pub shared: bool,
+}
+
+fn scopes(grant: Grant) -> String {
+    let mut scopes = SCOPES.to_owned();
+    if grant.calendar {
+        scopes = format!("{scopes} {CALENDAR_SCOPE}");
     }
+    if grant.shared {
+        scopes = format!("{scopes} {SHARED_SCOPES}");
+    }
+    scopes
 }
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -92,10 +109,12 @@ pub struct Tokens {
 
 /// Opens Microsoft's sign-in page with `open_browser` and waits (up to 15
 /// minutes) for the browser to come back with a code. `login_hint` suggests
-/// the account to sign in as. Dropping the future cancels it.
+/// the account to sign in as; `shared` asks for `SHARED_SCOPES` too. Dropping
+/// the future cancels it.
 pub async fn sign_in(
     app: &App,
     login_hint: Option<&str>,
+    shared: bool,
     open_browser: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<Tokens> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -107,7 +126,10 @@ pub async fn sign_in(
     let verifier = random_token(32);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token(16);
-    let scope = scopes(true);
+    let scope = scopes(Grant {
+        calendar: true,
+        shared,
+    });
     let mut url = url::Url::parse_with_params(
         &app.endpoint("authorize"),
         [
@@ -148,12 +170,12 @@ pub async fn sign_in(
     .await
 }
 
-/// Trades a refresh token for a new access token, with the calendar
-/// permission if the account has granted it.
-pub async fn refresh(app: &App, refresh_token: &str, calendar: bool) -> Result<Tokens> {
+/// Trades a refresh token for a new access token, with the permissions the
+/// account has granted (`grant`).
+pub async fn refresh(app: &App, refresh_token: &str, grant: Grant) -> Result<Tokens> {
     token_request(
         app,
-        &scopes(calendar),
+        &scopes(grant),
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -316,6 +338,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_shared_mailbox_asks_for_the_shared_permissions() {
+        let own = scopes(Grant {
+            calendar: true,
+            shared: false,
+        });
+        assert!(!own.contains(".Shared"));
+        let shared = scopes(Grant {
+            calendar: true,
+            shared: true,
+        });
+        for scope in [
+            "Mail.ReadWrite.Shared",
+            "Mail.Send.Shared",
+            "Calendars.ReadWrite.Shared",
+        ] {
+            assert!(shared.contains(&format!("https://graph.microsoft.com/{scope}")));
+        }
+        assert!(shared.starts_with(&own));
+    }
+
+    #[test]
     fn app_ids_are_checked() {
         assert!(
             App::new(
@@ -362,7 +405,7 @@ mod tests {
         let app = App::new("client", "contoso.com").unwrap();
         let (url_tx, url_rx) = tokio::sync::oneshot::channel();
         let sign_in = tokio::spawn(async move {
-            sign_in(&app, Some("me@contoso.com"), |url| {
+            sign_in(&app, Some("me@contoso.com"), false, |url| {
                 url_tx.send(url.to_owned()).unwrap();
                 Ok(())
             })

@@ -207,7 +207,9 @@ registrations → New registration). If you can't register apps, ask IT:
   `http://localhost` (any port matches; spark-rs picks a free one).
 - API permissions, Microsoft Graph, delegated: `User.Read`,
   `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `offline_access`. If
-  your tenant requires admin consent, IT has to grant it.
+  your tenant requires admin consent, IT has to grant it. For shared
+  mailboxes, also `Mail.ReadWrite.Shared`, `Mail.Send.Shared` and
+  `Calendars.ReadWrite.Shared`.
 - No client secret: desktop apps are public clients.
 
 Then choose **Microsoft 365** and enter the Application (client) ID and the
@@ -215,6 +217,13 @@ Directory (tenant) ID, or your domain such as `contoso.onmicrosoft.com`.
 Your browser opens Microsoft's sign-in; when it's done the account appears.
 Check your company's rules first: using your own mail client on work mail may
 not be allowed, and neither may AI (see AI below).
+
+**Microsoft 365 shared mailboxes.** A shared mailbox (like
+`support@contoso.com`) your admin has given you Full Access to can be added
+as an account of its own: fill in the Microsoft 365 form as above, put the
+shared mailbox's address under **Shared mailbox**, and sign in as yourself.
+Its mail and calendar sync like any account's, and mail you send from it
+comes from its address, which needs the Send As permission on it.
 
 **Other IMAP servers.** Choose **Other (IMAP)** and enter the servers. Ports
 993 and 465 use TLS from the start; 143 and 587 use STARTTLS.

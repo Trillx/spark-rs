@@ -91,6 +91,11 @@ pub enum AccountConfig {
         /// Signed in with the calendar permission (`oauth::CALENDAR_SCOPE`).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         calendar: bool,
+        /// Set for a shared mailbox, whose address is the account's: the
+        /// address of the person whose sign-in opens it
+        /// (`oauth::SHARED_SCOPES`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_in_as: Option<String>,
     },
 }
 
@@ -548,7 +553,7 @@ impl Engine {
         open_browser: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<Account> {
         let app = App::new(client_id, tenant)?;
-        let tokens = oauth::sign_in(&app, None, open_browser).await?;
+        let tokens = oauth::sign_in(&app, None, false, open_browser).await?;
         let me = Graph::new(&tokens.access_token).me().await?;
         let email = me
             .address()
@@ -561,6 +566,7 @@ impl Engine {
             client_id: app.client_id.clone(),
             tenant: app.tenant.clone(),
             calendar: true,
+            signed_in_as: None,
         };
         let account = self.store().add_account(&NewAccount {
             kind: AccountKind::Microsoft,
@@ -577,6 +583,83 @@ impl Engine {
         Ok(account)
     }
 
+    /// Signs in to Microsoft in the browser as someone with access to the
+    /// shared mailbox at `address`, and adds that mailbox as an account of
+    /// its own. Its label defaults to the address's name part.
+    pub async fn add_shared_mailbox(
+        &self,
+        client_id: &str,
+        tenant: &str,
+        address: &str,
+        label: &str,
+        open_browser: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<Account> {
+        let address = shared_address(address)?;
+        let app = App::new(client_id, tenant)?;
+        let tokens = oauth::sign_in(&app, None, true, open_browser).await?;
+        let me = Graph::new(&tokens.access_token).me().await?;
+        let user = me
+            .address()
+            .ok_or_else(|| Error::Server("Microsoft didn't say who signed in.".into()))?
+            .to_owned();
+        self.add_shared_mailbox_as(&app, &user, address, label, &tokens)
+            .await
+    }
+
+    /// `add_shared_mailbox` once `user` has signed in with `tokens`: checks
+    /// they can open the mailbox, then adds it.
+    async fn add_shared_mailbox_as(
+        &self,
+        app: &App,
+        user: &str,
+        address: &str,
+        label: &str,
+        tokens: &oauth::Tokens,
+    ) -> Result<Account> {
+        if user.eq_ignore_ascii_case(address) {
+            return Err(Error::Config(format!(
+                "{address} is your own mailbox. Add it as a Microsoft 365 account."
+            )));
+        }
+        Graph::with_base(&self.graph_base, &tokens.access_token)
+            .for_mailbox(address)
+            .open_inbox()
+            .await
+            .map_err(|e| match e {
+                Error::Gone | Error::Auth(_) => Error::Auth(format!(
+                    "{user} can't open {address}. Ask your admin for Full Access to it."
+                )),
+                e => e,
+            })?;
+        let refresh = tokens.refresh_token.clone().ok_or_else(|| {
+            Error::Auth("Microsoft didn't allow staying signed in (no refresh token).".into())
+        })?;
+        let config = AccountConfig::Microsoft {
+            client_id: app.client_id.clone(),
+            tenant: app.tenant.clone(),
+            calendar: true,
+            signed_in_as: Some(user.to_owned()),
+        };
+        let name_part = address.split('@').next().unwrap_or(address);
+        let label = match label.trim() {
+            "" => name_part,
+            label => label,
+        };
+        let account = self.store().add_account(&NewAccount {
+            kind: AccountKind::Microsoft,
+            email: address,
+            name: "",
+            label,
+            config: &to_json(&config),
+        })?;
+        if let Err(e) = self.secrets.set(&token_key(account.id), &refresh) {
+            self.store().remove_account(account.id)?;
+            return Err(Error::Config(format!("Couldn't save the sign-in: {e}")));
+        }
+        self.cache_token(account.id, tokens);
+        Ok(account)
+    }
+
     /// Signs in to Microsoft again for an existing account, asking for the
     /// calendar permission as new sign-ins do, and keeps the new sign-in.
     /// It must be the same mailbox.
@@ -587,7 +670,10 @@ impl Engine {
     ) -> Result<Account> {
         let account = self.account(account_id)?;
         let AccountConfig::Microsoft {
-            client_id, tenant, ..
+            client_id,
+            tenant,
+            signed_in_as,
+            ..
         } = config(&account)?
         else {
             return Err(Error::Config(
@@ -595,15 +681,13 @@ impl Engine {
             ));
         };
         let app = App::new(&client_id, &tenant)?;
-        let tokens = oauth::sign_in(&app, Some(&account.email), open_browser).await?;
+        // A shared mailbox is opened by its user's sign-in, not its own.
+        let user = signed_in_as.as_deref().unwrap_or(&account.email);
+        let tokens = oauth::sign_in(&app, Some(user), signed_in_as.is_some(), open_browser).await?;
         let me = Graph::new(&tokens.access_token).me().await?;
-        if !me
-            .address()
-            .is_some_and(|a| a.eq_ignore_ascii_case(&account.email))
-        {
+        if !me.address().is_some_and(|a| a.eq_ignore_ascii_case(user)) {
             return Err(Error::Auth(format!(
-                "That was another account. Sign in as {}.",
-                account.email
+                "That was another account. Sign in as {user}."
             )));
         }
         let refresh = tokens.refresh_token.clone().ok_or_else(|| {
@@ -616,6 +700,7 @@ impl Engine {
             client_id,
             tenant,
             calendar: true,
+            signed_in_as,
         };
         self.store()
             .set_account_config(account_id, &to_json(&config))?;
@@ -1707,13 +1792,23 @@ impl Engine {
             .ok_or_else(|| Error::Config("That folder is gone.".into()))
     }
 
+    /// A Graph client signed in for the account, opening its mailbox: the
+    /// user's own, or the shared one the account is.
     async fn graph(&self, account_id: i64, client_id: &str, tenant: &str) -> Result<Graph> {
-        Ok(Graph::with_base(
+        let graph = Graph::with_base(
             &self.graph_base,
             &self
                 .access_token(account_id, &App::new(client_id, tenant)?)
                 .await?,
-        ))
+        );
+        let account = self.account(account_id)?;
+        Ok(match config(&account)? {
+            AccountConfig::Microsoft {
+                signed_in_as: Some(_),
+                ..
+            } => graph.for_mailbox(&account.email),
+            _ => graph,
+        })
     }
 
     /// A Graph client for the account's rounds and searches, keeping to
@@ -2236,11 +2331,11 @@ impl Engine {
             AccountConfig::Microsoft {
                 client_id, tenant, ..
             } => {
-                let token = self
-                    .access_token(account_id, &App::new(&client_id, &tenant)?)
-                    .await?;
                 let remote = original.as_ref().and_then(|(_, remote)| remote.as_deref());
-                Graph::new(&token).send_draft(draft, remote, &files).await?
+                self.graph(account_id, &client_id, &tenant)
+                    .await?
+                    .send_draft(draft, remote, &files)
+                    .await?
             }
         };
         // People you write to skip the Gatekeeper.
@@ -2280,6 +2375,7 @@ impl Engine {
             client_id,
             tenant,
             calendar: true,
+            ..
         } = config(&account)?
         else {
             return Ok(());
@@ -2766,10 +2862,10 @@ impl Engine {
             AccountConfig::Microsoft {
                 client_id, tenant, ..
             } => {
-                let token = self
-                    .access_token(account.id, &App::new(&client_id, &tenant)?)
+                self.graph(account.id, &client_id, &tenant)
+                    .await?
+                    .send_mime(&message.formatted())
                     .await?;
-                Graph::new(&token).send_mime(&message.formatted()).await?;
             }
         }
         self.store().set_rsvp(message_id, answer.as_str())?;
@@ -3115,10 +3211,10 @@ impl Engine {
                 client_id, tenant, ..
             } => {
                 let remote = at.remote_id.ok_or(Error::Gone)?;
-                let token = self
-                    .access_token(account.id, &App::new(&client_id, &tenant)?)
-                    .await?;
-                Graph::new(&token).raw(&remote).await
+                self.graph(account.id, &client_id, &tenant)
+                    .await?
+                    .raw(&remote)
+                    .await
             }
         }
     }
@@ -3300,11 +3396,18 @@ impl Engine {
                     "Sign in to Microsoft again: remove the account and add it back.".into(),
                 )
             })?;
-        let calendar = self
-            .account(account_id)
-            .and_then(|a| config(&a))
-            .is_ok_and(|c| matches!(c, AccountConfig::Microsoft { calendar: true, .. }));
-        let tokens = oauth::refresh(app, &refresh, calendar).await?;
+        let grant = match self.account(account_id).and_then(|a| config(&a)) {
+            Ok(AccountConfig::Microsoft {
+                calendar,
+                signed_in_as,
+                ..
+            }) => oauth::Grant {
+                calendar,
+                shared: signed_in_as.is_some(),
+            },
+            _ => oauth::Grant::default(),
+        };
+        let tokens = oauth::refresh(app, &refresh, grant).await?;
         if let Some(rotated) = &tokens.refresh_token
             && rotated != &refresh
         {
@@ -3542,6 +3645,17 @@ fn folder_name(name: &str) -> Result<&str> {
         return Err(Error::Config("Enter a name for the folder.".into()));
     }
     Ok(name)
+}
+
+/// A shared mailbox's address as the user typed it, trimmed.
+fn shared_address(address: &str) -> Result<&str> {
+    let address = address.trim();
+    match address.parse::<lettre::Address>() {
+        Ok(_) => Ok(address),
+        Err(_) => Err(Error::Config(format!(
+            "\"{address}\" isn't an email address. Enter the shared mailbox's address."
+        ))),
+    }
 }
 
 fn default_label(label: &str, kind: AccountKind, email: &str) -> String {
@@ -4040,6 +4154,7 @@ mod tests {
             client_id: "c".into(),
             tenant: "t".into(),
             calendar: false,
+            signed_in_as: None,
         };
         assert_eq!(
             to_json(&microsoft),
@@ -4050,6 +4165,7 @@ mod tests {
             client_id: "c".into(),
             tenant: "t".into(),
             calendar: true,
+            signed_in_as: None,
         };
         let with_calendar = to_json(&calendar);
         assert_eq!(
@@ -4074,6 +4190,7 @@ mod tests {
             client_id: "c".into(),
             tenant: "t".into(),
             calendar: false,
+            signed_in_as: None,
         };
         let account = |config: &AccountConfig, sync_state: &str| Account {
             id: 1,
@@ -6292,10 +6409,133 @@ mod tests {
                     client_id: "c".into(),
                     tenant: "t".into(),
                     calendar: false,
+                    signed_in_as: None,
                 }),
             })
             .unwrap();
         (signed_in(store, base, account.id), account.id)
+    }
+
+    /// An engine whose account is the shared mailbox support@contoso.com,
+    /// opened by me@contoso.com's sign-in to the Graph stand-in at `base`.
+    fn shared_mailbox_engine(base: String) -> (Engine, i64) {
+        let store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Microsoft,
+                email: "support@contoso.com",
+                name: "",
+                label: "support",
+                config: &to_json(&AccountConfig::Microsoft {
+                    client_id: "c".into(),
+                    tenant: "t".into(),
+                    calendar: true,
+                    signed_in_as: Some("me@contoso.com".into()),
+                }),
+            })
+            .unwrap();
+        (signed_in(store, base, account.id), account.id)
+    }
+
+    const SHARED: &str = "/users/support%40contoso.com/";
+
+    #[tokio::test]
+    async fn a_shared_mailbox_syncs_from_its_own_mail_and_calendar() {
+        fn shared(path: &str) -> Option<serde_json::Value> {
+            path.starts_with(SHARED)
+                .then(|| serde_json::json!({ "value": [], "@odata.deltaLink": "/delta2" }))
+        }
+        let (base, seen) = graph::tests::stand_in(shared).await;
+        let (engine, account_id) = shared_mailbox_engine(base);
+        engine.run(account_id, true).await.unwrap();
+        assert_eq!(delta_link(&engine, account_id).as_deref(), Some("/delta2"));
+        let now = now_ms();
+        engine
+            .refresh_calendar(account_id, now, now + 86_400_000)
+            .await
+            .unwrap();
+        let asked = seen.lock().unwrap().clone();
+        assert!(
+            asked
+                .iter()
+                .any(|p| p.contains("/mailFolders/inbox/messages/delta?")),
+            "{asked:?}"
+        );
+        assert!(asked.iter().any(|p| p.contains("/calendars?")), "{asked:?}");
+        assert!(asked.iter().all(|p| p.starts_with(SHARED)), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn a_shared_mailbox_is_added_only_if_its_user_can_open_it() {
+        let tokens = oauth::Tokens {
+            access_token: "token".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: now_ms() + 3_600_000,
+        };
+        let app = App::new("c", "t").unwrap();
+        let engine_at = |base: String| {
+            let mut engine = Engine::new(
+                Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+                Arc::new(TestSecrets),
+            );
+            engine.graph_base = base;
+            engine
+        };
+
+        fn inbox(path: &str) -> Option<serde_json::Value> {
+            (path == "/users/support%40contoso.com/mailFolders/inbox?$select=id")
+                .then(|| serde_json::json!({ "id": "inbox" }))
+        }
+        let (base, _) = graph::tests::stand_in(inbox).await;
+        let engine = engine_at(base);
+        let added = engine
+            .add_shared_mailbox_as(&app, "me@contoso.com", "support@contoso.com", " ", &tokens)
+            .await
+            .unwrap();
+        assert_eq!(
+            (added.email.as_str(), added.label.as_str()),
+            ("support@contoso.com", "support")
+        );
+        assert_eq!(
+            config(&added).unwrap(),
+            AccountConfig::Microsoft {
+                client_id: "c".into(),
+                tenant: "t".into(),
+                calendar: true,
+                signed_in_as: Some("me@contoso.com".into()),
+            }
+        );
+        assert_eq!(
+            added.config,
+            r#"{"type":"microsoft","clientId":"c","tenant":"t","calendar":true,"signedInAs":"me@contoso.com"}"#
+        );
+        let own = engine
+            .add_shared_mailbox_as(&app, "Me@contoso.com", "me@contoso.com", "", &tokens)
+            .await
+            .unwrap_err();
+        assert!(own.to_string().contains("your own mailbox"), "{own}");
+
+        // Graph answers 404 for every mailbox the user has no access to.
+        fn nothing(_: &str) -> Option<serde_json::Value> {
+            None
+        }
+        let (base, _) = graph::tests::stand_in(nothing).await;
+        let engine = engine_at(base);
+        let refused = engine
+            .add_shared_mailbox_as(&app, "me@contoso.com", "sales@contoso.com", "", &tokens)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            Error::Auth(
+                "me@contoso.com can't open sales@contoso.com. Ask your admin for Full Access to it."
+                    .into()
+            )
+            .to_string()
+        );
+        assert!(engine.store().accounts().unwrap().is_empty());
+        assert!(shared_address("not an address").is_err());
+        assert_eq!(shared_address(" a@b.com ").unwrap(), "a@b.com");
     }
 
     /// An engine for `store`, its Microsoft account `account_id` signed in

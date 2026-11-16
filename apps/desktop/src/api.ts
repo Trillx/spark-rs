@@ -136,9 +136,17 @@ export function addImapAccount(form: ImapAccountForm, trusted: TrustedCerts = {}
   return Promise.reject(DESKTOP_ONLY);
 }
 
-/** Opens the system browser for Microsoft sign-in; resolves once it finishes, which can take minutes. */
-export function addMicrosoftAccount(clientId: string, tenant: string, label: string): Promise<AccountView> {
-  if (isTauri()) return invoke("add_microsoft_account", { clientId, tenant, label });
+/**
+ * Opens the system browser for Microsoft sign-in; resolves once it finishes, which can take minutes. With `shared`,
+ * the account added is the shared mailbox at that address, opened with the user's own sign-in.
+ */
+export function addMicrosoftAccount(
+  clientId: string,
+  tenant: string,
+  label: string,
+  shared?: string,
+): Promise<AccountView> {
+  if (isTauri()) return invoke("add_microsoft_account", { clientId, tenant, label, shared: shared || null });
   return Promise.reject(DESKTOP_ONLY);
 }
 

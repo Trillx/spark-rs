@@ -515,6 +515,9 @@ impl Standing {
 pub struct Graph {
     token: String,
     base: String,
+    /// The shared mailbox requests go to (`for_mailbox`), or `None` for the
+    /// signed-in user's own.
+    mailbox: Option<String>,
     standing: Arc<Standing>,
     /// `REPAIR_TIME`, shorter in tests.
     repair_time: Duration,
@@ -549,6 +552,7 @@ impl Graph {
         Self {
             token: access_token.to_owned(),
             base: base.trim_end_matches('/').to_owned(),
+            mailbox: None,
             standing: Arc::default(),
             repair_time: REPAIR_TIME,
             repair_request_time: REPAIR_REQUEST_TIME,
@@ -561,16 +565,41 @@ impl Graph {
         Self { standing, ..self }
     }
 
+    /// This client, for the shared mailbox at `address` rather than the
+    /// signed-in user's own: its mail and calendar requests go to
+    /// `/users/{address}` instead of `/me`. The sign-in needs the `.Shared`
+    /// permissions (`oauth::SHARED_SCOPES`). `me` still says who signed in.
+    pub fn for_mailbox(self, address: &str) -> Self {
+        Self {
+            mailbox: Some(address.to_owned()),
+            ..self
+        }
+    }
+
     pub(crate) fn request(&self, method: Method, url: &str) -> RequestBuilder {
         let url = if url.starts_with("http") {
             url.to_owned()
         } else {
             format!("{}{url}", self.base)
         };
+        let url = match &self.mailbox {
+            Some(mailbox) => self.in_mailbox(url, mailbox),
+            None => url,
+        };
         http()
             .request(method, url)
             .bearer_auth(&self.token)
             .header("Prefer", "IdType=\"ImmutableId\"")
+    }
+
+    /// `url`, with a request under `/me/` sent to `mailbox` instead. Links
+    /// Graph hands back (next pages, delta links) already name it.
+    fn in_mailbox(&self, url: String, mailbox: &str) -> String {
+        let me = format!("{}/me/", self.base);
+        match url.strip_prefix(&me) {
+            Some(rest) => format!("{}/users/{}/{rest}", self.base, path(mailbox)),
+            None => url,
+        }
     }
 
     /// Sends `request`, keeping to Graph's pause (`send_once`).
@@ -647,6 +676,15 @@ impl Graph {
             "/me?$select=displayName,mail,userPrincipalName",
         ))
         .await
+    }
+
+    /// Whether the mailbox opens: its inbox's id is there to read. Fails
+    /// as `Gone` or `Auth` when the user has no access to a shared mailbox.
+    pub async fn open_inbox(&self) -> Result<()> {
+        let _: Value = self
+            .json(self.request(Method::GET, "/me/mailFolders/inbox?$select=id"))
+            .await?;
+        Ok(())
     }
 
     /// Brings the inbox into the store through a delta query.
@@ -3225,6 +3263,43 @@ pub(crate) mod tests {
         /// Fails the next listing for repair (`listed_for_repair`), as
         /// though the app were killed as it wrote it.
         pub(crate) static LISTING_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[test]
+    fn a_shared_mailbox_is_asked_for_in_place_of_the_users_own() {
+        let graph =
+            Graph::with_base("https://g/v1.0/", "token").for_mailbox("help+desk@contoso.com");
+        let url = |path: &str| {
+            graph
+                .request(Method::GET, path)
+                .build()
+                .unwrap()
+                .url()
+                .to_string()
+        };
+        assert_eq!(
+            url("/me/mailFolders/inbox?$select=id"),
+            "https://g/v1.0/users/help%2Bdesk%40contoso.com/mailFolders/inbox?$select=id"
+        );
+        assert_eq!(
+            url("https://g/v1.0/me/messages/delta?$select=id"),
+            "https://g/v1.0/users/help%2Bdesk%40contoso.com/messages/delta?$select=id"
+        );
+        // Who signed in, and links that already name the mailbox, stay.
+        assert_eq!(url("/me?$select=mail"), "https://g/v1.0/me?$select=mail");
+        assert_eq!(
+            url("https://g/v1.0/users/x/messages?$skip=10"),
+            "https://g/v1.0/users/x/messages?$skip=10"
+        );
+        let own = Graph::with_base("https://g/v1.0", "token");
+        assert_eq!(
+            own.request(Method::GET, "/me/messages")
+                .build()
+                .unwrap()
+                .url()
+                .as_str(),
+            "https://g/v1.0/me/messages"
+        );
     }
 
     #[test]

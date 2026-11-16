@@ -84,7 +84,7 @@ Last full check: 2026-10-26.
 ## Team Collaboration
 
 Spark's team features run on Readdle's servers. spark-rs has no server, so
-they aren't planned.
+they aren't planned, except where the mail server does the sharing.
 
 | Feature | spark-rs | Notes |
 |---|:-:|---|
@@ -94,7 +94,7 @@ they aren't planned.
 | Shared Drafts | ➖ | Needs a shared server |
 | Assignments | ➖ | Needs a shared server |
 | Team File Storage | ➖ | Needs a shared server |
-| Shared Inboxes | ➖ | Needs a shared server |
+| Shared Inboxes | 🟡 | Microsoft 365 shared mailboxes you have access to open as accounts of their own, with your sign-in: mail, calendar, and sending from the mailbox's address. Spark's team inbox features (assigning, comments, seeing who's replying) need a shared server. Not yet tried with a real shared mailbox |
 | Shared Templates | ➖ | Needs a shared server |
 | Team Administration | ➖ | Needs a shared server |
 | Read Statuses | ➖ | Needs a server to track when an email is opened |
