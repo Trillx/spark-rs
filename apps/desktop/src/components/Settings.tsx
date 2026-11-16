@@ -108,6 +108,15 @@ import {
   type HomeSettings,
 } from "../lib/homeScreen";
 import { saveLoadRemoteImages, useLoadRemoteImages } from "../lib/remoteImages";
+import {
+  ACCENTS,
+  BACKGROUNDS,
+  DEFAULT_TERMINAL,
+  saveTerminal,
+  useTerminalPrefs,
+  type EmailStyle,
+  type TerminalPrefs,
+} from "../lib/terminal";
 import type { ThemePref } from "../lib/theme";
 import { signatureLabel } from "../lib/signatures";
 import type {
@@ -2211,6 +2220,8 @@ function AppearancePage({
         </div>
       </section>
 
+      {theme === "terminal" && <TerminalColors />}
+
       <Group title="Conversations">
         <Row
           label="Minimize old emails"
@@ -2291,6 +2302,89 @@ function AppearancePage({
 }
 
 /** A tiny sketch of the window: dark sidebar, list, reader. */
+const EMAIL_STYLES: { key: EmailStyle; label: string }[] = [
+  { key: "original", label: "As sent" },
+  { key: "font", label: "Terminal font" },
+  { key: "colors", label: "Font and colors" },
+];
+
+/** Settings → Appearance with the Terminal theme: its colors, and how emails show in it. */
+function TerminalColors() {
+  const prefs = useTerminalPrefs();
+  const set = (change: Partial<TerminalPrefs>) => saveTerminal({ ...prefs, ...change });
+  const swatches = (
+    label: string,
+    list: { label: string; hex: string }[],
+    value: string,
+    pick: (hex: string) => void,
+  ) => (
+    <div role="radiogroup" aria-label={label} className="flex flex-wrap items-center gap-1.5">
+      {list.map(({ label: name, hex }) => (
+        <button
+          key={hex}
+          role="radio"
+          aria-checked={value.toLowerCase() === hex}
+          aria-label={name}
+          data-tip={name}
+          onClick={() => pick(hex)}
+          className={`size-6 rounded-full border ${
+            value.toLowerCase() === hex ? "border-base-content ring-1 ring-base-content" : "border-hairline"
+          }`}
+          style={{ background: hex }}
+        />
+      ))}
+      <label data-tip="Custom" className="relative grid size-6 cursor-pointer place-items-center border border-dashed border-splitter text-[11px] text-text-2">
+        +
+        <input
+          type="color"
+          aria-label={`Custom ${label.toLowerCase()}`}
+          value={value}
+          onChange={(e) => pick(e.target.value)}
+          className="absolute inset-0 cursor-pointer opacity-0"
+        />
+      </label>
+    </div>
+  );
+  return (
+    <Group
+      title="Terminal colors"
+      note={
+        <>
+          Emails show differently only here: what's sent and kept stays as it was.{" "}
+          <button className="text-primary hover:underline" onClick={() => saveTerminal(DEFAULT_TERMINAL)}>
+            Reset to defaults
+          </button>
+        </>
+      }
+    >
+      <Row label="Color" description="Prompts, buttons, highlights and borders.">
+        {swatches("Color", ACCENTS, prefs.accent, (accent) => set({ accent }))}
+      </Row>
+      <Row label="Background">{swatches("Background", BACKGROUNDS, prefs.background, (background) => set({ background }))}</Row>
+      <Row label="One-color text" description="All text in the color too, like an old monochrome screen." htmlFor="term-mono">
+        <Switch id="term-mono" on={prefs.mono} onToggle={() => set({ mono: !prefs.mono })} />
+      </Row>
+      <Row
+        label="Emails"
+        description="Terminal font keeps each email's colors and layout. Font and colors also turns every email into terminal text, which can hide text set on a colored background."
+      >
+        <select
+          aria-label="How emails show"
+          value={prefs.email}
+          onChange={(e) => set({ email: e.target.value as EmailStyle })}
+          className="select select-sm h-8 w-44 rounded-lg border-hairline text-[13px]"
+        >
+          {EMAIL_STYLES.map(({ key, label }) => (
+            <option key={key} value={key}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </Row>
+    </Group>
+  );
+}
+
 function ThemePreview({ kind }: { kind: ThemePref }) {
   const pane = (dark: boolean) => (
     <div className={`flex h-full ${dark ? "bg-[#1f2124]" : "bg-white"}`}>
@@ -2305,16 +2399,7 @@ function ThemePreview({ kind }: { kind: ThemePref }) {
       </div>
     </div>
   );
-  if (kind === "terminal") {
-    return (
-      <div className="h-[72px] overflow-hidden rounded-lg border border-hairline bg-[#0c0c0c] p-1.5 font-mono text-[8px] leading-[10px] text-[#16c60c]">
-        <div>$ spark inbox</div>
-        <div className="text-[#cccccc]">&gt; 3 new</div>
-        <div className="text-[#61d6d6]">&gt; 1 pinned</div>
-        <div>$ <span className="inline-block h-[8px] w-[5px] animate-pulse bg-[#16c60c] align-middle" /></div>
-      </div>
-    );
-  }
+  if (kind === "terminal") return <TerminalPreview />;
   return (
     <div className="h-[72px] overflow-hidden rounded-lg border border-hairline">
       {kind === "system" ? (
@@ -2994,4 +3079,22 @@ function host(url: string) {
   } catch {
     return url;
   }
+}
+
+function TerminalPreview() {
+  const { accent, background, mono } = useTerminalPrefs();
+  return (
+    <div
+      className="h-[72px] overflow-hidden rounded-lg border border-hairline p-1.5 font-mono text-[8px] leading-[10px]"
+      style={{ background, color: accent }}
+    >
+      <div>$ spark inbox</div>
+      <div style={{ color: mono ? accent : "#cccccc" }}>&gt; 3 new</div>
+      <div style={{ opacity: 0.7 }}>&gt; 1 pinned</div>
+      <div>
+        ${" "}
+        <span className="inline-block h-[8px] w-[5px] animate-pulse align-middle" style={{ background: accent }} />
+      </div>
+    </div>
+  );
 }

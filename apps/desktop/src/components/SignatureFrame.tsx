@@ -1,7 +1,8 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { backdropColor, cssColor, darkColors, type Rgb } from "../lib/darkColors";
 import { fitImage, resetFonts, undoDarkMode } from "../lib/signatures";
-import { useDarkTheme } from "../lib/theme";
+import { TERMINAL_FONT, TERMINAL_FONT_FACE, useTerminalPrefs } from "../lib/terminal";
+import { useDarkTheme, useTerminalTheme } from "../lib/theme";
 
 // A signature is HTML the user pasted from anywhere, so it's shown and
 // edited like an email: in a frame sandboxed without `allow-scripts`, under
@@ -62,6 +63,12 @@ const SignatureFrame = forwardRef<
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
   const dark = useDarkTheme();
+  const terminal = useTerminalTheme();
+  const { email, accent } = useTerminalPrefs();
+  const terminalCss =
+    terminal && email !== "original"
+      ? `${TERMINAL_FONT_FACE} body, body * { font-family: ${TERMINAL_FONT} !important; } a { color: ${accent}; }`
+      : "";
   const editable = onInput !== undefined;
   /** What the frame holds: its first HTML, then what's typed. */
   const held = useRef(html);
@@ -83,10 +90,10 @@ const SignatureFrame = forwardRef<
     () =>
       "<!doctype html><html><head>" +
       `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: cid: https: http:; style-src 'unsafe-inline'; font-src data:">` +
-      `<meta name="referrer" content="no-referrer"><style>${FRAME_CSS}${dark ? DARK_CSS : LIGHT_CSS}</style>` +
+      `<meta name="referrer" content="no-referrer"><style>${FRAME_CSS}${dark ? DARK_CSS : LIGHT_CSS}${terminalCss}</style>` +
       `<style id="spark-adapted">${dark ? ":root { visibility: hidden; }" : ""}</style></head>` +
       `<body${editable ? ' contenteditable="true"' : ""} data-placeholder="${escapeAttribute(placeholder)}">${held.current}</body></html>`,
-    [loaded, editable, placeholder, dark],
+    [loaded, editable, placeholder, dark, terminalCss],
   );
 
   const doc = () => frameRef.current?.contentDocument ?? null;

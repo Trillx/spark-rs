@@ -600,8 +600,10 @@ html[data-window="popup"] body {
   --spark-ai-time: #c678dd;
   --spark-email-inset: 10px;
 
-  --term-green: #16c60c;
-  --term-dim: #0e7a08;
+  --term-accent: #16c60c;
+  --term-dim: #11690c;
+  --term-glow: rgba(22, 198, 12, 0.35);
+  --term-home: #0f1f0e;
   --term-font: "JetBrains Mono Variable", "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
   --font-sans: var(--term-font);
   --font-mono: var(--term-font);
@@ -627,24 +629,24 @@ html[data-window="popup"] body {
   box-shadow: var(--spark-shadow-popup) !important;
 }
 [data-theme="spark-terminal"] ::selection {
-  background: var(--term-green);
-  color: #000;
+  background: var(--term-accent);
+  color: var(--color-primary-content);
 }
 [data-theme="spark-terminal"] input,
 [data-theme="spark-terminal"] textarea,
 [data-theme="spark-terminal"] [contenteditable] {
-  caret-color: var(--term-green);
+  caret-color: var(--term-accent);
   caret-shape: block;
 }
 [data-theme="spark-terminal"] :focus-visible {
-  outline: 1px dashed var(--term-green) !important;
+  outline: 1px dashed var(--term-accent) !important;
   outline-offset: 1px;
 }
 [data-theme="spark-terminal"] ::-webkit-scrollbar-thumb {
   background: var(--term-dim);
 }
 [data-theme="spark-terminal"] ::-webkit-scrollbar-thumb:hover {
-  background: var(--term-green);
+  background: var(--term-accent);
 }
 /* Section headings read like comments, h2 like a prompt. */
 [data-theme="spark-terminal"] h3::before {
@@ -654,7 +656,7 @@ html[data-window="popup"] body {
 [data-theme="spark-terminal"] h1::before,
 [data-theme="spark-terminal"] h2::before {
   content: "$ ";
-  color: var(--term-green);
+  color: var(--term-accent);
 }
 /* daisyUI buttons as [ label ]. */
 [data-theme="spark-terminal"] .btn {
@@ -693,14 +695,14 @@ html[data-window="popup"] body {
 }
 /* Home Screen: a black console instead of the day's wallpaper, the greeting a prompt with a cursor. */
 [data-theme="spark-terminal"] .home-wallpaper {
-  background: radial-gradient(ellipse at 30% 20%, #0f1f0e 0%, #050805 70%) !important;
+  background: radial-gradient(ellipse at 30% 20%, var(--term-home) 0%, var(--color-base-100) 70%) !important;
 }
 [data-theme="spark-terminal"] .home-wallpaper > .bg-black\/20 {
   display: none;
 }
 [data-theme="spark-terminal"] .home-wallpaper h2 {
-  color: var(--term-green);
-  text-shadow: 0 0 18px rgba(22, 198, 12, 0.35);
+  color: var(--term-accent);
+  text-shadow: 0 0 18px var(--term-glow);
 }
 [data-theme="spark-terminal"] .home-wallpaper h2::after {
   content: "_";

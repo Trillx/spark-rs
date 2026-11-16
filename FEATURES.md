@@ -38,7 +38,7 @@ Last full check: 2026-10-26.
 | Command Center | ✅ | `Ctrl+K` lists every action with its shortcut |
 | Quick Replies | ➖ | An iOS feature in Spark; the +AI quick replies below work |
 | Print Emails | ✅ | An email or a whole conversation, through Windows' print dialog, which also saves as PDF; Save as .eml too |
-| Dark Mode | ✅ | Light, dark, terminal (the default), or the same as Windows |
+| Dark Mode | ✅ | Light, dark, terminal (the default, with color choices and terminal-font emails), or the same as Windows |
 
 ## Enhanced Productivity
 

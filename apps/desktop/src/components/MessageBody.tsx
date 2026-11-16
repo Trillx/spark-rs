@@ -5,7 +5,8 @@ import { findLinks, MAYBE_LINK } from "../lib/linkify";
 import { openLink } from "../lib/links";
 import { cssIsRemote, isRemoteUrl, srcsetIsRemote } from "../lib/remoteImages";
 import { cidKey } from "../lib/richText";
-import { useDarkTheme } from "../lib/theme";
+import { terminalFrameCss, useTerminalPrefs } from "../lib/terminal";
+import { useDarkTheme, useTerminalTheme } from "../lib/theme";
 import { forwardWheelZoom } from "../lib/wheelZoom";
 import type { InlineImages } from "../types";
 import { ImageViewer, type ViewedImage } from "./ImageViewer";
@@ -209,9 +210,19 @@ export function HtmlBody({
     setQuoteShown(!quoteShown);
   };
   const dark = useDarkTheme();
+  const terminal = useTerminalTheme();
+  const terminalPrefs = useTerminalPrefs();
   const frame = useMemo(
-    () => frameDocument(html, { remoteImages, inlineImages, quotes, card: dark ? cardColor() : null }),
-    [html, remoteImages, inlineImages, quotes, dark],
+    () =>
+      frameDocument(html, {
+        remoteImages,
+        inlineImages,
+        quotes,
+        card: dark ? cardColor() : null,
+        terminal: terminal ? terminalFrameCss(terminalPrefs, cssColor(cardColor())) : "",
+        recolor: terminal && terminalPrefs.email === "colors",
+      }),
+    [html, remoteImages, inlineImages, quotes, dark, terminal, terminalPrefs],
   );
   /** What the laid-out frame shows from the web (`showsRemote`); until it's laid out, `frame.remote`. */
   const [shown, setShown] = useState<{ frame: Frame; remote: boolean } | null>(null);
@@ -358,11 +369,22 @@ function frameDocument(
     inlineImages,
     quotes,
     card,
-  }: { remoteImages: boolean; inlineImages: InlineImages | null; quotes: boolean; card: Rgb | null },
+    terminal = "",
+    recolor = false,
+  }: {
+    remoteImages: boolean;
+    inlineImages: InlineImages | null;
+    quotes: boolean;
+    card: Rgb | null;
+    /** The Terminal theme's extra CSS (lib/terminal.ts), last so it wins. */
+    terminal?: string;
+    /** The Terminal theme recolors every email itself: none stays on a light sheet or gets adapted. */
+    recolor?: boolean;
+  },
 ): Frame {
   const doc = new DOMParser().parseFromString(html, "text/html");
   // Before its <meta http-equiv> tags go: they count.
-  const scheme = card ? emailScheme(doc) : "light";
+  const scheme = recolor ? "native" : card ? emailScheme(doc) : "light";
   const dark = scheme !== "light";
   for (const el of doc.querySelectorAll("script, meta[http-equiv], base, link, iframe, frame, frameset, object, embed")) {
     el.remove();
@@ -388,6 +410,8 @@ function frameDocument(
       `<base target="_blank">` +
       `<style>${css}</style>`,
   );
+  // After the email's own styles, so its fonts and colors give way.
+  if (terminal) doc.body.insertAdjacentHTML("beforeend", `<style>${terminal}</style>`);
   return {
     srcDoc: `<!doctype html>${doc.documentElement.outerHTML}`,
     sheet: !dark,

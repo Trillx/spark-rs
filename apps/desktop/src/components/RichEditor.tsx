@@ -45,6 +45,7 @@ import {
 } from "../lib/richText";
 import { IS_MAC } from "../lib/shortcuts";
 import { undoDarkMode } from "../lib/signatures";
+import { TERMINAL_FONT, TERMINAL_FONT_FACE, contrast, useTerminalPrefs } from "../lib/terminal";
 import { useDarkTheme, useTerminalTheme } from "../lib/theme";
 import { tipAttrs, type Tip } from "../lib/tooltip";
 import { forwardWheelZoom } from "../lib/wheelZoom";
@@ -138,6 +139,7 @@ const RichEditor = forwardRef<
   const [height, setHeight] = useState(0);
   const dark = useDarkTheme();
   const terminal = useTerminalTheme();
+  const { accent } = useTerminalPrefs();
   /** What the editor holds: the HTML it was given, then what's typed. */
   const held = useRef<string | null>(null);
   const latest = useRef({ html, onChange, onMention, onKey, onError, readOnly, imageSize, scroller, placeholder });
@@ -631,12 +633,13 @@ const RichEditor = forwardRef<
     style.textContent =
       `:root { color-scheme: ${dark ? "dark" : "light"}; } body { color: ${color}; }` +
       ` a { color: ${dark ? "#4da3ff" : "#007cff"}; }` +
-      // Only how it shows here: the frame's CSP keeps out the app's font, so Windows' own monospace.
+      // Only how it shows here: what's sent keeps the fonts it has.
       (terminal
-        ? ` body { font-family: "Cascadia Mono", Consolas, ui-monospace, monospace; caret-color: #16c60c; }` +
-          ` a { color: #61d6d6; } ::selection { background: #16c60c; color: #000; }`
+        ? TERMINAL_FONT_FACE +
+          ` body { font-family: ${TERMINAL_FONT}; font-variant-ligatures: none; caret-color: ${accent}; }` +
+          ` a { color: ${accent}; } ::selection { background: ${accent}; color: ${contrast(accent)}; }`
         : "");
-  }, [wired, dark, terminal]);
+  }, [wired, dark, terminal, accent]);
 
   useEffect(() => {
     const r = wired;

@@ -233,6 +233,7 @@ import {
   presetOf,
   type LaterPreset,
 } from "./lib/format";
+import { applyTerminal, loadTerminal } from "./lib/terminal";
 import { applyTheme, loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
   CARDS,
@@ -1200,6 +1201,7 @@ export default function App() {
       const nextTheme = loadTheme();
       setTheme(nextTheme);
       applyTheme(nextTheme);
+      applyTerminal(loadTerminal());
       applyZoom(loadZoom());
     };
     window.addEventListener("storage", onStorage);
