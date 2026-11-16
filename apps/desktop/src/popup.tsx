@@ -1,3 +1,4 @@
+import "@fontsource-variable/jetbrains-mono";
 import "@fontsource-variable/inter";
 import { LucideProvider } from "lucide-react";
 import { StrictMode } from "react";

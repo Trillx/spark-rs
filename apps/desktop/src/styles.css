@@ -536,3 +536,183 @@ html[data-window="popup"] body {
     animation: none;
   }
 }
+
+/* ---- Terminal theme (RiverCity fork) ----
+   Everything as if in a terminal: one monospace face, square corners, green-on-black
+   with ANSI accents, boxes drawn with thin green rules instead of shadows. `:root`
+   in the selector outranks the system-dark block above, which also matches here. */
+:root[data-theme="spark-terminal"] {
+  color-scheme: dark;
+  --color-base-100: #0c0c0c;
+  --color-base-200: #121212;
+  --color-base-300: #1a1a1a;
+  --color-base-content: #d0d0d0;
+
+  --color-primary: #16c60c;
+  --color-primary-content: #0c0c0c;
+  --color-secondary: #61d6d6;
+  --color-secondary-content: #0c0c0c;
+  --color-accent: #c678dd;
+  --color-accent-content: #0c0c0c;
+  --color-neutral: #1a1a1a;
+  --color-neutral-content: #a0a0a0;
+
+  --color-info: #3b8eea;
+  --color-info-content: #0c0c0c;
+  --color-success: #16c60c;
+  --color-success-content: #0c0c0c;
+  --color-warning: #f9c74f;
+  --color-warning-content: #0c0c0c;
+  --color-error: #e74856;
+  --color-error-content: #0c0c0c;
+
+  --radius-selector: 0;
+  --radius-field: 0;
+  --radius-box: 0;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+
+  --spark-text-2: #8f8f8f;
+  --spark-text-3: #5c5c5c;
+  --spark-hairline: rgba(22, 198, 12, 0.16);
+  --spark-splitter: rgba(22, 198, 12, 0.32);
+  --spark-row-selected: #0f2a0d;
+  --spark-row-hover: #151815;
+  --spark-popover: #0c0c0c;
+  --spark-card: #101010;
+  --spark-token-contact: #0f2f45;
+  --spark-token-attachment: #12301a;
+  --spark-sidebar-rail: #000000;
+  --spark-sidebar-hover: rgba(22, 198, 12, 0.14);
+  --spark-sidebar-active: #146c10;
+  --spark-sidebar-selected: #146c10;
+  --spark-command-bg: #0c0c0c;
+  --spark-command-row: #146c10;
+  --spark-tooltip: #16c60c;
+  --spark-tooltip-text: #000000;
+  --spark-tooltip-key: rgba(0, 0, 0, 0.2);
+  --spark-ai-tint: linear-gradient(to left, rgba(198, 120, 221, 0.08), rgba(97, 214, 214, 0.08));
+  --spark-shadow-popup: 0 0 0 1px rgba(22, 198, 12, 0.55), 0 0 24px rgba(22, 198, 12, 0.1);
+  --spark-priority-fill: #221d0b;
+  --spark-priority-line: #4a3d12;
+  --spark-chip: #1a1a1a;
+  --spark-ai-time: #c678dd;
+  --spark-email-inset: 10px;
+
+  --term-green: #16c60c;
+  --term-dim: #0e7a08;
+  --term-font: "JetBrains Mono Variable", "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --font-sans: var(--term-font);
+  --font-mono: var(--term-font);
+  --default-font-family: var(--term-font);
+  --color-pin: #f9c74f;
+  --color-priority: #f9c74f;
+}
+
+[data-theme="spark-terminal"] body {
+  font-family: var(--term-font);
+  font-size: 13px;
+  font-variant-ligatures: none;
+  background: var(--color-base-100);
+}
+/* Square everything except the AI's spinning orb. */
+[data-theme="spark-terminal"] *:not(.ai-orb, .ai-orb *),
+[data-theme="spark-terminal"] *::before,
+[data-theme="spark-terminal"] *::after {
+  border-radius: 0 !important;
+}
+/* Raised surfaces are boxed, not shadowed. */
+[data-theme="spark-terminal"] [class*="shadow"]:not([class*="shadow-none"], [class*="drop-shadow"]) {
+  box-shadow: var(--spark-shadow-popup) !important;
+}
+[data-theme="spark-terminal"] ::selection {
+  background: var(--term-green);
+  color: #000;
+}
+[data-theme="spark-terminal"] input,
+[data-theme="spark-terminal"] textarea,
+[data-theme="spark-terminal"] [contenteditable] {
+  caret-color: var(--term-green);
+  caret-shape: block;
+}
+[data-theme="spark-terminal"] :focus-visible {
+  outline: 1px dashed var(--term-green) !important;
+  outline-offset: 1px;
+}
+[data-theme="spark-terminal"] ::-webkit-scrollbar-thumb {
+  background: var(--term-dim);
+}
+[data-theme="spark-terminal"] ::-webkit-scrollbar-thumb:hover {
+  background: var(--term-green);
+}
+/* Section headings read like comments, h2 like a prompt. */
+[data-theme="spark-terminal"] h3::before {
+  content: "# ";
+  color: var(--term-dim);
+}
+[data-theme="spark-terminal"] h1::before,
+[data-theme="spark-terminal"] h2::before {
+  content: "$ ";
+  color: var(--term-green);
+}
+/* daisyUI buttons as [ label ]. */
+[data-theme="spark-terminal"] .btn {
+  font-weight: 500;
+  text-transform: lowercase;
+}
+[data-theme="spark-terminal"] .btn:not(.btn-circle, .btn-square)::before {
+  content: "[";
+  opacity: 0.6;
+}
+[data-theme="spark-terminal"] .btn:not(.btn-circle, .btn-square)::after {
+  content: "]";
+  opacity: 0.6;
+}
+/* The AI's gradients become plain ANSI colors. */
+[data-theme="spark-terminal"] .text-ai {
+  background-image: none;
+  color: #c678dd;
+}
+[data-theme="spark-terminal"] .bg-ai-gradient {
+  background-image: none;
+  background-color: #8a3fa0;
+}
+[data-theme="spark-terminal"] .bg-ai-gradient-soft {
+  background-image: none;
+  background-color: rgba(198, 120, 221, 0.25);
+}
+/* A faint scanline sheen over the whole window; it never takes clicks. */
+[data-theme="spark-terminal"] #root::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgba(255, 255, 255, 0.018) 0 1px, transparent 1px 3px);
+}
+/* Home Screen: a black console instead of the day's wallpaper, the greeting a prompt with a cursor. */
+[data-theme="spark-terminal"] .home-wallpaper {
+  background: radial-gradient(ellipse at 30% 20%, #0f1f0e 0%, #050805 70%) !important;
+}
+[data-theme="spark-terminal"] .home-wallpaper > .bg-black\/20 {
+  display: none;
+}
+[data-theme="spark-terminal"] .home-wallpaper h2 {
+  color: var(--term-green);
+  text-shadow: 0 0 18px rgba(22, 198, 12, 0.35);
+}
+[data-theme="spark-terminal"] .home-wallpaper h2::after {
+  content: "_";
+  animation: term-blink 1.1s steps(1) infinite;
+}
+@keyframes term-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="spark-terminal"] .home-wallpaper h2::after {
+    animation: none;
+  }
+}

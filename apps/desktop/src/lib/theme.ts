@@ -3,21 +3,23 @@
 
 import { useEffect, useState } from "react";
 
-export type ThemePref = "system" | "light" | "dark";
+export type ThemePref = "system" | "light" | "dark" | "terminal";
 
 const STORAGE_KEY = "spark-rs.theme";
 const SYSTEM_DARK = "(prefers-color-scheme: dark)";
 
 export function loadTheme(): ThemePref {
   const saved = localStorage.getItem(STORAGE_KEY);
-  return saved === "light" || saved === "dark" ? saved : "system";
+  // Terminal is this fork's default: a machine that never chose a theme gets it.
+  if (saved === null) return "terminal";
+  return saved === "light" || saved === "dark" || saved === "terminal" ? saved : "system";
 }
 
 /** "system" removes `data-theme`, so the stylesheet follows `prefers-color-scheme`. */
 export function applyTheme(pref: ThemePref) {
   const root = document.documentElement;
   if (pref === "system") delete root.dataset.theme;
-  else root.dataset.theme = pref === "dark" ? "spark-dark" : "spark-light";
+  else root.dataset.theme = pref === "terminal" ? "spark-terminal" : pref === "dark" ? "spark-dark" : "spark-light";
 }
 
 export function saveTheme(pref: ThemePref) {
@@ -28,7 +30,7 @@ export function saveTheme(pref: ThemePref) {
 /** Whether the app shows its dark theme now: chosen, or the system's. */
 function isDark() {
   const chosen = document.documentElement.dataset.theme;
-  return chosen ? chosen === "spark-dark" : matchMedia(SYSTEM_DARK).matches;
+  return chosen ? chosen !== "spark-light" : matchMedia(SYSTEM_DARK).matches;
 }
 
 /** `isDark`, kept current as the setting or the system changes. */
@@ -47,4 +49,17 @@ export function useDarkTheme() {
     };
   }, []);
   return dark;
+}
+
+/** Whether the Terminal theme is showing, kept current as the setting changes. */
+export function useTerminalTheme() {
+  const read = () => document.documentElement.dataset.theme === "spark-terminal";
+  const [on, setOn] = useState(read);
+  useEffect(() => {
+    const chosen = new MutationObserver(() => setOn(read()));
+    chosen.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    setOn(read());
+    return () => chosen.disconnect();
+  }, []);
+  return on;
 }

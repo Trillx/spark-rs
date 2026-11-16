@@ -103,7 +103,7 @@ export default function HomeScreen({
   return (
     <section
       aria-label="Home Screen"
-      className="relative flex min-w-0 flex-1 flex-col overflow-hidden text-white"
+      className="home-wallpaper relative flex min-w-0 flex-1 flex-col overflow-hidden text-white"
       style={{ background: WALLPAPERS[dayOfYear(now) % WALLPAPERS.length] }}
     >
       <div className="pointer-events-none absolute inset-0 bg-black/20" />

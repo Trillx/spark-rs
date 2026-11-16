@@ -45,7 +45,7 @@ import {
 } from "../lib/richText";
 import { IS_MAC } from "../lib/shortcuts";
 import { undoDarkMode } from "../lib/signatures";
-import { useDarkTheme } from "../lib/theme";
+import { useDarkTheme, useTerminalTheme } from "../lib/theme";
 import { tipAttrs, type Tip } from "../lib/tooltip";
 import { forwardWheelZoom } from "../lib/wheelZoom";
 
@@ -137,6 +137,7 @@ const RichEditor = forwardRef<
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
   const dark = useDarkTheme();
+  const terminal = useTerminalTheme();
   /** What the editor holds: the HTML it was given, then what's typed. */
   const held = useRef<string | null>(null);
   const latest = useRef({ html, onChange, onMention, onKey, onError, readOnly, imageSize, scroller, placeholder });
@@ -629,8 +630,13 @@ const RichEditor = forwardRef<
     const color = getComputedStyle(frameRef.current).color;
     style.textContent =
       `:root { color-scheme: ${dark ? "dark" : "light"}; } body { color: ${color}; }` +
-      ` a { color: ${dark ? "#4da3ff" : "#007cff"}; }`;
-  }, [wired, dark]);
+      ` a { color: ${dark ? "#4da3ff" : "#007cff"}; }` +
+      // Only how it shows here: the frame's CSP keeps out the app's font, so Windows' own monospace.
+      (terminal
+        ? ` body { font-family: "Cascadia Mono", Consolas, ui-monospace, monospace; caret-color: #16c60c; }` +
+          ` a { color: #61d6d6; } ::selection { background: #16c60c; color: #000; }`
+        : "");
+  }, [wired, dark, terminal]);
 
   useEffect(() => {
     const r = wired;
