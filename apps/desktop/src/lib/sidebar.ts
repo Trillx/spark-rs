@@ -357,6 +357,19 @@ export function listFolderIds(key: ListKey, folders: FolderView[], account?: Acc
   return folders.filter((f) => f.role === role && (account === undefined || f.account === account)).map((f) => f.id);
 }
 
+/**
+ * Server folders starred into the sidebar (its top section or Folders), in sidebar order. Their
+ * unread mail shows in the Inbox as a card each (RiverCity fork): mail filed away by server rules
+ * would otherwise never reach the Inbox.
+ */
+export function starredFolders(layout: SidebarLayout, folders: FolderView[]): ListKey[] {
+  return [...layout.favorites, ...layout.folders].filter((key) => {
+    const id = folderIdOf(key);
+    const folder = id === undefined ? undefined : folders.find((f) => f.id === id);
+    return folder !== undefined && folder.selectable && !folder.role;
+  });
+}
+
 /** Folders to keep in sync: every list the sidebar shows, plus the open one. */
 export function watchedFolderIds(layout: SidebarLayout, folders: FolderView[], open: ListKey): number[] {
   const keys = new Set([...shownKeys(layout, folders), open]);

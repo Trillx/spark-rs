@@ -36,6 +36,7 @@ import {
   type ListModel,
   type ListView,
 } from "../lib/layout";
+import type { ListKey } from "../lib/sidebar";
 import { LIST_MAX, LIST_MIN, startHorizontalDrag } from "../lib/panes";
 import { changed, scrolled, type ListNow, type Reach, type Step } from "../lib/reachBack";
 import { LIST_ITEMS, pagedPastEnd, renderForPaging } from "../lib/scroll";
@@ -55,7 +56,7 @@ import {
 import Dropdown, { MenuItem } from "./Dropdown";
 import MessageRow, { ROW_HEIGHT, type RowActions } from "./MessageRow";
 import OverlayScroll from "./OverlayScroll";
-import { GatekeeperCard, GroupRow, SmartInboxCard, type CardSettings } from "./SmartInboxCard";
+import { FolderCard, GatekeeperCard, GroupRow, SmartInboxCard, type CardSettings } from "./SmartInboxCard";
 import { tipAttrs } from "../lib/tooltip";
 
 export interface GatekeeperActions {
@@ -78,6 +79,10 @@ interface Props {
   gatekeeper: GatekeeperActions;
   onDoneAll: (items: Message[]) => void;
   onShowAll: (key: CardKey) => void;
+  /** A starred folder's card: "Show all" opens the folder. */
+  onOpenFolder: (key: ListKey) => void;
+  /** A starred folder's card: marks its emails read, which takes them off the card. */
+  onReadAll: (items: Message[]) => void;
   onOpenGroup: (key: GroupKey) => void;
   onBack: () => void;
   onModeChange: (mode: InboxMode) => void;
@@ -178,6 +183,21 @@ export default function MessageList(props: Props) {
             onCompleteAll={() => props.onDoneAll(b.items)}
             onShowAll={() => props.onShowAll(b.key)}
             settings={props.cardSettings(b.key)}
+          />,
+        );
+      case "folder":
+        return boxed(
+          b,
+          `folder:${b.key}`,
+          <FolderCard
+            label={b.label}
+            detail={b.detail}
+            items={b.items}
+            shown={b.shown}
+            renderRow={row}
+            onReadAll={() => props.onReadAll(b.items)}
+            onDoneAll={() => props.onDoneAll(b.items)}
+            onShowAll={() => props.onOpenFolder(b.key)}
           />,
         );
       case "gatekeeper":
@@ -324,6 +344,8 @@ function blockKey(block: ListBlock): BlockKey {
       return `group:${block.key}`;
     case "card":
       return `card:${block.key}`;
+    case "folder":
+      return `folder:${block.key}`;
     case "gatekeeper":
       return "gatekeeper";
   }
@@ -338,6 +360,10 @@ function sizeKey(block: Exclude<ListBlock, { kind: "row" }>) {
     case "card": {
       const rows = Math.min(block.shown, block.items.length);
       return `card:${block.key}:${rows}:${rows < block.items.length}`;
+    }
+    case "folder": {
+      const rows = Math.min(block.shown, block.items.length);
+      return `folder:${rows}:${rows < block.items.length}`;
     }
     case "gatekeeper":
       return `gatekeeper:${block.layout}`;
@@ -361,6 +387,8 @@ function estimate(block: Exclude<ListBlock, { kind: "row" }>) {
       if (block.key !== "priority") return 2 + 52 + rows + 40 + 10;
       return 44 + 5 + rows + (shown < block.items.length ? 40 : 5) + 10;
     }
+    case "folder":
+      return 2 + 52 + Math.min(block.shown, block.items.length) * ROW_HEIGHT + 40 + 10;
     case "gatekeeper":
       return block.layout === "strip" ? 40 + 138 + 4 + 10 : 8 + Math.ceil(block.items.length / 2) * 146;
   }
@@ -387,7 +415,8 @@ function layoutOf(blocks: ListBlock[], measured: ReadonlyMap<string, number>): L
       heights[i] = ROW_HEIGHT;
       return;
     }
-    if (block.kind === "card") for (const m of block.items.slice(0, block.shown)) index.set(m.id, i);
+    if (block.kind === "card" || block.kind === "folder")
+      for (const m of block.items.slice(0, block.shown)) index.set(m.id, i);
     if (block.kind === "group") index.set(block.items[0].id, i);
     const size = sizeKey(block);
     heights[i] = measured.get(size) ?? estimate(block);

@@ -69,6 +69,8 @@ export interface ListView {
 export type ListBlock =
   /** `shown` rows, then "Show all". */
   | { kind: "card"; key: CardKey; items: Message[]; total: number; shown: number }
+  /** A starred folder's unread mail: `shown` rows, then "Show all", which opens the folder. */
+  | { kind: "folder"; key: ListKey; label: string; detail?: string; items: Message[]; shown: number }
   /** New senders: a strip of cards above the list, or the full grid of its own view. */
   | { kind: "gatekeeper"; items: Message[]; layout: "strip" | "grid" }
   | { kind: "period"; title: string }
@@ -257,6 +259,8 @@ export interface ListContext {
   /** Cards settings. */
   cards?: CardPrefs;
   grouped?: Grouped;
+  /** Starred server folders (`starredFolders`), each a card in the Inbox. */
+  inboxFolders?: ListKey[];
 }
 
 /** Mail waiting in New Senders, out of the lists until its sender is accepted. */
@@ -368,7 +372,7 @@ function rowIds(blocks: ListBlock[]) {
   return blocks.flatMap((b) =>
     b.kind === "row"
       ? [b.message.id]
-      : b.kind === "card"
+      : b.kind === "card" || b.kind === "folder"
         ? b.items.slice(0, b.shown).map((m) => m.id)
         : b.kind === "group"
           ? [b.items[0].id]
@@ -522,7 +526,37 @@ export function buildList(
   }
 
   const inbox = inboxMessages(messages, view.account, view.showDone, ctx.gatekeeper);
-  const mail = rows.of(inbox.mail);
+
+  // Starred folders' unread mail (and mail read during this visit, so it doesn't jump away),
+  // a card per folder. That mail shows only there; read, inbox mail goes back to the cards.
+  const folderCards: ListBlock[] = [];
+  const inFolderCard = new Set<number>();
+  for (const key of ctx.inboxFolders ?? []) {
+    const ids = listFolderIds(key, ctx.folders);
+    const held = messages
+      .filter(
+        (m) =>
+          (m.state === "filed" || m.state === "inbox") &&
+          !inFolderCard.has(m.id) &&
+          !waiting(m, ctx.gatekeeper) &&
+          (view.account === "all" || m.account === view.account) &&
+          (m.unread || sticky.has(m.id)) &&
+          inFolders(ids)(m),
+      )
+      .sort(newestInInbox);
+    if (!held.length) continue;
+    for (const m of held) inFolderCard.add(m.id);
+    const info = listInfo(key, ctx.folders, ctx.smartFolders);
+    folderCards.push({
+      kind: "folder",
+      key,
+      label: info?.label ?? "Folder",
+      detail: info?.detail,
+      items: rows.of(held),
+      shown: ctx.cards?.rows.people ?? CARD_LIMIT,
+    });
+  }
+  const mail = rows.of(inFolderCard.size ? inbox.mail.filter((m) => !inFolderCard.has(m.id)) : inbox.mail);
   const screening = inbox.screening;
   const title = (view.account !== "all" && accounts.find((a) => a.id === view.account)?.label) || "Inbox";
   const gatekeeper: ListBlock[] = screening.length ? [{ kind: "gatekeeper", items: screening, layout: "strip" }] : [];
@@ -609,6 +643,7 @@ export function buildList(
     for (const key of CARD_ORDER) {
       if (key === "seen") blocks.push(...groups);
       if (cards[key].length) blocks.push(card(key, cards[key]));
+      if (key === "people") blocks.push(...folderCards);
       // New senders sit right under Priority.
       if (key === "priority") blocks.push(...gatekeeper);
     }
@@ -619,10 +654,10 @@ export function buildList(
     // Priority mail sits in a card on top; the rest is grouped by date,
     // with invitations, notifications and newsletters folded into one row each.
     const top: ListBlock[] = priority.size ? [card("priority", cards.priority)] : [];
-    return rows.model(title, [...top, ...gatekeeper, ...withPeriods(fold(groupMail), inboxTime)]);
+    return rows.model(title, [...top, ...gatekeeper, ...folderCards, ...withPeriods(fold(groupMail), inboxTime)]);
   }
 
-  return rows.model(title, [...gatekeeper, ...withPeriods(fold(mail), inboxTime)]);
+  return rows.model(title, [...gatekeeper, ...folderCards, ...withPeriods(fold(mail), inboxTime)]);
 }
 
 /** A search's `from:`, `has:attachment`, `is:unread` and `date:today`, and the free text left. */

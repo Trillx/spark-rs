@@ -1,4 +1,4 @@
-import { Check, ChevronRight, Ellipsis, Mail, Minus, Plus, ThumbsDown, ThumbsUp, Zap } from "lucide-react";
+import { Check, CheckCheck, ChevronRight, Ellipsis, FolderOpen, Mail, Minus, Plus, ThumbsDown, ThumbsUp, Zap } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import type { Message } from "../types";
 import { CARDS, GATEKEEPER, groupInfo, type CardKey, type GroupKey } from "../lib/layout";
@@ -134,6 +134,60 @@ function PriorityCard({
           </span>
         </button>
       )}
+    </section>
+  );
+}
+
+/**
+ * A starred folder's unread mail in the Inbox (RiverCity fork). Gone once nothing in it is unread.
+ * Mark all read and Done all act on the card's emails; "Show all" opens the folder.
+ */
+export function FolderCard({
+  label,
+  detail,
+  items,
+  shown,
+  renderRow,
+  onReadAll,
+  onDoneAll,
+  onShowAll,
+}: {
+  label: string;
+  detail?: string;
+  items: Message[];
+  shown: number;
+  renderRow: (m: Message, inPriorityCard: boolean) => ReactNode;
+  onReadAll: () => void;
+  onDoneAll: () => void;
+  onShowAll: () => void;
+}) {
+  return (
+    <section aria-label={`${label} folder`} className="mb-2.5 rounded-2xl border border-hairline">
+      <header className="flex h-[52px] items-center gap-2.5 pl-3.5 pr-2.5">
+        <span className="grid size-6 shrink-0 place-items-center rounded-full bg-[#3d8bff] text-white">
+          <FolderOpen size={14} strokeWidth={2} />
+        </span>
+        <h3 data-tip={detail} className="min-w-0 flex-1 truncate text-[13px] font-medium leading-[18px]">
+          {label}
+        </h3>
+        <button
+          data-tip={`Mark all ${items.length} as read`}
+          aria-label={`Mark all ${label} as read`}
+          onClick={onReadAll}
+          className="grid size-7 place-items-center rounded-full text-text-2 hover:bg-base-content/10 hover:text-base-content"
+        >
+          <CheckCheck size={16} />
+        </button>
+        <CompleteAll label={label} count={items.length} onClick={onDoneAll} />
+      </header>
+      <div className="px-[5px]">{items.slice(0, shown).map((m) => renderRow(m, false))}</div>
+      <button
+        onClick={onShowAll}
+        className="flex h-10 w-full items-center gap-1 rounded-b-2xl px-3.5 text-[13px] text-text-2 hover:bg-row-hover hover:text-base-content"
+      >
+        {items.length > shown ? `Show all (${items.length})` : `Open ${label}`}
+        <ChevronRight size={14} className="ml-auto" />
+      </button>
     </section>
   );
 }

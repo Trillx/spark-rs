@@ -293,6 +293,7 @@ import {
   sidebarKeys,
   smartIdOf,
   visit,
+  starredFolders,
   watchedFolderIds,
   type ListKey,
   type SidebarLayout,
@@ -689,6 +690,9 @@ export default function App() {
     reloadMessages,
     view.account === "all" ? undefined : view.account,
   );
+  // Starred folders' unread mail shows in the Inbox as cards; the key keeps the memo stable.
+  const inboxFolderKey = starredFolders(layout, folders).join("|");
+  const inboxFolders = useMemo(() => (inboxFolderKey ? (inboxFolderKey.split("|") as ListKey[]) : []), [inboxFolderKey]);
   const ctx: ListContext = useMemo(
     () => ({
       accounts,
@@ -700,8 +704,9 @@ export default function App() {
       priorityLines,
       cards: cardPrefs,
       grouped,
+      inboxFolders,
     }),
-    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode, priorityLines, cardPrefs, grouped],
+    [accounts, folders, layout.smartFolders, seen, hits, gatekeeperMode, priorityLines, cardPrefs, grouped, inboxFolders],
   );
   const listed = useMemo(
     () => (discarding.size ? messages.filter((m) => !discarding.has(m.id)) : messages),
@@ -4656,6 +4661,11 @@ export default function App() {
                   gatekeeper={gatekeeper}
                   onDoneAll={doneAll}
                   onShowAll={(key) => changeView({ sub: { kind: "card", key } }, true)}
+                  onOpenFolder={(key) => selectList(key)}
+                  onReadAll={(items) => {
+                    const unread = items.flatMap(together).filter((m) => m.unread);
+                    act(unread, { unread: false }, `${plural(unread.length, "email")} marked as read`, ICONS.read);
+                  }}
                   onOpenGroup={(key) => changeView({ sub: { kind: "group", key } }, true)}
                   onBack={() => changeView({ sub: null }, true)}
                   onModeChange={setMode}

@@ -25,7 +25,7 @@ Last full check: 2026-10-26.
 |---|:-:|---|
 | Unlimited Email Accounts | ✅ | Microsoft 365 through Microsoft Graph, Gmail, and any IMAP server |
 | Cross-Device Sync | ➖ | There's no sync server. Mail, read, Done, pins and folders go through your mail servers, so every device sees them; snooze, Set Aside, Priority and Gatekeeper decisions stay on the computer you set them on |
-| Smart Inbox | ✅ | Priority, Pins, Invitations, People, Responses, Notifications and Newsletters as cards (each can be turned off or show more), or as one focused list; a sender can be moved to another category |
+| Smart Inbox | ✅ | Priority, Pins, Invitations, People, Responses, Notifications and Newsletters as cards (each can be turned off or show more), or as one focused list; a sender can be moved to another category; a starred folder's unread mail shows as a card of its own |
 | Unified Inbox | ✅ | Every account in one inbox, with a row per account to see one alone |
 | Smart Search | 🟡 | Full-text search on your computer and on each mail server, in every account or just the one you're in, with `from:`, `has:attachment`, `is:unread` and `date:today`, search by sender and recent searches; no plain-language searches such as "PDFs from Anna last week" |
 | Smart Notifications | ✅ | Only mail from people notifies, unless you change it to all mail or only Priority mail. Beyond Spark, as in Gmail: mail with a sign-in code notifies from any sender, with a button that copies the code, and the list and the open email offer to copy it too (not yet tried with a real account) |
