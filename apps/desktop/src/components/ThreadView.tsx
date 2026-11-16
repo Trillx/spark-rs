@@ -1321,8 +1321,9 @@ function MessageCard({
               <span className="mx-1 h-5 w-px bg-hairline" />
             </>
           )}
-          <ToolbarButton tip={hint("Reply", "reply")} Icon={Reply} onClick={() => actions.reply(m)} />
-          <ToolbarButton tip={hint("Forward", "forward")} Icon={Forward} onClick={() => actions.forward(m)} />
+          <ReplyButton tip={hint("Reply", "reply")} label="Reply" Icon={Reply} onClick={() => actions.reply(m)} />
+          <ReplyButton tip={hint("Reply all", "replyAll")} label="Reply all" Icon={ReplyAll} onClick={() => actions.replyAll(m)} />
+          <ReplyButton tip={hint("Forward", "forward")} label="Forward" Icon={Forward} onClick={() => actions.forward(m)} />
         </footer>
       )}
     </article>
@@ -1732,6 +1733,21 @@ function SegmentButton({ tip, Icon, onClick }: { tip: Tip; Icon: LucideIcon; onC
       onClick={onClick}
     >
       <Icon size={17} />
+    </button>
+  );
+}
+
+/** The reply bar's buttons under each email: icon and word, in the theme's color in the Terminal theme. */
+function ReplyButton({ tip, label, Icon, onClick }: { tip: Tip; label: string; Icon: LucideIcon; onClick: () => void }) {
+  return (
+    <button
+      className="reply-action flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-text-2 hover:bg-base-content/10 hover:text-base-content"
+      {...tipAttrs(tip)}
+      aria-label={label}
+      onClick={onClick}
+    >
+      <Icon size={15} />
+      {label}
     </button>
   );
 }

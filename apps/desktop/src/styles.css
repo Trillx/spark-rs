@@ -718,3 +718,14 @@ html[data-window="popup"] body {
     animation: none;
   }
 }
+/* The reply bar under each email: Reply, Reply all, Forward in the chosen color. */
+[data-theme="spark-terminal"] .reply-action {
+  color: var(--term-accent);
+  border: 1px solid var(--spark-splitter);
+  text-transform: lowercase;
+}
+[data-theme="spark-terminal"] .reply-action:hover {
+  background: var(--term-accent);
+  color: var(--color-primary-content);
+  border-color: var(--term-accent);
+}
