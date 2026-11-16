@@ -205,6 +205,7 @@ export default function ThreadView({
   actions,
   scrollRef,
   findRequest = 0,
+  reply,
 }: {
   /** The email opened from the list, with its conversation's flags. Toolbar actions act on its conversation. */
   message: Message;
@@ -223,6 +224,8 @@ export default function ThreadView({
   scrollRef: RefObject<HTMLDivElement | null>;
   /** Goes up each time Find in Conversation is asked for (Ctrl+Shift+F, the Command Center). */
   findRequest?: number;
+  /** A reply or forward being written, under the last email. */
+  reply?: ReactNode;
 }) {
   const screening = m.screening && m.state === "inbox";
   const blocked = m.state === "blocked";
@@ -463,6 +466,7 @@ export default function ThreadView({
                 )}
               </Fragment>
             ))}
+            {reply}
           </div>
         )}
         {summary && (

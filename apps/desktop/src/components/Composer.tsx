@@ -107,6 +107,7 @@ export default function Composer({
   draft,
   saved = false,
   full,
+  inline = false,
   fullStyle,
   floatStyle,
   onChange,
@@ -124,6 +125,8 @@ export default function Composer({
   /** It's in Drafts as it stands. */
   saved?: boolean;
   full: boolean;
+  /** Under the conversation's last email, in its flow, rather than floating. */
+  inline?: boolean;
   /** Where the full-pane composer sits (the reading pane's box). */
   fullStyle: CSSProperties;
   /** Moves the floating composer, e.g. clear of the AI Assistant's panel. */
@@ -145,6 +148,18 @@ export default function Composer({
   ai?: ComposerAi;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
+  // Written under the conversation, it comes into view as it opens.
+  // The reader holds its place while bodies load, so this tries again once they've settled.
+  useEffect(() => {
+    if (!inline) return;
+    const show = () => rootRef.current?.scrollIntoView({ block: "end" });
+    const frame = requestAnimationFrame(show);
+    const timers = [150, 400, 900].map((ms) => window.setTimeout(show, ms));
+    return () => {
+      cancelAnimationFrame(frame);
+      timers.forEach(clearTimeout);
+    };
+  }, [inline]);
   const recipientsRef = useRef<RecipientsHandle>(null);
   const editorRef = useRef<RichEditorHandle>(null);
   const quoteRef = useRef<HTMLTextAreaElement>(null);
@@ -395,11 +410,13 @@ export default function Composer({
       role="dialog"
       aria-label={draft.title}
       onKeyDown={onKeyDown}
-      style={full ? fullStyle : floatStyle}
-      className={`z-50 flex flex-col overflow-hidden border bg-base-100 transition-colors ${dropping ? "border-primary" : "border-hairline"} ${
+      style={full ? fullStyle : inline ? undefined : floatStyle}
+      className={`flex flex-col overflow-hidden border bg-base-100 transition-colors ${dropping ? "border-primary" : "border-hairline"} ${
         full
-          ? "fixed bottom-0 top-8 rounded-tl-xl"
-          : "fixed bottom-4 right-4 h-[min(540px,calc(100vh-64px))] w-[560px] max-w-[calc(100vw-32px)] rounded-xl shadow-popup"
+          ? "fixed bottom-0 top-8 z-50 rounded-tl-xl"
+          : inline
+            ? "inline-reply relative mt-2 h-[min(460px,calc(100vh-160px))] scroll-mb-4 rounded-2xl"
+            : "fixed bottom-4 right-4 z-50 h-[min(540px,calc(100vh-64px))] w-[560px] max-w-[calc(100vw-32px)] rounded-xl shadow-popup"
       }`}
     >
       <div className="flex h-10 shrink-0 items-center gap-1 border-b border-hairline pl-4 pr-1.5">

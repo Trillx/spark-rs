@@ -233,6 +233,7 @@ import {
   presetOf,
   type LaterPreset,
 } from "./lib/format";
+import { useReplyInline } from "./lib/replyPlace";
 import { applyTerminal, loadTerminal } from "./lib/terminal";
 import { applyTheme, loadTheme, saveTheme, type ThemePref } from "./lib/theme";
 import {
@@ -578,6 +579,7 @@ export default function App() {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [composerKey, setComposerKey] = useState(0);
   const [composerFull, setComposerFull] = useState(false);
+  const replyInlinePref = useReplyInline();
   /** The AI Assistant's panel at the right, and a question for it from the pill. */
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [assistantAsk, setAssistantAsk] = useState<Ask | null>(null);
@@ -4554,6 +4556,63 @@ export default function App() {
   const readerLeft = THREAD_WINDOW !== null ? 0 : sidebarSpace + (twoColumns && !homeShown ? listWidthUsed : 0);
   /** The full-pane composer beside the assistant's panel, or over it when the pane would be too narrow. */
   const fullComposerRight = windowWidth - readerLeft - assistantSpace >= COMPOSER_MIN_BESIDE ? assistantSpace : 0;
+  // Settings → Composer → Reply in the conversation: a reply or forward to an email of the open
+  // conversation is written under its last email, not in the floating window.
+  const replyInline =
+    replyInlinePref &&
+    !composerFull &&
+    draft?.replyTo !== undefined &&
+    (THREAD_WINDOW === null ? conversation : windowConversation).some((x) => x.id === draft.replyTo);
+  const composerElement = draft ? (
+      <Composer
+        key={composerKey}
+        draft={draft}
+        saved={draftSaved === draftKey(draft)}
+        full={composerFull}
+        inline={replyInline}
+        fullStyle={{ left: readerLeft, right: fullComposerRight }}
+        floatStyle={composerBesideAssistant}
+        onChange={(patch) =>
+          setDraft(
+            (d) =>
+              d &&
+              (patch.from !== undefined && patch.from !== d.from
+                ? withAutoRecipients({ ...d, ...patch }, patch.from)
+                : { ...d, ...patch }),
+          )
+        }
+        onToggleFull={() => setComposerFull((f) => !f)}
+        onClose={() => void track(closeComposer())}
+        onDiscard={() => void discardComposer()}
+        onSend={() => void track(send())}
+        onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
+        onSignatureSettings={() => openSettings("signatures")}
+        onTemplateFromDraft={() => {
+          setNewTemplate({
+            id: null,
+            name: draft.subject.trim(),
+            subject: draft.subject.trim(),
+            html: draft.bodyHtml ?? textToHtml(draft.body),
+          });
+          openSettings("templates");
+        }}
+        onTemplateSettings={() => openSettings("templates")}
+        ai={{
+          writing: writing?.composer === composerKey ? writing : null,
+          quickReplies: draftReference(draft)?.relation === "reply",
+          run: writeWithAi,
+          stop: stopAi,
+          retry: () => writing && writeWithAi(writing.request),
+          undo: undoAi,
+          dismiss: () => setWriting(null),
+          setUp: () => {
+            setWriting(null);
+            openSettings("ai");
+          },
+        }}
+      />
+  ) : null;
+  const inlineReply = draft && replyInline ? composerElement : undefined;
 
   return (
     <AccountsContext value={accounts}>
@@ -4633,6 +4692,7 @@ export default function App() {
                   actions={threadActions}
                   scrollRef={readerScroll}
                   findRequest={findRequest}
+                  reply={inlineReply}
                 />
               </section>
             </div>
@@ -4722,6 +4782,7 @@ export default function App() {
                   actions={threadActions}
                   scrollRef={readerScroll}
                   findRequest={findRequest}
+                  reply={inlineReply}
                 />
               ) : (
                 <EmptyReader />
@@ -4768,6 +4829,7 @@ export default function App() {
                   actions={threadActions}
                   scrollRef={readerScroll}
                   findRequest={findRequest}
+                  reply={inlineReply}
                 />
               ) : (
                 <div className="grid flex-1 place-items-center text-[13px] text-text-2">
@@ -4778,54 +4840,7 @@ export default function App() {
           </main>
         )}
 
-        {draft && (
-          <Composer
-            key={composerKey}
-            draft={draft}
-            saved={draftSaved === draftKey(draft)}
-            full={composerFull}
-            fullStyle={{ left: readerLeft, right: fullComposerRight }}
-            floatStyle={composerBesideAssistant}
-            onChange={(patch) =>
-              setDraft(
-                (d) =>
-                  d &&
-                  (patch.from !== undefined && patch.from !== d.from
-                    ? withAutoRecipients({ ...d, ...patch }, patch.from)
-                    : { ...d, ...patch }),
-              )
-            }
-            onToggleFull={() => setComposerFull((f) => !f)}
-            onClose={() => void track(closeComposer())}
-            onDiscard={() => void discardComposer()}
-            onSend={() => void track(send())}
-            onError={(text) => showToast(text, undefined, ICONS.error, { duration: ERROR_TOAST_MS })}
-            onSignatureSettings={() => openSettings("signatures")}
-            onTemplateFromDraft={() => {
-              setNewTemplate({
-                id: null,
-                name: draft.subject.trim(),
-                subject: draft.subject.trim(),
-                html: draft.bodyHtml ?? textToHtml(draft.body),
-              });
-              openSettings("templates");
-            }}
-            onTemplateSettings={() => openSettings("templates")}
-            ai={{
-              writing: writing?.composer === composerKey ? writing : null,
-              quickReplies: draftReference(draft)?.relation === "reply",
-              run: writeWithAi,
-              stop: stopAi,
-              retry: () => writing && writeWithAi(writing.request),
-              undo: undoAi,
-              dismiss: () => setWriting(null),
-              setUp: () => {
-                setWriting(null);
-                openSettings("ai");
-              },
-            }}
-          />
-        )}
+        {draft && !replyInline && composerElement}
 
         {palette?.kind === "actions" && (
           <CommandCenter

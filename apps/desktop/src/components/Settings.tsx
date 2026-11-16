@@ -118,6 +118,7 @@ import {
   type TerminalPrefs,
 } from "../lib/terminal";
 import type { ThemePref } from "../lib/theme";
+import { saveReplyInline, useReplyInline } from "../lib/replyPlace";
 import { signatureLabel } from "../lib/signatures";
 import type {
   AccountView,
@@ -2029,6 +2030,7 @@ const UNDO_SEND_SECONDS = [5, 10, 15, 30, 60];
 
 function ComposerPage() {
   const { prefs, status, change } = usePrefs();
+  const replyInline = useReplyInline();
   const accounts = useAccounts().filter((a) => !a.demo);
   const [mail, setMail] = useState<{ supported: boolean; default: boolean } | null>(null);
   const [mailStatus, setMailStatus] = useState<Status>({ kind: "idle" });
@@ -2048,6 +2050,15 @@ function ComposerPage() {
   };
   return (
     <>
+      <Group title="Replies">
+        <Row
+          label="Reply in the conversation"
+          description="Reply, Reply all and Forward open under the conversation's last email. Off, they open in a floating window. Full screen works either way."
+          htmlFor="reply-inline"
+        >
+          <Switch id="reply-inline" on={replyInline} onToggle={() => saveReplyInline(!replyInline)} />
+        </Row>
+      </Group>
       <Group title="Sending">
         <Row
           label="Undo Send"
