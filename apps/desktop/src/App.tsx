@@ -692,8 +692,9 @@ export default function App() {
     reloadMessages,
     view.account === "all" ? undefined : view.account,
   );
-  // Starred folders' unread mail shows in the Inbox as cards; the key keeps the memo stable.
-  const inboxFolderKey = starredFolders(layout, folders).join("|");
+  // Starred folders' unread mail shows in the Inbox as cards, unless Settings → Inbox turns them
+  // off; the key keeps the memo stable.
+  const inboxFolderKey = cardPrefs.folders ? starredFolders(layout, folders).join("|") : "";
   const inboxFolders = useMemo(() => (inboxFolderKey ? (inboxFolderKey.split("|") as ListKey[]) : []), [inboxFolderKey]);
   const ctx: ListContext = useMemo(
     () => ({
@@ -2501,7 +2502,7 @@ export default function App() {
     toggleGroup("domains", domain, domain);
   }
 
-  /** A card's menu, and Settings → Appearance: its rows, or turning it off (People takes its mail). */
+  /** A card's menu, and Settings → Inbox: its rows, or turning it off (People takes its mail). */
   function cardSettings(key: CardKey): CardSettings {
     return {
       setRows: (rows) => setCardPrefs((p) => ({ ...p, rows: { ...p.rows, [key]: rows } })),

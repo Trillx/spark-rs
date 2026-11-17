@@ -155,6 +155,7 @@ export type SettingsPage =
   | "automation"
   | "agents"
   | "home"
+  | "inbox"
   | "gatekeeper"
   | "priority"
   | "notifications"
@@ -174,6 +175,7 @@ const NAV: { key: SettingsPage; label: string; Icon: LucideIcon }[][] = [
   ],
   [
     { key: "home", label: "Home Screen", Icon: House },
+    { key: "inbox", label: "Inbox", Icon: Inbox },
     { key: "gatekeeper", label: "Gatekeeper", Icon: UserCheck },
     { key: "priority", label: "Priority", Icon: Zap },
     { key: "notifications", label: "Notifications", Icon: Bell },
@@ -329,6 +331,7 @@ export default function Settings({
               {page === "agents" && <AgentsPage onAddAccount={() => onPage("accounts")} />}
               {page === "about" && <About updates={updates} />}
               {page === "home" && <HomeScreenPage settings={home} onChange={onHome} />}
+              {page === "inbox" && <InboxPage cards={cards} onCards={onCards} />}
               {page === "gatekeeper" && <GatekeeperPage mode={gatekeeper} onMode={onGatekeeper} />}
               {page === "priority" && (
                 <PriorityPage
@@ -347,8 +350,6 @@ export default function Settings({
                   onMinimize={onMinimize}
                   popOut={popOut}
                   onPopOut={onPopOut}
-                  cards={cards}
-                  onCards={onCards}
                 />
               )}
             </div>
@@ -2190,8 +2191,6 @@ function AppearancePage({
   onMinimize,
   popOut,
   onPopOut,
-  cards,
-  onCards,
 }: {
   theme: ThemePref;
   onTheme: (theme: ThemePref) => void;
@@ -2199,11 +2198,7 @@ function AppearancePage({
   onMinimize: (on: boolean) => void;
   popOut: boolean;
   onPopOut: (on: boolean) => void;
-  cards: CardPrefs;
-  onCards: (cards: CardPrefs) => void;
 }) {
-  // Priority's size is Settings → Priority's; People always shows.
-  const sized = (key: CardKey) => key !== "priority";
   const { prefs, change } = usePrefs();
   const remoteImages = useLoadRemoteImages();
   return (
@@ -2269,7 +2264,16 @@ function AppearancePage({
           </Row>
         )}
       </Group>
+    </>
+  );
+}
 
+/** The Inbox's cards: which show, and how many emails each shows. */
+function InboxPage({ cards, onCards }: { cards: CardPrefs; onCards: (cards: CardPrefs) => void }) {
+  // Priority's size is Settings → Priority's; People always shows.
+  const sized = (key: CardKey) => key !== "priority";
+  return (
+    <>
       <Group title="Unread cards" note="A card that's off gives its emails to People.">
         {CARD_ORDER.map((key) => {
           const on = !cards.hidden.includes(key);
@@ -2307,6 +2311,16 @@ function AppearancePage({
             </Row>
           );
         })}
+      </Group>
+
+      <Group title="Starred folders">
+        <Row
+          label="Show starred folders' unread mail as cards"
+          description="Each folder starred in the sidebar gets a card in the Inbox with its unread emails. Off, that mail stays in its folder."
+          htmlFor="folder-cards"
+        >
+          <Switch id="folder-cards" on={cards.folders} onToggle={() => onCards({ ...cards, folders: !cards.folders })} />
+        </Row>
       </Group>
     </>
   );

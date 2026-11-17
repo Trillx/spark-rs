@@ -172,6 +172,8 @@ export const CARD_ORDER: CardKey[] = [
 export interface CardPrefs {
   hidden: CardKey[];
   rows: Partial<Record<CardKey, number>>;
+  /** Starred folders' unread mail as cards of their own (Settings → Inbox). */
+  folders: boolean;
 }
 
 const CARDS_KEY = "spark-rs.cards";
@@ -183,9 +185,10 @@ export function loadCardPrefs(): CardPrefs {
     return {
       hidden: Array.isArray(saved.hidden) ? saved.hidden.filter(known) : [],
       rows: typeof saved.rows === "object" && saved.rows ? saved.rows : {},
+      folders: saved.folders !== false,
     };
   } catch {
-    return { hidden: [], rows: {} };
+    return { hidden: [], rows: {}, folders: true };
   }
 }
 
