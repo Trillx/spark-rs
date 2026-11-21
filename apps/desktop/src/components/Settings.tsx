@@ -2268,12 +2268,45 @@ function AppearancePage({
   );
 }
 
-/** The Inbox's cards: which show, and how many emails each shows. */
+const CHECK_MAIL_CHOICES = [
+  { seconds: 10, label: "Every 10 seconds" },
+  { seconds: 30, label: "Every 30 seconds" },
+  { seconds: 60, label: "Every minute" },
+  { seconds: 120, label: "Every 2 minutes" },
+  { seconds: 300, label: "Every 5 minutes" },
+];
+
+/** How often new mail is checked for, and the Inbox's cards: which show, and how many emails each shows. */
 function InboxPage({ cards, onCards }: { cards: CardPrefs; onCards: (cards: CardPrefs) => void }) {
   // Priority's size is Settings → Priority's; People always shows.
   const sized = (key: CardKey) => key !== "priority";
+  const { prefs, status, change } = usePrefs();
   return (
     <>
+      {prefs && (
+        <Group title="New mail">
+          <Row
+            label="Check for new mail"
+            description="How often Microsoft 365 inboxes are checked. Gmail and IMAP inboxes get new mail as it arrives, and use this only when that connection drops."
+            htmlFor="check-mail"
+          >
+            <select
+              id="check-mail"
+              value={prefs.checkMailSeconds}
+              onChange={(e) => void change({ checkMailSeconds: Number(e.target.value) })}
+              className="select select-sm h-8 w-44 rounded-lg border-hairline text-[13px]"
+            >
+              {CHECK_MAIL_CHOICES.map((c) => (
+                <option key={c.seconds} value={c.seconds}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </Row>
+        </Group>
+      )}
+      <StatusLine status={status} />
+
       <Group title="Unread cards" note="A card that's off gives its emails to People.">
         {CARD_ORDER.map((key) => {
           const on = !cards.hidden.includes(key);

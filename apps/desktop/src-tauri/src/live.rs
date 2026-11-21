@@ -3,7 +3,8 @@
 //! A worker loops: send what's due, push local changes once they're past the
 //! undo window, and fetch new mail on Spark's schedule. IMAP inboxes are
 //! watched with IDLE, so new mail comes in as it arrives; other inboxes are
-//! checked every 30 seconds, and when the window comes to the front. Every
+//! checked every 30 seconds (Settings → Inbox → Check for new mail), and
+//! when the window comes to the front. Every
 //! five minutes a sweep also syncs the folders the UI watches, lists the
 //! folders again and fetches what Microsoft mail was stored without. Older
 //! mail is reached back for when the UI asks, and while nothing else waits,
@@ -27,18 +28,21 @@ use spark_mail::engine::{folder_has_older, inbox_has_older};
 use spark_mail::{CutShort, Engine, Error, Round, Untrusted, Watch};
 use spark_store::{Store, now_ms};
 use tauri::async_runtime::JoinHandle;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Notify, oneshot};
 
 use crate::mailbox::{SyncStatus, SyncView, certificate_of};
 use crate::notify;
+use crate::prefs::PrefsState;
 use crate::secrets::MailSecrets;
 
 const TICK: Duration = Duration::from_secs(2);
 /// How often the UI hears what the background download changed, while it
 /// goes on: each time, it works over the whole mailbox again.
 const BACKGROUND_TELLS: Duration = Duration::from_secs(30);
-/// How often an inbox IDLE doesn't watch is checked, as in Spark.
+/// How often an inbox IDLE doesn't watch is checked, as in Spark, until the
+/// user picks another time (`Prefs::check_mail_seconds`). Coming to the
+/// front and mail the server held back keep to this one.
 const INBOX_EVERY: Duration = Duration::from_secs(30);
 /// How often the sweep runs, as in Spark: the inbox (watched or not), the
 /// folders the UI watches, and the folder list.
@@ -542,6 +546,8 @@ async fn work(
                 || !waiters.is_empty(),
         };
         let watching = watcher.watching.load(Ordering::Relaxed);
+        // Read each time, so a new choice in Settings counts at once.
+        schedule.inbox_every = app.state::<PrefsState>().get().check_mail_every();
         if let Some(plan) = schedule.plan(Instant::now(), watching, &wanted) {
             let Plan { fetch, sweep } = plan;
             let list_folders = list_asked || sweep;
@@ -670,8 +676,9 @@ async fn notice_waking(shared: Arc<Shared>, tick: Duration, wall: impl Fn() -> i
 
 /// A worker's timetable: when it last fetched the inbox and swept, and
 /// what a failed or cut-short round left to do.
-#[derive(Default)]
 struct Schedule {
+    /// How often an inbox IDLE doesn't watch is checked: the user's choice.
+    inbox_every: Duration,
     last_fetch: Option<Instant>,
     last_sweep: Option<Instant>,
     /// After a failed round, rounds nothing asked for wait until then.
@@ -681,6 +688,19 @@ struct Schedule {
     owed: Option<Instant>,
     /// Inbox fetches in a row the server cut short.
     short: u32,
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self {
+            inbox_every: INBOX_EVERY,
+            last_fetch: None,
+            last_sweep: None,
+            retry_at: None,
+            owed: None,
+            short: 0,
+        }
+    }
 }
 
 /// What a round was asked for, besides the schedule.
@@ -721,7 +741,11 @@ impl Schedule {
         let past = |at: Option<Instant>, every| at.is_none_or(|at| now - at >= every);
         let sweep = wanted.sweep || wanted.woke || past(self.last_sweep, SWEEP_EVERY);
         // IDLE tells when the inbox changes, so then only the sweep checks it.
-        let every = if watching { SWEEP_EVERY } else { INBOX_EVERY };
+        let every = if watching {
+            SWEEP_EVERY
+        } else {
+            self.inbox_every
+        };
         let focus = wanted.focused && past(self.last_fetch, INBOX_EVERY);
         let owed = self.owed.is_some_and(|at| now >= at);
         let fetch = sweep || wanted.inbox || focus || owed || past(self.last_fetch, every);
@@ -762,7 +786,7 @@ impl Schedule {
 
 /// Keeps IDLE on the account's inbox, so the worker fetches new mail as it
 /// arrives. Ends for accounts it can't watch; the worker checks their inbox
-/// every `INBOX_EVERY` instead, as it does while IDLE is down.
+/// every `Schedule::inbox_every` instead, as it does while IDLE is down.
 async fn watch(engine: Arc<Engine>, account_id: i64, shared: Arc<Shared>) {
     let Shared {
         wake,
@@ -958,6 +982,22 @@ mod tests {
         let nothing = Wanted::default();
         assert_eq!(schedule.plan(at(29), false, &nothing), Some(QUIET));
         assert_eq!(schedule.plan(at(30), false, &nothing), Some(INBOX));
+    }
+
+    #[test]
+    fn an_unwatched_inbox_is_checked_as_often_as_the_user_picked() {
+        let (mut schedule, at) = swept();
+        let nothing = Wanted::default();
+        schedule.inbox_every = Duration::from_secs(10);
+        assert_eq!(schedule.plan(at(9), false, &nothing), Some(QUIET));
+        assert_eq!(schedule.plan(at(10), false, &nothing), Some(INBOX));
+        schedule.finished(at(10), &INBOX, Ended::Whole);
+
+        schedule.inbox_every = Duration::from_secs(120);
+        assert_eq!(schedule.plan(at(129), false, &nothing), Some(QUIET));
+        assert_eq!(schedule.plan(at(130), false, &nothing), Some(INBOX));
+        // IDLE still leaves a watched one to the sweep.
+        assert_eq!(schedule.plan(at(299), true, &nothing), Some(QUIET));
     }
 
     #[test]

@@ -1432,6 +1432,7 @@ let browserPrefs: Prefs = {
   allDayAlert: 720,
   suggestRecipients: true,
   autoDownloadAttachments: true,
+  checkMailSeconds: 30,
   undoSendSeconds: 5,
   sendAndDone: false,
   replyAttachments: "never",

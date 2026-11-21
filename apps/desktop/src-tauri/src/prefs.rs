@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,10 @@ pub struct Prefs {
     /// Spark's Auto-download attachments: an email's files are fetched as
     /// it's opened, so they open at once.
     pub auto_download_attachments: bool,
+    /// How often an inbox IDLE doesn't watch is checked for new mail, in
+    /// seconds: Microsoft 365's, and IMAP's while IDLE is down. 30, as
+    /// Spark, unless the user picks 10, 60, 120 or 300.
+    pub check_mail_seconds: u32,
     /// The "still running" notice has been shown, on the first close.
     pub told_keep_running: bool,
     /// What agents may do in each account, by account id; absent is none.
@@ -155,6 +160,7 @@ impl Default for Prefs {
             all_day_alert: Some(720),
             suggest_recipients: true,
             auto_download_attachments: true,
+            check_mail_seconds: 30,
             told_keep_running: false,
             agent_access: BTreeMap::new(),
         }
@@ -162,6 +168,12 @@ impl Default for Prefs {
 }
 
 impl Prefs {
+    /// `check_mail_seconds`, kept to between 10 seconds and an hour, so a
+    /// hand-edited file can't make the app check all the time.
+    pub fn check_mail_every(&self) -> Duration {
+        Duration::from_secs(self.check_mail_seconds.clamp(10, 3600).into())
+    }
+
     fn path(dir: &Path) -> PathBuf {
         dir.join(FILE_NAME)
     }
@@ -351,6 +363,25 @@ mod tests {
         assert!(prefs.event_alerts);
         assert_eq!(prefs.meeting_popup_minutes, 1, "a minute before, as Spark");
         assert!(prefs.code_alerts && prefs.after_code_copy == AfterCodeCopy::Keep);
+        assert_eq!(
+            prefs.check_mail_every(),
+            Duration::from_secs(30),
+            "as Spark"
+        );
+    }
+
+    #[test]
+    fn checking_for_mail_stays_between_10_seconds_and_an_hour() {
+        let every = |check_mail_seconds| {
+            Prefs {
+                check_mail_seconds,
+                ..Prefs::default()
+            }
+            .check_mail_every()
+        };
+        assert_eq!(every(0), Duration::from_secs(10));
+        assert_eq!(every(120), Duration::from_secs(120));
+        assert_eq!(every(u32::MAX), Duration::from_secs(3600));
     }
 
     #[test]

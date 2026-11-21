@@ -309,6 +309,8 @@ export interface Prefs {
   suggestRecipients: boolean;
   /** Spark's Auto-download attachments: an email's files are fetched as it's opened. */
   autoDownloadAttachments: boolean;
+  /** How often an inbox that can't be told of new mail (Microsoft 365's, IMAP's while IDLE is down) is checked, in seconds: 10, 30, 60, 120 or 300. */
+  checkMailSeconds: number;
   /** How long Undo can stop a message after Send, in seconds. */
   undoSendSeconds: number;
   /** Replies start with "Mark as Done after sending" on. */
