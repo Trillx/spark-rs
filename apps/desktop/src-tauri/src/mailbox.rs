@@ -1043,9 +1043,10 @@ pub async fn get_message_content(
     })
 }
 
-/// Answers the invitation a message carries, by email to its organizer.
-/// Resolves once the reply is sent; the app's other windows are told then
-/// ("invite-answered"), even if the asking window has closed meanwhile.
+/// Answers the invitation a message carries (`Engine::answer_invite`).
+/// Resolves once the answer is sent; the app's other windows are told then
+/// ("invite-answered", and "calendar-changed" for the calendar it may have
+/// changed), even if the asking window has closed meanwhile.
 #[tauri::command]
 pub async fn answer_invite(
     window: Window,
@@ -1062,6 +1063,7 @@ pub async fn answer_invite(
             .answer_invite(id, answer)
             .await
             .map_err(text)?;
+        let _ = window.emit("calendar-changed", ());
     }
     let answered = serde_json::json!({ "window": window.label(), "id": id });
     let _ = window.emit("invite-answered", answered);

@@ -768,7 +768,7 @@ async fn rsvp(env: &Env<'_>, a: &Args<'_>) -> Done {
         ..Reply::new(
             json!({ "id": message, "status": answer.as_str() }),
             format!(
-                "{}. The organizer gets an email with the answer.",
+                "{}. The organizer hears back if they asked to.",
                 super::capitalize(&summary)
             ),
         )

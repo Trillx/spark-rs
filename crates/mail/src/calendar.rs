@@ -1091,6 +1091,34 @@ impl Graph {
         Ok(())
     }
 
+    /// The event in the user's calendar that meeting message `message`
+    /// invites to (Exchange puts it there when the invitation arrives),
+    /// with whether its organizer asked to hear back. `None` if there's no
+    /// such event, or no such message.
+    pub async fn invited_event(&self, message: &str) -> Result<Option<(String, bool)>> {
+        #[derive(Deserialize)]
+        struct Invited {
+            id: String,
+            #[serde(rename = "responseRequested")]
+            response_requested: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        struct Message {
+            event: Option<Invited>,
+        }
+        let url = format!(
+            "/me/messages/{}?$select=id&$expand=microsoft.graph.eventMessage/event($select=id,responseRequested)",
+            path(message)
+        );
+        match self.json::<Message>(self.request(Method::GET, &url)).await {
+            Ok(m) => Ok(m
+                .event
+                .map(|e| (e.id, e.response_requested.unwrap_or(true)))),
+            Err(crate::Error::Gone) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Makes an event in calendar `calendar` (`new_event_body`); Outlook
     /// sends the invitations. Returns its id.
     pub async fn create_event(&self, calendar: &str, body: &serde_json::Value) -> Result<String> {
@@ -1615,6 +1643,33 @@ mod tests {
             seen.lock().unwrap().last().unwrap(),
             "/me/events/e1/tentativelyAccept"
         );
+    }
+
+    #[tokio::test]
+    async fn an_invitation_leads_to_the_event_it_put_in_the_calendar() {
+        fn reply(path: &str) -> Option<serde_json::Value> {
+            Some(match path {
+                p if p.starts_with("/me/messages/invite?") => json!({
+                    "id": "invite",
+                    "event": { "id": "e9", "responseRequested": false }
+                }),
+                p if p.starts_with("/me/messages/plain?") => json!({ "id": "plain" }),
+                _ => return None,
+            })
+        }
+        let (base, seen) = crate::graph::tests::stand_in(reply).await;
+        let graph = Graph::with_base(&base, "token");
+        assert_eq!(
+            graph.invited_event("invite").await.unwrap(),
+            Some(("e9".into(), false))
+        );
+        assert!(
+            seen.lock().unwrap()[0].contains("$expand=microsoft.graph.eventMessage/event"),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(graph.invited_event("plain").await.unwrap(), None);
+        assert_eq!(graph.invited_event("deleted").await.unwrap(), None);
     }
 
     /// Wall-clock time in a zone 7 hours behind UTC, standing in for the user's.

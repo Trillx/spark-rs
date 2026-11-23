@@ -42,8 +42,9 @@ const ANSWERS: {
  * An invite email's event in place of its body, Spark style: a date tile,
  * the title and time, then Accept / Maybe / Decline for an invitation (a
  * banner for a reply or cancellation), and who's invited, the call to join,
- * the place and the description. An answer shows at once and goes out by
- * email to the organizer; if sending fails, the card says so and goes back.
+ * the place and the description. An answer shows at once and goes to the
+ * calendar and the organizer; if sending fails, the card says so and goes back.
+ * The answer already chosen can be sent again, through Change.
  */
 export default function InviteCard({ id, invite, account }: { id: number; invite: Invite; account?: AccountView }) {
   const [answer, setAnswer] = useState(invite.answer);
@@ -56,7 +57,6 @@ export default function InviteCard({ id, invite, account }: { id: number; invite
 
   const choose = (chosen: InviteAnswer) => {
     setChanging(false);
-    if (chosen === answer) return;
     const before = answer;
     setAnswer(chosen);
     setError(null);

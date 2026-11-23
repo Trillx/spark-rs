@@ -320,7 +320,10 @@ pub enum CalendarStatus {
 }
 
 /// The longest stretch of calendar fetched at once.
-const CALENDAR_STRETCH_MS: i64 = 400 * 86_400_000;
+const CALENDAR_STRETCH_MS: i64 = 400 * DAY;
+
+/// A day, in ms.
+const DAY: i64 = 86_400_000;
 
 /// Auto-download leaves alone an email whose attachments add up to more.
 pub const PREFETCH_MAX_BYTES: u64 = 30 * 1024 * 1024;
@@ -2812,17 +2815,25 @@ impl Engine {
         self.graph(account.id, &client_id, &tenant).await
     }
 
-    /// Answers the invitation message `message_id` carries, by email: a
-    /// REPLY to its organizer, sent at once rather than through the outbox.
-    /// The answer is kept with the message for its card.
+    /// Answers the invitation message `message_id` carries. In a Microsoft
+    /// 365 calendar, the event the invitation put there is answered, as
+    /// Outlook does, and the calendar refreshed around it; otherwise by
+    /// email: a REPLY to its organizer, sent at once rather than through
+    /// the outbox. The answer is kept with the message for its card.
     pub async fn answer_invite(&self, message_id: i64, answer: Answer) -> Result<()> {
-        let (account_id, invite, original) = {
+        let (account_id, invite, original, remote_id) = {
             let store = self.store();
             let gone = || Error::Config("That email is no longer here.".into());
             let message = store.message(message_id)?.ok_or_else(gone)?;
             let content = store.content(message_id)?.ok_or_else(gone)?;
             let headers = store.headers(message_id)?.unwrap_or_default();
-            (message.account_id, content.invite, headers.message_id)
+            let remote_id = store.location(message_id)?.and_then(|l| l.remote_id);
+            (
+                message.account_id,
+                content.invite,
+                headers.message_id,
+                remote_id,
+            )
         };
         let account = self.account(account_id)?;
         let not_an_invitation = || Error::Config("That invitation can't be answered.".into());
@@ -2830,6 +2841,30 @@ impl Engine {
             .as_deref()
             .and_then(Invite::from_json)
             .ok_or_else(not_an_invitation)?;
+        if let (
+            AccountConfig::Microsoft {
+                client_id,
+                tenant,
+                calendar: true,
+                ..
+            },
+            Some(remote_id),
+            invite::Kind::Invitation,
+        ) = (config(&account)?, remote_id, invite.kind)
+        {
+            let graph = self.graph(account.id, &client_id, &tenant).await?;
+            if let Some((event, tell_organizer)) = graph.invited_event(&remote_id).await? {
+                graph.answer_event(&event, answer, tell_organizer).await?;
+                self.store().set_rsvp(message_id, answer.as_str())?;
+                // Its day as the calendar has it now; the calendar's own
+                // refresh brings in the rest of a series.
+                let end = invite.end.unwrap_or(invite.start).max(invite.start);
+                let _ = self
+                    .refresh_calendar(account.id, invite.start - DAY, end + DAY)
+                    .await;
+                return Ok(());
+            }
+        }
         let organizer = invite.organizer.as_ref().ok_or_else(not_an_invitation)?;
         let reply = invite::reply(&invite.ics, &account.email, &account.name, answer, now_ms())
             .ok_or_else(not_an_invitation)?;
@@ -6414,6 +6449,72 @@ mod tests {
             })
             .unwrap();
         (signed_in(store, base, account.id), account.id)
+    }
+
+    #[tokio::test]
+    async fn an_invitation_is_answered_in_the_microsoft_calendar() {
+        fn reply(path: &str) -> Option<serde_json::Value> {
+            use serde_json::json;
+            Some(match path {
+                p if p.starts_with("/me/messages/m1?") => json!({
+                    "id": "m1", "event": { "id": "e9", "responseRequested": true }
+                }),
+                "/me/events/e9/accept" => json!({}),
+                p if p.starts_with("/me/calendars?") => json!({ "value": [] }),
+                _ => return None,
+            })
+        }
+        let (base, seen) = graph::tests::stand_in(reply).await;
+        let store = Store::open_in_memory().unwrap();
+        let account = store
+            .add_account(&NewAccount {
+                kind: AccountKind::Microsoft,
+                email: "me@contoso.com",
+                name: "Me",
+                label: "Work",
+                config: &to_json(&AccountConfig::Microsoft {
+                    client_id: "c".into(),
+                    tenant: "t".into(),
+                    calendar: true,
+                    signed_in_as: None,
+                }),
+            })
+            .unwrap();
+        let engine = signed_in(store, base, account.id);
+        let invite = Invite {
+            kind: invite::Kind::Invitation,
+            summary: "Discussion".into(),
+            start: 1_800_000_000_000,
+            ..Default::default()
+        };
+        let incoming = Incoming {
+            account_id: account.id,
+            remote_id: Some("m1".into()),
+            from_address: "lee@contoso.com".into(),
+            subject: "Discussion".into(),
+            date: 1,
+            invite: Some(invite.to_json()),
+            ..Default::default()
+        };
+        let (Added::New(id) | Added::Known(id)) =
+            engine.store().add_incoming(&incoming, false).unwrap();
+
+        engine
+            .answer_invite(id, crate::invite::Answer::Accepted)
+            .await
+            .unwrap();
+        let asked = seen.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|p| p == "/me/events/e9/accept"),
+            "{asked:?}"
+        );
+        assert!(
+            asked.iter().any(|p| p.starts_with("/me/calendars?")),
+            "{asked:?}"
+        );
+        assert!(!asked.iter().any(|p| p.contains("sendMail")), "{asked:?}");
+        let rsvp = engine.store().content(id).unwrap().unwrap().rsvp;
+        assert_eq!(rsvp.as_deref(), Some("accepted"));
     }
 
     /// An engine whose account is the shared mailbox support@contoso.com,
