@@ -3218,6 +3218,12 @@ export default function App() {
     writeWithAi({ type: "quickReply", reply: chip });
   }
 
+  /** A reply your AI provider writes as `instructions` say (Reply to this, over selected text). */
+  function replyWithAi(m: Message, instructions: string) {
+    reply(m);
+    writeWithAi({ type: "write", instructions });
+  }
+
   /** The email a draft replies to or forwards, and which, for AI. */
   function draftReference(d: Draft): Reference | null {
     if (d.replyTo === undefined) return null;
@@ -4380,6 +4386,9 @@ export default function App() {
     openImageSettings: () => openSettings("appearance"),
     reply: (m) => reply(m),
     quickReply,
+    replyWithAi,
+    // A conversation's own window has no assistant.
+    askAssistant: THREAD_WINDOW === null ? (m, question) => openAssistant(question, m) : undefined,
     replyAll: (m) => void replyAll(m),
     forward: (m) => void forward(m),
     openAttachment: async (m, index) => {
@@ -4489,9 +4498,9 @@ export default function App() {
       : undefined;
 
   /** Opens the assistant's panel, asking `question` if there is one. */
-  function openAssistant(question?: string) {
+  function openAssistant(question?: string, about?: Message) {
     setAssistantOpen(true);
-    if (question) setAssistantAsk({ text: question, nonce: Date.now() });
+    if (question) setAssistantAsk({ text: question, nonce: Date.now(), screen: about && { openEmail: about.id } });
   }
 
   /** An email the assistant cited: in the reader if it's here, else in a window of its own. */
@@ -4791,7 +4800,7 @@ export default function App() {
             </section>
           )}
           {!assistantOpen && !draft && !homeShown && !calendarOpen && !pickedRows.length && windowWidth >= ASSISTANT_MIN_WIDTH && (
-            <AssistantPill suggestions={assistantSuggestions(openMessage)} onAsk={openAssistant} />
+            <AssistantPill suggestions={assistantSuggestions(openMessage)} onAsk={(q) => openAssistant(q)} />
           )}
           <AssistantPanel
             open={assistantOpen}

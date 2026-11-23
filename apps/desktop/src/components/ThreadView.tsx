@@ -90,6 +90,7 @@ import Dropdown, { MenuItem, Popover } from "./Dropdown";
 import FindBar from "./FindBar";
 import InviteCard from "./InviteCard";
 import { HtmlBody, TextBody, hasInlineImages, type KeptBody } from "./MessageBody";
+import SelectionAi from "./SelectionAi";
 import SummaryCard, { type SummaryState } from "./SummaryCard";
 
 export interface ThreadActions {
@@ -142,6 +143,10 @@ export interface ThreadActions {
   reply: (m: Message) => void;
   /** Opens a reply that AI writes for the chip. */
   quickReply: (m: Message, chip: QuickReply) => void;
+  /** Opens a reply that AI writes as `instructions` say. */
+  replyWithAi: (m: Message, instructions: string) => void;
+  /** Opens the AI Assistant asking `question` about `m`; absent where there's no assistant (a conversation's own window). */
+  askAssistant?: (m: Message, question: string) => void;
   replyAll: (m: Message) => void;
   forward: (m: Message) => void;
   /** The Gatekeeper's decisions about `m`'s sender, or everyone at its domain, for every account. */
@@ -417,6 +422,20 @@ export default function ThreadView({
         )}
       </div>
       {blocked && <BlockedSenderCard message={m} actions={actions} />}
+      <SelectionAi
+        container={scrollRef}
+        onAsk={
+          actions.askAssistant &&
+          ((id, question) => {
+            const x = conversation.find((c) => c.id === id);
+            if (x) actions.askAssistant?.(x, question);
+          })
+        }
+        onReply={(id, instructions) => {
+          const x = conversation.find((c) => c.id === id);
+          if (x) actions.replyWithAi(x, instructions);
+        }}
+      />
       {finding && <FindBar root={scrollRef} focus={findFocus} onClose={() => setFinding(false)} />}
       <OverlayScroll
         className="min-h-0 flex-1"

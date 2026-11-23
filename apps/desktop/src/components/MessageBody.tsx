@@ -24,6 +24,12 @@ import { ImageViewer, type ViewedImage } from "./ImageViewer";
 // card (`adaptColors`). A reply's quote of earlier mail folds behind "•••".
 // Double-clicking a picture opens it in the viewer (`ImageViewer`).
 
+/** Sent from an email's frame, at the frame, when a pointer or a selecting key lets go in it. */
+export const SELECT_END = "spark:selectend";
+
+/** Keys that can end a selection: Shift with arrows and the like, and Ctrl/Cmd+A. */
+export const SELECTING_KEYS = /^(?:Shift|a|A|Arrow\w+|Home|End|PageUp|PageDown)$/;
+
 /** A runaway layout (e.g. `100vh` content) stops growing here. */
 const MAX_FRAME_HEIGHT = 50_000;
 
@@ -97,7 +103,7 @@ export function TextBody({
   const visible = cut < 0 || shown ? paragraphs : paragraphs.slice(0, cut);
   return (
     <>
-      <div className={`select-text space-y-3 break-words px-5 pt-2 text-sm leading-[1.57] ${cut < 0 ? "pb-5" : "pb-3"}`}>
+      <div data-body className={`select-text space-y-3 break-words px-5 pt-2 text-sm leading-[1.57] ${cut < 0 ? "pb-5" : "pb-3"}`}>
         {visible.map((paragraph, i) => (
           <p key={i} className={`whitespace-pre-line ${cut >= 0 && i >= cut ? "text-text-2" : ""}`}>
             {linkify(paragraph)}
@@ -691,6 +697,11 @@ function wireFrame(
   const onWheel = forwardWheelZoom(host);
   // Open menus close on an outside pointerdown, which a click in the frame wouldn't send.
   const onPointer = () => host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+  // Selecting in the frame can end a selection: the reader offers AI for it (`SelectionAi`).
+  const onSelectEnd = (e: Event) => {
+    if (e instanceof KeyboardEvent && !SELECTING_KEYS.test(e.key)) return;
+    host.dispatchEvent(new Event(SELECT_END, { bubbles: true }));
+  };
   const onDoubleClick = (e: MouseEvent) => {
     const target = e.target as Element | null;
     if (target?.tagName !== "IMG" || !viewable(target as HTMLImageElement)) return;
@@ -713,6 +724,8 @@ function wireFrame(
   doc.addEventListener("wheel", onWheel, { passive: false });
   doc.addEventListener("pointerdown", onPointer);
   doc.addEventListener("dblclick", onDoubleClick);
+  doc.addEventListener("pointerup", onSelectEnd);
+  doc.addEventListener("keyup", onSelectEnd);
   measure();
 
   return [
@@ -727,6 +740,8 @@ function wireFrame(
       doc.removeEventListener("wheel", onWheel);
       doc.removeEventListener("pointerdown", onPointer);
       doc.removeEventListener("dblclick", onDoubleClick);
+      doc.removeEventListener("pointerup", onSelectEnd);
+      doc.removeEventListener("keyup", onSelectEnd);
     },
   ];
 }

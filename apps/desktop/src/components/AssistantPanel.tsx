@@ -86,12 +86,14 @@ export function AssistantPill({ suggestions, onAsk }: { suggestions: string[]; o
 }
 
 /**
- * A question asked from outside the panel (the pill), which starts a chat of its own; `nonce`
- * tells two asks of the same apart.
+ * A question asked from outside the panel (the pill, or text selected in an email), which starts
+ * a chat of its own; `nonce` tells two asks of the same apart. `screen`, when given, is what it's
+ * about in place of what's on screen: the email the text was selected in.
  */
 export interface Ask {
   text: string;
   nonce: number;
+  screen?: Screen;
 }
 
 /**
@@ -156,8 +158,8 @@ export default function AssistantPanel({
     });
   }
 
-  /** Asks `question` in this chat, or with `fresh` in a new one. */
-  async function send(question: string, fresh = false) {
+  /** Asks `question` in this chat, or with `fresh` in a new one; about `about`, if given, rather than the screen. */
+  async function send(question: string, fresh = false, about?: Screen) {
     const text = question.trim();
     if (!text) return;
     if (working && chat.id) await stop();
@@ -169,7 +171,7 @@ export default function AssistantPanel({
     setChat((c) => (fresh ? { id: null, entries: asked } : { ...c, entries: [...c.entries, ...asked] }));
     const onEvent = (event: AssistantEvent) => updateAnswer(token, (a) => reduceAnswer(a, event));
     try {
-      const id = await assistantSend(chatId.current, text, screen, onEvent);
+      const id = await assistantSend(chatId.current, text, about ?? screen, onEvent);
       if (run.current === token && id) setChat((c) => ({ ...c, id }));
     } catch (error) {
       updateAnswer(token, (a) => ({ ...a, status: "failed", message: String(error) }));
@@ -218,7 +220,7 @@ export default function AssistantPanel({
   useEffect(() => {
     if (!ask || asked.current === ask.nonce) return;
     asked.current = ask.nonce;
-    void send(ask.text, true);
+    void send(ask.text, true, ask.screen);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ask]);
 
